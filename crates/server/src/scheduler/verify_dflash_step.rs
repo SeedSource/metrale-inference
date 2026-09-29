@@ -68,7 +68,8 @@ pub fn step_verify_dflash(
     // instead.
     let verified = if dflash_verify_raw_argmax
         && !sched.levers.dflash_masked_verify
-        && !crate::scheduler::sample_step::speculative_bias_forces_host(
+        // 2026-09-29: A146: a thinking row never takes the raw verdict.
+        && !crate::scheduler::sample_step::speculative_raw_argmax_forbidden(
             a,
             sched.levers.think_ended_gpu_argmax,
         ) {

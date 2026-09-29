@@ -12,10 +12,12 @@
 //!   `inside_tool_body` unchanged. Speculative `accept_token` advances are
 //!   rolled back by history delta, and the flags are restored (pick_all.rs,
 //!   pick_positions.rs).
-//! - `a.output_tokens` does not grow during a pick, so every position sees
-//!   the step-start history. Only the two `min_tokens` checks
-//!   (`MinTokensEosMask`, `ForcedTokenFastPath`) and the sampling seed add
-//!   `verify_pos` to compensate.
+//! - 2026-09-29: A146: `pick_positions_from_host` pushes each position's
+//!   pick onto `a.output_tokens` before the next position (and truncates on
+//!   exit), so every position sees the committed history plus the window's
+//!   earlier picks, as decode would; it passes `verify_pos` 0. The
+//!   `min_tokens` checks (`MinTokensEosMask`, `ForcedTokenFastPath`) and the
+//!   sampling seed add `verify_pos` for callers that do not push.
 
 mod argmax;
 mod fast_masked;
@@ -28,6 +30,7 @@ mod scratch;
 use crate::scheduler::ActiveSeq;
 use crate::scheduler::helpers::bf16_to_f32;
 use crate::scheduler::logit_processors::LogitsContext;
+use metrale_gpu_runtime::gpu::DevicePtr;
 use metrale_model_engine::traits::Model;
 
 /// 2026-09-25: pick the token for one verify position.
@@ -199,6 +202,29 @@ pub fn verify_pick_with_pipeline(
     let best_id = argmax::greedy_pick_last_wins(&f32_logits);
     ctx.tel.mark(Phase::Argmax, t_argmax);
     best_id
+}
+
+/// 2026-09-29: A146, spec-in-think parity: pick ONE decode row (the MTP
+/// bootstrap token) through the full host pipeline, as `process_decode_logits` does for every thinking row.
+/// The bootstrap's `sample_token_with_grammar` applies penalties and bias
+/// only (no forced `</think>` injection, mid-word mask, F2 or pin), so a
+/// bootstrap inside `<think>` could emit a token spec-off never would.
+/// `None` on a D2H failure (the caller fails the step as before).
+pub fn pick_decode_row_with_pipeline(
+    model: &dyn Model,
+    row_logits: DevicePtr,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+) -> Option<u32> {
+    let vocab = model.vocab_size();
+    let is_fp32 = model.decode_logits_fp32();
+    let mut buf = vec![0u8; vocab * if is_fp32 { 4 } else { 2 }];
+    model.copy_logits_to_host(row_logits, &mut buf).ok()?;
+    // 2026-09-29: the pipeline mutates the accumulators on `a` directly here
+    // (decode semantics); a stale verify-window trail must not overwrite
+    // them.
+    a.spec_think_trail.clear();
+    Some(verify_pick_with_pipeline(&buf, is_fp32, vocab, a, ctx, 0))
 }
 
 pub use pick_all::verify_pick_all_with_pipeline;

@@ -52,6 +52,8 @@ pub(super) fn process_decoded_token(
     // earlier thinking-watchdog fire (at most 4 times, so 1/16), floored at 8.
     // `PostCloseThinkMask` masks `a.think_start_token` while `think_ended` is
     // set.
+    // 2026-09-29: A146: `emit_token` and `pick_positions_from_host` use
+    // `think_commit::spontaneous_think_budget`, the same decay and floor.
     if !a.inside_thinking && think_start_token == Some(tok) {
         let decay_shift = a.think_watchdog_fires.min(4);
         let decayed = a.spontaneous_think_budget >> decay_shift;
@@ -105,6 +107,9 @@ pub(super) fn process_decoded_token(
     if a.inside_thinking {
         a.consume_generation_budget();
         if think_end_token == Some(tok) {
+            // 2026-09-29: A146: `emit_token`'s `</think>` branch and the
+            // speculative flip in `pick_positions_from_host` reset the same
+            // fields; keep the three in step.
             a.inside_thinking = false;
             a.force_end_thinking = false;
             a.sentence_defer_count = 0;
@@ -115,52 +120,26 @@ pub(super) fn process_decoded_token(
             // (`PinToToolCallStart` reads it); the next content token clears it.
             a.think_just_ended = true;
         } else {
-            a.thinking_tokens += 1;
-            // 2026-09-25: Track ``` code-fence parity inside thinking; a forced
-            // `</think>` is deferred inside a fence (`should_inject_think_end`).
-            // The thinking-loop watchdog below ignores fences.
-            a.in_code_fence = toggle_code_fence(a.in_code_fence, tok, code_fence_token);
-            // 2026-09-25: Budget exhausted: arm the forced `</think>`, which a later
-            // step's pipeline injects.
-            if let Some(budget) = a.thinking_budget
-                && a.thinking_tokens >= budget
-                && !a.force_end_thinking
-            {
-                a.force_end_thinking = true;
-                a.sentence_defer_count = 0;
-                tracing::info!(target: "met::scheduler::decode_logits_step", source = if a.enable_thinking {
-                        "request (client budget/effort; scaled by --max-thinking-budget)"
-                    } else {
-                        "spontaneous <think> (--max-thinking-budget / MODEL.toml)"
-                    },
-                    "Thinking budget exhausted ({budget} tokens), arming </think>; \
-                     deferring up to {MAX_SENTENCE_DEFER_TOKENS} tokens for sentence boundary"
-                );
-            }
-            // 2026-09-25: Thinking-loop watchdog: every `THINK_LOOP_CHECK_STRIDE`
-            // thinking tokens (from `THINK_LOOP_MIN_TOKENS` on), look for a
-            // repeating tail and arm the forced `</think>`.
-            if !sched.levers.disable_watchdogs
-                && sched.watchdog.enable_think_loop_watchdog
-                && !a.force_end_thinking
-                && a.thinking_tokens >= THINK_LOOP_MIN_TOKENS
-                && a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
-                && detect_thinking_token_loop_with(
-                    &a.output_tokens,
-                    a.repetition_detection,
-                    sched.watchdog,
-                )
-            {
-                a.force_end_thinking = true;
-                a.sentence_defer_count = 0;
-                a.think_watchdog_fires = a.think_watchdog_fires.saturating_add(1);
-                tracing::warn!(target: "met::scheduler::decode_logits_step", thinking_tokens = a.thinking_tokens,
-                    watchdog_fires = a.think_watchdog_fires,
-                    "Thinking-loop watchdog fired (period-{}…{} repeat in tail); forcing </think> early",
-                    THINK_LOOP_PERIOD_MIN,
-                    THINK_LOOP_PERIOD_MAX,
-                );
-            }
+            // 2026-09-29: A146: `thinking_tokens`, ``` fence parity, the budget
+            // arm and the thinking-loop watchdog, in one body
+            // (`think_commit::advance_thinking_token`) that `emit_token` also
+            // runs at commit and `pick_positions_from_host` runs per verify
+            // position, so a token committed inside `<think>` advances the
+            // same state on every path. `tok` is not pushed yet: the history
+            // is all of `output_tokens`.
+            let history_len = a.output_tokens.len();
+            crate::scheduler::think_commit::advance_thinking_token(
+                a,
+                tok,
+                history_len,
+                crate::scheduler::think_commit::ThinkTokenEnv {
+                    code_fence_token,
+                    think_loop_enabled: !sched.levers.disable_watchdogs
+                        && sched.watchdog.enable_think_loop_watchdog,
+                    watchdog: sched.watchdog,
+                },
+                true,
+            );
         }
     } else {
         handle_content_token(a, model, sched);
@@ -196,6 +175,8 @@ pub(super) fn process_decoded_token(
             }
         }
     }
+    // 2026-09-29: A146: `emit_token` (before its push) and
+    // `pick_positions_from_host` apply the same 512-token clear.
     // 2026-09-25: `require_tool_call` still set after 512 output tokens: clear it,
     // which lifts its hold on EOS.
     if a.require_tool_call && a.output_tokens.len() > 512 {

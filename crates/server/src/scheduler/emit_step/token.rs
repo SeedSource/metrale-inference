@@ -32,6 +32,14 @@ pub fn emit_token(
         a.output_tokens.len(),
         tok,
     );
+    // 2026-09-29: A146, spec-in-think parity: re-apply the logits pipeline's
+    // accumulators (F2 streak and arming, forced-`</think>` defer ticks) as
+    // they stood after THIS position's pipeline in the verify pick window,
+    // which is what decode's `process_seq_logits` leaves before its commit.
+    // Producer: `pick_positions_from_host`. A no-op outside a verify commit
+    // run.
+    crate::scheduler::think_commit::apply_spec_think_trail(a, tok);
+
     // 2026-09-25: the streaming side set the request's cancel flag: finish
     // now, without naming a guard.
     if sched.io.req.is_cancelled(a.cancel_flag.as_ref()) {
@@ -83,7 +91,10 @@ pub fn emit_token(
         a.post_think_emitted = 0;
         a.think_ended = false;
         a.think_skip_count = 0;
-        a.thinking_budget = Some(a.spontaneous_think_budget);
+        // 2026-09-29: A146: decayed per earlier thinking-watchdog fire, the
+        // same budget as decode's spontaneous `<think>` branch
+        // (`think_commit::spontaneous_think_budget`).
+        a.thinking_budget = Some(crate::scheduler::think_commit::spontaneous_think_budget(a));
         tracing::debug!("Spontaneous <think> detected in emit_token, entering thinking mode");
         return;
     }
@@ -115,6 +126,17 @@ pub fn emit_token(
     if a.require_tool_call && a.tool_call_start_token == Some(tok) && !a.inside_thinking {
         a.require_tool_call = false;
         a.tool_call_opened = true;
+    }
+    // 2026-09-29: A146: the twin of decode's 512-token `require_tool_call`
+    // safety clear (`decode_logits_step/per_token.rs`, judged on the pre-push
+    // length there too). Without it a long speculative `<think>` kept the flag
+    // set past 512 tokens, so the post-`</think>` `<tool_call>` pin
+    // (`PinToToolCallStart`) and the legacy EOS hold diverged from spec-off.
+    if a.require_tool_call && a.output_tokens.len() > 512 {
+        tracing::warn!(
+            "require_tool_call safety: no <tool_call> after 512 tokens, clearing EOS suppression"
+        );
+        a.require_tool_call = false;
     }
 
     // 2026-09-25: tool-body / parameter-body state. `decode_logits_step`
@@ -195,6 +217,11 @@ pub fn emit_token(
             a.think_force_closed = a.force_end_thinking;
             a.force_end_thinking = false;
             a.sentence_defer_count = 0;
+            // 2026-09-29: A146: the other resets of decode's `</think>`
+            // transition: a later re-entry into `<think>` starts with a fresh
+            // F2 streak and outside a fence.
+            a.consecutive_confident = 0;
+            a.in_code_fence = false;
             a.think_ended = true;
             // 2026-09-25: one-shot read by `PinToToolCallStart` on the next
             // step; cleared by the next non-thinking token below.
@@ -205,25 +232,25 @@ pub fn emit_token(
                 a.thinking_budget,
             );
         } else {
-            a.thinking_tokens += 1;
-            if let Some(budget) = a.thinking_budget
-                && a.thinking_tokens >= budget
-                && !a.force_end_thinking
-            {
-                a.force_end_thinking = true;
-                a.sentence_defer_count = 0;
-                // 2026-09-25: the log names the budget's source, as in
-                // `decode_logits_step`.
-                tracing::info!(
-                    source = if a.enable_thinking {
-                        "request (client budget/effort; scaled by --max-thinking-budget)"
-                    } else {
-                        "spontaneous <think> (--max-thinking-budget / MODEL.toml)"
-                    },
-                    "Thinking budget exhausted ({budget} tokens), arming </think>; \
-                     deferring to next sentence boundary"
-                );
-            }
+            // 2026-09-29: A146: the body decode (`decode_logits_step`) and the
+            // verify window (`pick_positions_from_host`) also run:
+            // `thinking_tokens`, ``` fence parity (never toggled here before),
+            // the budget arm, and the thinking-loop watchdog (decode-only
+            // before). `tok` is already pushed, so the loop scan gets
+            // `len - 1`, the history decode sees.
+            let history_len = a.output_tokens.len().saturating_sub(1);
+            crate::scheduler::think_commit::advance_thinking_token(
+                a,
+                tok,
+                history_len,
+                crate::scheduler::think_commit::ThinkTokenEnv {
+                    code_fence_token: sched.limits.code_fence_token,
+                    think_loop_enabled: !sched.levers.disable_watchdogs
+                        && sched.watchdog.enable_think_loop_watchdog,
+                    watchdog: sched.watchdog,
+                },
+                true,
+            );
         }
     } else {
         a.consume_generation_budget();
@@ -348,6 +375,15 @@ pub fn emit_token(
         return;
     }
     if a.eos_tokens.contains(&tok) && suppress_eos {
+        // 2026-09-29: A146: inside `<think>` the dropped EOS must not stay in
+        // the history: decode never pushes a held-back EOS, and the history
+        // feeds the mid-word `</think>` mask, the sentence-boundary injection
+        // gate, the penalties and the thinking-loop scan of every later
+        // token. A held-back EOS in the content phase keeps its push, outside
+        // the spec-in-think scope.
+        if a.inside_thinking && a.output_tokens.last() == Some(&tok) {
+            a.output_tokens.pop();
+        }
         return;
     }
     // 2026-09-25: thinking tokens of a request without thinking enabled are

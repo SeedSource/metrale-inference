@@ -194,6 +194,21 @@ pub(super) fn step_mtp_bootstrap_batched(
         let row_logits = logits.offset(j * vocab * elem);
         let batched = batch_toks.as_ref().filter(|_| greedy[j]).map(|t| t[j]);
         let tok = match batched {
+            // 2026-09-29: A146, spec-in-think parity: a thinking row takes
+            // decode's full host pipeline (twin of the per-sequence bootstrap
+            // in `mtp_step/serial_bootstrap.rs`).
+            _ if a.inside_thinking => {
+                match crate::scheduler::verify_pipeline_helper::pick_decode_row_with_pipeline(
+                    model, row_logits, a, verify_ctx,
+                ) {
+                    Some(t) => t,
+                    None => {
+                        tracing::error!("batched bootstrap in-think pipeline pick: D2H failed");
+                        a.finished = true;
+                        continue;
+                    }
+                }
+            }
             Some(t) => t,
             None => {
                 let history = crate::scheduler::sample_step::penalty_history_scope(

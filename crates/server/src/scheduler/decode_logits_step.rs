@@ -41,6 +41,8 @@ fn logits_ctx<'a>(
         think_start_token,
         tool_call_start_token,
         tool_call_end_token,
+        // 2026-09-29: A146: read only by the verify pick window.
+        code_fence_token: sched.limits.code_fence_token,
         verify_pos: 0,
         watchdog: sched.watchdog,
         scratch,

@@ -391,6 +391,7 @@ fn run_scenario_inner(sc: &Scenario, build: DeviceBuilder) -> Vec<String> {
                     im_start_hard_stop: None,
                     tool_response_hard_stop: None,
                     max_seq_len: 4096,
+                    code_fence_token: None,
                 },
                 watchdog: WatchdogParams::default(),
                 levers,

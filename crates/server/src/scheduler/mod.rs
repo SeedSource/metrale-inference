@@ -19,6 +19,8 @@ mod decode_logits_step;
 mod decode_step;
 #[cfg(test)]
 mod emit_eos_thinking_tests;
+#[cfg(test)]
+mod emit_spec_think_tests;
 mod emit_step;
 #[cfg(test)]
 mod emit_tool_call_finish_tests;
@@ -75,6 +77,7 @@ mod swap_out_tests;
 mod teardown;
 #[cfg(test)]
 mod test_support;
+mod think_commit;
 #[cfg(test)]
 mod think_skip_tests;
 #[cfg(test)]
@@ -91,7 +94,6 @@ mod verify_pipeline_helper;
 pub mod vocab_masks;
 
 use beam_prefill::resolve_beam_hyp;
-use confidence::*;
 use decode_logits_content::*;
 use decode_logits_seq::*;
 use decode_logits_step::*;

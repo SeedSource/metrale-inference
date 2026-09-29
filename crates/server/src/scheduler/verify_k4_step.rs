@@ -97,7 +97,8 @@ pub fn step_verify_k4(
     // instead.
     let (v0, v1, v2, v3) = if dflash_verify_raw_argmax
         && !sched.levers.dflash_masked_verify
-        && !crate::scheduler::sample_step::speculative_bias_forces_host(
+        // 2026-09-29: A146: a thinking row never takes the raw verdict.
+        && !crate::scheduler::sample_step::speculative_raw_argmax_forbidden(
             a,
             sched.levers.think_ended_gpu_argmax,
         ) {

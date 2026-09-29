@@ -152,6 +152,12 @@ pub(in crate::scheduler) struct ActiveSeq {
     /// preemption and on swap-in, so a resumed sequence re-measures. See
     /// `adaptive_spec`.
     pub spec_adapt: crate::scheduler::adaptive_spec::AdaptState,
+    /// 2026-09-29: A146, spec-in-think parity: the per-position post-pipeline
+    /// accumulators the last verify pick window left, consumed one position
+    /// at a time by `emit_token` (see `think_commit::SpecThinkTrail`).
+    /// Transient: empty outside a verify commit run, reset on swap-in.
+    pub spec_think_trail:
+        std::collections::VecDeque<crate::scheduler::think_commit::SpecThinkTrail>,
     /// 2026-09-25: Consecutive `</think>` tokens skipped outside thinking; the 50th ends
     /// the turn.
     pub think_skip_count: u32,

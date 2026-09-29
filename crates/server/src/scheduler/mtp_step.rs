@@ -144,7 +144,8 @@ pub fn step_mtp(
             // it through the masked pipeline.
             if a.grammar_state.is_some()
                 || g < 1
-                || crate::scheduler::sample_step::speculative_bias_forces_host(
+                // 2026-09-29: A146: a thinking row needs the host pipeline too.
+                || crate::scheduler::sample_step::speculative_raw_argmax_forbidden(
                     a,
                     sched.levers.think_ended_gpu_argmax,
                 )

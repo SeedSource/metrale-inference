@@ -114,6 +114,7 @@ fn logits_context_field_set_is_stable() {
         think_start_token: Some(2),
         tool_call_start_token: Some(3),
         tool_call_end_token: Some(4),
+        code_fence_token: None,
         verify_pos: 0,
     };
     // 2026-09-25: `Clone`, not `Copy`: the masks are `Arc`s.

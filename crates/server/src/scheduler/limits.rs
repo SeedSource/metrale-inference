@@ -2,9 +2,10 @@
 
 //! 2026-09-25: [`SchedLimits`]: the run's hard stops, from this model's tokenizer and the CLI.
 //!
-//! `serve_load` builds the value for a run: the two token ids come from
+//! `serve_load` builds the value for a run: the token ids come from
 //! `TokenizerRuntime` and `max_seq_len` from `--max-seq-len`. The token ids are
-//! valid only for the tokenizer that resolved them.
+//! valid only for the tokenizer that resolved them. 2026-09-29: A146 adds the
+//! code-fence token, which is not a stop (see its field).
 //!
 //! Owner: scheduler.
 //! Invariants: none beyond the types.
@@ -23,6 +24,12 @@ pub struct SchedLimits {
     /// 2026-09-25: Served-context ceiling (`--max-seq-len`), checked per decode step.
     /// `0` means no ceiling: `helpers::seqlen_force_stop` then never fires.
     pub max_seq_len: usize,
+    /// 2026-09-29: A146: the tokenizer's atomic ``` code-fence token, when it
+    /// has one. Not a stop: `emit_token` needs it to track `in_code_fence`
+    /// exactly as `process_decode_logits` does (which receives it as a
+    /// parameter), so the forced-`</think>` fence deferral agrees across the
+    /// two commit paths.
+    pub code_fence_token: Option<u32>,
 }
 
 impl SchedLimits {
@@ -32,6 +39,7 @@ impl SchedLimits {
         im_start_hard_stop: None,
         tool_response_hard_stop: None,
         max_seq_len: 0,
+        code_fence_token: None,
     };
 }
 

@@ -70,6 +70,11 @@ pub struct LogitsContext<'a> {
     pub think_start_token: Option<u32>,
     pub tool_call_start_token: Option<u32>,
     pub tool_call_end_token: Option<u32>,
+    /// 2026-09-29: A146: the tokenizer's atomic ``` token. Read only by the
+    /// verify pick window (`pick_positions_from_host`), which advances
+    /// `in_code_fence` per position exactly as the commit paths do
+    /// (`think_commit`).
+    pub code_fence_token: Option<u32>,
     /// 2026-09-25: This position's index in the verify window (0 on the decode path).
     /// The `min_tokens` checks count `output_tokens.len() + verify_pos`.
     pub verify_pos: usize,

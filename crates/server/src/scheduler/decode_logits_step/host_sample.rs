@@ -76,6 +76,7 @@ pub(super) fn sample_on_host(
         let boundary_mask = sched.masks.boundary.clone();
         let mid_word_mask = sched.masks.mid_word.clone();
         let sampling = sched.levers.sampling();
+        let code_fence_token = sched.limits.code_fence_token;
         active
             .par_iter_mut()
             .enumerate()
@@ -89,6 +90,7 @@ pub(super) fn sample_on_host(
                         think_start_token,
                         tool_call_start_token,
                         tool_call_end_token,
+                        code_fence_token,
                         verify_pos: 0,
                         watchdog,
                         scratch,

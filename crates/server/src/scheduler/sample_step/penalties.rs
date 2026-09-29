@@ -204,6 +204,24 @@ pub(in crate::scheduler) fn speculative_base_logit_bias(
     Vec::new()
 }
 
+/// 2026-09-29: A146, spec-in-think parity: true when a speculative raw-argmax
+/// verdict (the DFlash verify steps K2/K3/K4, the DFlash single verify, the
+/// batched DFlash partition) must not be taken for this row. Decode never
+/// emits a thinking row from its device argmax (`decode_row_uses_gpu_argmax`
+/// is false while `inside_thinking`): every thinking token goes through the
+/// host pipeline (forced `</think>` injection, mid-word mask, the min-reasoning
+/// floor, F2). The raw-argmax verdicts skip that pipeline, so a window that
+/// starts inside `<think>` takes the masked pipeline
+/// (`verify_pick_all_with_pipeline`) instead. Inert while speculation never
+/// starts inside `<think>` (`mtp_gate::spec_dispatch_eligible`). The other
+/// half is [`speculative_bias_forces_host`] (A144).
+pub(in crate::scheduler) fn speculative_raw_argmax_forbidden(
+    a: &ActiveSeq,
+    admit_think_ended: bool,
+) -> bool {
+    a.inside_thinking || speculative_bias_forces_host(a, admit_think_ended)
+}
+
 /// 2026-09-29: A144: true when a speculative device-argmax shortcut (the
 /// verify grammar and grammarless fast paths, the masked chat fast path, the
 /// DFlash raw-argmax verdict, the DFlash batched verify) must not be taken

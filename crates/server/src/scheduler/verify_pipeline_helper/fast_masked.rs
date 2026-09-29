@@ -17,7 +17,7 @@ use metrale_model_engine::traits::Model;
 /// caller must try its other paths.
 ///
 /// Requires: the `dflash_masked_verify` and `fast_masked` levers on, no
-/// grammar, AdaDec diagnostics off, `F2ConfidenceEarlyStop`, the forced
+/// grammar, outside thinking (2026-09-29, A146), AdaDec diagnostics off, `F2ConfidenceEarlyStop`, the forced
 /// `</think>` and the tool-call pin all inactive, penalties not `Blocked`,
 /// and at every position an argmax that is not the think-end, think-start
 /// or tool-call-start token and, for `ReduceOnly` penalties, is
@@ -45,7 +45,14 @@ pub(super) fn try_chat_fast_path(
     }
     let fast_masked_enabled = ctx.sampling.fast_masked;
     let adadec_recording = ctx.sampling.adadec_diagnostic;
-    if !fast_masked_enabled || a.grammar_state.is_some() || adadec_recording {
+    // 2026-09-29: A146, spec-in-think parity: the checks below are judged on
+    // the step-start state, but inside `<think>` the window itself can cross
+    // the F2 400-token gate, the thinking budget or a thinking-loop stride
+    // (arming the forced `</think>` mid-window), and the stateful F2 and
+    // defer-tick stages must run per position. Decode never takes a device
+    // argmax for a thinking row (`decode_row_uses_gpu_argmax`), so neither
+    // does this shortcut.
+    if !fast_masked_enabled || a.grammar_state.is_some() || adadec_recording || a.inside_thinking {
         return None;
     }
     use crate::scheduler::confidence::{

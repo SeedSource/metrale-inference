@@ -264,7 +264,9 @@ mod feed_argmax_tests;
 mod penalties;
 pub use penalties::{apply_dry_penalty, apply_lz_penalty, apply_penalties_and_bias};
 mod sample_impl;
-pub use sample_impl::{sample_with_params_history, sample_with_params_seeded};
+pub use sample_impl::{
+    greedy_pick_last_wins, sample_with_params_history, sample_with_params_seeded,
+};
 
 /// 2026-09-25: `sample_with_params_history` with an empty history, so of the
 /// penalty stage only the logit bias applies.

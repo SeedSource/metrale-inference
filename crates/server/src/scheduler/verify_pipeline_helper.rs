@@ -39,7 +39,8 @@ use metrale_model_engine::traits::Model;
 ///   `METRALE_FORCE_TEMP_ZERO` raw argmax, or a forced grammar token);
 /// - a sample from the processed logits, when `mtp_verify_sample` is on and
 ///   the sequence's temperature is above 0;
-/// - the first-index argmax of the processed logits.
+/// - the last-index argmax of the processed logits (2026-09-29, A144b:
+///   decode's tie-break).
 ///
 /// The pipeline stages mutate `a` (for example the F2ConfidenceEarlyStop
 /// streak and `sentence_defer_count`). `verify_pos` is this position's index
@@ -183,11 +184,19 @@ pub fn verify_pick_with_pipeline(
         return sampled;
     }
 
-    // 2026-09-25: first-index-wins argmax. The sampler's own greedy branch
-    // breaks ties on the last index (`greedy_pick_last_wins`), so the two
-    // can differ on exact ties.
+    // 2026-09-29: A144b: this is decode's host greedy pick for this position
+    // (temperature 0 reaches here only when `process_position_logits`
+    // returned no forced token), so it uses decode's tie-break, last index
+    // wins (`greedy_pick_last_wins`), not first-index-wins
+    // `argmax_first_wins`. The first-wins pick was the A144b root cause: on
+    // quantised checkpoints exact logit ties are common, and spec-off decode
+    // and K3 verify emitted different tied ids (54/60 divergent TEB
+    // transcripts at temperature 0). `argmax_first_wins` stays where it
+    // mirrors the device argmax instead (`speculative_base_logit_bias`'s
+    // raw-argmax probe above), whose tie order is a different, unverified
+    // one.
     let t_argmax = ctx.clock.now();
-    let best_id = argmax::argmax_first_wins(&f32_logits);
+    let best_id = argmax::greedy_pick_last_wins(&f32_logits);
     ctx.tel.mark(Phase::Argmax, t_argmax);
     best_id
 }

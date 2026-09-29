@@ -591,3 +591,28 @@ fn a144_bias_skipped_exactly_where_decode_gpu_argmax_skips_it() {
     a.temperature = 0.7;
     assert!(speculative_bias_forces_host(&a, true));
 }
+
+// 2026-09-29: A144b: verify's final pick uses decode's tie-break. Decode's
+// host greedy path (`greedy_pick_last_wins`) and this host path process the
+// same dequantised logits (BF16 to F32, no extra rounding either side), so
+// an exact tie on a quantised checkpoint is real and common. The host path's
+// final argmax used to resolve ties to the first equal id while decode
+// resolves them to the last, which produced the K3-vs-spec-off synonym swaps
+// (54/60 divergent TEB transcripts at temperature 0).
+
+#[test]
+fn a144b_verify_exact_tie_matches_decodes_last_wins_tie_break() {
+    // 2026-09-29: HELLO (104) and TOOL_CALL_OPEN (128) tie at the row max,
+    // 9.0, which BF16 represents exactly, so the round trip cannot break the
+    // tie by accident.
+    let mut a = post_think_grammarless_seq();
+    a.min_tokens = 0;
+    let buf = bf16_rows(&[row(&[(HELLO, 9.0), (TOOL_CALL_OPEN, 9.0)])]);
+    let picks = with_ctx(|ctx| pick_positions_from_host(&buf, VOCAB, 2, 1, &mut a, ctx));
+    assert_eq!(
+        picks,
+        vec![TOOL_CALL_OPEN],
+        "TOOL_CALL_OPEN (id 128) is the last of the two tied ids (104, 128); \
+         decode's `greedy_pick_last_wins` must win here, not first-wins' HELLO"
+    );
+}

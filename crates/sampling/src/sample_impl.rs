@@ -188,7 +188,13 @@ pub fn sample_with_params_seeded(
 /// `max_by` expression itself runs; otherwise the result is the last index
 /// equal to the maximum, which is what `max_by` returns on NaN-free input,
 /// -0.0/+0.0 ties included.
-fn greedy_pick_last_wins(v: &[f32]) -> u32 {
+///
+/// 2026-09-29: A144b: `pub`, re-exported from the crate root, as the one
+/// tie-break for every other host-side greedy pick that must match what
+/// this (decode's) host path would emit at the same position: the server's
+/// verify final pick (`verify_pipeline_helper::verify_pick_with_pipeline`)
+/// calls it rather than a second last-wins implementation.
+pub fn greedy_pick_last_wins(v: &[f32]) -> u32 {
     const LANES: usize = 8;
     let mut acc = [f32::NEG_INFINITY; LANES];
     let mut any_nan = false;

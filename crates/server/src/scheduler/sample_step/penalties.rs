@@ -85,8 +85,12 @@ pub(in crate::scheduler) fn effective_min_p(
 /// - The minimum-reasoning floor below is appended to `logit_bias`.
 ///
 /// `FinalDecode` callers pass the step's temperature, seed and the
-/// sequence's `logit_bias`. `Verify` callers pass temperature 0.0, no seed
-/// and an empty base bias; a debug build asserts this.
+/// sequence's `logit_bias`. `Verify` callers pass temperature 0.0 and no
+/// seed; a debug build asserts this. 2026-09-29: their base bias is the one
+/// decode would apply at the same position ([`speculative_base_logit_bias`],
+/// A144): the sequence's `logit_bias` (the server's `<tool_call>` nudge
+/// included) when decode runs the host pipeline for the row, empty when
+/// decode's device-argmax path would skip it.
 pub(in crate::scheduler) fn penalty_params_for(
     a: &ActiveSeq,
     kind: PositionKind,
@@ -97,10 +101,12 @@ pub(in crate::scheduler) fn penalty_params_for(
     // carried on `WatchdogParams`: 16 when unset, 0 disables the floor.
     min_reasoning_floor: u32,
 ) -> SamplingParams {
+    // 2026-09-29: the base bias is no longer pinned empty for `Verify`
+    // (A144): verify must carry the `logit_bias` decode applies, or spec-on
+    // diverges from spec-off on every tools-present request.
     debug_assert!(
-        kind != PositionKind::Verify
-            || (temperature == 0.0 && seed.is_none() && base_logit_bias.is_empty()),
-        "Verify positions must pass temperature=0.0, seed=None, empty base bias"
+        kind != PositionKind::Verify || (temperature == 0.0 && seed.is_none()),
+        "Verify positions must pass temperature=0.0, seed=None"
     );
     let in_tool = a.inside_tool_body && !a.inside_thinking;
     let mut logit_bias = base_logit_bias;
@@ -148,4 +154,77 @@ pub(in crate::scheduler) fn penalty_params_for(
         stop_token_ids: Vec::new(),
         seed,
     }
+}
+
+/// 2026-09-29: A144: the base `logit_bias` a speculative position (MTP and
+/// DFlash verify, MTP bootstrap) hands to [`penalty_params_for`] so its pick
+/// matches what the single-row decode path would emit at the same position.
+///
+/// Decode applies `a.logit_bias` when it runs the host pipeline for the row.
+/// Its device-argmax path skips the bias
+/// (`decode_logits_step::decode_row_uses_gpu_argmax`), except when that
+/// argmax lands on a post-think `</think>`/`<think>` id, where it redoes the
+/// step on the host with the bias. Parity with decode, not "always apply",
+/// is the contract, so all three cases are mirrored:
+///  * bias empty: empty;
+///  * decode would run the host pipeline at `a.output_tokens.len() +
+///    verify_pos`: `a.logit_bias`;
+///  * decode would take the device argmax: empty, unless `a.think_ended` and
+///    the position's raw argmax (`raw_argmax`, evaluated only in this case)
+///    is `think_end_token` or `a.think_start_token`.
+///
+/// `admit_think_ended` is `think_ended_gpu_argmax`
+/// (`METRALE_NO_THINKENDED_GPU_ARGMAX` turns it off). `a` must reflect the
+/// position's state: the verify loop advances the think and tool-body flags
+/// per position (`pick_positions_from_host`). The in-tool-body opener strip
+/// is not done here; [`penalty_params_for`] applies it from the same `a`.
+pub(in crate::scheduler) fn speculative_base_logit_bias(
+    a: &ActiveSeq,
+    verify_pos: usize,
+    think_end_token: Option<u32>,
+    admit_think_ended: bool,
+    raw_argmax: impl FnOnce() -> u32,
+) -> Vec<(u32, f32)> {
+    if a.logit_bias.is_empty() {
+        return Vec::new();
+    }
+    if !crate::scheduler::decode_logits_step::decode_row_uses_gpu_argmax(
+        a,
+        a.output_tokens.len() + verify_pos,
+        admit_think_ended,
+    ) {
+        return a.logit_bias.clone();
+    }
+    if a.think_ended {
+        let tok = raw_argmax();
+        if Some(tok) == think_end_token || Some(tok) == a.think_start_token {
+            return a.logit_bias.clone();
+        }
+    }
+    Vec::new()
+}
+
+/// 2026-09-29: A144: true when a speculative device-argmax shortcut (the
+/// verify grammar and grammarless fast paths, the masked chat fast path, the
+/// DFlash raw-argmax verdict, the DFlash batched verify) must not be taken
+/// because decode would apply a non-empty `logit_bias` to this row: the bias
+/// can raise a competitor above the raw argmax, and those shortcuts never
+/// see it. When decode would itself take its device argmax (bias skipped),
+/// the shortcut stays legal; the post-think structural-id exception is left
+/// to the callers' existing structural fallbacks.
+///
+/// Evaluated on the step-start state. Sound for the fast paths because they
+/// require `!inside_thinking` (no `</think>` can flip the think flags inside
+/// the window) and the `min_tokens` term only relaxes with position;
+/// conservative (forces host) otherwise.
+pub(in crate::scheduler) fn speculative_bias_forces_host(
+    a: &ActiveSeq,
+    admit_think_ended: bool,
+) -> bool {
+    !a.logit_bias.is_empty()
+        && !crate::scheduler::decode_logits_step::decode_row_uses_gpu_argmax(
+            a,
+            a.output_tokens.len(),
+            admit_think_ended,
+        )
 }

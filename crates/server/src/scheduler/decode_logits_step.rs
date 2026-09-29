@@ -98,42 +98,70 @@ pub(super) fn decode_readback_plan<'a>(
     }
 }
 
-/// 2026-09-25: The predicate behind [`decode_readback_plan`]: may these rows take the
-/// device argmax, or must the block come to the host? Also what the
-/// pipelined lane asks of a batch before it runs a step ahead.
-pub(super) fn argmax_readback_eligible<'a>(
-    rows: impl Iterator<Item = &'a ActiveSeq> + Clone,
-    sched: &crate::scheduler::sched_ctx::SchedCtx,
+/// 2026-09-29: A144: would the single-row decode step emit this row straight
+/// from the device argmax, with no host pipeline and so no penalties and no
+/// `logit_bias`?
+///
+/// The per-row half of [`argmax_readback_eligible`] (the model-level
+/// `decode_logits_fp32` term stays there): greedy temperature, no grammar, no
+/// logprobs, the `min_tokens` floor met at `emitted_len`, and either outside
+/// thinking entirely or a `think_ended` row with neutral penalties admitted by
+/// `admit_think_ended` (`METRALE_NO_THINKENDED_GPU_ARGMAX` turns that off).
+/// `emitted_len` is the output length at the position being decided:
+/// `a.output_tokens.len()` on the decode path, plus `verify_pos` on the
+/// speculative paths.
+///
+/// The speculative paths (verify, MTP bootstrap, DFlash) consult it to apply
+/// `logit_bias` exactly when decode would, including where decode's device
+/// argmax skips it. A `true` row still falls back to the host pipeline, bias
+/// included, when the argmax lands on a post-think `</think>`/`<think>` id;
+/// callers mirror that separately.
+pub(super) fn decode_row_uses_gpu_argmax(
+    a: &ActiveSeq,
+    emitted_len: usize,
+    admit_think_ended: bool,
 ) -> bool {
-    let active = rows;
-    let any_grammar = active.clone().any(|a| a.grammar_state.is_some());
-    let any_logprobs = active.clone().any(|a| a.top_logprobs.is_some());
-    let model_logits_fp32 = sched.io.dev.model().decode_logits_fp32();
     // 2026-09-25: A `think_ended` row may still take the device argmax when it is
     // outside thinking, has no grammar and neutral penalties
     // (`METRALE_NO_THINKENDED_GPU_ARGMAX` turns this off). `PostCloseThinkMask`
     // masks two ids for such a row; `process_decode_logits_skipping` falls back
     // to the host when the device argmax lands on one of them.
-    let think_ended_gpu_ok = |a: &ActiveSeq| {
-        a.think_ended
-            && !a.inside_thinking
-            && a.grammar_state.is_none()
-            && a.repetition_penalty == 1.0
-            && a.presence_penalty == 0.0
-            && a.frequency_penalty == 0.0
-            && a.lz_penalty == 0.0
-            && a.dry_multiplier == 0.0
-    };
-    let admit_think_ended = sched.levers.think_ended_gpu_argmax;
-    let needs_host_logits = active.clone().any(|a| {
-        let excused = admit_think_ended && think_ended_gpu_ok(a);
-        (a.inside_thinking || a.think_ended || a.grammar_state.is_some()) && !excused
-    }) || any_logprobs
-        || model_logits_fp32
+    let think_ended_gpu_ok = a.think_ended
+        && !a.inside_thinking
+        && a.grammar_state.is_none()
+        && a.repetition_penalty == 1.0
+        && a.presence_penalty == 0.0
+        && a.frequency_penalty == 0.0
+        && a.lz_penalty == 0.0
+        && a.dry_multiplier == 0.0;
+    let excused = admit_think_ended && think_ended_gpu_ok;
+    let row_needs_host =
+        (a.inside_thinking || a.think_ended || a.grammar_state.is_some()) && !excused;
+    a.temperature == 0.0
+        && a.grammar_state.is_none()
+        && a.top_logprobs.is_none()
         // 2026-09-25: GPU argmax bypasses the pre-sampling EOS mask. Keep requests with
         // an active minimum-token floor on the host pipeline.
-        || active.clone().any(|a| a.min_tokens > a.output_tokens.len());
-    active.clone().all(|a| a.temperature == 0.0) && !any_grammar && !needs_host_logits
+        && a.min_tokens <= emitted_len
+        && !row_needs_host
+}
+
+/// 2026-09-25: The predicate behind [`decode_readback_plan`]: may these rows take the
+/// device argmax, or must the block come to the host? Also what the
+/// pipelined lane asks of a batch before it runs a step ahead.
+///
+/// 2026-09-29: per-row eligibility is [`decode_row_uses_gpu_argmax`] (A144),
+/// term for term the earlier `all(temperature == 0) && !any_grammar &&
+/// !needs_host_logits` conjunction.
+pub(super) fn argmax_readback_eligible<'a>(
+    rows: impl Iterator<Item = &'a ActiveSeq> + Clone,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) -> bool {
+    let mut active = rows;
+    let model_logits_fp32 = sched.io.dev.model().decode_logits_fp32();
+    let admit_think_ended = sched.levers.think_ended_gpu_argmax;
+    !model_logits_fp32
+        && active.all(|a| decode_row_uses_gpu_argmax(a, a.output_tokens.len(), admit_think_ended))
 }
 
 /// 2026-09-25: The readback for a decode block a lane produced beside its own forward

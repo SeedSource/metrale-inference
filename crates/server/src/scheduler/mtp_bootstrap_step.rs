@@ -118,15 +118,32 @@ pub(super) fn step_mtp_bootstrap_batched(
     // is set) and the row would take that function's fast-greedy branch with
     // no grammar and `PenaltyGate::Neutral` penalties. The batch call runs
     // only with at least two eligible rows; every other row samples per row.
+    //
+    // 2026-09-29: A144: each row's base bias is what decode would apply at
+    // this position (`sample_step::speculative_base_logit_bias`); a
+    // non-empty bias classifies `Blocked`, so such a row leaves the
+    // batched-argmax set and its per-row sample applies the bias on host.
     let pen: Vec<_> = refs
         .iter()
-        .map(|a| {
+        .enumerate()
+        .map(|(j, a)| {
+            let base_bias = crate::scheduler::sample_step::speculative_base_logit_bias(
+                a,
+                0,
+                verify_ctx.think_end_token,
+                sched.levers.think_ended_gpu_argmax,
+                || {
+                    model
+                        .argmax_on_device(logits.offset(j * vocab * elem), 0)
+                        .unwrap_or(u32::MAX)
+                },
+            );
             crate::scheduler::sample_step::penalty_params_for(
                 a,
                 crate::scheduler::sample_step::PositionKind::Verify,
                 0.0,
                 None,
-                Vec::new(),
+                base_bias,
                 sched.watchdog.min_reasoning_floor,
             )
         })

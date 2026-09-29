@@ -137,7 +137,18 @@ pub fn step_mtp(
         for &idx in &verify_idxs {
             let a = &active[idx];
             let g = a.pending_drafts.len();
-            if a.grammar_state.is_some() || g < 1 {
+            // 2026-09-29: A144: the batched DFlash verdict is raw argmax
+            // only (no pipeline, no `logit_bias`); a row whose
+            // decode-effective bias is non-empty (the tools-active
+            // `<tool_call>` nudge) takes the per-sequence step, which routes
+            // it through the masked pipeline.
+            if a.grammar_state.is_some()
+                || g < 1
+                || crate::scheduler::sample_step::speculative_bias_forces_host(
+                    a,
+                    sched.levers.think_ended_gpu_argmax,
+                )
+            {
                 serial_idxs.push(idx);
             } else if gamma == 0 || g == gamma {
                 gamma = g;

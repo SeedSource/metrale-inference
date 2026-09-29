@@ -157,7 +157,15 @@ pub fn step_verify_k2(
     a.last_token_time = sched.io.clock.now();
     let (v0_argmax, v1_argmax) = (result_vec[0], result_vec[1]);
 
-    let (v0, v1) = if dflash_verify_raw_argmax && !sched.levers.dflash_masked_verify {
+    // 2026-09-29: A144: raw argmax never sees `logit_bias`; when decode
+    // would apply a non-empty bias to this row, take the masked pipeline
+    // instead.
+    let (v0, v1) = if dflash_verify_raw_argmax
+        && !sched.levers.dflash_masked_verify
+        && !crate::scheduler::sample_step::speculative_bias_forces_host(
+            a,
+            sched.levers.think_ended_gpu_argmax,
+        ) {
         // 2026-09-25: DFlash without masked verify: judge on the raw argmax,
         // with no masks or penalties.
         (v0_argmax, v1_argmax)

@@ -18,6 +18,14 @@ use super::*;
 static VERIFY_THINK_MASK_FALLBACKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// 2026-09-29: A144: counts calls to [`verify_pick_all_with_pipeline`] where
+/// a non-empty decode-effective `logit_bias`
+/// (`sample_step::speculative_bias_forces_host`) turned off the
+/// GPU-argmax fast paths and forced the host pipeline. Write-only
+/// diagnostic counter.
+pub(crate) static VERIFY_BIAS_HOST_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// 2026-09-29: true when thinking has already closed (`think_ended`) and any
 /// verify-window GPU argmax is the `</think>` or `<think>` id (A143 sibling).
 ///
@@ -67,8 +75,25 @@ pub fn verify_pick_all_with_pipeline(
         return Vec::new();
     }
 
+    // 2026-09-29: A144 logit-bias guard. The GPU-argmax fast paths below
+    // never see `logit_bias`, and a bias can raise a competitor above the raw
+    // argmax (the tools-active `<tool_call>` +3.0 nudge does). When decode
+    // would apply a non-empty bias to this row, force the host pipeline,
+    // where `verify_pick_with_pipeline` applies it per position. When decode
+    // would itself take its device argmax (bias skipped), the fast paths stay
+    // legal: parity with decode, not "always apply".
+    let bias_forces_host = crate::scheduler::sample_step::speculative_bias_forces_host(
+        a,
+        ctx.sampling.think_ended_gpu_argmax,
+    );
+    if bias_forces_host {
+        VERIFY_BIAS_HOST_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // 2026-09-25: the masked chat path; its gates are in `fast_masked.rs`.
-    if let Some(picks) = fast_masked::try_chat_fast_path(model, argmax_ids, a, ctx, row_base) {
+    if !bias_forces_host
+        && let Some(picks) = fast_masked::try_chat_fast_path(model, argmax_ids, a, ctx, row_base)
+    {
         return picks;
     }
 
@@ -124,6 +149,7 @@ pub fn verify_pick_all_with_pipeline(
     };
     if fast_penalty_gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked
         && !think_structural_hit
+        && !bias_forces_host
     {
         let t_fast = ctx.clock.now();
         let vocab = model.vocab_size();
@@ -228,6 +254,7 @@ pub fn verify_pick_all_with_pipeline(
     };
     if chat_fast_gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked
         && !think_structural_hit
+        && !bias_forces_host
     {
         let t_fast = ctx.clock.now();
         let vocab = model.vocab_size();

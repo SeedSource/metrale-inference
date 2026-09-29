@@ -8,9 +8,10 @@
 //! Invariants:
 //! - `verify_pick_all_with_pipeline` returns with the grammar matcher at the
 //!   history depth it entered with, and with `inside_thinking`,
-//!   `think_ended` and `think_just_ended` unchanged. Speculative
-//!   `accept_token` advances are rolled back by history delta, and the
-//!   thinking flags are restored (pick_all.rs, pick_positions.rs).
+//!   `think_ended`, `think_just_ended` and (2026-09-29, A144)
+//!   `inside_tool_body` unchanged. Speculative `accept_token` advances are
+//!   rolled back by history delta, and the flags are restored (pick_all.rs,
+//!   pick_positions.rs).
 //! - `a.output_tokens` does not grow during a pick, so every position sees
 //!   the step-start history. Only the two `min_tokens` checks
 //!   (`MinTokensEosMask`, `ForcedTokenFastPath`) and the sampling seed add
@@ -84,14 +85,32 @@ pub fn verify_pick_with_pipeline(
 
     // 2026-09-25: verify positions take the sequence's repetition, presence,
     // frequency, LZ and DRY penalties and the min-reasoning `</think>` floor
-    // bias, with temperature 0, no seed and no request bias
-    // (`penalty_params_for`). Built before `a` is borrowed mutably below.
+    // bias, with temperature 0 and no seed (`penalty_params_for`). Built
+    // before `a` is borrowed mutably below.
+    //
+    // 2026-09-29: A144: the base bias is the one decode would apply at this
+    // position (`speculative_base_logit_bias`). It was empty, so the
+    // server's tools-active `<tool_call>` +3.0 nudge (and any client
+    // `logit_bias`) never reached verified tokens and spec-on diverged from
+    // spec-off on tool-bearing requests. `a` carries this position's think
+    // and tool-body state (advanced per position by
+    // `pick_positions_from_host`), so the in-tool-body opener strip in
+    // `penalty_params_for` is per position too. The raw-argmax probe runs
+    // only in decode's device-argmax regime, on a `think_ended` row with a
+    // non-empty bias.
+    let base_bias = crate::scheduler::sample_step::speculative_base_logit_bias(
+        a,
+        verify_pos,
+        ctx.think_end_token,
+        ctx.sampling.think_ended_gpu_argmax,
+        || argmax::argmax_first_wins(&f32_logits),
+    );
     let penalties = crate::scheduler::sample_step::penalty_params_for(
         a,
         crate::scheduler::sample_step::PositionKind::Verify,
         0.0,
         None,
-        Vec::new(),
+        base_bias,
         ctx.watchdog.min_reasoning_floor,
     );
 

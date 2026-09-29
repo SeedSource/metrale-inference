@@ -107,12 +107,24 @@ pub(super) fn bootstrap_seq(
     // 2026-09-25: The sequence's penalties from `penalty_params_for`, the
     // builder the non-MTP decode path also uses. Built before
     // `grammar_state` is borrowed mutably below.
+    //
+    // 2026-09-29: A144: the bootstrap token carries the base `logit_bias`
+    // decode would apply at this position (the tools-active `<tool_call>`
+    // nudge included); a non-empty bias blocks `sample_token_with_grammar`'s
+    // device-argmax path via `classify_penalties`, so it is applied on host.
+    let base_bias = crate::scheduler::sample_step::speculative_base_logit_bias(
+        a,
+        0,
+        verify_ctx.think_end_token,
+        sched.levers.think_ended_gpu_argmax,
+        || model.argmax_on_device(logits, 0).unwrap_or(u32::MAX),
+    );
     let penalties = crate::scheduler::sample_step::penalty_params_for(
         a,
         crate::scheduler::sample_step::PositionKind::Verify,
         0.0,
         None,
-        Vec::new(),
+        base_bias,
         sched.watchdog.min_reasoning_floor,
     );
     // 2026-09-25: Penalty history scoped to the current tool-call

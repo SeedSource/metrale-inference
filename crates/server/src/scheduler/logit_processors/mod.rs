@@ -127,6 +127,11 @@ pub struct SamplingLevers {
     /// `sample_token_with_grammar` and the temperature > 0 branch of
     /// `verify_pick_with_pipeline`. On unless `METRALE_NO_MTP_MINP=1`.
     pub mtp_minp: bool,
+    /// 2026-09-29: `SchedLevers::think_ended_gpu_argmax`
+    /// (`METRALE_NO_THINKENDED_GPU_ARGMAX=1` turns it off), read by the
+    /// speculative paths to apply `logit_bias` exactly where decode does
+    /// (A144, `sample_step::speculative_base_logit_bias`).
+    pub think_ended_gpu_argmax: bool,
 }
 
 /// 2026-09-25: What a stage tells the driver: keep going, or emit this token and stop.

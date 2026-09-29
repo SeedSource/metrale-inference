@@ -11,9 +11,11 @@
 //! - Request: temperature 0, seed 0, `max_tokens` = `MAX_TOKENS`, and
 //!   `reasoning_effort: "none"` in the body, which the server maps to thinking
 //!   off, so the gate serve needs no thinking flag. Thinking off matters:
-//!   speculative dispatch is off inside `<think>` unless
-//!   `METRALE_DFLASH_SPEC_THINK=1` (`spec_dispatch_eligible`), so a
-//!   thinking-on run would measure serial decode.
+//!   speculative dispatch is off inside `<think>` unless the lane's
+//!   spec-in-think lever is on (`spec_dispatch_eligible`; 2026-09-29, A146:
+//!   MTP on GLM-5.3 by default, otherwise `METRALE_MTP_SPEC_THINK=1` or
+//!   `METRALE_DFLASH_SPEC_THINK=1`), so a thinking-on run could measure
+//!   serial decode.
 //! - Runs: `RUNS`, with no warmup parameter. The metric is the median
 //!   `usage."response_token/s"`.
 //!

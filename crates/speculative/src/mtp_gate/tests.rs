@@ -341,7 +341,7 @@ fn stale_other_baseline_cannot_steal_mode() {
 }
 
 #[test]
-fn standard_mtp_stays_serial_in_think() {
+fn mtp_spec_think_lever_off_stays_serial_in_think() {
     assert!(!spec_dispatch_eligible(
         true, 0, 0, false, false, false, 0, false
     ));
@@ -354,7 +354,7 @@ fn standard_mtp_stays_serial_in_think() {
 }
 
 #[test]
-fn standard_mtp_spec_think_opts_in() {
+fn mtp_spec_think_lever_on_speculates_in_think() {
     assert!(spec_dispatch_eligible(
         true, 0, 50, false, false, true, 0, false
     ));
@@ -375,6 +375,32 @@ fn dflash_spec_think_opts_in() {
     assert!(spec_dispatch_eligible(
         true, 0, 0, false, false, true, 0, true
     ));
+}
+
+/// 2026-09-29: A146: the MTP-lane default is on for GLM-5.3 only.
+#[test]
+fn mtp_spec_think_default_is_glm53_only() {
+    assert!(mtp_spec_think_default("glm5_next"));
+    assert!(mtp_spec_think_default("glm5_next_text"));
+    for other in [
+        "qwen3_next",
+        "qwen3_5_moe",
+        "deepseek_v4",
+        "step3p7",
+        "glm5",
+        "",
+    ] {
+        assert!(!mtp_spec_think_default(other), "{other} must stay opt-in");
+    }
+}
+
+/// 2026-09-29: A146: each lane reads only its own lever.
+#[test]
+fn spec_think_for_lane_reads_only_the_active_lanes_lever() {
+    assert!(spec_think_for_lane(false, true, false));
+    assert!(!spec_think_for_lane(false, false, true));
+    assert!(spec_think_for_lane(true, false, true));
+    assert!(!spec_think_for_lane(true, true, false));
 }
 
 /// 2026-09-25: A 2048-token think from depth 64 crosses two depth regimes

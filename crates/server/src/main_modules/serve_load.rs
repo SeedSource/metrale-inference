@@ -300,6 +300,13 @@ pub(crate) fn load_model(
     // (`METRALE_DFLASH_MASKED_VERIFY`, on unless `0`) sends the picks back
     // through the masking at the pick sites; it does not change this bool.
     let dflash_verify_raw_argmax = args.dflash;
+    // 2026-09-29: A146: MTP-lane speculation inside `<think>`: default on only
+    // for architectures that passed the spec-in-think quality and safety
+    // gates (GLM-5.3); resolved from the model config once, here, so the
+    // scheduler never string-matches a model. The env overrides it (see
+    // `SchedLevers::mtp_spec_think`).
+    let mtp_spec_think_default =
+        metrale_speculative::mtp_gate::mtp_spec_think_default(&config.model_type);
     let watchdog_params = crate::scheduler::WatchdogParams::from_behavior(
         &ptx_set.behavior,
         args.max_inter_tool_prose,
@@ -355,6 +362,7 @@ pub(crate) fn load_model(
                 max_batch_size,
                 use_speculative,
                 dflash_verify_raw_argmax,
+                mtp_spec_think_default,
                 num_drafts,
                 policy,
                 max_prefill_tokens,

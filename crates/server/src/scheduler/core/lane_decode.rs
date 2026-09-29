@@ -37,6 +37,7 @@ impl SchedulerCore {
         let use_self_speculative = self.use_self_speculative;
         let num_drafts = self.num_drafts;
         let dflash_verify_raw_argmax = self.dflash_verify_raw_argmax;
+        let mtp_spec_think_default = self.mtp_spec_think_default;
         let adaptive_sampling = self.adaptive_sampling;
         if !self.did_mixed_step {
             // 2026-09-25: Order this decode on the default stream after the work queued
@@ -84,10 +85,19 @@ impl SchedulerCore {
             // is not speculated until it has emitted this many tokens after
             // `</think>` (see `spec_dispatch_eligible`).
             let dflash_resume_guard = sched.levers.dflash_resume_guard;
-            // 2026-09-25: `METRALE_DFLASH_SPEC_THINK`: without it, no sequence inside
-            // `<think>` is speculated, for MTP and DFlash alike
-            // (`spec_dispatch_eligible`).
-            let dflash_spec_think = sched.levers.dflash_spec_think;
+            // 2026-09-29: A146: spec-in-think, per lane and per model. The MTP
+            // lane speculates inside `<think>` by default only on models whose
+            // `mtp_spec_think_default` is on (GLM-5.3);
+            // `METRALE_MTP_SPEC_THINK=0` or `METRALE_DFLASH_SPEC_THINK=0`
+            // disables it, `=1` opts other models in. The DFlash lane
+            // (`dflash_verify_raw_argmax` = `args.dflash`, every DFlash verify
+            // mode) stays serial inside `<think>` unless
+            // `METRALE_DFLASH_SPEC_THINK=1` (`spec_dispatch_eligible`).
+            let spec_think = metrale_speculative::mtp_gate::spec_think_for_lane(
+                dflash_verify_raw_argmax,
+                sched.levers.mtp_spec_think(mtp_spec_think_default),
+                sched.levers.dflash_spec_think,
+            );
             // 2026-09-25: Every speculative branch also requires each active slot to be
             // below `spec_slot_cap` (see `SchedulerCore::new`); otherwise the batch
             // takes the plain-decode branch.
@@ -137,7 +147,7 @@ impl SchedulerCore {
                             a.output_tokens.len() as u32,
                             a.suppress_tool_call,
                             a.disable_mtp,
-                            dflash_spec_think,
+                            spec_think,
                             dflash_resume_guard,
                             dflash_verify_raw_argmax,
                         )

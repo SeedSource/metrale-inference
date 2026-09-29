@@ -25,7 +25,7 @@ fn the_five_opt_out_levers_ship_on() {
 /// `false` as well as `0`.
 ///
 /// Pinned in `from_env()`, not just `defaults()`, for the reason
-/// `spec_think_is_off_in_the_resolver_the_server_actually_uses` exists:
+/// `spec_think_per_lane_in_the_resolver_the_server_actually_uses` exists:
 /// `defaults()` is a hand-written literal and cannot catch a change to
 /// what the server resolves.
 #[test]
@@ -62,6 +62,9 @@ fn every_opt_in_lever_ships_off() {
     let d = SchedLevers::defaults();
     assert!(!d.force_temp_zero);
     assert!(!d.dflash_masked_verify && !d.dflash_adaptive && !d.dflash_spec_think);
+    // 2026-09-29: A146: no explicit MTP spec-in-think choice: the model's
+    // default applies.
+    assert_eq!(d.mtp_spec_think_env, None);
     assert!(!d.disable_watchdogs);
     assert!(!d.decode_timing && !d.mtp_timing && !d.adadec_diagnostic);
 }
@@ -75,27 +78,59 @@ fn every_opt_in_lever_ships_off() {
 /// `every_opt_in_lever_ships_off` above — unchanged and green while
 /// production resolves a different value.
 ///
-/// This asserts the resolver itself, with no env set.
-/// `mtp_gate::spec_dispatch_eligible` reads `dflash_spec_think` as
+/// So this asserts the resolver itself. 2026-09-29: A146: the contract
+/// changed: spec-in-think is split per lane, and the MTP lane's default is
+/// per model, on only for GLM-5.3, whose parity chain made spec-in-think
+/// commit exactly what spec-off decode would (Atlas, 2026-09-26: K=3
+/// byte-identical 6/6; TEB 156/176 identical to spec-off per scenario).
+/// Every other model, and the DFlash lane on every model, stays opt-in until
+/// it passes the same gates. With no env set the resolver must therefore
+/// express NO opinion for MTP (`None`, so the model default applies) and keep
+/// DFlash off.
 ///
-///     if inside_thinking && !spec_think { return false; }
-///
-/// for both lanes, so defaulting it on would let plain MTP speculate
-/// inside `<think>`.
+/// One test on purpose: every case mutates the same process env, and the
+/// harness runs tests on parallel threads.
 #[test]
-fn spec_think_is_off_in_the_resolver_the_server_actually_uses() {
-    // 2026-09-25: SAFETY: nothing else in this test binary writes these
+fn spec_think_per_lane_in_the_resolver_the_server_actually_uses() {
+    use metrale_speculative::mtp_gate::mtp_spec_think_default;
+    const MTP: &str = "METRALE_MTP_SPEC_THINK";
+    const DFLASH: &str = "METRALE_DFLASH_SPEC_THINK";
+    let glm = mtp_spec_think_default("glm5_next");
+    let other = mtp_spec_think_default("qwen3_next");
+    // 2026-09-29: SAFETY: nothing else in this test binary writes these
     // variables. `cargo test` runs tests on parallel threads, so a
     // concurrent environment access from another test is not excluded.
-    unsafe { std::env::remove_var("METRALE_DFLASH_SPEC_THINK") };
+    let set = |mtp: Option<&str>, dflash: Option<&str>| unsafe {
+        match mtp {
+            Some(v) => std::env::set_var(MTP, v),
+            None => std::env::remove_var(MTP),
+        }
+        match dflash {
+            Some(v) => std::env::set_var(DFLASH, v),
+            None => std::env::remove_var(DFLASH),
+        }
+    };
+
+    set(None, None);
     let live = SchedLevers::from_env(None);
+    assert_eq!(
+        live.mtp_spec_think_env, None,
+        "with no env set the resolver must defer to the model default"
+    );
+    assert!(
+        live.mtp_spec_think(glm),
+        "GLM-5.3 MTP spec-in-think ships ON"
+    );
+    assert!(
+        !live.mtp_spec_think(other),
+        "non-GLM MTP spec-in-think must stay OPT-IN until independently qualified"
+    );
     assert!(
         !live.dflash_spec_think,
-        "METRALE_DFLASH_SPEC_THINK must stay OPT-IN: from_env() resolved it ON. \
-         It is the one lever here that is not gated behind dflash_verify_raw_argmax, \
-         so defaulting it on changes plain-MTP serving and deterministically \
-         damages agentic trajectories. See mtp_gate::spec_dispatch_eligible."
+        "METRALE_DFLASH_SPEC_THINK must stay OPT-IN for the DFlash lane: from_env() \
+         resolved it ON. DFlash-in-think has no GPU + TEB qualification yet."
     );
+    // 2026-09-29: the two DFlash levers graduated earlier stay graduated.
     assert!(
         live.dflash_masked_verify,
         "masked_verify is intentionally default-ON"
@@ -104,6 +139,122 @@ fn spec_think_is_off_in_the_resolver_the_server_actually_uses() {
         live.dflash_seam_serial,
         "seam_serial is intentionally default-ON"
     );
+
+    set(Some("0"), None);
+    let l = SchedLevers::from_env(None);
+    assert!(
+        !l.mtp_spec_think(glm),
+        "METRALE_MTP_SPEC_THINK=0 turns GLM off"
+    );
+
+    set(None, Some("0"));
+    let l = SchedLevers::from_env(None);
+    assert!(
+        !l.mtp_spec_think(glm),
+        "METRALE_DFLASH_SPEC_THINK=0 must keep working as an off switch for MTP"
+    );
+    assert!(!l.dflash_spec_think);
+
+    set(None, Some("1"));
+    let l = SchedLevers::from_env(None);
+    assert!(
+        l.mtp_spec_think(glm) && l.mtp_spec_think(other),
+        "METRALE_DFLASH_SPEC_THINK=1 keeps its pre-split MTP opt-in on every model"
+    );
+    assert!(
+        l.dflash_spec_think,
+        "METRALE_DFLASH_SPEC_THINK=1 opts DFlash in"
+    );
+
+    set(Some("1"), None);
+    let l = SchedLevers::from_env(None);
+    assert!(
+        l.mtp_spec_think(other),
+        "METRALE_MTP_SPEC_THINK=1 is the per-lane opt-in for qualification runs"
+    );
+    assert!(
+        !l.dflash_spec_think,
+        "the MTP switch must not opt the DFlash lane in"
+    );
+
+    set(Some("1"), Some("0"));
+    assert!(
+        !SchedLevers::from_env(None).mtp_spec_think(glm),
+        "an explicit =0 on either variable beats an opt-in"
+    );
+
+    set(None, None);
+}
+
+#[test]
+fn mtp_spec_think_env_resolution_table() {
+    use crate::scheduler::levers::resolve_mtp_spec_think_env as r;
+    assert_eq!(r(None, None), None);
+    assert_eq!(r(Some("0"), None), Some(false));
+    assert_eq!(r(None, Some("0")), Some(false));
+    assert_eq!(r(Some("1"), None), Some(true));
+    assert_eq!(r(None, Some("1")), Some(true));
+    assert_eq!(r(Some("1"), Some("0")), Some(false));
+    assert_eq!(r(Some("0"), Some("1")), Some(false));
+    // 2026-09-29: anything but an exact 0/1 is no opinion, like `opt_in`.
+    assert_eq!(r(Some("true"), Some("")), None);
+}
+
+/// 2026-09-29: A146: the lane and model split, through the levers the
+/// server resolves with no env set (`defaults()`: no explicit choice) and
+/// the per-model default resolved at serve load.
+fn in_think_eligible(levers: &SchedLevers, model_type: &str, dflash_lane: bool) -> bool {
+    use metrale_speculative::mtp_gate::{
+        mtp_spec_think_default, spec_dispatch_eligible, spec_think_for_lane,
+    };
+    let spec_think = spec_think_for_lane(
+        dflash_lane,
+        levers.mtp_spec_think(mtp_spec_think_default(model_type)),
+        levers.dflash_spec_think,
+    );
+    spec_dispatch_eligible(true, 0, 50, false, false, spec_think, 0, dflash_lane)
+}
+
+#[test]
+fn glm53_mtp_speculates_in_think_by_default() {
+    let d = SchedLevers::defaults();
+    assert!(in_think_eligible(&d, "glm5_next", false));
+    assert!(in_think_eligible(&d, "glm5_next_text", false));
+}
+
+#[test]
+fn other_models_mtp_stays_serial_in_think_by_default() {
+    let d = SchedLevers::defaults();
+    assert!(!in_think_eligible(&d, "qwen3_next", false));
+    // 2026-09-29: METRALE_DFLASH_SPEC_THINK=1 (or METRALE_MTP_SPEC_THINK=1)
+    // opts it in.
+    let mut opted = SchedLevers::defaults();
+    opted.mtp_spec_think_env = Some(true);
+    assert!(in_think_eligible(&opted, "qwen3_next", false));
+}
+
+#[test]
+fn glm53_mtp_spec_think_zero_turns_it_off() {
+    let mut off = SchedLevers::defaults();
+    // 2026-09-29: METRALE_MTP_SPEC_THINK=0.
+    off.mtp_spec_think_env = Some(false);
+    assert!(!in_think_eligible(&off, "glm5_next", false));
+}
+
+#[test]
+fn dflash_lane_unchanged_opt_in_on_every_model() {
+    let d = SchedLevers::defaults();
+    for m in ["glm5_next", "qwen3_next"] {
+        assert!(!in_think_eligible(&d, m, true), "{m}: DFlash stays opt-in");
+    }
+    // 2026-09-29: the MTP override never reaches the DFlash lane.
+    let mut mtp_on = SchedLevers::defaults();
+    mtp_on.mtp_spec_think_env = Some(true);
+    assert!(!in_think_eligible(&mtp_on, "glm5_next", true));
+    let mut df_on = SchedLevers::defaults();
+    // 2026-09-29: METRALE_DFLASH_SPEC_THINK=1.
+    df_on.dflash_spec_think = true;
+    assert!(in_think_eligible(&df_on, "qwen3_next", true));
 }
 
 #[test]
@@ -234,7 +385,7 @@ fn the_per_token_scheduler_path_does_not_read_the_environment() {
 
 /// 2026-09-25: The verify-step levers' polarities. `dflash_eagle_fix` is
 /// asserted against `from_env()` as well as `defaults()`, for the reason
-/// `spec_think_is_off_in_the_resolver_the_server_actually_uses` exists.
+/// `spec_think_per_lane_in_the_resolver_the_server_actually_uses` exists.
 #[test]
 fn the_verify_step_levers_hold_their_polarities() {
     let d = SchedLevers::defaults();

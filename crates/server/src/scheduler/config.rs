@@ -21,6 +21,11 @@ pub struct SchedulerConfig {
     pub max_batch_size: usize,
     pub use_speculative: bool,
     pub dflash_verify_raw_argmax: bool,
+    /// 2026-09-29: A146: this model's MTP-lane spec-in-think default
+    /// (`mtp_gate::mtp_spec_think_default(config.model_type)`, resolved once
+    /// at serve load); `METRALE_MTP_SPEC_THINK` / `METRALE_DFLASH_SPEC_THINK`
+    /// override it through `levers`.
+    pub mtp_spec_think_default: bool,
     pub num_drafts: usize,
     /// 2026-09-25: `--scheduler {fifo|slai}`: admission and ordering.
     pub policy: Box<dyn SchedulingPolicy>,

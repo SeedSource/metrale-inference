@@ -9,6 +9,38 @@
 
 use super::*;
 
+/// 2026-09-29: the verify-time analogue of `SchedCtx::think_mask_fallbacks`
+/// (decode_logits_step.rs): counts calls to
+/// [`verify_pick_all_with_pipeline`] where the post-think structural guard
+/// (A143 sibling, [`fast_hits_post_think_structural`]) turned off the
+/// GPU-argmax fast paths and forced the host pipeline. Write-only
+/// diagnostic counter.
+static VERIFY_THINK_MASK_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 2026-09-29: true when thinking has already closed (`think_ended`) and any
+/// verify-window GPU argmax is the `</think>` or `<think>` id (A143 sibling).
+///
+/// Mirrors the single-row decode guard in `decode_logits_step.rs`
+/// (`a.think_ended && (Some(tok) == think_end_token || Some(tok) ==
+/// a.think_start_token)`): once thinking has ended, the host pipeline's
+/// `PostCloseThinkMask` masks both ids so the runner-up wins, while the
+/// grammar and grammarless fast paths below return the raw GPU argmax. It
+/// scans every position of the verify window rather than one token.
+///
+/// O(K) over `argmax_ids`, which are already on the host; no extra D2H.
+pub(super) fn fast_hits_post_think_structural(
+    think_ended: bool,
+    argmax_ids: &[u32],
+    think_end_token: Option<u32>,
+    think_start_token: Option<u32>,
+) -> bool {
+    think_ended
+        && argmax_ids
+            .iter()
+            .any(|&tok| Some(tok) == think_end_token || Some(tok) == think_start_token)
+}
+
 /// 2026-09-25: pick a token for each of one sequence's verify positions.
 ///
 /// `argmax_ids` holds the GPU argmax of each position and sets K. The fast
@@ -38,6 +70,24 @@ pub fn verify_pick_all_with_pipeline(
     // 2026-09-25: the masked chat path; its gates are in `fast_masked.rs`.
     if let Some(picks) = fast_masked::try_chat_fast_path(model, argmax_ids, a, ctx, row_base) {
         return picks;
+    }
+
+    // 2026-09-29: post-think structural guard (A143 sibling). The decode
+    // path falls back to the host pipeline when a `think_ended` argmax lands
+    // on `</think>`/`<think>`, so `PostCloseThinkMask` masks both ids and the
+    // runner-up wins. The grammar and grammarless fast paths below had no
+    // such check and returned the structural id unmasked; a hit now forces
+    // the host path (`pick_positions::pick_positions_from_host`), which runs
+    // `process_position_logits`, `PostCloseThinkMask` included, per
+    // position. The masked chat path above already refuses both ids.
+    let think_structural_hit = fast_hits_post_think_structural(
+        a.think_ended,
+        argmax_ids,
+        ctx.think_end_token,
+        a.think_start_token,
+    );
+    if think_structural_hit {
+        VERIFY_THINK_MASK_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // 2026-09-25: grammar fast path. Eligible when `fast_greedy_grammar` is on
@@ -72,7 +122,9 @@ pub fn verify_pick_all_with_pipeline(
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
-    if fast_penalty_gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked {
+    if fast_penalty_gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked
+        && !think_structural_hit
+    {
         let t_fast = ctx.clock.now();
         let vocab = model.vocab_size();
         let logits_base = model.logits_buffer_ptr();
@@ -174,7 +226,9 @@ pub fn verify_pick_all_with_pipeline(
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
-    if chat_fast_gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked {
+    if chat_fast_gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked
+        && !think_structural_hit
+    {
         let t_fast = ctx.clock.now();
         let vocab = model.vocab_size();
         let logits_base = model.logits_buffer_ptr();
@@ -227,4 +281,76 @@ pub fn verify_pick_all_with_pipeline(
     ctx.tel.mark(Phase::D2h, t_d2h);
 
     pick_positions::pick_positions_from_host(&buf, vocab, elem_bytes, k, a, ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fast_hits_post_think_structural;
+
+    const THINK_END: u32 = 100;
+    const THINK_START: u32 = 101;
+    const HELLO: u32 = 42;
+
+    #[test]
+    fn no_hit_when_think_not_ended() {
+        // 2026-09-29: inside thinking the guard must not fire even on the
+        // structural ids: `PostCloseThinkMask` does not apply yet.
+        assert!(!fast_hits_post_think_structural(
+            false,
+            &[THINK_END, THINK_START],
+            Some(THINK_END),
+            Some(THINK_START),
+        ));
+    }
+
+    #[test]
+    fn no_hit_when_no_row_is_structural() {
+        assert!(!fast_hits_post_think_structural(
+            true,
+            &[HELLO, HELLO, HELLO],
+            Some(THINK_END),
+            Some(THINK_START),
+        ));
+    }
+
+    #[test]
+    fn hits_on_think_end_reopen() {
+        assert!(fast_hits_post_think_structural(
+            true,
+            &[HELLO, THINK_END, HELLO],
+            Some(THINK_END),
+            Some(THINK_START),
+        ));
+    }
+
+    #[test]
+    fn hits_on_think_start_reentry() {
+        assert!(fast_hits_post_think_structural(
+            true,
+            &[THINK_START],
+            Some(THINK_END),
+            Some(THINK_START),
+        ));
+    }
+
+    #[test]
+    fn no_hit_when_tokens_are_not_configured() {
+        // 2026-09-29: with neither id configured nothing can match.
+        assert!(!fast_hits_post_think_structural(
+            true,
+            &[THINK_END, THINK_START],
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn empty_verify_window_never_hits() {
+        assert!(!fast_hits_post_think_structural(
+            true,
+            &[],
+            Some(THINK_END),
+            Some(THINK_START),
+        ));
+    }
 }

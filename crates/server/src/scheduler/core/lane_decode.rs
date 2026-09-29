@@ -54,6 +54,15 @@ impl SchedulerCore {
                     .stream_wait_event(sched.io.dev.model().default_stream(), prefill_event);
             }
 
+            // 2026-09-29: A146: a spec-in-think trail lives for ONE verify
+            // commit run. Entries left by a partial accept must never reach a
+            // later step's emit (the fast-path, raw-argmax and bootstrap emits
+            // run no window), so drop them at every step boundary.
+            // `verify_pick_all_with_pipeline` also clears on entry.
+            for a in active.iter_mut() {
+                a.spec_think_trail.clear();
+            }
+
             // 2026-09-25: The LogitsContext the speculative steps below pass to the
             // logits processors: special-token ids, masks and sampling levers.
             let verify_ctx = crate::scheduler::logit_processors::LogitsContext {

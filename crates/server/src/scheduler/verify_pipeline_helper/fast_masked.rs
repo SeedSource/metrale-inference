@@ -93,16 +93,16 @@ pub(super) fn try_chat_fast_path(
         return None;
     }
     let t_fast = ctx.clock.now();
-    let scoped_history: Vec<u32> =
+    // 2026-09-29: A146: position i is judged against the committed history
+    // plus picks 0..i-1, as the host path and decode judge it
+    // (`window_penalty_history` / `position_history`).
+    let window_history: Vec<u32> =
         if penalty_gate == crate::scheduler::fast_greedy::PenaltyGate::ReduceOnly {
-            crate::scheduler::sample_step::penalty_history_scope(
-                &a.output_tokens,
-                ctx.tool_call_end_token,
-            )
-            .to_vec()
+            super::window_penalty_history(a, argmax_ids)
         } else {
             Vec::new()
         };
+    let base_len = a.output_tokens.len();
     let vocab = model.vocab_size();
     let logits_base = model.logits_buffer_ptr();
     let mut all_clear = true;
@@ -117,15 +117,19 @@ pub(super) fn try_chat_fast_path(
             break;
         }
         if penalty_gate == crate::scheduler::fast_greedy::PenaltyGate::ReduceOnly
-            && !crate::scheduler::fast_greedy::argmax_immune(tok, &scoped_history, || {
-                crate::scheduler::fast_greedy::logit_is_positive(
-                    model,
-                    logits_base,
-                    row_base + i,
-                    vocab,
-                    tok,
-                )
-            })
+            && !crate::scheduler::fast_greedy::argmax_immune(
+                tok,
+                super::position_history(&window_history, base_len, i, ctx),
+                || {
+                    crate::scheduler::fast_greedy::logit_is_positive(
+                        model,
+                        logits_base,
+                        row_base + i,
+                        vocab,
+                        tok,
+                    )
+                },
+            )
         {
             all_clear = false;
             break;

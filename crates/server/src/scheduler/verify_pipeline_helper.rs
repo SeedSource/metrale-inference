@@ -204,6 +204,38 @@ pub fn verify_pick_with_pipeline(
     best_id
 }
 
+/// 2026-09-29: A146: the committed history followed by the window's
+/// positions `0..K-1` (`argmax_ids[..K-1]`; the last position is never
+/// history for another). Pair with [`position_history`]: position `i` must
+/// be judged against the committed tokens PLUS picks `0..i-1`, which is what
+/// decode (which has committed them) and the host path
+/// (`pick_positions_from_host` pushes them) see. Before this the fast paths
+/// tested immunity against the committed history only, so `[X, X]` with X
+/// new passed position 1 unpenalised while the host path and decode
+/// penalised it.
+pub(crate) fn window_penalty_history(a: &ActiveSeq, argmax_ids: &[u32]) -> Vec<u32> {
+    let prefix = &argmax_ids[..argmax_ids.len().saturating_sub(1)];
+    let mut h = Vec::with_capacity(a.output_tokens.len() + prefix.len());
+    h.extend_from_slice(&a.output_tokens);
+    h.extend_from_slice(prefix);
+    h
+}
+
+/// 2026-09-29: A146: position `i`'s penalty history (scoped like the
+/// pipeline's `penalty_history_scope`) out of a [`window_penalty_history`]
+/// buffer whose committed part is `base_len` long.
+pub(crate) fn position_history<'h>(
+    h: &'h [u32],
+    base_len: usize,
+    i: usize,
+    ctx: &LogitsContext,
+) -> &'h [u32] {
+    crate::scheduler::sample_step::penalty_history_scope(
+        &h[..(base_len + i).min(h.len())],
+        ctx.tool_call_end_token,
+    )
+}
+
 /// 2026-09-29: A146, spec-in-think parity: pick ONE decode row (the MTP
 /// bootstrap token) through the full host pipeline, as `process_decode_logits` does for every thinking row.
 /// The bootstrap's `sample_token_with_grammar` applies penalties and bias

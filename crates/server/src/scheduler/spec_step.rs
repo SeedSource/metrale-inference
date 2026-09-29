@@ -34,7 +34,16 @@ pub fn step_self_spec(
             return;
         }
     };
-    let token_0 = match model.argmax_on_device(logits, 0) {
+    // 2026-09-29: A146, spec-in-think parity: decode never takes a device
+    // argmax for a thinking row.
+    let token_0 = match if a.inside_thinking {
+        crate::scheduler::verify_pipeline_helper::pick_decode_row_with_pipeline(
+            model, logits, a, verify_ctx,
+        )
+        .ok_or_else(|| anyhow::anyhow!("in-think pipeline pick: D2H failed"))
+    } else {
+        model.argmax_on_device(logits, 0)
+    } {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("self-spec argmax error: {e:#}");
@@ -101,49 +110,22 @@ pub fn step_self_spec(
     // 2026-09-25: replace each position's raw argmax with the
     // logits-processor pipeline's pick; the helper falls back to the raw
     // argmax if the logits copy fails.
-    let verified = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
-        model,
-        &verified_argmax,
-        a,
-        verify_ctx,
-        0,
-    );
-
-    let n_drafts = draft_tokens.len();
-    let mut num_accepted = 0;
-
-    emit_token(a, token_0, None, sched);
-    if a.finished {
+    //
+    // 2026-09-29: A146: commit token_0, THEN pick the window and accept.
+    // Verify position 0 is the token AFTER token_0, so the window's base
+    // state (history, thinking_tokens, pipeline accumulators) must already
+    // include it; see `self_spec_commit`.
+    let Some(num_accepted) = self_spec_commit(a, token_0, &draft_tokens, sched, |a| {
+        crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+            model,
+            &verified_argmax,
+            a,
+            verify_ctx,
+            0,
+        )
+    }) else {
         return;
-    }
-
-    for i in 0..n_drafts {
-        if draft_tokens[i] == verified[i] {
-            emit_token(a, draft_tokens[i], None, sched);
-            if a.finished {
-                return;
-            }
-            num_accepted += 1;
-        } else {
-            emit_token(a, verified[i], None, sched);
-            if a.finished {
-                return;
-            }
-            a.last_token = verified[i];
-            break;
-        }
-    }
-
-    if num_accepted == n_drafts && n_drafts > 0 {
-        emit_token(a, verified[n_drafts], None, sched);
-        if !a.finished {
-            a.last_token = verified[n_drafts];
-        }
-    } else if num_accepted < n_drafts {
-        // 2026-09-25: a.last_token was already set above, in the break.
-    } else {
-        a.last_token = token_0;
-    }
+    };
 
     // 2026-09-25: drop the verify tokens past token_0 and the accepted
     // drafts.
@@ -162,6 +144,59 @@ pub fn step_self_spec(
             tracing::error!("self-spec rollback: {e:#}");
         }
     }
+}
+
+/// 2026-09-29: A146: the self-speculative commit: emit `token_0`, run the
+/// verify window (`pick`) on the post-`token_0` state, then emit the
+/// accepted drafts and the correction or bonus token. Returns the number of
+/// accepted drafts, or `None` when the sequence finished mid-commit.
+///
+/// Spec-in-think parity: the window used to run BEFORE `token_0` was
+/// committed, so every position's history and `thinking_tokens` were one
+/// short (the mid-word and boundary previous token, the penalties, the F2
+/// and budget gates) and the trail never matched at commit, resetting the
+/// F2 and defer accumulators every step.
+pub(crate) fn self_spec_commit(
+    a: &mut ActiveSeq,
+    token_0: u32,
+    draft_tokens: &[u32],
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    pick: impl FnOnce(&mut ActiveSeq) -> Vec<u32>,
+) -> Option<usize> {
+    emit_token(a, token_0, None, sched);
+    if a.finished {
+        return None;
+    }
+    let verified = pick(a);
+    let n_drafts = draft_tokens.len();
+    let mut num_accepted = 0;
+    for i in 0..n_drafts {
+        if draft_tokens[i] == verified[i] {
+            emit_token(a, draft_tokens[i], None, sched);
+            if a.finished {
+                return None;
+            }
+            num_accepted += 1;
+        } else {
+            emit_token(a, verified[i], None, sched);
+            if a.finished {
+                return None;
+            }
+            a.last_token = verified[i];
+            break;
+        }
+    }
+    if num_accepted == n_drafts && n_drafts > 0 {
+        emit_token(a, verified[n_drafts], None, sched);
+        if !a.finished {
+            a.last_token = verified[n_drafts];
+        }
+    } else if num_accepted < n_drafts {
+        // 2026-09-25: a.last_token was already set above, in the break.
+    } else {
+        a.last_token = token_0;
+    }
+    Some(num_accepted)
 }
 
 /// 2026-09-25: N-gram speculative step for `active[0]`: CPU proposer, CUDA-graphed K=2 verify.
@@ -198,7 +233,16 @@ pub fn step_ngram(
                 return;
             }
         };
-        let tok = match model.argmax_on_device(logits, 0) {
+        // 2026-09-29: A146, spec-in-think parity: decode never takes a
+        // device argmax for a thinking row.
+        let tok = match if a.inside_thinking {
+            crate::scheduler::verify_pipeline_helper::pick_decode_row_with_pipeline(
+                model, logits, a, verify_ctx,
+            )
+            .ok_or_else(|| anyhow::anyhow!("in-think pipeline pick: D2H failed"))
+        } else {
+            model.argmax_on_device(logits, 0)
+        } {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("ngram bootstrap argmax error: {e:#}");

@@ -71,6 +71,10 @@ pub fn verify_pick_all_with_pipeline(
 ) -> Vec<u32> {
     use crate::scheduler::mtp_timing::Phase;
     let k = argmax_ids.len();
+    // 2026-09-29: A146: a previous window's trail is dead here whichever arm
+    // returns below: only `pick_positions_from_host` may leave a trail for
+    // THIS commit run (the fast paths and the D2H fallback emit without one).
+    a.spec_think_trail.clear();
     if k == 0 {
         return Vec::new();
     }
@@ -157,16 +161,16 @@ pub fn verify_pick_all_with_pipeline(
         // 2026-09-25: the same history scope the host path penalises
         // (`penalty_history_scope`), copied before `a.grammar_state` is
         // borrowed mutably.
-        let scoped_history: Vec<u32> =
+        // 2026-09-29: A146: position i is judged against the committed history
+        // plus picks 0..i-1, as the host path and decode judge it
+        // (`window_penalty_history` / `position_history`).
+        let window_history: Vec<u32> =
             if fast_penalty_gate == crate::scheduler::fast_greedy::PenaltyGate::ReduceOnly {
-                crate::scheduler::sample_step::penalty_history_scope(
-                    &a.output_tokens,
-                    ctx.tool_call_end_token,
-                )
-                .to_vec()
+                window_penalty_history(a, argmax_ids)
             } else {
                 Vec::new()
             };
+        let base_len = a.output_tokens.len();
         let before = a.grammar_state.as_ref().map(|gs| gs.num_history_steps());
         let mut fast: Vec<u32> = Vec::with_capacity(k);
         let mut all_allowed = true;
@@ -180,15 +184,19 @@ pub fn verify_pick_all_with_pipeline(
                 // 2026-09-25: `ReduceOnly`: the argmax must be absent from the
                 // scoped history and have a raw logit above 0.
                 if fast_penalty_gate == crate::scheduler::fast_greedy::PenaltyGate::ReduceOnly
-                    && !crate::scheduler::fast_greedy::argmax_immune(tok, &scoped_history, || {
-                        crate::scheduler::fast_greedy::logit_is_positive(
-                            model,
-                            logits_base,
-                            row_base + i,
-                            vocab,
-                            tok,
-                        )
-                    })
+                    && !crate::scheduler::fast_greedy::argmax_immune(
+                        tok,
+                        position_history(&window_history, base_len, i, ctx),
+                        || {
+                            crate::scheduler::fast_greedy::logit_is_positive(
+                                model,
+                                logits_base,
+                                row_base + i,
+                                vocab,
+                                tok,
+                            )
+                        },
+                    )
                 {
                     all_allowed = false;
                     break;
@@ -259,27 +267,31 @@ pub fn verify_pick_all_with_pipeline(
         let t_fast = ctx.clock.now();
         let vocab = model.vocab_size();
         let logits_base = model.logits_buffer_ptr();
-        let scoped_history: Vec<u32> =
+        // 2026-09-29: A146: position i is judged against the committed history
+        // plus picks 0..i-1, as the host path and decode judge it
+        // (`window_penalty_history` / `position_history`).
+        let window_history: Vec<u32> =
             if chat_fast_gate == crate::scheduler::fast_greedy::PenaltyGate::ReduceOnly {
-                crate::scheduler::sample_step::penalty_history_scope(
-                    &a.output_tokens,
-                    ctx.tool_call_end_token,
-                )
-                .to_vec()
+                window_penalty_history(a, argmax_ids)
             } else {
                 Vec::new()
             };
+        let base_len = a.output_tokens.len();
         let all_immune = argmax_ids.iter().enumerate().all(|(i, &tok)| {
             chat_fast_gate == crate::scheduler::fast_greedy::PenaltyGate::Neutral
-                || crate::scheduler::fast_greedy::argmax_immune(tok, &scoped_history, || {
-                    crate::scheduler::fast_greedy::logit_is_positive(
-                        model,
-                        logits_base,
-                        row_base + i,
-                        vocab,
-                        tok,
-                    )
-                })
+                || crate::scheduler::fast_greedy::argmax_immune(
+                    tok,
+                    position_history(&window_history, base_len, i, ctx),
+                    || {
+                        crate::scheduler::fast_greedy::logit_is_positive(
+                            model,
+                            logits_base,
+                            row_base + i,
+                            vocab,
+                            tok,
+                        )
+                    },
+                )
         });
         ctx.tel.mark(Phase::FastGreedy, t_fast);
         if all_immune {

@@ -355,6 +355,9 @@ pub fn emit_token(
         && ((a.inside_thinking && a.grammar_state.is_some())
             || crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens));
     let legacy_suppresses_eos = a.require_tool_call;
+    // 2026-09-29: TODO(A146 follow-up): judged AFTER the push (len + 1),
+    // where decode judges the pre-push length; there is also no post-think
+    // EOS guard or `honor_eos_inside_thinking` twin here.
     let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
     // 2026-09-25: thinking holds EOS back until a hard ceiling is hit, the
     // same `eos_suppressed_by_thinking` term as `decode_logits_step`.
@@ -384,6 +387,9 @@ pub fn emit_token(
         if a.inside_thinking && a.output_tokens.last() == Some(&tok) {
             a.output_tokens.pop();
         }
+        // 2026-09-29: TODO(A146 follow-up): a held-back content-phase EOS
+        // stays in `output_tokens` here; decode (`per_token.rs`) never pushes
+        // it.
         return;
     }
     // 2026-09-25: thinking tokens of a request without thinking enabled are

@@ -20,6 +20,8 @@ mod decode_step;
 #[cfg(test)]
 mod emit_eos_thinking_tests;
 mod emit_step;
+#[cfg(test)]
+mod emit_tool_call_finish_tests;
 mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;

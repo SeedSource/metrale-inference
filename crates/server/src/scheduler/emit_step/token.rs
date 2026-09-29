@@ -125,6 +125,18 @@ pub fn emit_token(
     // complete, which the `tool_eos_escape` gate below reads.
     if a.tool_call_end_token == Some(tok) && !a.inside_thinking {
         a.tool_call_completed = true;
+        // 2026-09-29: A143 part B: the twin of the plain-chat hard stop in
+        // `decode_logits_step/per_token.rs`, which ends the turn when a
+        // request with no grammar and no declared tools emits `</tool_call>`.
+        // Without it a spec-on turn (MTP, K2/K3/K4 and DFlash verify-accept)
+        // kept generating past the call that spec-off stops at. There is no
+        // early return: `tok` falls through to the push and stream below, so
+        // `</tool_call>` itself is emitted and nothing after it, because
+        // every verify-accept caller stops its window once `a.finished` is
+        // set.
+        if a.grammar_state.is_none() && !a.tools_present {
+            a.finished = true;
+        }
     }
 
     // 2026-09-25: a `<tool_call>` outside thinking resets the inter-tool

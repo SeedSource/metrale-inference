@@ -186,10 +186,12 @@ fn every_finish_site_is_a_recorded_decision() {
     // decode_logits_content: post-think cap, content loop, inter-tool prose.
     //
     // Unnamed: emit_step: cancel flag, `<|im_start|>`, EOS, failed stream
-    // send, length stop. decode_logits_step: post-completion tool-open cap,
-    // two failed stream sends, `</tool_call>` with no grammar and no tools
-    // declared, EOS, `remaining == 0`, `max_seq_len` ceiling, terminated
-    // grammar.
+    // send, length stop, and (2026-09-29, A143 part B) `</tool_call>` with no
+    // grammar and no tools declared, the speculative twin of decode's
+    // unnamed site: a content-based natural stop, not a server cut.
+    // decode_logits_step: post-completion tool-open cap, two failed stream
+    // sends, `</tool_call>` with no grammar and no tools declared, EOS,
+    // `remaining == 0`, `max_seq_len` ceiling, terminated grammar.
     const LEDGER: &[(&str, &str, usize, usize)] = &[
         (
             "decode_logits_step.rs + decode_logits_step/{host_sample,per_token,content_emit}.rs",
@@ -209,7 +211,7 @@ fn every_finish_site_is_a_recorded_decision() {
                 include_str!("emit_step/grammar_close.rs"),
                 include_str!("emit_step/tool_param.rs")
             ),
-            11,
+            12,
             6,
         ),
         (

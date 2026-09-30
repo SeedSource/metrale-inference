@@ -9,6 +9,9 @@
 //!   `hyper_connection` module.
 //! - `glm_hc_pre` refuses more tokens than `mhc_mix_max_tokens()`, the bound the loader sizes
 //!   each site's `mix` scratch from.
+//! - `glm_hc_pre` launches `hc_mix` + `hc_finish` once per `MHC_SLICE_ROWS`-row slice
+//!   (`mhc_slices`); at `num_tokens <= MHC_SLICE_ROWS` that is the one unsliced pair, same grids
+//!   and pointers. Slicing changes no output bit: see `glm_hc_pre_sliced`.
 
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -150,10 +153,42 @@ pub fn mhc_mix_max_tokens() -> usize {
     })
 }
 
+/// 2026-09-29: Token rows per `hc_mix` + `hc_finish` launch pair in `glm_hc_pre`.
+///
+/// `hc_mix` runs grid `(T, mix_hc)`, and the hardware issues blocks in linear block order,
+/// `blockIdx.x` (the token) fastest (observed behaviour, not a CUDA guarantee). So each of the
+/// `mix_hc` mixing rows is a sweep over all `T` tokens, and every sweep reads each token's whole
+/// `hc_mult * hidden` FP32 highway row again (`glm5next_mhc.cu` `glm5next_hc_mix_bf16`:
+/// `x = streams + t * hc_dim`, read by the RMS loop and the dot loop). The sweep's working set
+/// is `T * hc_mult * hidden * 4` bytes: 16.8 MB at GLM-5.3's 256 x 4 x 4096, which fits GB10's
+/// 24 MB L2, and 134 MB at 2048 rows, which does not, so at 2048 rows all 24 sweeps re-read the
+/// highway from DRAM (24 x 134 MB = 3.2 GB per call). `hc_finish`, launched after the mix, reads
+/// the same highway rows once more, from L2 only while the slice fits. Measured (nsys, pp8192,
+/// 2026-09-29): `hc_mix_bf16` 0.495 ms per 256-row call and about 13.5 ms per 2048-row call
+/// (derived from the staged profile's totals), 3.4x the linear 3.96 ms; 3.2 GB in 13.5 ms is
+/// 239 GB/s, GB10's measured STREAM ceiling (237-240 GB/s). `hc_finish` 0.030 ms and about
+/// 0.77 ms, 3.2x. The cause is inferred from the code and those totals, not from an L2 counter.
+/// 256 is also the attention-side width every unstaged and staged prefill already launches at.
+pub const MHC_SLICE_ROWS: u32 = 256;
+
+/// 2026-09-29: The `(first token, rows)` slices `glm_hc_pre_sliced` launches for `num_tokens`
+/// tokens at `slice_rows` (at least 1) rows each: consecutive, tiling `0..num_tokens`, each at
+/// most `slice_rows` rows. When `num_tokens <= slice_rows`, 0 included, the only slice is
+/// `(0, num_tokens)`, so the launches are exactly the unsliced launcher's.
+pub fn mhc_slices(num_tokens: u32, slice_rows: u32) -> impl Iterator<Item = (u32, u32)> {
+    let s = slice_rows.max(1);
+    let n = num_tokens.div_ceil(s).max(1);
+    (0..n).map(move |i| {
+        let t = (i as u64 * s as u64) as u32;
+        (t, s.min(num_tokens - t))
+    })
+}
+
 /// 2026-09-25: Collapse each token's `hc_mult` FP32 streams to one BF16 row in `y_out`, and write
-/// this site's `post` and `comb`, by launching `hc_mix` (or `hc_mix_bf16`) then `hc_finish`.
-/// `streams` is read, not written, so `glm_hc_post` can take it as its residual. Errors when
-/// `num_tokens` exceeds `mhc_mix_max_tokens()`.
+/// this site's `post` and `comb`, by launching `hc_mix` (or `hc_mix_bf16`) then `hc_finish`,
+/// once per `MHC_SLICE_ROWS`-row slice (`glm_hc_pre_sliced`). `streams` is read, not written, so
+/// `glm_hc_post` can take it as its residual. Errors when `num_tokens` exceeds
+/// `mhc_mix_max_tokens()`.
 #[allow(clippy::too_many_arguments)]
 pub fn glm_hc_pre(
     gpu: &dyn GpuBackend,
@@ -169,6 +204,60 @@ pub fn glm_hc_pre(
     sinkhorn_iters: u32,
     norm_eps: f32,
     hc_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    glm_hc_pre_sliced(
+        gpu,
+        kernels,
+        streams,
+        w,
+        y_out,
+        post_out,
+        comb_out,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        sinkhorn_iters,
+        norm_eps,
+        hc_eps,
+        MHC_SLICE_ROWS,
+        stream,
+    )
+}
+
+/// 2026-09-29: `glm_hc_pre` at `slice_rows` rows per launch pair: for each `mhc_slices` slice
+/// `(t0, k)`, `hc_mix` on grid `(k, mix_hc)` then `hc_finish` on grid `(k, 1 + ceil(H / 256))`,
+/// every pointer advanced by `t0` rows. `glm_hc_pre` passes `MHC_SLICE_ROWS`; the microtest
+/// `glm5next_hc_slice_microtest` sweeps other widths.
+///
+/// Why every output bit equals the unsliced pair's (grid `(T, ...)`, one launch each):
+/// - Both kernels use `blockIdx.x` only as the token index `t`, to address `streams + t * hc *
+///   H`, `mix + t * mix_hc`, `y_out + t * H`, `post_out + t * hc` and `comb_out + t * hc * hc`;
+///   neither reads `gridDim.x`. `hc_finish` reads `gridDim.y`, which is unchanged. Block
+///   `(t - t0, y)` of a slice launched at those pointers advanced by `t0` rows therefore reads
+///   the same addresses, runs the same code at the same `blockDim` (256), and so reduces in the
+///   same order and writes the same bytes to the same addresses as block `(t, y)` unsliced.
+/// - Order on the stream: `hc_finish` of slice `s` reads `mix` rows of slice `s` only, which
+///   `hc_mix` of slice `s` wrote before it. Neither kernel writes `streams`, and the later mix
+///   launches write only later slices' `mix` rows, so no launch reads a value another launch
+///   changes afterwards. `y_out`, `post_out` and `comb_out` are written by `hc_finish` alone,
+///   one row per token.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_hc_pre_sliced(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextMhcKernels,
+    streams: DevicePtr,
+    w: &Glm5NextMhcSiteWeights,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    slice_rows: u32,
     stream: u64,
 ) -> Result<()> {
     let mix_hc = (2 + hc_mult) * hc_mult;
@@ -187,33 +276,42 @@ pub fn glm_hc_pre(
     } else {
         kernels.hc_mix
     };
-    KernelLaunch::new(gpu, mix_kernel)
-        .grid([num_tokens, mix_hc, 1])
-        .block([256, 1, 1])
-        .arg_ptr(streams)
-        .arg_ptr(w.hc_fn)
-        .arg_ptr(w.mix)
-        .arg_u32(hidden_size)
-        .arg_u32(hc_mult)
-        .arg_f32(norm_eps)
-        .launch(stream)?;
-    KernelLaunch::new(gpu, kernels.hc_finish)
-        // 2026-09-25: Block `y == 0` computes post, comb and the Sinkhorn; blocks `1..` split the
-        // collapse.
-        .grid([num_tokens, 1 + collapse_blocks(hidden_size), 1])
-        .block([256, 1, 1])
-        .arg_ptr(streams)
-        .arg_ptr(w.mix)
-        .arg_ptr(w.hc_scale)
-        .arg_ptr(w.hc_base)
-        .arg_ptr(y_out)
-        .arg_ptr(post_out)
-        .arg_ptr(comb_out)
-        .arg_u32(hidden_size)
-        .arg_u32(hc_mult)
-        .arg_u32(sinkhorn_iters)
-        .arg_f32(hc_eps)
-        .launch(stream)
+    let (h, hc) = (hidden_size as usize, hc_mult as usize);
+    for (t0, k) in mhc_slices(num_tokens, slice_rows) {
+        let t0 = t0 as usize;
+        // 2026-09-29: Row strides in bytes: FP32 highway `[hc, H]`, FP32 `mix` `[mix_hc]`, BF16
+        // `y` `[H]`, FP32 `post` `[hc]` and `comb` `[hc, hc]`.
+        let s_streams = streams.offset(t0 * hc * h * 4);
+        let s_mix = w.mix.offset(t0 * mix_hc as usize * 4);
+        KernelLaunch::new(gpu, mix_kernel)
+            .grid([k, mix_hc, 1])
+            .block([256, 1, 1])
+            .arg_ptr(s_streams)
+            .arg_ptr(w.hc_fn)
+            .arg_ptr(s_mix)
+            .arg_u32(hidden_size)
+            .arg_u32(hc_mult)
+            .arg_f32(norm_eps)
+            .launch(stream)?;
+        KernelLaunch::new(gpu, kernels.hc_finish)
+            // 2026-09-25: Block `y == 0` computes post, comb and the Sinkhorn; blocks `1..` split
+            // the collapse.
+            .grid([k, 1 + collapse_blocks(hidden_size), 1])
+            .block([256, 1, 1])
+            .arg_ptr(s_streams)
+            .arg_ptr(s_mix)
+            .arg_ptr(w.hc_scale)
+            .arg_ptr(w.hc_base)
+            .arg_ptr(y_out.offset(t0 * h * 2))
+            .arg_ptr(post_out.offset(t0 * hc * 4))
+            .arg_ptr(comb_out.offset(t0 * hc * hc * 4))
+            .arg_u32(hidden_size)
+            .arg_u32(hc_mult)
+            .arg_u32(sinkhorn_iters)
+            .arg_f32(hc_eps)
+            .launch(stream)?;
+    }
+    Ok(())
 }
 
 /// 2026-09-25: `out[j] = post[j] * block_out + Σ_i comb[i][j] * residual[i]` for each token.
@@ -290,6 +388,60 @@ mod mhc_shape_tests {
     fn the_mix_bound_never_goes_below_the_shipped_floor() {
         assert_eq!(mhc_mix_max_tokens(), MHC_MIX_MAX_TOKENS);
         assert!(mhc_mix_max_tokens() >= MHC_MIX_MAX_TOKENS);
+    }
+
+    /// 2026-09-29: `mhc_slices` tiles `0..T` with consecutive slices of at most the width, and a
+    /// call that fits (0 tokens included) is the single unsliced launch `(0, T)`.
+    #[test]
+    fn slices_tile_the_tokens_and_a_fitting_call_is_one_launch() {
+        for t in [
+            0u32, 1, 2, 7, 255, 256, 257, 511, 512, 1000, 1280, 2048, 2072, 4096,
+        ] {
+            for s in [0u32, 1, 3, 64, 128, 256, 512, 4096, u32::MAX] {
+                let v: Vec<(u32, u32)> = mhc_slices(t, s).collect();
+                if t <= s.max(1) {
+                    assert_eq!(v, vec![(0, t)], "T={t} slice={s}: one unsliced launch");
+                    continue;
+                }
+                let mut next = 0u32;
+                for (i, &(t0, k)) in v.iter().enumerate() {
+                    assert_eq!(t0, next, "T={t} slice={s}: contiguous");
+                    assert!(k >= 1 && k <= s.max(1), "T={t} slice={s}: width");
+                    if i + 1 < v.len() {
+                        assert_eq!(k, s.max(1), "T={t} slice={s}: only the tail is narrower");
+                    }
+                    next = t0 + k;
+                }
+                assert_eq!(next, t, "T={t} slice={s}: covers every token");
+            }
+        }
+    }
+
+    /// 2026-09-29: The staged FFN window (2048 rows) runs as eight 256-row pairs; the attention
+    /// side (256 rows) and decode (1 row) are single launches, as before.
+    #[test]
+    fn production_widths_slice_as_expected() {
+        let w: Vec<(u32, u32)> = mhc_slices(2048, MHC_SLICE_ROWS).collect();
+        assert_eq!(w.len(), 8);
+        assert!(w.iter().all(|&(t0, k)| k == 256 && t0 % 256 == 0));
+        assert_eq!(
+            mhc_slices(256, MHC_SLICE_ROWS).collect::<Vec<_>>(),
+            vec![(0, 256)]
+        );
+        assert_eq!(
+            mhc_slices(1, MHC_SLICE_ROWS).collect::<Vec<_>>(),
+            vec![(0, 1)]
+        );
+        assert_eq!(
+            mhc_slices(1280, MHC_SLICE_ROWS)
+                .map(|s| s.1)
+                .collect::<Vec<_>>(),
+            vec![256; 5]
+        );
+        assert_eq!(
+            mhc_slices(1000, MHC_SLICE_ROWS).collect::<Vec<_>>(),
+            vec![(0, 256), (256, 256), (512, 256), (768, 232)]
+        );
     }
 
     /// 2026-09-25: Total `mix` scratch over 90 sites (45 text layers, 2 sites each) at

@@ -363,6 +363,15 @@ pub(crate) const VARIANTS: &[Variant] = &[
         256,
         true,
     ),
+    // 2026-09-30: `bt_m128_k64` with coalesced 16-byte A staging (VEC_A); same smem_A bits, so
+    // it must stay byte-identical to REFERENCE.
+    m1(
+        "BT M128 K64 VA",
+        "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va",
+        128,
+        256,
+        false,
+    ),
     // 2026-09-30: Bench-only pipeline-stage isolators of `bt_m128_k64`, gated behind
     // GLM_TILE_BENCH_DIAG=1 (see `diag()` and `moe_w4a16_grouped_core`'s DIAG doc comment in
     // moe_w4a16_grouped_gemm.cu). Never used in production.

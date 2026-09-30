@@ -701,7 +701,7 @@ __device__ __forceinline__ float e2m1_decode(unsigned int n) {
 //   5  NOLOAD-AW: DIAG 3 and DIAG 4 combined — both A and the weight/scale bytes come from
 //      their tiny CTA-shared caches; only dequant, mma, sync and pipeline overhead remain.
 template <int MT, int NTILE, int KS, int WARPS, bool SPLIT_N, bool KMAJOR, bool ARITH_LUT,
-          bool BT, bool MFAST = false, int DIAG = 0>
+          bool BT, bool MFAST = false, int DIAG = 0, bool VEC_A = false>
 __device__ __forceinline__ void moe_w4a16_grouped_core(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ B_packed_ptrs,
@@ -826,9 +826,53 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
         __syncthreads();
     }
 
+    // 2026-09-30: VEC_A needs 16-byte aligned rows: A itself and K * 2 bytes. Otherwise the
+    // scalar loop runs (same smem_A contents either way).
+    static_assert(!VEC_A || (KS % 8 == 0 && MT * (KS / 8) >= THREADS && ((MT * (KS / 8)) % THREADS) == 0),
+                  "VEC_A: the 8-element A chunks must divide evenly across the block");
+    const bool a_vec_ok = VEC_A && ((((unsigned long long)A) & 15ull) == 0ull) && ((K & 7u) == 0u);
+
     for (unsigned int k_base = 0; k_base < K; k_base += KS) {
 
-        {
+        if (VEC_A && a_vec_ok) {
+            // 2026-09-30: VEC_A: the same smem_A tile as the scalar loop below, bit for bit
+            // (same rows, same gather through sorted_token_ids, same zero fill), staged with
+            // coalesced 16-byte loads: consecutive threads take consecutive 8-element chunks of a
+            // row, so a warp reads 4 whole 128-byte rows per instruction instead of 32 scalar
+            // 2-byte loads per thread with lanes 64 bytes apart (met-moediag2: A staging is the
+            // bt_m128_k64 limiter, NOLOAD-A -25..-64 %). A chunk that is not fully inside
+            // [0, K) falls back to the scalar semantics element by element.
+            constexpr unsigned int CPR = (unsigned int)(KS / 8);
+            // 2026-09-30: 1 for non-VEC_A instantiations (branch dead; avoids a zero trip count).
+            constexpr unsigned int CPT = VEC_A ? (unsigned int)((MT * CPR) / THREADS) : 1u;
+            #pragma unroll
+            for (unsigned int j = 0; j < CPT; j++) {
+                unsigned int c = threadIdx.x + j * (unsigned int)THREADS;
+                unsigned int row = c / CPR;
+                unsigned int col = (c % CPR) * 8u;
+                unsigned int gc = k_base + col;
+                bool row_ok = (cta_m_local + row) < M_eff;
+                unsigned int a_row = 0;
+                if (row_ok) {
+                    a_row = sorted_token_ids
+                        ? (unsigned int)sorted_token_ids[cta_m + row]
+                        : (cta_m + row);
+                }
+                if (row_ok && gc + 8u <= K) {
+                    uint4 v = *(const uint4*)(A + (unsigned long long)a_row * K + gc);
+                    const __nv_bfloat16* e = (const __nv_bfloat16*)&v;
+                    #pragma unroll
+                    for (int q = 0; q < 8; q++) smem_A[row][col + q] = e[q];
+                } else {
+                    #pragma unroll
+                    for (int q = 0; q < 8; q++) {
+                        smem_A[row][col + q] = (row_ok && gc + q < K)
+                            ? A[a_row * K + gc + q]
+                            : __float2bfloat16(0.0f);
+                    }
+                }
+            }
+        } else {
             constexpr unsigned int ept = (unsigned int)((MT * KS) / THREADS);
             #pragma unroll
             for (unsigned int i = 0; i < ept; i++) {
@@ -1069,6 +1113,27 @@ void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
         expert_offsets, sorted_token_ids, num_experts, N, K);                 \
 }
 
+// 2026-09-30: `P3B_GROUPED_VARIANT` with VEC_A = true (coalesced 16-byte A staging, same smem_A
+// bits). Same MFAST = false launch/grid convention and smem footprint as `P3B_GROUPED_VARIANT`.
+#define P3B_GROUPED_VARIANT_VA(SUFFIX, MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT) \
+extern "C" __global__ __launch_bounds__((WARPS) * 32)                         \
+void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
+    const __nv_bfloat16* __restrict__ A,                                      \
+    const unsigned long long* __restrict__ B_packed_ptrs,                     \
+    const unsigned long long* __restrict__ B_scale_ptrs,                      \
+    const float* __restrict__ scale2_vals,                                    \
+    __nv_bfloat16* __restrict__ C,                                            \
+    const int* __restrict__ expert_offsets,                                   \
+    const int* __restrict__ sorted_token_ids,                                 \
+    unsigned int num_experts,                                                 \
+    unsigned int N,                                                           \
+    unsigned int K                                                            \
+) {                                                                           \
+    moe_w4a16_grouped_core<MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, false, 0, true>( \
+        A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,                       \
+        expert_offsets, sorted_token_ids, num_experts, N, K);                 \
+}
+
 // 2026-09-30: `P3B_GROUPED_VARIANT` with an explicit DIAG mode (1 NODEQ, 2 NOMMA, 3 NOLOAD-W,
 // 4 NOLOAD-A, 5 NOLOAD-AW; see `moe_w4a16_grouped_core`'s DIAG doc comment). Bench-only
 // (examples/glm5next_moe_grouped_tile_bench, GLM_TILE_BENCH_DIAG=1); never used in
@@ -1209,3 +1274,6 @@ P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_nomma,    128, 64, 64, 8, false, true,
 P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noload,   128, 64, 64, 8, false, true, true, true, 3)
 P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noloada,  128, 64, 64, 8, false, true, true, true, 4)
 P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noloadaw, 128, 64, 64, 8, false, true, true, true, 5)
+// 2026-09-30: `bt_m128_k64` with VEC_A (coalesced 16-byte A staging). Bench first
+// (examples/glm5next_moe_grouped_tile_bench asserts byte identity vs `bt_m16_k128`).
+P3B_GROUPED_VARIANT_VA(bt_m128_k64_va, 128, 64, 64, 8, false, true, true, true)

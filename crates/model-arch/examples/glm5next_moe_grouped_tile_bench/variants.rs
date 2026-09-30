@@ -21,6 +21,10 @@ pub(crate) struct Variant {
     /// 2026-09-29: Whole-chunk prefill M1 tile: its output must be byte-identical to
     /// `REFERENCE`'s, and the bench exits nonzero if it is not.
     pub must_match_ref: bool,
+    /// 2026-09-30: A bench-only pipeline-stage isolator of `bt_m128_k64` (see `diag()`
+    /// below). Excluded from every run unless `GLM_TILE_BENCH_DIAG=1`; reported as DIAG, not
+    /// compared for byte identity, and never pushed to the M1 failure list.
+    pub is_diag: bool,
 }
 
 /// 2026-09-29: The production default tile, the byte-identity reference of the M1 tiles.
@@ -41,6 +45,7 @@ const fn v(
         threads,
         m_fast: false,
         must_match_ref: false,
+        is_diag: false,
     }
 }
 
@@ -60,6 +65,27 @@ const fn m1(
         threads,
         m_fast,
         must_match_ref: true,
+        is_diag: false,
+    }
+}
+
+/// 2026-09-30: A bench-only diagnostic tile that isolates one pipeline stage of
+/// `bt_m128_k64` (`moe_w4a16_grouped_core`'s DIAG template parameter: NODEQ, NOMMA or
+/// NOLOAD-W). Same MT=128, NTILE=64, KS=64, WARPS=8 grid/block/smem footprint as
+/// `bt_m128_k64`, so its timing is directly comparable. Its output differs from every other
+/// variant's by construction, so `must_match_ref` is false (never an M1 failure) and the
+/// bench reports it as DIAG rather than comparing it for byte identity. Excluded from every
+/// run unless `GLM_TILE_BENCH_DIAG=1`.
+const fn diag(name: &'static str, kernel: &'static str) -> Variant {
+    Variant {
+        name,
+        kernel,
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: false,
+        must_match_ref: false,
+        is_diag: true,
     }
 }
 
@@ -336,5 +362,20 @@ pub(crate) const VARIANTS: &[Variant] = &[
         128,
         256,
         true,
+    ),
+    // 2026-09-30: Bench-only pipeline-stage isolators of `bt_m128_k64`, gated behind
+    // GLM_TILE_BENCH_DIAG=1 (see `diag()` and `moe_w4a16_grouped_core`'s DIAG doc comment in
+    // moe_w4a16_grouped_gemm.cu). Never used in production.
+    diag(
+        "DIAG bt_m128_k64 NODEQ",
+        "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_diag_nodeq",
+    ),
+    diag(
+        "DIAG bt_m128_k64 NOMMA",
+        "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_diag_nomma",
+    ),
+    diag(
+        "DIAG bt_m128_k64 NOLOAD-W",
+        "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_diag_noload",
     ),
 ];

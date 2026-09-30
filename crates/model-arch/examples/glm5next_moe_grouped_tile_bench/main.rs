@@ -34,6 +34,14 @@
 //! - `GLM_TILE_BENCH_RING=<n>`: weight copies, as above.
 //! - `GLM_TILE_BENCH_ONLY=<suffix,...>`: time only the base kernel, `bt_m16_k128` and the
 //!   variants whose kernel name ends in one of the suffixes (e.g. `bt_k128,bt_m128_k64_mfast`).
+//! - `GLM_TILE_BENCH_DIAG=1`: also run the bench-only
+//!   `bt_m128_k64_diag_{nodeq,nomma,noload,noloada,noloadaw}` pipeline-stage isolators
+//!   (met-moeprobe residual-limiter classification). Each one's output differs from the base
+//!   kernel's by construction; the bench reports it as DIAG, not as an identity failure, and
+//!   it is excluded from every run unless this is set. Combine with
+//!   `GLM_TILE_BENCH_ONLY=bt_m128_k64,bt_m128_k64_diag_nodeq,bt_m128_k64_diag_nomma,\
+//!   bt_m128_k64_diag_noload,bt_m128_k64_diag_noloada,bt_m128_k64_diag_noloadaw` to time only
+//!   `bt_m128_k64` and its five isolators.
 //!
 //!   cargo run -p metrale-model-arch --release --example glm5next_moe_grouped_tile_bench \
 //!       --features cuda,gpu-examples -- `[rows[,rows...]]`   (default 256,1024,2048,4096)
@@ -214,6 +222,12 @@ fn main() -> Result<()> {
 }
 
 fn selected(v: &Variant, only: Option<&[String]>) -> bool {
+    // 2026-09-30: A DIAG variant's output differs from the base kernel's by construction
+    // (see variants.rs); it never runs unless GLM_TILE_BENCH_DIAG=1, so a default run (any
+    // run without that env var) is byte-for-byte unchanged from before DIAG variants existed.
+    if v.is_diag && std::env::var("GLM_TILE_BENCH_DIAG").as_deref() != Ok("1") {
+        return false;
+    }
     match only {
         None => true,
         Some(list) => {
@@ -307,10 +321,18 @@ fn run_rows(
          swept(local & non-empty)={swept}  mean rows/expert {mean:.2}  busiest {busiest}"
     );
 
-    for (label, n_out, kk, gather) in [
+    let mut cases = vec![
         ("gate/up  N=2048 K=4096", MOE_INTER, HIDDEN, true),
         ("down     N=4096 K=2048", HIDDEN, MOE_INTER, false),
-    ] {
+    ];
+    // 2026-09-30: `GLM_TILE_BENCH_GATHER_X=1` adds the crossed cases, gate/up's shape with A
+    // already in expert order and down's shape with A gathered through sorted_token_ids, to
+    // separate the gather from the shape.
+    if std::env::var("GLM_TILE_BENCH_GATHER_X").as_deref() == Ok("1") {
+        cases.push(("gate/up  N=2048 K=4096 NO-GATHER", MOE_INTER, HIDDEN, false));
+        cases.push(("down     N=4096 K=2048 GATHER", HIDDEN, MOE_INTER, true));
+    }
+    for (label, n_out, kk, gather) in cases {
         // 2026-09-25: Weight bytes of one sweep over the swept experts: NVFP4 is 0.5 B packed
         // plus 1/16 B of E4M3 block scale per element.
         let bytes = swept as f64 * (n_out * kk) as f64 * (0.5 + 1.0 / 16.0);
@@ -420,23 +442,38 @@ fn run_rows(
             let gbs = bytes / (ms * 1.0e6);
 
             let out = dn_raw(gpu, d_c, c_bytes)?;
-            let vs_base = match &base_out {
-                None => "—".to_string(),
-                Some(b) => first_diff(b, &out, n_out)
-                    .map(|d| format!("🔴 {d}"))
-                    .unwrap_or_else(|| "BYTE-IDENTICAL".to_string()),
+            // 2026-09-30: A DIAG variant isolates one pipeline stage and its output is
+            // expected to differ from both comparators by construction — report it as DIAG,
+            // never as a 🔴 identity failure, and never push it to m1_failures (it also never
+            // sets must_match_ref, so the push below cannot fire for it regardless).
+            let vs_base = if v.is_diag {
+                "DIAG (differs by construction)".to_string()
+            } else {
+                match &base_out {
+                    None => "—".to_string(),
+                    Some(b) => first_diff(b, &out, n_out)
+                        .map(|d| format!("🔴 {d}"))
+                        .unwrap_or_else(|| "BYTE-IDENTICAL".to_string()),
+                }
             };
-            let vs_ref = match &ref_out {
-                None => "—".to_string(),
-                Some(r) => match first_diff(r, &out, n_out) {
-                    None => "BYTE-IDENTICAL".to_string(),
-                    Some(d) => {
-                        if v.must_match_ref {
-                            m1_failures.push(format!("rows={rows} {label} {}: {d}", v.kernel));
+            let vs_ref = if v.is_diag {
+                "DIAG (differs by construction)".to_string()
+            } else {
+                match &ref_out {
+                    None => "—".to_string(),
+                    Some(r) => match first_diff(r, &out, n_out) {
+                        None => "BYTE-IDENTICAL".to_string(),
+                        Some(d) => {
+                            if v.must_match_ref {
+                                m1_failures.push(format!(
+                                    "rows={rows} {label} {}: {d}",
+                                    v.kernel
+                                ));
+                            }
+                            format!("🔴 {d}")
                         }
-                        format!("🔴 {d}")
-                    }
-                },
+                    },
+                }
             };
             if v.must_match_ref && ref_out.is_none() {
                 m1_failures.push(format!(

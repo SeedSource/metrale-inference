@@ -9,7 +9,9 @@
 //
 // Entry points: `moe_w4a16_grouped_gemm` (all experts' weights in one buffer); `_ptrtable` (per-expert pointer
 // tables, A rows gathered through sorted_token_ids); `_ptrtable_t` (the same with weights stored [K/2, N]); the
-// `_ptrtable_<suffix>` tile variants from P3B_GROUPED_VARIANT; and `moe_w4a16_grouped_stream_probe`.
+// `_ptrtable_<suffix>` tile variants from P3B_GROUPED_VARIANT; `moe_w4a16_grouped_stream_probe`; and (bench-only,
+// GLM_TILE_BENCH_DIAG=1) the `_ptrtable_bt_m128_k64_diag_{nodeq,nomma,noload,noloada,noloadaw}` pipeline-stage
+// isolators from P3B_GROUPED_VARIANT_DIAG.
 //
 // Owner: gb10 kernels.
 // Invariants: none beyond the types.
@@ -677,8 +679,29 @@ __device__ __forceinline__ float e2m1_decode(unsigned int n) {
     return __int_as_float(bits);
 }
 
+// 2026-09-30: DIAG (bench-only; every production/default entry point instantiates DIAG = 0,
+// byte-identical to before this parameter existed). Used only by the `_diag_*` entry points
+// below `bt_m128_k64` (examples/glm5next_moe_grouped_tile_bench, GLM_TILE_BENCH_DIAG=1):
+//   0  normal.
+//   1  NODEQ: keeps the two weight-byte loads (w0, w1) and the scale-byte load, skips the
+//      E2M1 LUT/arith decode and the two multiplies, and stores a BF16 folded from the loaded
+//      bytes (XOR) so the compiler cannot prove the loads dead.
+//   2  NOMMA: keeps the loads, dequant, smem_B stores and both __syncthreads(), skips
+//      mma.sync, and accumulates a value folded (XOR) from the same fragment registers the
+//      mma would have consumed, so they cannot be proven dead.
+//   3  NOLOAD-W: keeps dequant and mma unchanged, but every (gk, gn) reads the same ~8 weight
+//      bytes and 1 scale byte from a tiny CTA-shared cache loaded once at CTA entry, instead
+//      of walking B_expert/S_expert in DRAM — negligible DRAM weight traffic per CTA.
+//   4  NOLOAD-A: keeps weight loads, dequant, mma and the sorted_token_ids gather-index read
+//      unchanged, but every A element is read from a KS-wide CTA-shared cache (one M row's
+//      worth of A, thread-cooperatively loaded once at CTA entry) instead of walking
+//      A[a_row * K + gc] in DRAM; the gather index's low byte is XORed into the cached
+//      value's raw bit pattern so the index load cannot be proven dead — negligible DRAM A
+//      traffic per CTA.
+//   5  NOLOAD-AW: DIAG 3 and DIAG 4 combined — both A and the weight/scale bytes come from
+//      their tiny CTA-shared caches; only dequant, mma, sync and pipeline overhead remain.
 template <int MT, int NTILE, int KS, int WARPS, bool SPLIT_N, bool KMAJOR, bool ARITH_LUT,
-          bool BT, bool MFAST = false>
+          bool BT, bool MFAST = false, int DIAG = 0, bool VEC_A = false>
 __device__ __forceinline__ void moe_w4a16_grouped_core(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ B_packed_ptrs,
@@ -771,9 +794,85 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
 
     const bool warp_has_rows = (cta_m_local + (int)warp_m_offset) < M_expert;
 
+    // 2026-09-30: DIAG == 3 or 5 (NOLOAD-W / NOLOAD-AW) only. One thread reads the expert's
+    // first 8 weight bytes and first scale byte into a CTA-shared cache; every (gk, gn) below
+    // then decodes from this cache instead of B_expert/S_expert, so the CTA's DRAM weight
+    // traffic is this one small read, not the full N * K/2 + N * K/GROUP_SIZE sweep.
+    __shared__ unsigned int diag_w0, diag_w1;
+    __shared__ unsigned char diag_scale;
+    if (DIAG == 3 || DIAG == 5) {
+        if (threadIdx.x == 0) {
+            diag_w0 = *(const unsigned int*)(B_expert);
+            diag_w1 = *(const unsigned int*)(B_expert + 4);
+            diag_scale = S_expert[0];
+        }
+        __syncthreads();
+    }
+
+    // 2026-09-30: DIAG == 4 or 5 (NOLOAD-A / NOLOAD-AW) only. Thread-cooperative load of one
+    // M row's KS-wide slice of A — row 0 of this CTA's M tile, gathered through
+    // sorted_token_ids exactly as the per-iteration load below would gather it — into a tiny
+    // CTA-shared cache, once at CTA entry. `cta_m_local < M_expert` is already guaranteed by
+    // the early return above, so row 0 is always a real, in-range row. Every K-step's A load
+    // below then reads from this cache instead of walking A in DRAM.
+    __shared__ __nv_bfloat16 diag_a_row[KS];
+    if (DIAG == 4 || DIAG == 5) {
+        unsigned int a_row0 = sorted_token_ids
+            ? (unsigned int)sorted_token_ids[cta_m]
+            : cta_m;
+        for (unsigned int col = threadIdx.x; col < (unsigned int)KS; col += THREADS) {
+            diag_a_row[col] = (col < K) ? A[(unsigned long long)a_row0 * K + col] : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+    }
+
+    // 2026-09-30: VEC_A needs 16-byte aligned rows: A itself and K * 2 bytes. Otherwise the
+    // scalar loop runs (same smem_A contents either way).
+    static_assert(!VEC_A || (KS % 8 == 0 && MT * (KS / 8) >= THREADS && ((MT * (KS / 8)) % THREADS) == 0),
+                  "VEC_A: the 8-element A chunks must divide evenly across the block");
+    const bool a_vec_ok = VEC_A && ((((unsigned long long)A) & 15ull) == 0ull) && ((K & 7u) == 0u);
+
     for (unsigned int k_base = 0; k_base < K; k_base += KS) {
 
-        {
+        if (VEC_A && a_vec_ok) {
+            // 2026-09-30: VEC_A: the same smem_A tile as the scalar loop below, bit for bit
+            // (same rows, same gather through sorted_token_ids, same zero fill), staged with
+            // coalesced 16-byte loads: consecutive threads take consecutive 8-element chunks of a
+            // row, so a warp reads 4 whole 128-byte rows per instruction instead of 32 scalar
+            // 2-byte loads per thread with lanes 64 bytes apart (met-moediag2: A staging is the
+            // bt_m128_k64 limiter, NOLOAD-A -25..-64 %). A chunk that is not fully inside
+            // [0, K) falls back to the scalar semantics element by element.
+            constexpr unsigned int CPR = (unsigned int)(KS / 8);
+            // 2026-09-30: 1 for non-VEC_A instantiations (branch dead; avoids a zero trip count).
+            constexpr unsigned int CPT = VEC_A ? (unsigned int)((MT * CPR) / THREADS) : 1u;
+            #pragma unroll
+            for (unsigned int j = 0; j < CPT; j++) {
+                unsigned int c = threadIdx.x + j * (unsigned int)THREADS;
+                unsigned int row = c / CPR;
+                unsigned int col = (c % CPR) * 8u;
+                unsigned int gc = k_base + col;
+                bool row_ok = (cta_m_local + row) < M_eff;
+                unsigned int a_row = 0;
+                if (row_ok) {
+                    a_row = sorted_token_ids
+                        ? (unsigned int)sorted_token_ids[cta_m + row]
+                        : (cta_m + row);
+                }
+                if (row_ok && gc + 8u <= K) {
+                    uint4 v = *(const uint4*)(A + (unsigned long long)a_row * K + gc);
+                    const __nv_bfloat16* e = (const __nv_bfloat16*)&v;
+                    #pragma unroll
+                    for (int q = 0; q < 8; q++) smem_A[row][col + q] = e[q];
+                } else {
+                    #pragma unroll
+                    for (int q = 0; q < 8; q++) {
+                        smem_A[row][col + q] = (row_ok && gc + q < K)
+                            ? A[a_row * K + gc + q]
+                            : __float2bfloat16(0.0f);
+                    }
+                }
+            }
+        } else {
             constexpr unsigned int ept = (unsigned int)((MT * KS) / THREADS);
             #pragma unroll
             for (unsigned int i = 0; i < ept; i++) {
@@ -786,7 +885,18 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
                     unsigned int a_row = sorted_token_ids
                         ? (unsigned int)sorted_token_ids[cta_m + row]
                         : (cta_m + row);
-                    smem_A[row][col] = A[a_row * K + gc];
+                    if (DIAG == 4 || DIAG == 5) {
+                        // 2026-09-30: NOLOAD-A — reads from the KS-wide CTA-cached row above
+                        // instead of A[a_row * K + gc] in DRAM. `a_row`'s gather-index read
+                        // just above is unchanged (sorted_token_ids traffic stays); its low
+                        // byte is XORed into the cached value's raw bit pattern so the load
+                        // cannot be proven dead.
+                        unsigned short bits = *(const unsigned short*)&diag_a_row[col];
+                        bits = (unsigned short)(bits ^ (unsigned short)(a_row & 0xFFu));
+                        *(unsigned short*)&smem_A[row][col] = bits;
+                    } else {
+                        smem_A[row][col] = A[a_row * K + gc];
+                    }
                 } else {
                     smem_A[row][col] = __float2bfloat16(0.0f);
                 }
@@ -815,36 +925,59 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
                 unsigned int gk = k_base + kg;
                 unsigned int gn = cta_n + n;
                 if (gk < K && gn < N) {
-                    const unsigned char* bp =
-                        B_expert + (unsigned long long)gn * half_K + (gk / 2);
-                    unsigned char sb =
-                        S_expert[(unsigned long long)gn * num_groups + (gk / GROUP_SIZE)];
-                    __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
-                    float sc = (float)fp8 * scale2;
-                    unsigned int w0 = *(const unsigned int*)(bp);
-                    unsigned int w1 = *(const unsigned int*)(bp + 4);
-
-
+                    unsigned int w0, w1;
+                    float sc;
+                    if (DIAG == 3 || DIAG == 5) {
+                        // 2026-09-30: NOLOAD-W (DIAG 3 and 5) — every (gk, gn) reads the same
+                        // CTA-cached bytes instead of B_expert/S_expert; no per-iteration DRAM
+                        // weight traffic.
+                        w0 = diag_w0;
+                        w1 = diag_w1;
+                        __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = diag_scale;
+                        sc = (float)fp8 * scale2;
+                    } else {
+                        const unsigned char* bp =
+                            B_expert + (unsigned long long)gn * half_K + (gk / 2);
+                        unsigned char sb =
+                            S_expert[(unsigned long long)gn * num_groups + (gk / GROUP_SIZE)];
+                        __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
+                        sc = (float)fp8 * scale2;
+                        w0 = *(const unsigned int*)(bp);
+                        w1 = *(const unsigned int*)(bp + 4);
+                    }
 
                     __nv_bfloat16* st = smem_B + (unsigned int)(n * B_STRIDE) + kg;
-                    #pragma unroll
-                    for (int j = 0; j < 4; j++) {
-                        unsigned char c0 = (unsigned char)((w0 >> (j * 8)) & 0xFF);
-                        unsigned char c1 = (unsigned char)((w1 >> (j * 8)) & 0xFF);
-                        float v0 = ARITH_LUT ? e2m1_decode(c0 & 0xF) : E2M1_LUT_MOE[c0 & 0xF];
-                        float v1 = ARITH_LUT ? e2m1_decode(c0 >> 4)   : E2M1_LUT_MOE[c0 >> 4];
-                        float v2 = ARITH_LUT ? e2m1_decode(c1 & 0xF) : E2M1_LUT_MOE[c1 & 0xF];
-                        float v3 = ARITH_LUT ? e2m1_decode(c1 >> 4)   : E2M1_LUT_MOE[c1 >> 4];
-                        if (BT) {
-                            st[j * 2]         = __float2bfloat16(v0 * sc);
-                            st[j * 2 + 1]     = __float2bfloat16(v1 * sc);
-                            st[8 + j * 2]     = __float2bfloat16(v2 * sc);
-                            st[8 + j * 2 + 1] = __float2bfloat16(v3 * sc);
-                        } else {
-                            smem_B[(kg + j * 2) * B_STRIDE + n]         = __float2bfloat16(v0 * sc);
-                            smem_B[(kg + j * 2 + 1) * B_STRIDE + n]     = __float2bfloat16(v1 * sc);
-                            smem_B[(kg + 8 + j * 2) * B_STRIDE + n]     = __float2bfloat16(v2 * sc);
-                            smem_B[(kg + 8 + j * 2 + 1) * B_STRIDE + n] = __float2bfloat16(v3 * sc);
+                    if (DIAG == 1) {
+                        // 2026-09-30: NODEQ — w0, w1 and sc above are still real loads (kept
+                        // live by the XOR below); skip the LUT/arith decode and the two
+                        // multiplies per element.
+                        __nv_bfloat16 dv = __float2bfloat16(
+                            (float)((w0 ^ w1 ^ __float_as_uint(sc)) & 0xFFu));
+                        #pragma unroll
+                        for (int j = 0; j < GROUP_SIZE; j++) {
+                            if (BT) st[j] = dv;
+                            else smem_B[(kg + j) * B_STRIDE + n] = dv;
+                        }
+                    } else {
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            unsigned char c0 = (unsigned char)((w0 >> (j * 8)) & 0xFF);
+                            unsigned char c1 = (unsigned char)((w1 >> (j * 8)) & 0xFF);
+                            float v0 = ARITH_LUT ? e2m1_decode(c0 & 0xF) : E2M1_LUT_MOE[c0 & 0xF];
+                            float v1 = ARITH_LUT ? e2m1_decode(c0 >> 4)   : E2M1_LUT_MOE[c0 >> 4];
+                            float v2 = ARITH_LUT ? e2m1_decode(c1 & 0xF) : E2M1_LUT_MOE[c1 & 0xF];
+                            float v3 = ARITH_LUT ? e2m1_decode(c1 >> 4)   : E2M1_LUT_MOE[c1 >> 4];
+                            if (BT) {
+                                st[j * 2]         = __float2bfloat16(v0 * sc);
+                                st[j * 2 + 1]     = __float2bfloat16(v1 * sc);
+                                st[8 + j * 2]     = __float2bfloat16(v2 * sc);
+                                st[8 + j * 2 + 1] = __float2bfloat16(v3 * sc);
+                            } else {
+                                smem_B[(kg + j * 2) * B_STRIDE + n]         = __float2bfloat16(v0 * sc);
+                                smem_B[(kg + j * 2 + 1) * B_STRIDE + n]     = __float2bfloat16(v1 * sc);
+                                smem_B[(kg + 8 + j * 2) * B_STRIDE + n]     = __float2bfloat16(v2 * sc);
+                                smem_B[(kg + 8 + j * 2 + 1) * B_STRIDE + n] = __float2bfloat16(v3 * sc);
+                            }
                         }
                     }
                 } else {
@@ -896,12 +1029,25 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
                         b1 = ((unsigned int)sB[(k1 + 1) * b_stride + nc] << 16) |
                              (unsigned int)sB[k1 * b_stride + nc];
                     }
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                        : "=f"(acc[nt][0]), "=f"(acc[nt][1]), "=f"(acc[nt][2]), "=f"(acc[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-                          "f"(acc[nt][0]), "f"(acc[nt][1]), "f"(acc[nt][2]), "f"(acc[nt][3]));
+                    if (DIAG == 2) {
+                        // 2026-09-30: NOMMA — a0..a3, b0, b1 are the same fragment registers
+                        // the mma.sync below would consume (the smem reads, stores and both
+                        // barriers above are unchanged); fold them with XOR instead of issuing
+                        // the mma, so the registers cannot be proven dead.
+                        unsigned int mix = a0 ^ a1 ^ a2 ^ a3 ^ b0 ^ b1;
+                        float mixed = (float)(mix & 0xFFFFu) * 1.0e-6f;
+                        acc[nt][0] += mixed;
+                        acc[nt][1] += mixed;
+                        acc[nt][2] += mixed;
+                        acc[nt][3] += mixed;
+                    } else {
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                            : "=f"(acc[nt][0]), "=f"(acc[nt][1]), "=f"(acc[nt][2]), "=f"(acc[nt][3])
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+                              "f"(acc[nt][0]), "f"(acc[nt][1]), "f"(acc[nt][2]), "f"(acc[nt][3]));
+                    }
                 }
             }
         }
@@ -963,6 +1109,50 @@ void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
     unsigned int K                                                            \
 ) {                                                                           \
     moe_w4a16_grouped_core<MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, true>( \
+        A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,                       \
+        expert_offsets, sorted_token_ids, num_experts, N, K);                 \
+}
+
+// 2026-09-30: `P3B_GROUPED_VARIANT` with VEC_A = true (coalesced 16-byte A staging, same smem_A
+// bits). Same MFAST = false launch/grid convention and smem footprint as `P3B_GROUPED_VARIANT`.
+#define P3B_GROUPED_VARIANT_VA(SUFFIX, MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT) \
+extern "C" __global__ __launch_bounds__((WARPS) * 32)                         \
+void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
+    const __nv_bfloat16* __restrict__ A,                                      \
+    const unsigned long long* __restrict__ B_packed_ptrs,                     \
+    const unsigned long long* __restrict__ B_scale_ptrs,                      \
+    const float* __restrict__ scale2_vals,                                    \
+    __nv_bfloat16* __restrict__ C,                                            \
+    const int* __restrict__ expert_offsets,                                   \
+    const int* __restrict__ sorted_token_ids,                                 \
+    unsigned int num_experts,                                                 \
+    unsigned int N,                                                           \
+    unsigned int K                                                            \
+) {                                                                           \
+    moe_w4a16_grouped_core<MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, false, 0, true>( \
+        A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,                       \
+        expert_offsets, sorted_token_ids, num_experts, N, K);                 \
+}
+
+// 2026-09-30: `P3B_GROUPED_VARIANT` with an explicit DIAG mode (1 NODEQ, 2 NOMMA, 3 NOLOAD-W,
+// 4 NOLOAD-A, 5 NOLOAD-AW; see `moe_w4a16_grouped_core`'s DIAG doc comment). Bench-only
+// (examples/glm5next_moe_grouped_tile_bench, GLM_TILE_BENCH_DIAG=1); never used in
+// production. Same MFAST = false launch/grid convention as `P3B_GROUPED_VARIANT`.
+#define P3B_GROUPED_VARIANT_DIAG(SUFFIX, MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, DIAGMODE) \
+extern "C" __global__ __launch_bounds__((WARPS) * 32)                         \
+void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
+    const __nv_bfloat16* __restrict__ A,                                      \
+    const unsigned long long* __restrict__ B_packed_ptrs,                     \
+    const unsigned long long* __restrict__ B_scale_ptrs,                      \
+    const float* __restrict__ scale2_vals,                                    \
+    __nv_bfloat16* __restrict__ C,                                            \
+    const int* __restrict__ expert_offsets,                                   \
+    const int* __restrict__ sorted_token_ids,                                 \
+    unsigned int num_experts,                                                 \
+    unsigned int N,                                                           \
+    unsigned int K                                                            \
+) {                                                                           \
+    moe_w4a16_grouped_core<MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, false, DIAGMODE>( \
         A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,                       \
         expert_offsets, sorted_token_ids, num_experts, N, K);                 \
 }
@@ -1073,3 +1263,17 @@ P3B_GROUPED_VARIANT_MFAST(bt_m16_k128_mfast, 16, 64, 128,    4, true,  true,  tr
 P3B_GROUPED_VARIANT_MFAST(bt_m64_k128_mfast, 64, 64, 128,    4, false, true,  true, true)
 P3B_GROUPED_VARIANT(bt_m128_k64,            128, 64,  64,    8, false, true,  true, true)
 P3B_GROUPED_VARIANT_MFAST(bt_m128_k64_mfast, 128, 64, 64,    8, false, true,  true, true)
+
+// 2026-09-30: Bench-only diagnostic variants of `bt_m128_k64`, isolating one pipeline stage
+// each (met-moeprobe, .planning residual-limiter classification). Never used in production;
+// gated at the bench layer behind GLM_TILE_BENCH_DIAG=1
+// (examples/glm5next_moe_grouped_tile_bench). Same MT/NTILE/KS/WARPS/grid/block/smem
+// footprint as `bt_m128_k64`; only the DIAG mode differs.
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_nodeq,    128, 64, 64, 8, false, true, true, true, 1)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_nomma,    128, 64, 64, 8, false, true, true, true, 2)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noload,   128, 64, 64, 8, false, true, true, true, 3)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noloada,  128, 64, 64, 8, false, true, true, true, 4)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noloadaw, 128, 64, 64, 8, false, true, true, true, 5)
+// 2026-09-30: `bt_m128_k64` with VEC_A (coalesced 16-byte A staging). Bench first
+// (examples/glm5next_moe_grouped_tile_bench asserts byte identity vs `bt_m16_k128`).
+P3B_GROUPED_VARIANT_VA(bt_m128_k64_va, 128, 64, 64, 8, false, true, true, true)

@@ -134,7 +134,12 @@ pub const MHC_MIX_MAX_TOKENS: usize = 256;
 pub fn mhc_mix_max_tokens() -> usize {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        let t = crate::glm5next_layer::prefill_rows().max(MHC_MIX_MAX_TOKENS);
+        // 2026-09-29: `prefill_rows_ffn()` is the staged prefill's FFN window, whose FFN-site
+        // `hc_pre` covers that many tokens; it equals `prefill_rows()` unless
+        // `METRALE_GLM_PREFILL_STAGED=1`.
+        let t = crate::glm5next_layer::prefill_rows()
+            .max(crate::glm5next_layer::prefill_rows_ffn())
+            .max(MHC_MIX_MAX_TOKENS);
         if t != MHC_MIX_MAX_TOKENS {
             tracing::warn!(
                 "GLM mHC `mix` scratch widened to {t} tokens (floor {MHC_MIX_MAX_TOKENS}) to \

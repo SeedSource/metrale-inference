@@ -159,7 +159,7 @@ impl Glm5NextLayer {
         let t_norm = profile::start();
         self.norm(gpu, hidden, self.post_attn_norm, normed, 1, stream)?;
         profile::end(profile::NORM, t_norm, gpu, stream);
-        self.mlp_forward(normed, ffn_out, 1, ctx, stream)?;
+        self.mlp_forward(normed, ffn_out, 1, 1, ctx, stream)?;
         let t_mhc_post = profile::start();
         glm_hc_post(
             gpu,
@@ -202,8 +202,50 @@ impl Glm5NextLayer {
     ///
     /// With `take_snapshots`, a KDA layer writes its state after row `t` to intermediate `t`
     /// for `t < k - 1`.
+    ///
+    /// 2026-09-29: The body is `attn_half` then `ffn_half` over the same `k` rows, the launch
+    /// sequence it has always issued; the staged prefill (`prefill_staged_run`) calls the two
+    /// halves at different widths.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::glm5next_layer) fn forward_k(
+        &self,
+        hidden: DevicePtr,
+        k: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+        take_snapshots: bool,
+        slot_base: usize,
+        is_prefill: bool,
+    ) -> Result<()> {
+        self.attn_half(
+            hidden,
+            k,
+            state,
+            kv_cache,
+            seq_len,
+            block_table,
+            ctx,
+            stream,
+            take_snapshots,
+            slot_base,
+            is_prefill,
+        )?;
+        // 2026-09-29: One slice as wide as the call: the MLP's dense GEMMs run over all `k` rows
+        // at once, as before the split.
+        self.ffn_half(hidden, k, ctx, stream, slot_base, k)
+    }
+
+    /// 2026-09-29: The attention half of `forward_k` over rows `slot_base..slot_base + k`: the
+    /// optional `hc_expand` (layer 0), the attention site's `hc_pre`, the input norm, the mixer,
+    /// its all-reduce and `hc_post`. It writes highway slots `slot_base..slot_base + k`, their
+    /// `post`/`comb`, rows `0..k` of `hidden`, the mixer state and KV, and nothing the FFN half
+    /// of any other row reads.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::glm5next_layer) fn attn_half(
         &self,
         hidden: DevicePtr,
         k: usize,
@@ -232,7 +274,6 @@ impl Glm5NextLayer {
         let post = ctx.buffers.hc_post().offset(slot_base * hc * 4);
         let comb = ctx.buffers.hc_comb().offset(slot_base * hc * hc * 4);
         let normed = ctx.buffers.norm_output();
-        let ffn_out = ctx.buffers.moe_output();
         let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
 
         let kda_ctx = match &self.mixer {
@@ -357,6 +398,36 @@ impl Glm5NextLayer {
             stream,
         )?;
         profile::end(profile::MHC_POST, t_mhc_post, gpu, stream);
+        Ok(())
+    }
+
+    /// 2026-09-29: The FFN half of `forward_k` over rows `slot_base..slot_base + k`: the FFN
+    /// site's `hc_pre`, the post-attention norm, the MLP and its all-reduce, `hc_post`, and on
+    /// the last layer `hc_head_mean`. Row `t` reads only highway slot `slot_base + t` (and the
+    /// layer's weights); every launch here is row-local except the MLP's dense GEMMs, which run
+    /// in consecutive slices of `dense_slice` rows (`mlp_forward`). Errors on a layer without a
+    /// hyper-connection.
+    pub(in crate::glm5next_layer) fn ffn_half(
+        &self,
+        hidden: DevicePtr,
+        k: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+        slot_base: usize,
+        dense_slice: usize,
+    ) -> Result<()> {
+        let gpu = ctx.gpu;
+        let h = self.hidden;
+        let Some(mhc) = self.mhc.as_ref() else {
+            bail!("GLM layer {}: no hyper-connection bound", self.layer_idx);
+        };
+        let hc = mhc.hc_mult;
+        let streams = ctx.buffers.hc_streams().offset(slot_base * hc * h * 4);
+        let post = ctx.buffers.hc_post().offset(slot_base * hc * 4);
+        let comb = ctx.buffers.hc_comb().offset(slot_base * hc * hc * 4);
+        let normed = ctx.buffers.norm_output();
+        let ffn_out = ctx.buffers.moe_output();
+        let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
 
         let t_mhc = profile::start();
         glm_hc_pre(
@@ -379,7 +450,7 @@ impl Glm5NextLayer {
         let t_norm = profile::start();
         self.norm(gpu, hidden, self.post_attn_norm, normed, k, stream)?;
         profile::end(profile::NORM, t_norm, gpu, stream);
-        self.mlp_forward(normed, ffn_out, k, ctx, stream)?;
+        self.mlp_forward(normed, ffn_out, k, dense_slice, ctx, stream)?;
         let t_mhc_post = profile::start();
         glm_hc_post(
             gpu,

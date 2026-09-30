@@ -37,7 +37,9 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use crate::glm5next_dsa::layer::Glm5NextDsaLayer;
 use crate::glm5next_dsa::state::Glm5NextDsaState;
 use crate::glm5next_kda::{Glm5NextKdaConfig, Glm5NextKdaLayer, Glm5NextKdaWorkspace, KdaSeqState};
-use crate::glm5next_mlp::forward::{Glm5NextMlpWorkspace, forward_dense, forward_moe};
+use crate::glm5next_mlp::forward::{
+    Glm5NextMlpWorkspace, forward_dense_sliced, forward_moe_sliced,
+};
 use crate::glm5next_mlp::weights::{Glm5NextDenseMlpWeights, Glm5NextMoeWeights};
 use crate::glm5next_mlp::{Glm5NextMlpConfig, Glm5NextMlpKernels};
 use metrale_model_layers::layer::{ForwardContext, LayerState, SsmLayerState, TransformerLayer};
@@ -59,8 +61,11 @@ pub use state::alloc_kda_ssm_state;
 mod levers;
 mod steps;
 mod types;
-pub use levers::prefill_rows;
 pub(crate) use levers::{PREFILL_ROWS, cublas_wide_proj, dsa_batch_qidx};
+pub use levers::{
+    PREFILL_ROWS_FFN_MAX, prefill_rows, prefill_rows_ffn, prefill_staged, staged_merge_signature,
+};
+pub use steps::staged::{ffn_windows, sub_chunks};
 pub use types::{Glm5NextLayer, Glm5NextMhc, Glm5NextMixer, Glm5NextMlpSite};
 
 impl TransformerLayer for Glm5NextLayer {
@@ -151,6 +156,23 @@ impl TransformerLayer for Glm5NextLayer {
         } else {
             1
         };
+        // 2026-09-29: `METRALE_GLM_PREFILL_STAGED=1`, eager only: attention at `rows`, the FFN in
+        // windows of up to `prefill_rows_ffn()` rows (`steps/staged.rs`). Under graph capture,
+        // or with the lever off, the loop below runs as it always has.
+        if rows > 1 && prefill_staged() && !ctx.graph_capture {
+            return self.prefill_staged_run(
+                hidden,
+                num_tokens,
+                rows,
+                prefill_rows_ffn().min(cap).max(rows),
+                state,
+                kv_cache,
+                seq_len_start,
+                block_table,
+                ctx,
+                stream,
+            );
+        }
         if rows > 1 {
             let mut t = 0usize;
             while t < num_tokens {

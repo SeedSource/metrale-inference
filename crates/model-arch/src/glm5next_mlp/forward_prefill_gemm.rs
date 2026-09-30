@@ -24,6 +24,7 @@ mod tile;
 pub(crate) use tile::*;
 
 pub(super) use dispatch::forward_moe_grouped_prefill;
+pub use dispatch::grouped_prefill_selected;
 
 #[cfg(test)]
 mod tests;

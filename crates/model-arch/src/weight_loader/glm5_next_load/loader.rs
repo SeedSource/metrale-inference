@@ -106,21 +106,29 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         // 2026-09-25: Unless `METRALE_GLM_MLP_WS_SHARED=0`, one MLP workspace serves
         // every layer; otherwise each layer allocates its own. Either way it is
         // allocated here, at load, before the KV pool is sized.
-        let mlp_ws_bytes = crate::glm5next_mlp::forward::mlp_ws_total_bytes(&mlp_cfg, verify_k);
+        // 2026-09-29: The staged prefill (`METRALE_GLM_PREFILL_STAGED=1`) runs the MLP over
+        // windows of `prefill_rows_ffn()` rows, so the MLP scratch holds that many; `u_slot`
+        // stays at `verify_k` rows (`mlp_ws_bytes_sized`). Staged off, `mlp_rows == verify_k`
+        // and the allocation is the unstaged one.
+        let mlp_rows = verify_k.max(crate::glm5next_layer::prefill_rows_ffn());
+        let mlp_ws_bytes =
+            crate::glm5next_mlp::forward::mlp_ws_total_bytes_sized(&mlp_cfg, mlp_rows, verify_k);
         let shared_mlp_ws = if crate::glm5next_mlp::forward::mlp_ws_shared() {
             tracing::info!(
-                "GLM MLP workspace: SHARED, 1 x {:.1} MB for {} layers at {verify_k} rows \
+                "GLM MLP workspace: SHARED, 1 x {:.1} MB for {} layers at {mlp_rows} rows \
                  (per-layer would be {:.1} MB)",
                 mlp_ws_bytes as f64 / 1e6,
                 skeleton.layers.len(),
                 (mlp_ws_bytes * skeleton.layers.len()) as f64 / 1e6,
             );
             Some(std::sync::Arc::new(
-                crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new(gpu, &mlp_cfg, verify_k)?,
+                crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new_sized(
+                    gpu, &mlp_cfg, mlp_rows, verify_k,
+                )?,
             ))
         } else {
             tracing::warn!(
-                "GLM MLP workspace: PER-LAYER, {} x {:.1} MB at {verify_k} rows",
+                "GLM MLP workspace: PER-LAYER, {} x {:.1} MB at {mlp_rows} rows",
                 skeleton.layers.len(),
                 mlp_ws_bytes as f64 / 1e6,
             );
@@ -242,8 +250,8 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                 mlp_ws: match &shared_mlp_ws {
                     Some(ws) => ws.clone(),
                     None => std::sync::Arc::new(
-                        crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new(
-                            gpu, &mlp_cfg, verify_k,
+                        crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new_sized(
+                            gpu, &mlp_cfg, mlp_rows, verify_k,
                         )?,
                     ),
                 },

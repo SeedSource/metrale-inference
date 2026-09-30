@@ -82,3 +82,77 @@ pub fn prefill_rows() -> usize {
         r
     })
 }
+
+/// 2026-09-29: Ceiling of the staged prefill's FFN window (`prefill_rows_ffn`), in rows.
+pub const PREFILL_ROWS_FFN_MAX: usize = 4096;
+
+/// 2026-09-29: `METRALE_GLM_PREFILL_STAGED=1` runs a prefill chunk as two passes per layer: the
+/// attention half over every `prefill_rows()` sub-chunk, then the FFN half over windows of up to
+/// `prefill_rows_ffn()` rows (`Glm5NextLayer::prefill_staged_run`). Off unless set to `1`; read
+/// once. Eager prefill only: a call under graph capture takes the unstaged loop.
+pub fn prefill_staged() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_PREFILL_STAGED").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_STAGED=1 - GLM prefill runs attention at {} rows, then the \
+                 FFN in windows of up to {} rows (byte-identical to the unstaged loop by \
+                 construction; see steps/staged.rs)",
+                prefill_rows(),
+                prefill_rows_ffn()
+            );
+        }
+        on
+    })
+}
+
+/// 2026-09-29: The FFN window for attention width `attn` and a requested width: the request
+/// (default `attn`) capped at `PREFILL_ROWS_FFN_MAX`, rounded down to a multiple of `attn`, and
+/// never below `attn`.
+pub(crate) fn resolve_rows_ffn(attn: usize, requested: Option<usize>) -> usize {
+    let attn = attn.max(1);
+    let want = requested
+        .filter(|r| *r >= 1)
+        .unwrap_or(attn)
+        .min(PREFILL_ROWS_FFN_MAX);
+    ((want / attn) * attn).max(attn)
+}
+
+/// 2026-09-29: The staged prefill's FFN window, from `METRALE_GLM_PREFILL_ROWS_FFN` through
+/// `resolve_rows_ffn`; `prefill_rows()` when `prefill_staged()` is off, so every sizing that
+/// reads it is unchanged then. Read once.
+pub fn prefill_rows_ffn() -> usize {
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let attn = prefill_rows();
+        let staged = std::env::var("METRALE_GLM_PREFILL_STAGED").as_deref() == Ok("1");
+        if !staged {
+            return attn;
+        }
+        let req = std::env::var("METRALE_GLM_PREFILL_ROWS_FFN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let r = resolve_rows_ffn(attn, req);
+        if req.is_some_and(|q| q != r) {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_ROWS_FFN={} resolved to {r} (a multiple of the {attn}-row \
+                 attention width, at most {PREFILL_ROWS_FFN_MAX})",
+                req.unwrap_or_default()
+            );
+        }
+        r
+    })
+}
+
+/// 2026-09-29: The env-read inputs that decide which sub-chunks the staged FFN pass merges
+/// (`grouped_prefill_selected`): the grouped-GEMM minimum rows and its switch, forced host
+/// dispatch and route tracing, packed into one value for the rank-agreement check. A skew
+/// would give the ranks different window counts, and each window issues its own all-reduce.
+pub fn staged_merge_signature() -> u64 {
+    use crate::glm5next_mlp::forward_prefill_gemm::{prefill_gemm_enabled, prefill_gemm_min_rows};
+    ((prefill_gemm_min_rows() as u64) << 3)
+        | (u64::from(prefill_gemm_enabled()) << 2)
+        | (u64::from(crate::glm5next_mlp::forward::host_dispatch_forced()) << 1)
+        | u64::from(super::profile::trace_on())
+}

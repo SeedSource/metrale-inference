@@ -29,6 +29,23 @@ pub(super) fn assert_rank_levers_agree(
                 "METRALE_GLM_PREFILL_ROWS",
                 metrale_model_arch::glm5next_layer::prefill_rows() as u64,
             ),
+            // 2026-09-29: The staged prefill (`METRALE_GLM_PREFILL_STAGED`) runs the FFN in
+            // windows of `METRALE_GLM_PREFILL_ROWS_FFN` rows, one MLP all-reduce per window;
+            // which sub-chunks share a window also follows the MoE grouped-GEMM levers, packed
+            // in `staged_merge_signature`. All three change the collective count.
+            (
+                "METRALE_GLM_PREFILL_STAGED",
+                u64::from(metrale_model_arch::glm5next_layer::prefill_staged()),
+            ),
+            (
+                "METRALE_GLM_PREFILL_ROWS_FFN",
+                metrale_model_arch::glm5next_layer::prefill_rows_ffn() as u64,
+            ),
+            (
+                "GLM staged-prefill merge levers (MOE_PREFILL_GEMM[_MIN_ROWS], HOST_DISPATCH, \
+                 ROUTE_TRACE)",
+                metrale_model_arch::glm5next_layer::staged_merge_signature(),
+            ),
             // 2026-09-25: Performance only (the MLP reduces once per site
             // whichever arm runs); checked because the check is free.
             (

@@ -23,9 +23,12 @@ mod launch;
 mod moe_experts;
 mod workspace;
 
-pub use dense::forward_dense;
+use dense::row_slices;
+pub use dense::{forward_dense, forward_dense_sliced};
 use launch::{gemm, swiglu};
-pub use workspace::{mlp_ws_bytes, mlp_ws_total_bytes};
+pub use workspace::{
+    mlp_ws_bytes, mlp_ws_bytes_sized, mlp_ws_total_bytes, mlp_ws_total_bytes_sized,
+};
 
 const ACT_BLOCK: u32 = 256;
 
@@ -245,7 +248,7 @@ fn announce_grouped_prefill(on: bool, rows: usize) {
 /// 2026-09-25: `METRALE_GLM_MOE_HOST_DISPATCH=1` forces the host-dispatch expert loop (ids read
 /// back to the host, one GEMV per local expert) and turns off every device-dispatched routed
 /// path. Read once.
-fn host_dispatch_forced() -> bool {
+pub(crate) fn host_dispatch_forced() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("METRALE_GLM_MOE_HOST_DISPATCH").as_deref() == Ok("1"))
 }
@@ -287,6 +290,26 @@ pub fn forward_moe(
     ws: &Glm5NextMlpWorkspace,
     stream: u64,
 ) -> Result<()> {
+    forward_moe_sliced(gpu, k, cfg, w, x, out, rows, rows, ws, stream)
+}
+
+/// 2026-09-29: `forward_moe` with the router GEMM and the shared expert's GEMMs issued once per
+/// `row_slices(rows, dense_slice)` slice (each sees the M a separate call of that slice would);
+/// top-k, the routed experts, the combine and everything else run over all `rows` at once.
+/// `dense_slice >= rows` is exactly `forward_moe`.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_moe_sliced(
+    gpu: &dyn GpuBackend,
+    k: &Glm5NextMlpKernels,
+    cfg: &Glm5NextMlpConfig,
+    w: &Glm5NextMoeWeights,
+    x: DevicePtr,
+    out: DevicePtr,
+    rows: usize,
+    dense_slice: usize,
+    ws: &Glm5NextMlpWorkspace,
+    stream: u64,
+) -> Result<()> {
     if rows == 0 || rows > ws.max_rows {
         bail!(
             "GLM MoE: {rows} rows do not fit a workspace built for {}",
@@ -305,15 +328,7 @@ pub fn forward_moe(
     use crate::glm5next_layer::profile;
 
     let groups = moe_row_groups(rows, row_batch_max());
-    let grouped_prefill = rows > MOE_ROW_BATCH_MAX_ROWS
-        && rows >= forward_prefill_gemm::prefill_gemm_min_rows()
-        && forward_prefill_gemm::prefill_gemm_enabled()
-        && !host_dispatch_forced()
-        && !profile::trace_on()
-        && k.moe_sort_by_expert.0 != 0
-        && k.moe_grouped_gemm.0 != 0
-        && k.combine_indexed.0 != 0
-        && rows * cfg.top_k <= ws.max_total_expanded();
+    let grouped_prefill = forward_prefill_gemm::grouped_prefill_selected(k, cfg, ws, rows);
     let batched = !grouped_prefill
         && rows >= 2
         && !host_dispatch_forced()
@@ -329,33 +344,39 @@ pub fn forward_moe(
     announce_grouped_prefill(grouped_prefill, rows);
 
     let t = profile::start();
-    if rows > metrale_model_layers::layers::ops::DENSE_GEMV_BATCHM_MAX_M as usize
-        && crate::glm5next_layer::cublas_wide_proj()
-    {
-        metrale_model_layers::layers::ops::cublas_bf16_proj_dense_f32_out(
-            x,
-            w.router,
-            ws.logits,
-            rows as u32,
-            cfg.num_experts as u32,
-            cfg.hidden as u32,
-            stream,
-        )?;
-    } else {
-        for r in 0..rows {
-            gemm(
-                gpu,
-                k.gemm_f32,
-                k.gemv_f32,
-                KernelHandle(0),
-                x.offset(r * cfg.hidden * 2),
+    for (a, n) in row_slices(rows, dense_slice) {
+        let (xs, ls) = (
+            x.offset(a * cfg.hidden * 2),
+            ws.logits.offset(a * cfg.num_experts * 4),
+        );
+        if n > metrale_model_layers::layers::ops::DENSE_GEMV_BATCHM_MAX_M as usize
+            && crate::glm5next_layer::cublas_wide_proj()
+        {
+            metrale_model_layers::layers::ops::cublas_bf16_proj_dense_f32_out(
+                xs,
                 w.router,
-                ws.logits.offset(r * cfg.num_experts * 4),
-                1,
-                cfg.num_experts,
-                cfg.hidden,
+                ls,
+                n as u32,
+                cfg.num_experts as u32,
+                cfg.hidden as u32,
                 stream,
             )?;
+        } else {
+            for r in 0..n {
+                gemm(
+                    gpu,
+                    k.gemm_f32,
+                    k.gemv_f32,
+                    KernelHandle(0),
+                    xs.offset(r * cfg.hidden * 2),
+                    w.router,
+                    ls.offset(r * cfg.num_experts * 4),
+                    1,
+                    cfg.num_experts,
+                    cfg.hidden,
+                    stream,
+                )?;
+            }
         }
     }
     // 2026-09-25: One top-k launch for all rows: `glm5next_router_topk` handles row `blockIdx.x`.
@@ -404,7 +425,7 @@ pub fn forward_moe(
     }
 
     let t = profile::start();
-    forward_dense(
+    forward_dense_sliced(
         gpu,
         k,
         cfg,
@@ -413,6 +434,7 @@ pub fn forward_moe(
         x,
         ws.shared_out,
         rows,
+        dense_slice,
         ws,
         stream,
     )?;

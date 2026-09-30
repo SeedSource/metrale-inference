@@ -323,6 +323,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
         include_str!("../../glm5next_layer/steps.rs"),
         include_str!("../../glm5next_layer/steps/drafter.rs"),
         include_str!("../../glm5next_layer/steps/forward.rs"),
+        include_str!("../../glm5next_layer/steps/staged.rs"),
         include_str!("../../glm5next_layer/types.rs"),
     );
     assert_eq!(
@@ -335,6 +336,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
             "steps.rs",
             "steps/drafter.rs",
             "steps/forward.rs",
+            "steps/staged.rs",
             "tests.rs",
             "types.rs",
         ],
@@ -355,6 +357,21 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
     assert!(
         src.contains("// A speculative verify, NOT a prefill sub-chunk"),
         "the speculative verify must pass is_prefill = false, and say why"
+    );
+    // 2026-09-29: `attn_half` takes the same `is_prefill`. Its two callers are `forward_k`,
+    // which forwards its own argument, and the staged prefill's attention pass (`true`).
+    assert_eq!(
+        module.matches("self.attn_half(").count(),
+        2,
+        "a new attn_half caller must decide its own `is_prefill`, not inherit one"
+    );
+    let staged = include_str!("../../glm5next_layer/steps/staged.rs");
+    assert!(
+        staged.contains(
+            "// This IS a prefill sub-chunk (staged attention pass).
+                true,"
+        ),
+        "the staged attention pass must pass is_prefill = true"
     );
 }
 

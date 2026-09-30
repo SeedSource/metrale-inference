@@ -171,6 +171,10 @@ name = "glm5next_moe_grouped_prefill_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_ffn_staged_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_moe_microtest"
 required-features = ["cuda", "gpu-examples"]
 

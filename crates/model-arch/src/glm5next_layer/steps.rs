@@ -10,6 +10,7 @@ use super::*;
 
 mod drafter;
 mod forward;
+pub(super) mod staged;
 
 impl Glm5NextLayer {
     /// 2026-09-25: `rms_norm_vanilla` over `rows` contiguous `[hidden]` rows in one launch. The
@@ -127,11 +128,16 @@ impl Glm5NextLayer {
 
     /// 2026-09-25: The MLP over `rows` rows of `normed` into `out`, then one all-reduce of all
     /// rows when `Glm5NextMlpConfig::needs_all_reduce`.
+    ///
+    /// 2026-09-29: The dense GEMMs (router, shared expert, dense MLP) run in consecutive slices of
+    /// `dense_slice` rows (`forward_moe_sliced`, `forward_dense_sliced`); `dense_slice >= rows` is
+    /// one slice, the unsliced launch.
     fn mlp_forward(
         &self,
         normed: DevicePtr,
         out: DevicePtr,
         rows: usize,
+        dense_slice: usize,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -139,7 +145,7 @@ impl Glm5NextLayer {
             .then(profile::start)
             .flatten();
         match &self.mlp {
-            Glm5NextMlpSite::Dense(w) => forward_dense(
+            Glm5NextMlpSite::Dense(w) => forward_dense_sliced(
                 ctx.gpu,
                 &self.mlp_kernels,
                 &self.mlp_cfg,
@@ -148,10 +154,11 @@ impl Glm5NextLayer {
                 normed,
                 out,
                 rows,
+                dense_slice,
                 &self.mlp_ws,
                 stream,
             )?,
-            Glm5NextMlpSite::Moe(w) => forward_moe(
+            Glm5NextMlpSite::Moe(w) => forward_moe_sliced(
                 ctx.gpu,
                 &self.mlp_kernels,
                 &self.mlp_cfg,
@@ -159,6 +166,7 @@ impl Glm5NextLayer {
                 normed,
                 out,
                 rows,
+                dense_slice,
                 &self.mlp_ws,
                 stream,
             )?,
@@ -244,7 +252,7 @@ impl Glm5NextLayer {
         self.add_inplace(gpu, hidden, attn_out, h, stream)?;
 
         self.norm(gpu, hidden, self.post_attn_norm, normed, 1, stream)?;
-        self.mlp_forward(normed, ffn_out, 1, ctx, stream)?;
+        self.mlp_forward(normed, ffn_out, 1, 1, ctx, stream)?;
         self.add_inplace(gpu, hidden, ffn_out, h, stream)
     }
 

@@ -177,3 +177,24 @@ pub(crate) fn forward_moe_grouped_prefill(
     )?;
     Ok(())
 }
+
+/// 2026-09-29: Whether `forward_moe` over `rows` rows sends its routed experts through the
+/// grouped GEMM (`forward_prefill_gemm`). The staged prefill merges only sub-chunks for which
+/// this holds, so a merged window takes the same routed path each sub-chunk took on its own.
+pub fn grouped_prefill_selected(
+    k: &Glm5NextMlpKernels,
+    cfg: &Glm5NextMlpConfig,
+    ws: &Glm5NextMlpWorkspace,
+    rows: usize,
+) -> bool {
+    use crate::glm5next_layer::profile;
+    rows > super::super::forward::MOE_ROW_BATCH_MAX_ROWS
+        && rows >= super::tile::prefill_gemm_min_rows()
+        && super::tile::prefill_gemm_enabled()
+        && !super::super::forward::host_dispatch_forced()
+        && !profile::trace_on()
+        && k.moe_sort_by_expert.0 != 0
+        && k.moe_grouped_gemm.0 != 0
+        && k.combine_indexed.0 != 0
+        && rows * cfg.top_k <= ws.max_total_expanded()
+}

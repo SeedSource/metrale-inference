@@ -13,10 +13,10 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use super::super::forward::Glm5NextMlpWorkspace;
 use super::super::weights::Glm5NextMoeWeights;
 use super::super::{Glm5NextMlpConfig, Glm5NextMlpKernels};
-use super::tile::{GemmTile, gemm_tile, max_m_tiles_from_offsets, prefill_gemm_exact_tiles};
+use super::tile::{GemmTile, max_m_tiles_from_offsets, prefill_gemm_exact_tiles};
 
 /// 2026-09-25: `C = gather(A) @ dequant(W_expert)^T` for every expert in one launch: grid
-/// `(ceil(n_out / tile.n_tile), max_m_tiles, num_experts)`, `tile.threads` threads per block.
+/// `tile.grid_dims(n_out, max_m_tiles, num_experts)`, `tile.threads` threads per block.
 #[allow(clippy::too_many_arguments)]
 fn grouped_gemm(
     gpu: &dyn GpuBackend,
@@ -34,11 +34,7 @@ fn grouped_gemm(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, k)
-        .grid([
-            (n_out as u32).div_ceil(tile.n_tile),
-            max_m_tiles,
-            num_experts as u32,
-        ])
+        .grid(tile.grid_dims(n_out, max_m_tiles, num_experts))
         .block([tile.threads, 1, 1])
         .arg_ptr(a)
         .arg_ptr(t.packed_ptrs)
@@ -100,7 +96,9 @@ pub(crate) fn forward_moe_grouped_prefill(
     // 2026-09-25: With `prefill_gemm_exact_tiles()`, the grid height comes from the real expert
     // histogram; `copy_d2h_on_stream` synchronises the stream first, so the read sees the sort's
     // output. Otherwise it is the worst case, `ceil(rows * top_k / m_tile)`.
-    let tile = gemm_tile();
+    // 2026-09-29: The tile `resolve` actually bound (the base tile after a fallback), so the grid
+    // matches the kernel that runs.
+    let tile = k.moe_grouped_tile;
     let worst_case = te.div_ceil(tile.m_tile).max(1) as u32;
     let max_m_tiles = if prefill_gemm_exact_tiles() {
         let mut off_raw = vec![0u8; (cfg.num_experts + 1) * 4];

@@ -25,6 +25,14 @@
 //! The sort is checked separately from the arithmetic: a sort that dropped or duplicated a slot
 //! could still produce a plausible GEMM output.
 //!
+//! 2026-09-29: Tile identity (whole-chunk prefill M1). After the layout gate, every M1 tile
+//! (`M1_TILES`) runs on the same routing, weights and inputs as `bt_m16_k128`, the production
+//! default, and must write byte-identical output: skewed routing (one expert over 2 x 128
+//! rows, one with a handful, a partial last M tile everywhere), one remote expert with a NULL
+//! weight pointer, the gathered (gate/up) and direct (down) A paths, at the small shape and at
+//! the two production shapes. The output buffer starts as 0xFF so an unwritten element shows.
+//! Any mismatch, or an M1 tile or the reference missing from the PTX, exits nonzero.
+//!
 //!   cargo run -p metrale-model-arch --release --example glm5next_moe_grouped_prefill_microtest \
 //!       --features cuda,gpu-examples
 
@@ -188,7 +196,15 @@ fn score(got: &[f32], want: &[f32], scale: f32) -> Err2 {
 }
 
 fn main() -> Result<()> {
-    let g = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
+    // 2026-09-29: The (glm-5.3-flash, nvfp4) set when the build has it, as the tile bench does:
+    // in a build of every gb10 model, `ptx_modules()` is deepseek-v4-flash's set, whose own
+    // `moe_w4a16_grouped_gemm.cu` lacks the tile variants the M1 identity check needs.
+    let modules = metrale_kernels::all_ptx_sets()
+        .into_iter()
+        .find(|s| s.target.model == "glm-5.3-flash" && s.target.quant == "nvfp4")
+        .map(|s| s.modules)
+        .unwrap_or_else(metrale_kernels::ptx_modules);
+    let g = MetraleCudaBackend::new(0, &modules)?;
     let gpu: &dyn GpuBackend = &g;
     // 2026-09-25: Module names come from the `[modules]` table of the gb10 common KERNEL.toml
     // (`moe_permute = "moe"`, `moe_w4a16_grouped_gemm = "moe_w4a16"`); `w4a16_gemv` has no
@@ -452,6 +468,276 @@ fn main() -> Result<()> {
         "PASS — the grouped GEMM reads GLM's NVFP4 experts correctly; residual gap is BF16 \
          operand precision ({:.2}x closer to the BF16-weight reference).",
         e_gemm.abs / e_gemm_b.abs.max(f32::MIN_POSITIVE)
+    );
+
+    tile_identity(gpu, k_sort)?;
+    Ok(())
+}
+
+/// 2026-09-29: One grouped-GEMM tile: entry point and launch geometry (`GemmTile` in
+/// `glm5next_mlp/forward_prefill_gemm/tile.rs`).
+struct TileDef {
+    kernel: &'static str,
+    m_tile: u32,
+    n_tile: u32,
+    threads: u32,
+    m_fast: bool,
+}
+
+/// 2026-09-29: The byte-identity reference, the production default tile.
+const REF_TILE: TileDef = TileDef {
+    kernel: "moe_w4a16_grouped_gemm_ptrtable_bt_m16_k128",
+    m_tile: 16,
+    n_tile: 64,
+    threads: 128,
+    m_fast: false,
+};
+
+/// 2026-09-29: The whole-chunk prefill M1 tiles, each required to match `REF_TILE` exactly.
+const M1_TILES: &[TileDef] = &[
+    TileDef {
+        kernel: "moe_w4a16_grouped_gemm_ptrtable_bt_m16_k128_mfast",
+        m_tile: 16,
+        n_tile: 64,
+        threads: 128,
+        m_fast: true,
+    },
+    TileDef {
+        kernel: "moe_w4a16_grouped_gemm_ptrtable_bt_k128",
+        m_tile: 64,
+        n_tile: 64,
+        threads: 128,
+        m_fast: false,
+    },
+    TileDef {
+        kernel: "moe_w4a16_grouped_gemm_ptrtable_bt_m64_k128_mfast",
+        m_tile: 64,
+        n_tile: 64,
+        threads: 128,
+        m_fast: true,
+    },
+    TileDef {
+        kernel: "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64",
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: false,
+    },
+    TileDef {
+        kernel: "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_mfast",
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: true,
+    },
+];
+
+/// 2026-09-29: Tokens of the identity routing; at `top_k = 8` over 16 experts, 3072 slots.
+const IDENT_TOKENS: usize = 384;
+/// 2026-09-29: This expert gets a NULL weight pointer, as a remote EP expert does.
+const IDENT_REMOTE_EXPERT: usize = 5;
+
+#[allow(clippy::too_many_arguments)]
+fn launch_tile(
+    gpu: &dyn GpuBackend,
+    k: KernelHandle,
+    t: &TileDef,
+    a: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2: DevicePtr,
+    c: DevicePtr,
+    off: DevicePtr,
+    stid: DevicePtr,
+    busiest: u32,
+    n: usize,
+    kk: usize,
+) -> Result<()> {
+    let m_tiles = busiest.div_ceil(t.m_tile).max(1);
+    let n_tiles = (n as u32).div_ceil(t.n_tile);
+    let grid = if t.m_fast {
+        [m_tiles, n_tiles, NUM_EXPERTS as u32]
+    } else {
+        [n_tiles, m_tiles, NUM_EXPERTS as u32]
+    };
+    KernelLaunch::new(gpu, k)
+        .grid(grid)
+        .block([t.threads, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2)
+        .arg_ptr(c)
+        .arg_ptr(off)
+        .arg_ptr(stid)
+        .arg_u32(NUM_EXPERTS as u32)
+        .arg_u32(n as u32)
+        .arg_u32(kk as u32)
+        .launch(0)
+}
+
+/// 2026-09-29: Byte equality of every `M1_TILES` entry with `REF_TILE`; see the module doc.
+fn tile_identity(gpu: &dyn GpuBackend, k_sort: KernelHandle) -> Result<()> {
+    println!("\n--- M1 tile identity vs {} ---", REF_TILE.kernel);
+    let k_ref = gpu
+        .kernel("moe_w4a16", REF_TILE.kernel)
+        .map_err(|e| anyhow::anyhow!("reference tile {} unresolved: {e}", REF_TILE.kernel))?;
+    let mut tiles: Vec<(&TileDef, KernelHandle)> = Vec::new();
+    for t in M1_TILES {
+        match gpu.kernel("moe_w4a16", t.kernel) {
+            Ok(k) => tiles.push((t, k)),
+            Err(e) => bail!("M1 tile {} is not in this build's PTX: {e}", t.kernel),
+        }
+    }
+
+    let mut s = 0x1DE7_7117_u64;
+    // 2026-09-29: Expert e is drawn with probability (2e + 1) / 256, so expert 15 takes about
+    // 12 % of the slots (~360 rows: two full 128-row tiles and a partial one) and expert 0
+    // about 0.4 % (~12 rows).
+    let te = IDENT_TOKENS * TOP_K;
+    let mut ids: Vec<u32> = Vec::with_capacity(te);
+    for _ in 0..IDENT_TOKENS {
+        let mut picked: Vec<u32> = Vec::with_capacity(TOP_K);
+        while picked.len() < TOP_K {
+            let r = (lcg(&mut s) % 256) as usize;
+            let e = (0..NUM_EXPERTS).find(|e| (e + 1) * (e + 1) > r).unwrap() as u32;
+            if !picked.contains(&e) {
+                picked.push(e);
+            }
+        }
+        ids.extend(picked);
+    }
+    let d_ids = up_i32(gpu, &ids.iter().map(|x| *x as i32).collect::<Vec<_>>())?;
+    let d_stid = gpu.alloc(te * 4)?;
+    let d_seid = gpu.alloc(te * 4)?;
+    let d_off = gpu.alloc((NUM_EXPERTS + 1) * 4)?;
+    let d_t2p = gpu.alloc(te * 4)?;
+    KernelLaunch::new(gpu, k_sort)
+        .grid([1, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_ids)
+        .arg_ptr(d_stid)
+        .arg_ptr(d_seid)
+        .arg_ptr(d_off)
+        .arg_ptr(d_t2p)
+        .arg_u32(te as u32)
+        .arg_u32(NUM_EXPERTS as u32)
+        .arg_u32(TOP_K as u32)
+        .launch(0)?;
+    gpu.synchronize(0)?;
+    let off = dn_i32(gpu, d_off, NUM_EXPERTS + 1)?;
+    let counts: Vec<i32> = (0..NUM_EXPERTS).map(|e| off[e + 1] - off[e]).collect();
+    let busiest = counts.iter().copied().max().unwrap_or(0) as u32;
+    println!(
+        "  routing: {te} slots, rows per expert {counts:?}, expert {IDENT_REMOTE_EXPERT} remote"
+    );
+
+    let mut failures = 0usize;
+    for (n, kk) in [(N, K), (2048usize, 4096usize), (4096, 2048)] {
+        let packed_bytes = n * kk / 2;
+        let scale_bytes = n * kk / NVFP4_GROUP_SIZE;
+        let mut packed_ptrs = vec![0u64; NUM_EXPERTS];
+        let mut scale_ptrs = vec![0u64; NUM_EXPERTS];
+        let mut scale2 = vec![0f32; NUM_EXPERTS];
+        let mut owned: Vec<DevicePtr> = Vec::new();
+        for e in 0..NUM_EXPERTS {
+            let pb: Vec<u8> = (0..packed_bytes).map(|_| lcg(&mut s) as u8).collect();
+            // 2026-09-29: E4M3 codes 0x30..=0x47, as in `make_expert`.
+            let sb: Vec<u8> = (0..scale_bytes)
+                .map(|_| 0x30 + (lcg(&mut s) % 0x18) as u8)
+                .collect();
+            scale2[e] = 0.5 + (lcg(&mut s) % 64) as f32 / 64.0;
+            if e == IDENT_REMOTE_EXPERT {
+                continue;
+            }
+            let pp = up(gpu, &pb)?;
+            let sp = up(gpu, &sb)?;
+            packed_ptrs[e] = pp.0;
+            scale_ptrs[e] = sp.0;
+            owned.push(pp);
+            owned.push(sp);
+        }
+        let d_pp = up_u64(gpu, &packed_ptrs)?;
+        let d_sp = up_u64(gpu, &scale_ptrs)?;
+        let d_s2 = up_f32(gpu, &scale2)?;
+        // 2026-09-29: `te` rows of `kk` BF16 values in [-1, 1]; the gathered path reads the
+        // first IDENT_TOKENS of them.
+        let a: Vec<f32> = (0..te * kk)
+            .map(|_| (lcg(&mut s) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let d_a = up_bf16(gpu, &a)?;
+        let c_bytes = te * n * 2;
+        let d_c = gpu.alloc(c_bytes)?;
+
+        for (path, stid) in [("gathered", d_stid), ("direct", DevicePtr(0))] {
+            gpu.memset_async(d_c, 0xFF, c_bytes, 0)?;
+            launch_tile(
+                gpu, k_ref, &REF_TILE, d_a, d_pp, d_sp, d_s2, d_c, d_off, stid, busiest, n, kk,
+            )?;
+            gpu.synchronize(0)?;
+            let mut want = vec![0u8; c_bytes];
+            gpu.copy_d2h(d_c, &mut want)?;
+            // 2026-09-29: Sanity of the reference: exactly the remote expert's rows are left
+            // at the 0xFFFF fill (a NaN no finite product produces).
+            let unwritten = want
+                .chunks_exact(2)
+                .filter(|h| h[0] == 0xFF && h[1] == 0xFF)
+                .count();
+            let remote_elems = counts[IDENT_REMOTE_EXPERT] as usize * n;
+            if unwritten != remote_elems {
+                bail!(
+                    "reference {} left {unwritten} elements unwritten at N={n} K={kk} {path}, \
+                     expected {remote_elems} (the remote expert's rows)",
+                    REF_TILE.kernel
+                );
+            }
+            for (t, k) in &tiles {
+                gpu.memset_async(d_c, 0xFF, c_bytes, 0)?;
+                launch_tile(
+                    gpu, *k, t, d_a, d_pp, d_sp, d_s2, d_c, d_off, stid, busiest, n, kk,
+                )?;
+                gpu.synchronize(0)?;
+                let mut got = vec![0u8; c_bytes];
+                gpu.copy_d2h(d_c, &mut got)?;
+                let diffs = want
+                    .chunks_exact(2)
+                    .zip(got.chunks_exact(2))
+                    .filter(|(x, y)| x != y)
+                    .count();
+                match want.iter().zip(&got).position(|(x, y)| x != y) {
+                    None => println!(
+                        "  N={n:4} K={kk:4} {path:8} {:<52} BYTE-IDENTICAL",
+                        t.kernel
+                    ),
+                    Some(i) => {
+                        failures += 1;
+                        let e = i / 2;
+                        println!(
+                            "  N={n:4} K={kk:4} {path:8} {:<52} 🔴 {diffs} elements differ; first at \
+                             sorted row {}, n {}: want {:02x?} got {:02x?}",
+                            t.kernel,
+                            e / n,
+                            e % n,
+                            &want[e * 2..e * 2 + 2],
+                            &got[e * 2..e * 2 + 2]
+                        );
+                    }
+                }
+            }
+        }
+        for p in owned.into_iter().chain([d_pp, d_sp, d_s2, d_a, d_c]) {
+            gpu.free(p)?;
+        }
+    }
+    if failures > 0 {
+        bail!(
+            "{failures} M1 tile run(s) are NOT byte-identical to {}",
+            REF_TILE.kernel
+        );
+    }
+    println!(
+        "PASS — every M1 tile is byte-identical to {}",
+        REF_TILE.kernel
     );
     Ok(())
 }

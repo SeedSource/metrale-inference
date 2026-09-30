@@ -122,6 +122,10 @@ pub struct Glm5NextMlpKernels {
     /// prefill, at the tile `forward_prefill_gemm::gemm_tile` picks. When 0, the grouped
     /// prefill path is off.
     pub moe_grouped_gemm: KernelHandle,
+    /// 2026-09-29: The geometry of the kernel in `moe_grouped_gemm`: `gemm_tile()`, or
+    /// `GEMM_TILES[0]` when that tile is missing from the PTX. The dispatch sizes the grid from
+    /// it, so a fallback never runs the base kernel on another tile's grid.
+    pub(crate) moe_grouped_tile: forward_prefill_gemm::GemmTile,
     /// 2026-09-25: [`Self::combine`] reading the routed rows in expert-sorted order through
     /// `token_to_perm`, with the same accumulation order and single rounding.
     pub combine_indexed: KernelHandle,
@@ -129,6 +133,32 @@ pub struct Glm5NextMlpKernels {
 
 impl Glm5NextMlpKernels {
     pub fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
+        // 2026-09-25: Each tile is its own entry point, so the tile
+        // (`METRALE_GLM_MOE_GEMM_TILE`) is read before resolving. A missing tile
+        // other than the base falls back to `GEMM_TILES[0]`, with a warning, and the
+        // dispatch then launches with the base tile's geometry.
+        let (moe_grouped_gemm, moe_grouped_tile) = {
+            let tile = forward_prefill_gemm::gemm_tile();
+            let h = metrale_model_layers::layers::try_kernel(gpu, MOE_GROUPED_MODULE, tile.name);
+            if h.0 == 0 && tile.name != forward_prefill_gemm::GEMM_TILES[0].name {
+                tracing::warn!(
+                    "GLM routed-MoE grouped GEMM tile `{}` is not in this target's PTX — \
+                     falling back to `{}`",
+                    tile.name,
+                    forward_prefill_gemm::GEMM_TILES[0].name
+                );
+                (
+                    metrale_model_layers::layers::try_kernel(
+                        gpu,
+                        MOE_GROUPED_MODULE,
+                        forward_prefill_gemm::GEMM_TILES[0].name,
+                    ),
+                    forward_prefill_gemm::GEMM_TILES[0],
+                )
+            } else {
+                (h, tile)
+            }
+        };
         Ok(Self {
             gemm: gpu.kernel(GEMM_MODULE, "dense_gemm_bf16")?,
             gemm_f32: gpu.kernel(GEMM_MODULE, "dense_gemm_bf16_f32out")?,
@@ -205,29 +235,8 @@ impl Glm5NextMlpKernels {
                 MOE_MODULE,
                 "moe_sort_by_expert",
             ),
-            // 2026-09-25: Each tile is its own entry point, so the tile
-            // (`METRALE_GLM_MOE_GEMM_TILE`) is read before resolving. A missing tile
-            // other than the base falls back to `GEMM_TILES[0]`, with a warning.
-            moe_grouped_gemm: {
-                let tile = forward_prefill_gemm::gemm_tile();
-                let h =
-                    metrale_model_layers::layers::try_kernel(gpu, MOE_GROUPED_MODULE, tile.name);
-                if h.0 == 0 && tile.name != forward_prefill_gemm::GEMM_TILES[0].name {
-                    tracing::warn!(
-                        "GLM routed-MoE grouped GEMM tile `{}` is not in this target's PTX — \
-                         falling back to `{}`",
-                        tile.name,
-                        forward_prefill_gemm::GEMM_TILES[0].name
-                    );
-                    metrale_model_layers::layers::try_kernel(
-                        gpu,
-                        MOE_GROUPED_MODULE,
-                        forward_prefill_gemm::GEMM_TILES[0].name,
-                    )
-                } else {
-                    h
-                }
-            },
+            moe_grouped_gemm,
+            moe_grouped_tile,
             combine_indexed: metrale_model_layers::layers::try_kernel(
                 gpu,
                 FFN_MODULE,

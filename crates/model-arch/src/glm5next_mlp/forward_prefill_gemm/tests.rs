@@ -140,8 +140,9 @@ fn max_m_tiles_is_never_short_for_a_real_routing() {
     }
 }
 
-/// 2026-09-25: Each tile's geometry follows its name: `m16` tiles have `m_tile` 16 and the rest
-/// 64; `n128` tiles have `n_tile` 128 and 256 threads, the rest 64 and 128.
+/// 2026-09-25: Each tile's geometry follows its name: `m16` tiles have `m_tile` 16, `m128`
+/// tiles 128 and the rest 64; `n128` and `m128` tiles have 256 threads, the rest 128; `n128`
+/// tiles have `n_tile` 128, the rest 64; `mfast` tiles, and only they, have `m_fast`.
 #[test]
 fn every_gemm_tile_matches_its_kernel_geometry() {
     for t in GEMM_TILES {
@@ -151,9 +152,16 @@ fn every_gemm_tile_matches_its_kernel_geometry() {
             t.name
         );
         let expect_m16 = t.name.contains("m16");
+        let expect_m128 = t.name.contains("m128");
         assert_eq!(
             t.m_tile,
-            if expect_m16 { 16 } else { 64 },
+            if expect_m16 {
+                16
+            } else if expect_m128 {
+                128
+            } else {
+                64
+            },
             "{}: m_tile must equal the kernel's M_TILE or rows are dropped",
             t.name
         );
@@ -166,8 +174,14 @@ fn every_gemm_tile_matches_its_kernel_geometry() {
         );
         assert_eq!(
             t.threads,
-            if expect_n128 { 256 } else { 128 },
+            if expect_n128 || expect_m128 { 256 } else { 128 },
             "{}: block width must equal WARPS*32 or the cooperative load is short",
+            t.name
+        );
+        assert_eq!(
+            t.m_fast,
+            t.name.ends_with("_mfast"),
+            "{}: m_fast must match the kernel's grid order or the wrong tiles are computed",
             t.name
         );
     }
@@ -202,4 +216,18 @@ fn m16_tile_needs_more_rows_of_grid_than_the_base_tile() {
     assert_eq!(max_m_tiles_from_offsets(&off, 128, 64), 1);
     assert_eq!(max_m_tiles_from_offsets(&off, 128, 16), 3);
     assert_eq!(DEFAULT_GEMM_TILE.m_tile, 16);
+}
+
+/// 2026-09-29: An `m_fast` tile puts the M tiles in grid x and the N tiles in grid y; any other
+/// tile the reverse.
+#[test]
+fn grid_dims_follow_m_fast() {
+    let t = select_gemm_tile("bt_m16_k128").unwrap();
+    assert_eq!(t.grid_dims(2048, 7, 288), [32, 7, 288]);
+    let f = select_gemm_tile("bt_m16_k128_mfast").unwrap();
+    assert!(f.m_fast);
+    assert_eq!(f.grid_dims(2048, 7, 288), [7, 32, 288]);
+    let big = select_gemm_tile("bt_m128_k64_mfast").unwrap();
+    assert_eq!((big.m_tile, big.threads), (128, 256));
+    assert_eq!(big.grid_dims(4096, 2, 288), [2, 64, 288]);
 }

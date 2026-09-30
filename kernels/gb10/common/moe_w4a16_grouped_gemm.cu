@@ -678,7 +678,7 @@ __device__ __forceinline__ float e2m1_decode(unsigned int n) {
 }
 
 template <int MT, int NTILE, int KS, int WARPS, bool SPLIT_N, bool KMAJOR, bool ARITH_LUT,
-          bool BT>
+          bool BT, bool MFAST = false>
 __device__ __forceinline__ void moe_w4a16_grouped_core(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ B_packed_ptrs,
@@ -708,11 +708,17 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
     const int M_expert = m_end - m_start;
     if (M_expert <= 0) return;
 
-    const int cta_m_local = blockIdx.y * MT;
+    // 2026-09-29: MFAST swaps grid x and y: blockIdx.x is the M tile and blockIdx.y the N tile, so
+    // the CTAs of one (expert, N tile), which read the same weight columns, are adjacent in launch
+    // order. Only the block-to-tile mapping changes; each CTA computes exactly what it would
+    // with MFAST = false.
+    const unsigned int m_blk = MFAST ? blockIdx.x : blockIdx.y;
+    const unsigned int n_blk = MFAST ? blockIdx.y : blockIdx.x;
+    const int cta_m_local = (int)m_blk * MT;
     if (cta_m_local >= M_expert) return;
 
     const unsigned int cta_m = m_start + cta_m_local;
-    const unsigned int cta_n = blockIdx.x * NTILE;
+    const unsigned int cta_n = n_blk * NTILE;
 
     const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
     const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
@@ -939,6 +945,28 @@ void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
         expert_offsets, sorted_token_ids, num_experts, N, K);                 \
 }
 
+// 2026-09-29: `P3B_GROUPED_VARIANT` with MFAST = true: the launch grid is
+// (max_m_tiles, ceil(N / NTILE), num_experts), M tile in x. A grid in the default (N tile in x)
+// order computes the wrong tiles.
+#define P3B_GROUPED_VARIANT_MFAST(SUFFIX, MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT) \
+extern "C" __global__ __launch_bounds__((WARPS) * 32)                         \
+void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
+    const __nv_bfloat16* __restrict__ A,                                      \
+    const unsigned long long* __restrict__ B_packed_ptrs,                     \
+    const unsigned long long* __restrict__ B_scale_ptrs,                      \
+    const float* __restrict__ scale2_vals,                                    \
+    __nv_bfloat16* __restrict__ C,                                            \
+    const int* __restrict__ expert_offsets,                                   \
+    const int* __restrict__ sorted_token_ids,                                 \
+    unsigned int num_experts,                                                 \
+    unsigned int N,                                                           \
+    unsigned int K                                                            \
+) {                                                                           \
+    moe_w4a16_grouped_core<MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, true>( \
+        A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,                       \
+        expert_offsets, sorted_token_ids, num_experts, N, K);                 \
+}
+
 // 2026-09-25: suffix, MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ARITH_LUT, BT.
 // MT 64 with 4 warps over M; only KS differs from the base kernel's K_STEP.
 P3B_GROUPED_VARIANT(k32,            64,    64,  32,    4, false, false, false, false)
@@ -1029,3 +1057,19 @@ P3B_GROUPED_VARIANT(bt_m16_k128,     16,    64, 128,    4, true,  true,  true, t
 P3B_GROUPED_VARIANT(bt_m16_k256,     16,    64, 256,    4, true,  true,  true, true)
 P3B_GROUPED_VARIANT(bt_m16_n128_k128, 16,  128, 128,    8, true,  true,  true, true)
 P3B_GROUPED_VARIANT(bt_k128,         64,    64, 128,    4, false, true,  true, true)
+
+// 2026-09-29: Whole-chunk prefill M1 (spark-bench .planning/METRALE-WHOLE-CHUNK-PREFILL-DESIGN-20260929.md).
+// Every tile below stages the same BF16 A and B values as `bt_m16_k128` (same KMAJOR, ARITH_LUT
+// and BT staging, so each B value is __float2bfloat16(e2m1_decode(nibble) * (e4m3 * scale2))) and
+// feeds each output element's accumulator the same m16n8k16 MMAs in the same ascending
+// 16-wide k order, whatever KS is: the K loop visits k_base = 0, KS, 2*KS, ... and inside it
+// kf = 0, 16, ..., KS - 16. An element's result depends only on its A row, its B column and
+// that order, so M tile, warp split, KS and grid order change which CTA or warp computes an
+// element, not its bits (INFERRED; the tile bench and the prefill microtest assert it).
+// `bt_k128` above is already the M64 tile (4 warps over M, KS 128). The M128 tile uses KS 64:
+// at KS 128 its static shared memory would be 128 * 130 * 2 + 64 * 136 * 2 = 50,688 B, over
+// the 48 KB static limit; at KS 64 it is 128 * 66 * 2 + 64 * 72 * 2 = 26,112 B.
+P3B_GROUPED_VARIANT_MFAST(bt_m16_k128_mfast, 16, 64, 128,    4, true,  true,  true, true)
+P3B_GROUPED_VARIANT_MFAST(bt_m64_k128_mfast, 64, 64, 128,    4, false, true,  true, true)
+P3B_GROUPED_VARIANT(bt_m128_k64,            128, 64,  64,    8, false, true,  true, true)
+P3B_GROUPED_VARIANT_MFAST(bt_m128_k64_mfast, 128, 64, 64,    8, false, true,  true, true)

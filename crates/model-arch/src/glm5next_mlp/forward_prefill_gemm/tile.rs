@@ -30,6 +30,23 @@ pub(crate) struct GemmTile {
     pub n_tile: u32,
     /// 2026-09-25: Threads per block, 32 per warp.
     pub threads: u32,
+    /// 2026-09-29: The kernel is an `_mfast` variant: grid x counts M tiles and grid y N tiles
+    /// (`grid_dims`), so the CTAs of one (expert, N tile) launch adjacently.
+    pub m_fast: bool,
+}
+
+impl GemmTile {
+    /// 2026-09-29: Launch grid for `n_out` output columns, `max_m_tiles` M tiles and
+    /// `num_experts` experts: `(n tiles, m tiles, experts)`, or `(m tiles, n tiles, experts)`
+    /// for an `m_fast` tile.
+    pub(crate) fn grid_dims(&self, n_out: usize, max_m_tiles: u32, num_experts: usize) -> [u32; 3] {
+        let n_tiles = (n_out as u32).div_ceil(self.n_tile);
+        if self.m_fast {
+            [max_m_tiles, n_tiles, num_experts as u32]
+        } else {
+            [n_tiles, max_m_tiles, num_experts as u32]
+        }
+    }
 }
 
 /// 2026-09-25: The tile used when `METRALE_GLM_MOE_GEMM_TILE` is unset or names no known tile.
@@ -38,6 +55,7 @@ pub(crate) const DEFAULT_GEMM_TILE: GemmTile = GemmTile {
     m_tile: 16,
     n_tile: 64,
     threads: 128,
+    m_fast: false,
 };
 
 /// 2026-09-25: Every tile `select_gemm_tile` accepts.
@@ -49,30 +67,35 @@ pub(crate) const GEMM_TILES: &[GemmTile] = &[
         m_tile: 64,
         n_tile: 64,
         threads: 128,
+        m_fast: false,
     },
     GemmTile {
         name: "moe_w4a16_grouped_gemm_ptrtable_k32",
         m_tile: 64,
         n_tile: 64,
         threads: 128,
+        m_fast: false,
     },
     GemmTile {
         name: "moe_w4a16_grouped_gemm_ptrtable_k64",
         m_tile: 64,
         n_tile: 64,
         threads: 128,
+        m_fast: false,
     },
     GemmTile {
         name: "moe_w4a16_grouped_gemm_ptrtable_m16_k64",
         m_tile: 16,
         n_tile: 64,
         threads: 128,
+        m_fast: false,
     },
     GemmTile {
         name: "moe_w4a16_grouped_gemm_ptrtable_alkm_m16_k128",
         m_tile: 16,
         n_tile: 64,
         threads: 128,
+        m_fast: false,
     },
     DEFAULT_GEMM_TILE,
     GemmTile {
@@ -80,6 +103,46 @@ pub(crate) const GEMM_TILES: &[GemmTile] = &[
         m_tile: 16,
         n_tile: 128,
         threads: 256,
+        m_fast: false,
+    },
+    // 2026-09-29: Whole-chunk prefill M1. Each computes every element with the same MMAs in the
+    // same k order as `bt_m16_k128` (see the kernel file), so the output is byte-identical to
+    // it (INFERRED; `glm5next_moe_grouped_prefill_microtest` asserts it). `bt_k128` is the M64
+    // tile; `_mfast` tiles put the M tile in grid x for L2 reuse of one expert's weight columns.
+    GemmTile {
+        name: "moe_w4a16_grouped_gemm_ptrtable_bt_m16_k128_mfast",
+        m_tile: 16,
+        n_tile: 64,
+        threads: 128,
+        m_fast: true,
+    },
+    GemmTile {
+        name: "moe_w4a16_grouped_gemm_ptrtable_bt_k128",
+        m_tile: 64,
+        n_tile: 64,
+        threads: 128,
+        m_fast: false,
+    },
+    GemmTile {
+        name: "moe_w4a16_grouped_gemm_ptrtable_bt_m64_k128_mfast",
+        m_tile: 64,
+        n_tile: 64,
+        threads: 128,
+        m_fast: true,
+    },
+    GemmTile {
+        name: "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64",
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: false,
+    },
+    GemmTile {
+        name: "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_mfast",
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: true,
     },
 ];
 

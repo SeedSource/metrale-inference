@@ -76,9 +76,17 @@ pub(crate) fn launch(
     max_m_tiles: u32,
     n_tile: u32,
     threads: u32,
+    m_fast: bool,
 ) -> Result<()> {
+    let n_tiles = (n as u32).div_ceil(n_tile);
+    // 2026-09-29: `_mfast` kernels take the M tile from grid x and the N tile from grid y.
+    let grid = if m_fast {
+        [max_m_tiles, n_tiles, NUM_EXPERTS as u32]
+    } else {
+        [n_tiles, max_m_tiles, NUM_EXPERTS as u32]
+    };
     KernelLaunch::new(gpu, k)
-        .grid([(n as u32).div_ceil(n_tile), max_m_tiles, NUM_EXPERTS as u32])
+        .grid(grid)
         .block([threads, 1, 1])
         .arg_ptr(a)
         .arg_ptr(packed_ptrs)

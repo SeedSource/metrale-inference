@@ -248,6 +248,36 @@ pub(crate) fn prefill_gemm_exact_tiles() -> bool {
     })
 }
 
+/// 2026-09-30: Whether the routed-expert prefill gathers `x` into expert-sorted order once,
+/// into the workspace's own scratch buffer (`moe_permute_tokens`), then runs gate and up with
+/// `sorted_token_ids` NULL, instead of each of those two GEMMs gathering its own A rows through
+/// `sorted_token_ids`: `METRALE_GLM_MOE_PREFILL_PERMUTE=1`. Byte-identical by construction — the
+/// permuted buffer holds exactly the BF16 bits `A[sorted_token_ids[row]]` would have read, so a
+/// GEMM tile computes the same `mma.sync` sums in the same order either way
+/// (`glm5next_moe_prefill_permute_microtest` asserts it row-for-row at rows in
+/// {1, 17, 256, 1000, 2048, 4096}). MEASURED 2026-09-30 with
+/// `examples/glm5next_moe_grouped_tile_bench` (`GLM_TILE_BENCH_GATHER_X=1`; see
+/// `~/lazarus/spark-bench/runs/metrale/moeprobe/RESULT.md`): the embedded `sorted_token_ids`
+/// gather costs gate/up ~10% at the production window (2048 rows) and 44% at 4096 rows, so
+/// paying the gather once instead of twice is worth it in principle — but the permute pass's
+/// own GPU cost, and the net effect, are UNMEASURED (no GPU in this change). Off by default
+/// until measured. Read once.
+pub(crate) fn prefill_gemm_permute() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_MOE_PREFILL_PERMUTE").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "GLM routed-MoE prefill grouped GEMM: GATHER-ONCE gate/up A \
+                 (METRALE_GLM_MOE_PREFILL_PERMUTE=1) — permutes x into expert-sorted order once \
+                 per layer via moe_permute_tokens, then runs gate and up with sorted_token_ids \
+                 NULL; UNMEASURED on GPU as of 2026-09-30"
+            );
+        }
+        on
+    })
+}
+
 /// 2026-09-25: Grid height of the grouped GEMM: tiles of `m_tile` rows that the busiest expert
 /// in the host copy of `expert_offsets` needs, at least 1 and at most `worst_case`.
 pub(crate) fn max_m_tiles_from_offsets(offsets: &[i32], worst_case: u32, m_tile: usize) -> u32 {

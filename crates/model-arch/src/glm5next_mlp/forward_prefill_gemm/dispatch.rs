@@ -13,7 +13,9 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use super::super::forward::Glm5NextMlpWorkspace;
 use super::super::weights::Glm5NextMoeWeights;
 use super::super::{Glm5NextMlpConfig, Glm5NextMlpKernels};
-use super::tile::{GemmTile, max_m_tiles_from_offsets, prefill_gemm_exact_tiles};
+use super::tile::{
+    GemmTile, max_m_tiles_from_offsets, prefill_gemm_exact_tiles, prefill_gemm_permute,
+};
 
 /// 2026-09-25: `C = gather(A) @ dequant(W_expert)^T` for every expert in one launch: grid
 /// `tile.grid_dims(n_out, max_m_tiles, num_experts)`, `tile.threads` threads per block.
@@ -112,15 +114,44 @@ pub(crate) fn forward_moe_grouped_prefill(
         worst_case
     };
 
-    // 2026-09-25: Gate and up: the kernel gathers the rows of `x` through `sorted_token_ids`.
+    // 2026-09-30: `METRALE_GLM_MOE_PREFILL_PERMUTE=1`: gather `x` into `ws.moe_perm()` once, in
+    // expert-sorted order (`moe_permute_tokens`, `moe_permute.cu`, the same module
+    // `moe_sort_by_expert` ships in; launched through the existing, previously-uncalled wrapper
+    // `metrale_model_layers::layers::ops::moe_permute_tokens` — its own doc: "permuted[i] =
+    // hidden[sorted_token_ids[i]]. One block per output row."), then run gate AND up against
+    // that buffer with `sorted_token_ids` NULL. Byte-identical to gathering through
+    // `sorted_token_ids` inside each GEMM: `perm[row]` holds the exact BF16 bits
+    // `A[sorted_token_ids[row]]` would have, so `smem_A[row][col]` is the same either way
+    // (`examples/glm5next_moe_prefill_permute_microtest.rs`). Off (the `k.0 != 0` fallback
+    // covers a PTX missing the kernel while the env var is set): unchanged from before this
+    // lever existed — `a_in` is `x`, `stid_arg` is `ws.sorted_token_ids()`.
+    let permute = prefill_gemm_permute() && k.moe_permute_tokens.0 != 0;
+    let (a_in, stid_arg) = if permute {
+        metrale_model_layers::layers::ops::moe_permute_tokens(
+            gpu,
+            k.moe_permute_tokens,
+            x,
+            ws.moe_perm(),
+            ws.sorted_token_ids(),
+            cfg.hidden as u32,
+            te as u32,
+            stream,
+        )?;
+        (ws.moe_perm(), DevicePtr(0))
+    } else {
+        (x, ws.sorted_token_ids())
+    };
+
+    // 2026-09-25: Gate and up: the kernel gathers the rows of `x` through `sorted_token_ids`,
+    // unless the permute lever above already did it and handed a null `stid_arg`.
     grouped_gemm(
         gpu,
         k.moe_grouped_gemm,
-        x,
+        a_in,
         &w.ptrs.gate,
         ws.a_gate(),
         ws.expert_offsets(),
-        ws.sorted_token_ids(),
+        stid_arg,
         cfg.num_experts,
         mi,
         cfg.hidden,
@@ -131,11 +162,11 @@ pub(crate) fn forward_moe_grouped_prefill(
     grouped_gemm(
         gpu,
         k.moe_grouped_gemm,
-        x,
+        a_in,
         &w.ptrs.up,
         ws.a_up(),
         ws.expert_offsets(),
-        ws.sorted_token_ids(),
+        stid_arg,
         cfg.num_experts,
         mi,
         cfg.hidden,

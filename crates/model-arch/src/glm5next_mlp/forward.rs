@@ -27,7 +27,8 @@ use dense::row_slices;
 pub use dense::{forward_dense, forward_dense_sliced};
 use launch::{gemm, swiglu};
 pub use workspace::{
-    mlp_ws_bytes, mlp_ws_bytes_sized, mlp_ws_total_bytes, mlp_ws_total_bytes_sized,
+    mlp_ws_bytes, mlp_ws_bytes_sized, mlp_ws_permute_bytes, mlp_ws_total_bytes,
+    mlp_ws_total_bytes_sized,
 };
 
 const ACT_BLOCK: u32 = 256;
@@ -80,6 +81,11 @@ pub struct Glm5NextMlpWorkspace {
     /// 2026-09-25: `[rows, top_k]` I32: a slot's row in the expert-sorted output, read by
     /// `glm5next_moe_combine_indexed`.
     token_to_perm: DevicePtr,
+    /// 2026-09-30: `[rows * top_k, hidden]` BF16 gate/up gather-once buffer, `moe_permute_tokens`
+    /// (`METRALE_GLM_MOE_PREFILL_PERMUTE=1`, `forward_prefill_gemm::prefill_gemm_permute`).
+    /// `DevicePtr::NULL`, unallocated, when the lever is off — off leaves this workspace exactly
+    /// the size it was before the lever existed.
+    moe_perm: DevicePtr,
     max_inter: usize,
     /// 2026-09-25: Widest row group this scratch serves, at least 1.
     max_rows: usize,
@@ -138,6 +144,11 @@ impl Glm5NextMlpWorkspace {
     }
     pub(super) fn token_to_perm(&self) -> DevicePtr {
         self.token_to_perm
+    }
+    /// 2026-09-30: The `METRALE_GLM_MOE_PREFILL_PERMUTE=1` gather-once buffer; `DevicePtr::NULL`
+    /// when the lever is off.
+    pub(super) fn moe_perm(&self) -> DevicePtr {
+        self.moe_perm
     }
 }
 

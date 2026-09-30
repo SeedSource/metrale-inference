@@ -39,7 +39,7 @@ fn row_groups_at_the_shipping_widths() {
 
 mod ws_sizing {
     use crate::glm5next_mlp::Glm5NextMlpConfig;
-    use crate::glm5next_mlp::forward::{mlp_ws_bytes, mlp_ws_total_bytes};
+    use crate::glm5next_mlp::forward::{mlp_ws_bytes, mlp_ws_permute_bytes, mlp_ws_total_bytes};
 
     /// 2026-09-25: The config fixture's MLP geometry (hidden 4096, 288 experts, top_k 8) at
     /// TP=2, EP=2.
@@ -116,5 +116,25 @@ mod ws_sizing {
         let c = cfg();
         assert_eq!(mlp_ws_total_bytes(&c, 0), mlp_ws_total_bytes(&c, 1));
         assert!(mlp_ws_bytes(&c, 0).iter().all(|&b| b > 0));
+    }
+
+    /// 2026-09-30: `mlp_ws_permute_bytes` (the `METRALE_GLM_MOE_PREFILL_PERMUTE=1` gather-once
+    /// buffer): 0 with `on = false` at every row count including 0, and `rows * top_k * hidden *
+    /// 2` with `on = true`, 0 rows clamped to 1 like every other buffer in this module.
+    #[test]
+    fn permute_bytes_is_zero_off_and_rows_top_k_hidden_times_two_on() {
+        let c = cfg();
+        for rows in [0usize, 1, 16, 64, 128, 256, 1024] {
+            assert_eq!(
+                mlp_ws_permute_bytes(&c, rows, false),
+                0,
+                "lever off must allocate nothing at {rows} rows"
+            );
+            assert_eq!(
+                mlp_ws_permute_bytes(&c, rows, true),
+                rows.max(1) * c.top_k * c.hidden * 2,
+                "lever on at {rows} rows"
+            );
+        }
     }
 }

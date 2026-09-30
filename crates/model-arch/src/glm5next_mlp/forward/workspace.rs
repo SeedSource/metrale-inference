@@ -8,7 +8,7 @@
 //! - `mlp_ws_bytes` lists the sizes `Glm5NextMlpWorkspace::new` allocates, in its order.
 
 use anyhow::Result;
-use metrale_gpu_runtime::gpu::GpuBackend;
+use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::Glm5NextMlpWorkspace;
 use crate::glm5next_mlp::Glm5NextMlpConfig;
@@ -74,6 +74,20 @@ pub fn mlp_ws_total_bytes_sized(
     mlp_ws_bytes_sized(cfg, max_rows, union_rows).iter().sum()
 }
 
+/// 2026-09-30: Bytes of the `METRALE_GLM_MOE_PREFILL_PERMUTE=1` gather-once buffer
+/// (`Glm5NextMlpWorkspace::moe_perm`): `[max_rows * top_k, hidden]` BF16 when `on`, 0 (no
+/// allocation) when `on` is false — the caller passes `forward_prefill_gemm::prefill_gemm_permute()`
+/// explicitly so this stays a pure function of its arguments, not of process env state. Kept out
+/// of `mlp_ws_bytes`/`mlp_ws_total_bytes*`: those describe the workspace the lever leaves
+/// unchanged when off, and their hand-computed-footprint tests assume every entry is always
+/// positive.
+pub fn mlp_ws_permute_bytes(cfg: &Glm5NextMlpConfig, max_rows: usize, on: bool) -> usize {
+    if !on {
+        return 0;
+    }
+    max_rows.max(1) * cfg.top_k * cfg.hidden * 2
+}
+
 impl Glm5NextMlpWorkspace {
     pub fn new(gpu: &dyn GpuBackend, cfg: &Glm5NextMlpConfig, max_rows: usize) -> Result<Self> {
         Self::new_sized(gpu, cfg, max_rows, max_rows)
@@ -99,6 +113,16 @@ impl Glm5NextMlpWorkspace {
         let act_elems = (rows * max_inter)
             .max(rows * cfg.top_k * cfg.moe_intermediate)
             .max(1);
+        // 2026-09-30: `METRALE_GLM_MOE_PREFILL_PERMUTE=1` gather-once buffer for gate/up
+        // (`forward_prefill_gemm::prefill_gemm_permute`). Off (default): `DevicePtr::NULL`, no
+        // `gpu.alloc` call at all — the lever changes nothing about this workspace when unset.
+        let permute_on = crate::glm5next_mlp::forward_prefill_gemm::prefill_gemm_permute();
+        let moe_perm_bytes = mlp_ws_permute_bytes(cfg, rows, permute_on);
+        let moe_perm = if moe_perm_bytes > 0 {
+            gpu.alloc(moe_perm_bytes)?
+        } else {
+            DevicePtr::NULL
+        };
         Ok(Self {
             a_gate: gpu.alloc(act_elems * 2)?,
             a_up: gpu.alloc(act_elems * 2)?,
@@ -116,6 +140,7 @@ impl Glm5NextMlpWorkspace {
             sorted_expert_ids: gpu.alloc(rows * cfg.top_k * 4)?,
             expert_offsets: gpu.alloc((cfg.num_experts + 1) * 4)?,
             token_to_perm: gpu.alloc(rows * cfg.top_k * 4)?,
+            moe_perm,
             max_inter,
             max_rows: rows,
             max_total_expanded: rows * cfg.top_k,

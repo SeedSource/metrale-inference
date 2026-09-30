@@ -285,8 +285,10 @@ pub fn moe_w4a16_fused_gate_up_k64_n128(
 
 /// 2026-09-25: Gather token rows into expert-sorted order:
 /// `permuted[i] = hidden[sorted_token_ids[i]]`, `permuted` being `[total_expanded, hidden]`. One
-/// block per output row. No code calls it.
-#[allow(clippy::too_many_arguments, dead_code)]
+/// block per output row.
+/// 2026-09-30: Called by `glm5next_mlp::forward_prefill_gemm`'s `METRALE_GLM_MOE_PREFILL_PERMUTE=1`
+/// gate/up gather-once lever.
+#[allow(clippy::too_many_arguments)]
 pub fn moe_permute_tokens(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,

@@ -129,6 +129,12 @@ pub struct Glm5NextMlpKernels {
     /// 2026-09-25: [`Self::combine`] reading the routed rows in expert-sorted order through
     /// `token_to_perm`, with the same accumulation order and single rounding.
     pub combine_indexed: KernelHandle,
+    /// 2026-09-30: `moe_permute_tokens` (`moe_permute.cu`, same module as
+    /// [`Self::moe_sort_by_expert`]): `permuted[row] = hidden_states[sorted_token_ids[row]]`,
+    /// the `METRALE_GLM_MOE_PREFILL_PERMUTE=1` gather-once lever for gate/up
+    /// (`forward_prefill_gemm::prefill_gemm_permute`). When 0, the dispatch never takes the
+    /// lever even if the env var is set.
+    pub moe_permute_tokens: KernelHandle,
 }
 
 impl Glm5NextMlpKernels {
@@ -241,6 +247,11 @@ impl Glm5NextMlpKernels {
                 gpu,
                 FFN_MODULE,
                 "glm5next_moe_combine_indexed",
+            ),
+            moe_permute_tokens: metrale_model_layers::layers::try_kernel(
+                gpu,
+                MOE_MODULE,
+                "moe_permute_tokens",
             ),
         })
     }

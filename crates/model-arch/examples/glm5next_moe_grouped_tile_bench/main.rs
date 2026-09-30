@@ -34,12 +34,14 @@
 //! - `GLM_TILE_BENCH_RING=<n>`: weight copies, as above.
 //! - `GLM_TILE_BENCH_ONLY=<suffix,...>`: time only the base kernel, `bt_m16_k128` and the
 //!   variants whose kernel name ends in one of the suffixes (e.g. `bt_k128,bt_m128_k64_mfast`).
-//! - `GLM_TILE_BENCH_DIAG=1`: also run the bench-only `bt_m128_k64_diag_{nodeq,nomma,noload}`
-//!   pipeline-stage isolators (met-moeprobe residual-limiter classification). Each one's
-//!   output differs from the base kernel's by construction; the bench reports it as DIAG, not
-//!   as an identity failure, and it is excluded from every run unless this is set. Combine
-//!   with `GLM_TILE_BENCH_ONLY=bt_m128_k64,bt_m128_k64_diag_nodeq,bt_m128_k64_diag_nomma,\
-//!   bt_m128_k64_diag_noload` to time only `bt_m128_k64` and its three isolators.
+//! - `GLM_TILE_BENCH_DIAG=1`: also run the bench-only
+//!   `bt_m128_k64_diag_{nodeq,nomma,noload,noloada,noloadaw}` pipeline-stage isolators
+//!   (met-moeprobe residual-limiter classification). Each one's output differs from the base
+//!   kernel's by construction; the bench reports it as DIAG, not as an identity failure, and
+//!   it is excluded from every run unless this is set. Combine with
+//!   `GLM_TILE_BENCH_ONLY=bt_m128_k64,bt_m128_k64_diag_nodeq,bt_m128_k64_diag_nomma,\
+//!   bt_m128_k64_diag_noload,bt_m128_k64_diag_noloada,bt_m128_k64_diag_noloadaw` to time only
+//!   `bt_m128_k64` and its five isolators.
 //!
 //!   cargo run -p metrale-model-arch --release --example glm5next_moe_grouped_tile_bench \
 //!       --features cuda,gpu-examples -- `[rows[,rows...]]`   (default 256,1024,2048,4096)

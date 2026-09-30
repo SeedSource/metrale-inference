@@ -70,8 +70,8 @@ const fn m1(
 }
 
 /// 2026-09-30: A bench-only diagnostic tile that isolates one pipeline stage of
-/// `bt_m128_k64` (`moe_w4a16_grouped_core`'s DIAG template parameter: NODEQ, NOMMA or
-/// NOLOAD-W). Same MT=128, NTILE=64, KS=64, WARPS=8 grid/block/smem footprint as
+/// `bt_m128_k64` (`moe_w4a16_grouped_core`'s DIAG template parameter: NODEQ, NOMMA, NOLOAD-W,
+/// NOLOAD-A or NOLOAD-AW). Same MT=128, NTILE=64, KS=64, WARPS=8 grid/block/smem footprint as
 /// `bt_m128_k64`, so its timing is directly comparable. Its output differs from every other
 /// variant's by construction, so `must_match_ref` is false (never an M1 failure) and the
 /// bench reports it as DIAG rather than comparing it for byte identity. Excluded from every
@@ -377,5 +377,13 @@ pub(crate) const VARIANTS: &[Variant] = &[
     diag(
         "DIAG bt_m128_k64 NOLOAD-W",
         "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_diag_noload",
+    ),
+    diag(
+        "DIAG bt_m128_k64 NOLOAD-A",
+        "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_diag_noloada",
+    ),
+    diag(
+        "DIAG bt_m128_k64 NOLOAD-AW",
+        "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_diag_noloadaw",
     ),
 ];

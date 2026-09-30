@@ -10,8 +10,8 @@
 // Entry points: `moe_w4a16_grouped_gemm` (all experts' weights in one buffer); `_ptrtable` (per-expert pointer
 // tables, A rows gathered through sorted_token_ids); `_ptrtable_t` (the same with weights stored [K/2, N]); the
 // `_ptrtable_<suffix>` tile variants from P3B_GROUPED_VARIANT; `moe_w4a16_grouped_stream_probe`; and (bench-only,
-// GLM_TILE_BENCH_DIAG=1) the `_ptrtable_bt_m128_k64_diag_{nodeq,nomma,noload}` pipeline-stage isolators from
-// P3B_GROUPED_VARIANT_DIAG.
+// GLM_TILE_BENCH_DIAG=1) the `_ptrtable_bt_m128_k64_diag_{nodeq,nomma,noload,noloada,noloadaw}` pipeline-stage
+// isolators from P3B_GROUPED_VARIANT_DIAG.
 //
 // Owner: gb10 kernels.
 // Invariants: none beyond the types.
@@ -692,6 +692,14 @@ __device__ __forceinline__ float e2m1_decode(unsigned int n) {
 //   3  NOLOAD-W: keeps dequant and mma unchanged, but every (gk, gn) reads the same ~8 weight
 //      bytes and 1 scale byte from a tiny CTA-shared cache loaded once at CTA entry, instead
 //      of walking B_expert/S_expert in DRAM — negligible DRAM weight traffic per CTA.
+//   4  NOLOAD-A: keeps weight loads, dequant, mma and the sorted_token_ids gather-index read
+//      unchanged, but every A element is read from a KS-wide CTA-shared cache (one M row's
+//      worth of A, thread-cooperatively loaded once at CTA entry) instead of walking
+//      A[a_row * K + gc] in DRAM; the gather index's low byte is XORed into the cached
+//      value's raw bit pattern so the index load cannot be proven dead — negligible DRAM A
+//      traffic per CTA.
+//   5  NOLOAD-AW: DIAG 3 and DIAG 4 combined — both A and the weight/scale bytes come from
+//      their tiny CTA-shared caches; only dequant, mma, sync and pipeline overhead remain.
 template <int MT, int NTILE, int KS, int WARPS, bool SPLIT_N, bool KMAJOR, bool ARITH_LUT,
           bool BT, bool MFAST = false, int DIAG = 0>
 __device__ __forceinline__ void moe_w4a16_grouped_core(
@@ -786,17 +794,34 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
 
     const bool warp_has_rows = (cta_m_local + (int)warp_m_offset) < M_expert;
 
-    // 2026-09-30: DIAG == 3 (NOLOAD-W) only. One thread reads the expert's first 8 weight
-    // bytes and first scale byte into a CTA-shared cache; every (gk, gn) below then decodes
-    // from this cache instead of B_expert/S_expert, so the CTA's DRAM weight traffic is this
-    // one small read, not the full N * K/2 + N * K/GROUP_SIZE sweep.
+    // 2026-09-30: DIAG == 3 or 5 (NOLOAD-W / NOLOAD-AW) only. One thread reads the expert's
+    // first 8 weight bytes and first scale byte into a CTA-shared cache; every (gk, gn) below
+    // then decodes from this cache instead of B_expert/S_expert, so the CTA's DRAM weight
+    // traffic is this one small read, not the full N * K/2 + N * K/GROUP_SIZE sweep.
     __shared__ unsigned int diag_w0, diag_w1;
     __shared__ unsigned char diag_scale;
-    if (DIAG == 3) {
+    if (DIAG == 3 || DIAG == 5) {
         if (threadIdx.x == 0) {
             diag_w0 = *(const unsigned int*)(B_expert);
             diag_w1 = *(const unsigned int*)(B_expert + 4);
             diag_scale = S_expert[0];
+        }
+        __syncthreads();
+    }
+
+    // 2026-09-30: DIAG == 4 or 5 (NOLOAD-A / NOLOAD-AW) only. Thread-cooperative load of one
+    // M row's KS-wide slice of A — row 0 of this CTA's M tile, gathered through
+    // sorted_token_ids exactly as the per-iteration load below would gather it — into a tiny
+    // CTA-shared cache, once at CTA entry. `cta_m_local < M_expert` is already guaranteed by
+    // the early return above, so row 0 is always a real, in-range row. Every K-step's A load
+    // below then reads from this cache instead of walking A in DRAM.
+    __shared__ __nv_bfloat16 diag_a_row[KS];
+    if (DIAG == 4 || DIAG == 5) {
+        unsigned int a_row0 = sorted_token_ids
+            ? (unsigned int)sorted_token_ids[cta_m]
+            : cta_m;
+        for (unsigned int col = threadIdx.x; col < (unsigned int)KS; col += THREADS) {
+            diag_a_row[col] = (col < K) ? A[(unsigned long long)a_row0 * K + col] : __float2bfloat16(0.0f);
         }
         __syncthreads();
     }
@@ -816,7 +841,18 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
                     unsigned int a_row = sorted_token_ids
                         ? (unsigned int)sorted_token_ids[cta_m + row]
                         : (cta_m + row);
-                    smem_A[row][col] = A[a_row * K + gc];
+                    if (DIAG == 4 || DIAG == 5) {
+                        // 2026-09-30: NOLOAD-A — reads from the KS-wide CTA-cached row above
+                        // instead of A[a_row * K + gc] in DRAM. `a_row`'s gather-index read
+                        // just above is unchanged (sorted_token_ids traffic stays); its low
+                        // byte is XORed into the cached value's raw bit pattern so the load
+                        // cannot be proven dead.
+                        unsigned short bits = *(const unsigned short*)&diag_a_row[col];
+                        bits = (unsigned short)(bits ^ (unsigned short)(a_row & 0xFFu));
+                        *(unsigned short*)&smem_A[row][col] = bits;
+                    } else {
+                        smem_A[row][col] = A[a_row * K + gc];
+                    }
                 } else {
                     smem_A[row][col] = __float2bfloat16(0.0f);
                 }
@@ -847,10 +883,10 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
                 if (gk < K && gn < N) {
                     unsigned int w0, w1;
                     float sc;
-                    if (DIAG == 3) {
-                        // 2026-09-30: NOLOAD-W — every (gk, gn) reads the same CTA-cached
-                        // bytes instead of B_expert/S_expert; no per-iteration DRAM weight
-                        // traffic.
+                    if (DIAG == 3 || DIAG == 5) {
+                        // 2026-09-30: NOLOAD-W (DIAG 3 and 5) — every (gk, gn) reads the same
+                        // CTA-cached bytes instead of B_expert/S_expert; no per-iteration DRAM
+                        // weight traffic.
                         w0 = diag_w0;
                         w1 = diag_w1;
                         __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = diag_scale;
@@ -1033,8 +1069,8 @@ void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
         expert_offsets, sorted_token_ids, num_experts, N, K);                 \
 }
 
-// 2026-09-30: `P3B_GROUPED_VARIANT` with an explicit DIAG mode (1 NODEQ, 2 NOMMA, 3
-// NOLOAD-W; see `moe_w4a16_grouped_core`'s DIAG doc comment). Bench-only
+// 2026-09-30: `P3B_GROUPED_VARIANT` with an explicit DIAG mode (1 NODEQ, 2 NOMMA, 3 NOLOAD-W,
+// 4 NOLOAD-A, 5 NOLOAD-AW; see `moe_w4a16_grouped_core`'s DIAG doc comment). Bench-only
 // (examples/glm5next_moe_grouped_tile_bench, GLM_TILE_BENCH_DIAG=1); never used in
 // production. Same MFAST = false launch/grid convention as `P3B_GROUPED_VARIANT`.
 #define P3B_GROUPED_VARIANT_DIAG(SUFFIX, MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, DIAGMODE) \
@@ -1168,6 +1204,8 @@ P3B_GROUPED_VARIANT_MFAST(bt_m128_k64_mfast, 128, 64, 64,    8, false, true,  tr
 // gated at the bench layer behind GLM_TILE_BENCH_DIAG=1
 // (examples/glm5next_moe_grouped_tile_bench). Same MT/NTILE/KS/WARPS/grid/block/smem
 // footprint as `bt_m128_k64`; only the DIAG mode differs.
-P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_nodeq,  128, 64, 64, 8, false, true, true, true, 1)
-P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_nomma,  128, 64, 64, 8, false, true, true, true, 2)
-P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noload, 128, 64, 64, 8, false, true, true, true, 3)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_nodeq,    128, 64, 64, 8, false, true, true, true, 1)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_nomma,    128, 64, 64, 8, false, true, true, true, 2)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noload,   128, 64, 64, 8, false, true, true, true, 3)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noloada,  128, 64, 64, 8, false, true, true, true, 4)
+P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noloadaw, 128, 64, 64, 8, false, true, true, true, 5)

@@ -17,8 +17,8 @@
 //! - NEW: `glm_hc_pre`, i.e. `glm_hc_pre_sliced` at `MHC_SLICE_ROWS`.
 //! - SWEEP: `glm_hc_pre_sliced` at each `GLM_HC_SLICE_SWEEP` width (gated for bytes too).
 //!
-//! Every output and each arm's own `mix` scratch are filled with 0xAB before its launch, so an
-//! unwritten value cannot pass as a match.
+//! Every output and each arm's own `mix` scratch are filled before its launch, with 0xAB for OLD
+//! and 0xCD for NEW/SWEEP, so a byte that either side leaves unwritten cannot pass as a match.
 //!
 //! Timing is wall clock over `GLM_HC_SLICE_REPS` launches, synchronised once at each end:
 //! - `hot`: back to back, so a 256-row working set (16.8 MB) stays in GB10's 24 MB L2 across
@@ -130,9 +130,9 @@ impl Outs {
         [self.y, self.post, self.comb, self.mix]
     }
 
-    fn poison(&self, g: &dyn GpuBackend, t: usize) -> Result<()> {
+    fn poison(&self, g: &dyn GpuBackend, t: usize, byte: u8) -> Result<()> {
         for (p, (_, n)) in self.ptrs().into_iter().zip(Self::sizes(t)) {
-            g.copy_h2d(&vec![0xABu8; n], p)?;
+            g.copy_h2d(&vec![byte; n], p)?;
         }
         Ok(())
     }
@@ -392,7 +392,7 @@ fn main() -> Result<()> {
             let tt = t as u32;
 
             let old = Outs::new(g, t)?;
-            old.poison(g, t)?;
+            old.poison(g, t, 0xAB)?;
             old_pre(g, &k, &w, d_streams, &old, tt)?;
             let ref_b = old.read(g, t)?;
             for (b, (name, n)) in ref_b.iter().zip(Outs::sizes(t)) {
@@ -405,7 +405,7 @@ fn main() -> Result<()> {
             arms.extend(sweep.iter().map(|&s| (format!("slice{s}"), Some(s as u32))));
             let new = Outs::new(g, t)?;
             for (label, slice) in &arms {
-                new.poison(g, t)?;
+                new.poison(g, t, 0xCD)?;
                 new_pre(g, &k, &w, d_streams, &new, tt, *slice)?;
                 let got = new.read(g, t)?;
                 let mut bad = Vec::new();

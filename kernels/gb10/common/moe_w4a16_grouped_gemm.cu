@@ -700,8 +700,24 @@ __device__ __forceinline__ float e2m1_decode(unsigned int n) {
 //      traffic per CTA.
 //   5  NOLOAD-AW: DIAG 3 and DIAG 4 combined — both A and the weight/scale bytes come from
 //      their tiny CTA-shared caches; only dequant, mma, sync and pipeline overhead remain.
+//
+// 2026-09-30: VA2 (bench-only, `bt_m128_k64_va2`; every other entry point instantiates
+// VA2 = false and keeps its smem layout and code). The A tile is double-buffered in smem_A2
+// (two [MT][KS + 8] buffers: cp.async needs 16-byte aligned destinations and the KS + PAD row
+// stride is not) and each K-step's A tile is prefetched with 16-byte cp.async one step ahead:
+//   prologue   issue tile 0 into buffer 0, commit.
+//   step s     issue tile s + 1 into buffer (s + 1) & 1 if it exists; commit (an empty group on
+//              the last step, so the wait below is uniform); stage B (unchanged);
+//              cp.async.wait_group 1 (this thread's tile-s copies have landed, tile s + 1 may be
+//              in flight); __syncthreads (barrier 1: every thread's tile-s copies and zero
+//              fills plus smem_B visible); MMAs read buffer s & 1 (unchanged order);
+//              __syncthreads (barrier 2: buffer s & 1 and smem_B free for step s + 1 / s + 2).
+// Each buffer holds exactly the scalar path's tile for its K-step (same rows, same
+// sorted_token_ids gather, same zero fill), so smem_A contents, MMA inputs and accumulation
+// order are the scalar path's. When A is not 16-byte aligned or K % 8 != 0 the scalar staging
+// runs synchronously into smem_A2 instead (as VEC_A falls back).
 template <int MT, int NTILE, int KS, int WARPS, bool SPLIT_N, bool KMAJOR, bool ARITH_LUT,
-          bool BT, bool MFAST = false, int DIAG = 0, bool VEC_A = false>
+          bool BT, bool MFAST = false, int DIAG = 0, bool VEC_A = false, bool VA2 = false>
 __device__ __forceinline__ void moe_w4a16_grouped_core(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ B_packed_ptrs,
@@ -772,8 +788,20 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
 
     constexpr int B_STRIDE = BT ? (KS + 8) : (NTILE + PAD);
     constexpr int B_ELEMS = BT ? (NTILE * B_STRIDE) : (KS * B_STRIDE);
-    __shared__ __nv_bfloat16 smem_A[MT][KS + PAD];
+    // 2026-09-30: VA2 = false: smem_A is exactly [MT][KS + PAD] as before and smem_A2 is one
+    // unreferenced element (dropped from the PTX). VA2 = true: smem_A is one unreferenced element
+    // and the A tile lives in smem_A2 (see the VA2 comment above the template).
+    constexpr int A_STRIDE = VA2 ? (KS + 8) : (KS + PAD);
+    __shared__ __nv_bfloat16 smem_A[VA2 ? 1 : MT][VA2 ? 1 : (KS + PAD)];
     __shared__ __align__(16) __nv_bfloat16 smem_B[B_ELEMS];
+    __shared__ __align__(16) __nv_bfloat16 smem_A2[VA2 ? 2 : 1][VA2 ? MT : 1][VA2 ? (KS + 8) : 1];
+    // 2026-09-30: VA2 static smem: 2 * MT * (KS + 8) * 2 B + B_ELEMS * 2 B. bt_m128_k64_va2:
+    // 2 * 128 * 72 * 2 = 36864 + 64 * 72 * 2 = 9216 -> 46080 B <= 49152 (48 KB static limit).
+    static_assert(!VA2 || (2 * MT * (KS + 8) + B_ELEMS) * 2 <= 48 * 1024,
+                  "VA2: two A buffers plus smem_B exceed the 48 KB static shared-memory limit");
+    static_assert(!VA2 || (((KS + 8) * 2) % 16 == 0 && ((MT * (KS + 8) * 2) % 16) == 0),
+                  "VA2: every A row and buffer must start 16-byte aligned for cp.async");
+    static_assert(!VA2 || (!VEC_A && DIAG == 0), "VA2 is its own A staging mode");
 
     float acc[NT][4];
     #pragma unroll
@@ -782,7 +810,7 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
         acc[i][2] = 0.0f; acc[i][3] = 0.0f;
     }
 
-    const unsigned int a_stride = KS + PAD;
+    const unsigned int a_stride = (unsigned int)A_STRIDE;
     const unsigned int b_stride = (unsigned int)B_STRIDE;
     const unsigned int M_eff = (unsigned int)M_expert;
     const unsigned int half_K = K / 2;
@@ -832,9 +860,109 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
                   "VEC_A: the 8-element A chunks must divide evenly across the block");
     const bool a_vec_ok = VEC_A && ((((unsigned long long)A) & 15ull) == 0ull) && ((K & 7u) == 0u);
 
+    // 2026-09-30: VA2 only. Same alignment condition as VEC_A: A 16-byte aligned and K % 8 == 0,
+    // so every 8-element chunk (col a multiple of 8) is either wholly inside [0, K) or wholly
+    // past it, and every in-range chunk's source is 16-byte aligned. Otherwise the scalar
+    // staging runs synchronously (va2_pipe false).
+    static_assert(!VA2 || (KS % 8 == 0 && MT * (KS / 8) >= THREADS && ((MT * (KS / 8)) % THREADS) == 0),
+                  "VA2: the 8-element A chunks must divide evenly across the block");
+    [[maybe_unused]] const bool va2_pipe =
+        VA2 && ((((unsigned long long)A) & 15ull) == 0ull) && ((K & 7u) == 0u);
+    constexpr unsigned int VA2_CPR = (unsigned int)(KS / 8);
+    // 2026-09-30: 1 for non-VA2 instantiations (arrays unused; avoids a zero-size array).
+    constexpr unsigned int VA2_CPT = VA2 ? (unsigned int)((MT * VA2_CPR) / THREADS) : 1u;
+    // 2026-09-30: VA2: thread chunk j is row (threadIdx.x + j * THREADS) / VA2_CPR of the tile at
+    // column ((threadIdx.x + j * THREADS) % VA2_CPR) * 8 in every K-step, so its gathered source
+    // row does not depend on k_base: read sorted_token_ids once here (the same index the scalar
+    // path reads every K-step) instead of once per K-step ahead of each copy.
+    [[maybe_unused]] const __nv_bfloat16* va2_src[VA2_CPT];
+    [[maybe_unused]] bool va2_row_ok[VA2_CPT];
+    if constexpr (VA2) {
+        #pragma unroll
+        for (unsigned int j = 0; j < VA2_CPT; j++) {
+            unsigned int c = threadIdx.x + j * (unsigned int)THREADS;
+            unsigned int row = c / VA2_CPR;
+            bool row_ok = (cta_m_local + row) < M_eff;
+            unsigned int a_row = 0;
+            if (row_ok) {
+                a_row = sorted_token_ids
+                    ? (unsigned int)sorted_token_ids[cta_m + row]
+                    : (cta_m + row);
+            }
+            va2_row_ok[j] = row_ok;
+            va2_src[j] = A + (unsigned long long)a_row * K;
+        }
+    }
+    // 2026-09-30: VA2: stage the A tile at K offset kb into buffer b. Chunks wholly inside the
+    // tile's real rows and [0, K) go by 16-byte cp.async (commit/wait are the caller's); every
+    // other chunk is written with plain stores, element by element with the scalar path's
+    // semantics (with K % 8 == 0 that is all zeros for rows >= M_expert or cols >= K).
+    [[maybe_unused]] auto va2_stage_a = [&](unsigned int kb, unsigned int b) {
+        #pragma unroll
+        for (unsigned int j = 0; j < VA2_CPT; j++) {
+            unsigned int c = threadIdx.x + j * (unsigned int)THREADS;
+            unsigned int row = c / VA2_CPR;
+            unsigned int col = (c % VA2_CPR) * 8u;
+            unsigned int gc = kb + col;
+            __nv_bfloat16* dst = &smem_A2[b][row][col];
+            if (va2_row_ok[j] && gc + 8u <= K) {
+                unsigned int d = (unsigned int)__cvta_generic_to_shared(dst);
+                const void* src = (const void*)(va2_src[j] + gc);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(d), "l"(src) : "memory");
+            } else {
+                #pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    dst[q] = (va2_row_ok[j] && gc + q < K)
+                        ? va2_src[j][gc + q]
+                        : __float2bfloat16(0.0f);
+                }
+            }
+        }
+    };
+    if constexpr (VA2) {
+        // 2026-09-30: VA2 prologue: tile 0 into buffer 0; waited for in step 0 after B staging.
+        if (va2_pipe) {
+            va2_stage_a(0u, 0u);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+    }
+
     for (unsigned int k_base = 0; k_base < K; k_base += KS) {
 
-        if (VEC_A && a_vec_ok) {
+        if constexpr (VA2) {
+            const unsigned int va2_buf = (k_base / (unsigned int)KS) & 1u;
+            if (va2_pipe) {
+                // 2026-09-30: VA2 steady state: prefetch the next K-step's tile into the other
+                // buffer. That buffer was last read by the previous step's MMAs, which every
+                // thread finished before that step's closing __syncthreads. Always commit (an
+                // empty group when there is no next tile) so wait_group 1 below always means
+                // "this step's tile has landed".
+                if (k_base + (unsigned int)KS < K) {
+                    va2_stage_a(k_base + (unsigned int)KS, va2_buf ^ 1u);
+                }
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            } else {
+                // 2026-09-30: VA2 fallback: the scalar staging below, synchronous, into this
+                // step's buffer (stride KS + 8).
+                constexpr unsigned int ept = (unsigned int)((MT * KS) / THREADS);
+                #pragma unroll
+                for (unsigned int i = 0; i < ept; i++) {
+                    unsigned int idx = threadIdx.x * ept + i;
+                    unsigned int row = idx / KS;
+                    unsigned int col = idx % KS;
+                    unsigned int gc = k_base + col;
+                    bool valid = (cta_m_local + row) < M_eff && gc < K;
+                    if (valid) {
+                        unsigned int a_row = sorted_token_ids
+                            ? (unsigned int)sorted_token_ids[cta_m + row]
+                            : (cta_m + row);
+                        smem_A2[va2_buf][row][col] = A[a_row * K + gc];
+                    } else {
+                        smem_A2[va2_buf][row][col] = __float2bfloat16(0.0f);
+                    }
+                }
+            }
+        } else if (VEC_A && a_vec_ok) {
             // 2026-09-30: VEC_A: the same smem_A tile as the scalar loop below, bit for bit
             // (same rows, same gather through sorted_token_ids, same zero fill), staged with
             // coalesced 16-byte loads: consecutive threads take consecutive 8-element chunks of a
@@ -990,10 +1118,23 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
             }
         }
 
+        if constexpr (VA2) {
+            // 2026-09-30: VA2: this thread's copies of this step's tile (the older of the at most
+            // two pending groups) have landed; the __syncthreads below makes every thread's
+            // copies and plain stores visible before any MMA reads the buffer. No-op when
+            // va2_pipe is false (no group pending).
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+        }
+
         __syncthreads();
 
         if (warp_has_rows) {
-            const unsigned short* sA = (const unsigned short*)smem_A;
+            const unsigned short* sA;
+            if constexpr (VA2) {
+                sA = (const unsigned short*)&smem_A2[(k_base / (unsigned int)KS) & 1u][0][0];
+            } else {
+                sA = (const unsigned short*)smem_A;
+            }
             const unsigned short* sB = (const unsigned short*)smem_B;
             unsigned int fr0 = warp_m_offset + group_id;
             unsigned int fr1 = fr0 + 8;
@@ -1130,6 +1271,29 @@ void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
     unsigned int K                                                            \
 ) {                                                                           \
     moe_w4a16_grouped_core<MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, false, 0, true>( \
+        A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,                       \
+        expert_offsets, sorted_token_ids, num_experts, N, K);                 \
+}
+
+// 2026-09-30: `P3B_GROUPED_VARIANT` with VA2 = true (A tile double-buffered at stride KS + 8,
+// next K-step prefetched by 16-byte cp.async; same smem_A bits per K-step). Bench-only. Same
+// MFAST = false launch/grid convention as `P3B_GROUPED_VARIANT`; static smem is
+// 2 * MT * (KS + 8) * 2 B + smem_B (static_assert in the core).
+#define P3B_GROUPED_VARIANT_VA2(SUFFIX, MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT) \
+extern "C" __global__ __launch_bounds__((WARPS) * 32)                         \
+void moe_w4a16_grouped_gemm_ptrtable_##SUFFIX(                                \
+    const __nv_bfloat16* __restrict__ A,                                      \
+    const unsigned long long* __restrict__ B_packed_ptrs,                     \
+    const unsigned long long* __restrict__ B_scale_ptrs,                      \
+    const float* __restrict__ scale2_vals,                                    \
+    __nv_bfloat16* __restrict__ C,                                            \
+    const int* __restrict__ expert_offsets,                                   \
+    const int* __restrict__ sorted_token_ids,                                 \
+    unsigned int num_experts,                                                 \
+    unsigned int N,                                                           \
+    unsigned int K                                                            \
+) {                                                                           \
+    moe_w4a16_grouped_core<MT, NTILE, KS, WARPS, SPLIT_N, KMAJOR, ALUT, BT, false, 0, false, true>( \
         A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,                       \
         expert_offsets, sorted_token_ids, num_experts, N, K);                 \
 }
@@ -1277,3 +1441,7 @@ P3B_GROUPED_VARIANT_DIAG(bt_m128_k64_diag_noloadaw, 128, 64, 64, 8, false, true,
 // 2026-09-30: `bt_m128_k64` with VEC_A (coalesced 16-byte A staging). Bench first
 // (examples/glm5next_moe_grouped_tile_bench asserts byte identity vs `bt_m16_k128`).
 P3B_GROUPED_VARIANT_VA(bt_m128_k64_va, 128, 64, 64, 8, false, true, true, true)
+// 2026-09-30: `bt_m128_k64` with VA2 (VEC_A chunks via cp.async, A double-buffered and prefetched
+// one K-step ahead). Bench only (examples/glm5next_moe_grouped_tile_bench asserts byte identity
+// vs `bt_m16_k128`); not in KERNEL.toml or tile.rs.
+P3B_GROUPED_VARIANT_VA2(bt_m128_k64_va2, 128, 64, 64, 8, false, true, true, true)

@@ -372,6 +372,16 @@ pub(crate) const VARIANTS: &[Variant] = &[
         256,
         false,
     ),
+    // 2026-09-30: VA with the A tile double-buffered and the next K-step prefetched by 16-byte
+    // cp.async (VA2); each K-step's smem_A bits are the scalar path's, so it must stay
+    // byte-identical to REFERENCE.
+    m1(
+        "BT M128 K64 VA2",
+        "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va2",
+        128,
+        256,
+        false,
+    ),
     // 2026-09-30: Bench-only pipeline-stage isolators of `bt_m128_k64`, gated behind
     // GLM_TILE_BENCH_DIAG=1 (see `diag()` and `moe_w4a16_grouped_core`'s DIAG doc comment in
     // moe_w4a16_grouped_gemm.cu). Never used in production.

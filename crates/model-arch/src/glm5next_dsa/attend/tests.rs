@@ -108,3 +108,22 @@ fn the_score_scale_is_the_latent_width_not_the_v4_cache_width() {
         "the two scales must not be interchangeable by accident"
     );
 }
+
+/// 2026-09-29 (A153): `METRALE_GLM_MLA_SCALE_AUTHOR=1`'s arm is `qk_head_dim^-0.5`
+/// (`qk_nope_head_dim + qk_rope_head_dim`), 1/sqrt(256) = 1/16 for GLM-5.3's 256+0 split; the
+/// default (off) arm is unchanged from the test above.
+#[test]
+fn author_scale_arm_is_one_sixteenth_for_256_plus_0() {
+    let c = cfg();
+    assert_eq!(c.qk_nope_head_dim + c.qk_rope_head_dim, 256);
+    let author = mla_scale_for(&c, true);
+    assert!(
+        (author - 0.0625).abs() < 1e-9,
+        "1/sqrt(256) == 1/16, got {author}"
+    );
+    let default = mla_scale_for(&c, false);
+    assert!(
+        (default - (c.kv_lora_rank as f32).powf(-0.5)).abs() < 1e-9,
+        "the off arm is unchanged: kv_lora_rank^-0.5"
+    );
+}

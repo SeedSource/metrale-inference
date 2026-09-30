@@ -39,6 +39,34 @@ pub const DSA_DECODE_MODULE: &str = "glm5next_dsa_mla_decode";
 /// 2026-09-25: Threads per block: `NUM_WARPS * WARP_SIZE` (8 × 32) in the kernel.
 const DECODE_BLOCK: u32 = 256;
 
+/// 2026-09-29 (A153, CPU-confirmed): `METRALE_GLM_MLA_SCALE_AUTHOR=1` switches the NoPE MLA
+/// softmax scale from `kv_lora_rank^-0.5` (what this kernel shipped with) to
+/// `qk_head_dim^-0.5` (`qk_nope_head_dim + qk_rope_head_dim`), the convention the model author
+/// uses and `glm5next_dsa_ref::mla::mla_masked_attention` already implements. On GLM-5.3
+/// (NoPE, `qk_rope_head_dim == 0`) the two differ: 1/sqrt(512) vs 1/sqrt(256). Off by default;
+/// read once per process, like [`crate::glm5next_layer::prefill_staged`].
+pub fn mla_scale_author() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("METRALE_GLM_MLA_SCALE_AUTHOR").as_deref() == Ok("1"))
+}
+
+/// 2026-09-29: The NoPE MLA softmax scale for `cfg`, given the resolved
+/// `METRALE_GLM_MLA_SCALE_AUTHOR` choice. Split out from [`mla_scale`] so tests can check both
+/// arms without touching the process-wide env lever.
+pub(crate) fn mla_scale_for(cfg: &Glm5NextDsaConfig, author: bool) -> f32 {
+    if author {
+        ((cfg.qk_nope_head_dim + cfg.qk_rope_head_dim) as f32).powf(-0.5)
+    } else {
+        (cfg.kv_lora_rank as f32).powf(-0.5)
+    }
+}
+
+/// 2026-09-29: The NoPE MLA softmax scale for `cfg`: `kv_lora_rank^-0.5` (A153's default,
+/// unchanged) unless `METRALE_GLM_MLA_SCALE_AUTHOR=1`, in which case `qk_head_dim^-0.5`.
+pub fn mla_scale(cfg: &Glm5NextDsaConfig) -> f32 {
+    mla_scale_for(cfg, mla_scale_author())
+}
+
 /// 2026-09-25: The selected-index MLA decode entry point.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaDecodeKernel(KernelHandle);
@@ -177,8 +205,9 @@ pub fn decode_attention(
         .arg_u32(cfg.kv_lora_rank as u32)
         .arg_u32(paging.block_size as u32)
         // 2026-09-25: NoPE: the score scale is over the latent width, which is the
-        // whole cache token.
-        .arg_f32((cfg.kv_lora_rank as f32).powf(-0.5))
+        // whole cache token (A153: `METRALE_GLM_MLA_SCALE_AUTHOR=1` switches this to the
+        // model author's `qk_head_dim^-0.5`; see `mla_scale`).
+        .arg_f32(mla_scale(cfg))
         .arg_f32(inputs.k_scale)
         .arg_f32(inputs.v_scale)
         .arg_u64(paging.cache_stride_bytes)

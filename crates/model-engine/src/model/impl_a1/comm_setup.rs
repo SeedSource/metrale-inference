@@ -52,6 +52,14 @@ pub(super) fn assert_rank_levers_agree(
                 "METRALE_GLM_MOE_ROW_BATCH_MAX",
                 metrale_model_arch::glm5next_mlp::forward::row_batch_max() as u64,
             ),
+            // 2026-09-29 (A153): Not collective-shaping, but every TP rank's NoPE MLA decode
+            // launch must use the same softmax scale, or the attention each rank computes over
+            // its local heads is numerically inconsistent with the others; checked because the
+            // check is free.
+            (
+                "METRALE_GLM_MLA_SCALE_AUTHOR",
+                u64::from(metrale_model_arch::glm5next_dsa::attend::mla_scale_author()),
+            ),
             // 2026-09-25: The EP command protocol (`ep_protocol_v2`), which
             // both ranks must share.
             (
@@ -63,6 +71,21 @@ pub(super) fn assert_rank_levers_agree(
             ),
         ],
     )?;
+    // 2026-09-29 (A153): Log the resolved NoPE MLA softmax-scale choice once, on rank 0 only
+    // (every rank reads the same env var independently; the rank-agree check above is what
+    // guarantees they agree).
+    if comm.rank() == 0 {
+        let author = metrale_model_arch::glm5next_dsa::attend::mla_scale_author();
+        tracing::info!(
+            "METRALE_GLM_MLA_SCALE_AUTHOR={}: NoPE MLA softmax scale = {}",
+            u64::from(author),
+            if author {
+                "qk_head_dim^-0.5 (author convention)"
+            } else {
+                "kv_lora_rank^-0.5 (A153 default)"
+            }
+        );
+    }
     Ok(())
 }
 

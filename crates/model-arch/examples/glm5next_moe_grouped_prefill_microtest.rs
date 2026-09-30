@@ -529,6 +529,13 @@ const M1_TILES: &[TileDef] = &[
         n_tile: 64,
         threads: 256,
         m_fast: true,
+    },    // 2026-09-30: VEC_A (coalesced 16-byte A staging), same smem_A bits as `bt_m128_k64`.
+    TileDef {
+        kernel: "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va",
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: false,
     },
 ];
 

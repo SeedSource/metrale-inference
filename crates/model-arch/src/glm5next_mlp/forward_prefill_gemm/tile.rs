@@ -143,6 +143,15 @@ pub(crate) const GEMM_TILES: &[GemmTile] = &[
         n_tile: 64,
         threads: 256,
         m_fast: true,
+    },    // 2026-09-30: `bt_m128_k64` with coalesced 16-byte A staging (VEC_A): the same smem_A tile
+    // bit for bit, so the same MMAs in the same k order (met-moediag2: A staging is the
+    // bt_m128_k64 limiter). Byte-identical to `bt_m16_k128` (tile bench + prefill microtest).
+    GemmTile {
+        name: "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va",
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: false,
     },
 ];
 

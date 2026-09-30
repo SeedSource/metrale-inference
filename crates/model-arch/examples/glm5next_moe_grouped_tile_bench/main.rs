@@ -307,10 +307,18 @@ fn run_rows(
          swept(local & non-empty)={swept}  mean rows/expert {mean:.2}  busiest {busiest}"
     );
 
-    for (label, n_out, kk, gather) in [
+    let mut cases = vec![
         ("gate/up  N=2048 K=4096", MOE_INTER, HIDDEN, true),
         ("down     N=4096 K=2048", HIDDEN, MOE_INTER, false),
-    ] {
+    ];
+    // 2026-09-30: `GLM_TILE_BENCH_GATHER_X=1` adds the crossed cases, gate/up's shape with A
+    // already in expert order and down's shape with A gathered through sorted_token_ids, to
+    // separate the gather from the shape.
+    if std::env::var("GLM_TILE_BENCH_GATHER_X").as_deref() == Ok("1") {
+        cases.push(("gate/up  N=2048 K=4096 NO-GATHER", MOE_INTER, HIDDEN, false));
+        cases.push(("down     N=4096 K=2048 GATHER", HIDDEN, MOE_INTER, true));
+    }
+    for (label, n_out, kk, gather) in cases {
         // 2026-09-25: Weight bytes of one sweep over the swept experts: NVFP4 is 0.5 B packed
         // plus 1/16 B of E4M3 block scale per element.
         let bytes = swept as f64 * (n_out * kk) as f64 * (0.5 + 1.0 / 16.0);

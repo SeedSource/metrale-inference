@@ -152,6 +152,15 @@ pub(crate) const GEMM_TILES: &[GemmTile] = &[
         n_tile: 64,
         threads: 256,
         m_fast: false,
+    },    // 2026-09-30: VA2 = VEC_A plus a cp.async double-buffered A pipeline: the same smem_A bits
+    // and the same MMAs in the same k order as `bt_m128_k64`, byte-identical to `bt_m16_k128`
+    // (met-va2bench 16/16; 17-40 % below `_va` at production shapes).
+    GemmTile {
+        name: "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va2",
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: false,
     },
 ];
 

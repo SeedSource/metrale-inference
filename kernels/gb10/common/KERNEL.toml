@@ -93,6 +93,7 @@ moe_w4a16 = [
   "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64",
   "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_mfast",
   "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va",
+  "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va2",
   "moe_w4a16_grouped_gemm_ptrtable_bt_m16_k128",
   "moe_w4a16_grouped_gemm_ptrtable_bt_m16_k128_mfast",
   "moe_w4a16_grouped_gemm_ptrtable_bt_m16_k256",

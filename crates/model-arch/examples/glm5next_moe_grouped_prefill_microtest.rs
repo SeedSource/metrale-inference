@@ -536,6 +536,13 @@ const M1_TILES: &[TileDef] = &[
         n_tile: 64,
         threads: 256,
         m_fast: false,
+    },    // 2026-09-30: VA2 (cp.async double-buffered VEC_A), same smem_A bits as `bt_m128_k64`.
+    TileDef {
+        kernel: "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va2",
+        m_tile: 128,
+        n_tile: 64,
+        threads: 256,
+        m_fast: false,
     },
 ];
 

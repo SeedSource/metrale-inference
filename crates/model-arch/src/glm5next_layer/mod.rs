@@ -58,8 +58,8 @@ pub mod state;
 pub mod profile;
 pub use state::alloc_kda_ssm_state;
 
-// 2026-10-01: `pub(crate)` so the DSA launchers reach their levers (`levers::dsa_scores_tiled`)
-// by path.
+// 2026-10-01: `pub(crate)` so the DSA launchers reach their levers (`levers::dsa_scores_tiled`,
+// `levers::dsa_gemv_split`) by path.
 pub(crate) mod levers;
 mod steps;
 mod types;

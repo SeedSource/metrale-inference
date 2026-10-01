@@ -91,3 +91,16 @@ fn dsa_tiled_lever_parses_one_as_on_and_everything_else_as_off() {
         assert!(!parse_dsa_switch(v), "{v:?}");
     }
 }
+
+/// 2026-10-01: `METRALE_GLM_DSA_GEMV_SPLIT` shares the switch parser: on only for `1`.
+#[test]
+fn dsa_tiled_gemv_split_lever_shares_the_switch_parser() {
+    let src = include_str!("levers.rs");
+    let start = src
+        .find("pub(crate) fn dsa_gemv_split()")
+        .expect("dsa_gemv_split defined");
+    let body = &src[start..];
+    let body = &body[..body.find("\n}\n").expect("fn closes")];
+    assert!(body.contains("std::env::var(\"METRALE_GLM_DSA_GEMV_SPLIT\")"));
+    assert!(body.contains("parse_dsa_switch(raw.as_deref())"));
+}

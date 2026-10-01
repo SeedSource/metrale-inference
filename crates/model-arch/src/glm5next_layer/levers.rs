@@ -84,8 +84,8 @@ pub(crate) fn dsa_row_batch() -> bool {
     })
 }
 
-/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED` as a switch: `1` (surrounding blanks ignored) is
-/// on; unset, `0` and anything else are off.
+/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED` and `METRALE_GLM_DSA_GEMV_SPLIT` as a switch: `1`
+/// (surrounding blanks ignored) is on; unset, `0` and anything else are off.
 pub(crate) fn parse_dsa_switch(v: Option<&str>) -> bool {
     v.map(str::trim) == Some("1")
 }
@@ -118,6 +118,29 @@ pub(crate) fn dsa_scores_tiled() -> bool {
             );
         }
         warn_unparsed_dsa_switch("METRALE_GLM_DSA_SCORES_TILED", raw.as_deref());
+        on
+    })
+}
+
+/// 2026-10-01: `METRALE_GLM_DSA_GEMV_SPLIT=1` runs each batched indexer GEMV of the DSA row
+/// batch (`glm5next_dsa/layer/row_batch.rs`: `wk`, `compress_gate`, `weights_proj`, `wq_b`)
+/// as ONE launch over all `k` rows, `ceil(k / 16)` block rows of at most 16 rows each
+/// (`dense_gemv_batchm_split`), instead of one launch per 16 rows. Every row gets the same
+/// arithmetic in any split (`dense_gemv_bf16_batchm.cu` header), so the bytes do not change.
+/// Only reachable under `METRALE_GLM_DSA_ROW_BATCH=1`. Off unless set to `1`; read once.
+pub(crate) fn dsa_gemv_split() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DSA_GEMV_SPLIT").ok();
+        let on = parse_dsa_switch(raw.as_deref());
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_DSA_GEMV_SPLIT=1 - DSA row-batch indexer GEMVs run one y-split \
+                 launch per projection instead of one per 16 rows (byte-identical by \
+                 construction)"
+            );
+        }
+        warn_unparsed_dsa_switch("METRALE_GLM_DSA_GEMV_SPLIT", raw.as_deref());
         on
     })
 }

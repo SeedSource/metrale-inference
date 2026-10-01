@@ -440,3 +440,38 @@ fn glm5next_layer_files() -> Vec<String> {
     files.sort();
     files
 }
+
+/// 2026-10-01: A `METRALE_GLM_DSA_GEMV_SPLIT` launch gives every block row at most
+/// `DENSE_GEMV_BATCHM_MAX_M` rows and leaves none empty, so it passes
+/// `dense_gemv_batchm_split`'s check and the kernel's `MAX_M` clamp never drops a row.
+#[test]
+fn dsa_tiled_gemv_split_block_rows_stay_within_max_m() {
+    let max = metrale_model_layers::layers::ops::DENSE_GEMV_BATCHM_MAX_M as usize;
+    for rows in 1..=8192usize {
+        let y = row_batch::gemv_split_blocks(rows) as usize;
+        let per = rows.div_ceil(y);
+        assert!((1..=rows).contains(&y), "rows {rows}: y {y}");
+        assert!(per <= max, "rows {rows}: {per} rows per block row");
+        assert!((y - 1) * per < rows, "rows {rows}: an empty block row");
+    }
+    assert_eq!(row_batch::gemv_split_blocks(16), 1);
+    assert_eq!(row_batch::gemv_split_blocks(17), 2);
+    assert_eq!(row_batch::gemv_split_blocks(256), 16);
+}
+
+/// 2026-10-01: Both batched GEMV entry points carry the y-split prologue the split launch
+/// relies on, and `batchm_rows` takes the split only behind the lever.
+#[test]
+fn dsa_tiled_gemv_split_kernels_carry_the_y_split() {
+    let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../kernels/gb10/common/dense_gemv_bf16_batchm.cu");
+    let src = std::fs::read_to_string(&cu).expect("dense_gemv_bf16_batchm.cu readable");
+    for entry in ["dense_gemv_bf16_batchm(", "dense_gemv_bf16_fp32out_batchm("] {
+        let head = format!("extern \"C\" __global__ void {entry}");
+        assert!(src.contains(&head), "{cu:?} lacks {entry}");
+    }
+    let prologue = "const unsigned int r0 = blockIdx.y * rows_per_y;";
+    assert_eq!(src.matches(prologue).count(), 2, "{cu:?}: y-split prologue per entry");
+    let rb = include_str!("row_batch.rs");
+    assert!(rb.contains("if rows > 0 && crate::glm5next_layer::levers::dsa_gemv_split() {"));
+}

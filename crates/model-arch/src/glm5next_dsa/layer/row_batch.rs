@@ -17,6 +17,11 @@
 //!   `DENSE_GEMV_BATCHM_MAX_M` rows per launch: each row's result is bit-identical to the M = 1
 //!   GEMV the loop runs. `k_norm` in one launch: `nllb_layernorm_bf16` runs one block per row
 //!   and `rows` is only its bound.
+//! - 2026-10-01: With `METRALE_GLM_DSA_GEMV_SPLIT=1` those batched GEMVs take one launch per
+//!   projection over all `k` rows, `ceil(k / 16)` block rows (`dense_gemv_batchm_split`). Block
+//!   row `y` offsets `A` and `C` by its first row and then runs the 16-row body on at most
+//!   `DENSE_GEMV_BATCHM_MAX_M` rows; a row's arithmetic reads only its own `A` row, the weight
+//!   and `K`, never `blockIdx.y` or which rows share its block, so the bytes do not change.
 //! - Nothing in the loop reads the indexer cache, the latent cache or the head weights before
 //!   the loop ends when the batched selector is on, so writing every row first changes no
 //!   read.
@@ -37,7 +42,7 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_layers::layer::AttnMetadataDev;
 use metrale_model_layers::layers::ops::{
-    DENSE_GEMV_BATCHM_MAX_M, dense_gemv_batchm, dense_gemv_batchm_fp32out,
+    DENSE_GEMV_BATCHM_MAX_M, dense_gemv_batchm, dense_gemv_batchm_fp32out, dense_gemv_batchm_split,
 };
 use metrale_model_layers::weight_map::DenseWeight;
 
@@ -94,10 +99,21 @@ impl DsaRowBatch {
     }
 }
 
+/// 2026-10-01: Block rows of a `METRALE_GLM_DSA_GEMV_SPLIT` launch over `rows` rows:
+/// `ceil(rows / DENSE_GEMV_BATCHM_MAX_M)`, so each block row takes `ceil(rows / y)`, at most
+/// `DENSE_GEMV_BATCHM_MAX_M`, rows (the kernel's `rows_per_y`).
+pub(super) fn gemv_split_blocks(rows: usize) -> u32 {
+    rows.div_ceil(DENSE_GEMV_BATCHM_MAX_M as usize) as u32
+}
+
 /// 2026-10-01: `rows` rows of `C[t] = A[t] @ B^T` in launches of at most
 /// `DENSE_GEMV_BATCHM_MAX_M` rows (never the cuBLASLt arm of `gemm`, which sums in another
 /// order). `out_elem` is the output element size: 2 runs `dense_gemv_bf16_batchm`, 4
 /// `dense_gemv_bf16_fp32out_batchm`; `kernel` must be the matching one.
+/// 2026-10-01: Under `METRALE_GLM_DSA_GEMV_SPLIT=1`, one y-split launch over all `rows`
+/// instead (`gemv_split_blocks`; both kernels carry the same y-split code, and
+/// `dense_gemv_batchm_split` passes `out_stride` through, so it counts FP32 elements for the
+/// FP32-out kernel as `dense_gemv_batchm_fp32out` does).
 #[allow(clippy::too_many_arguments)]
 fn batchm_rows(
     gpu: &dyn GpuBackend,
@@ -112,6 +128,11 @@ fn batchm_rows(
     stream: u64,
 ) -> Result<()> {
     let w = DenseWeight { weight: b };
+    if rows > 0 && crate::glm5next_layer::levers::dsa_gemv_split() {
+        let (m, y) = (rows as u32, gemv_split_blocks(rows));
+        let (n, kk) = (n as u32, kk as u32);
+        return dense_gemv_batchm_split(gpu, kernel, a, &w, c, m, y, n, kk, n, stream);
+    }
     let max = DENSE_GEMV_BATCHM_MAX_M as usize;
     let mut r0 = 0;
     while r0 < rows {

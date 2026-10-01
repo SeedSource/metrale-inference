@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(win, vec![(0, 2048), (2048, 2048), (4096, 1280), (5376, 24)]);
     }
 
-    /// 2026-09-29: `resolve_rows_ffn`: default, rounding down to a multiple, the 4096 cap and the
+    /// 2026-09-29: `resolve_rows_ffn`: default, rounding down to a multiple, the 8192 cap and the
     /// attention-width floor.
     #[test]
     fn ffn_width_resolution() {

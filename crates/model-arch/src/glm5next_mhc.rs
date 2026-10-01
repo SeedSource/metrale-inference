@@ -12,6 +12,9 @@
 //! - `glm_hc_pre` launches `hc_mix` + `hc_finish` once per `MHC_SLICE_ROWS`-row slice
 //!   (`mhc_slices`); at `num_tokens <= MHC_SLICE_ROWS` that is the one unsliced pair, same grids
 //!   and pointers. Slicing changes no output bit: see `glm_hc_pre_sliced`.
+//! - 2026-10-01: `METRALE_GLM_MHC_TOKMAJOR=1` swaps `hc_mix_bf16` for `hc_mix_bf16_tokmajor`
+//!   (one block per token) in calls of at least `MHC_TOKMAJOR_MIN_ROWS` tokens; the mix bytes
+//!   are the same (argument in the `.cu`), and `hc_finish` / `hc_post` are unchanged.
 
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -36,6 +39,10 @@ pub struct Glm5NextMhcKernels {
     /// computes the FP32 kernel's result on the widened weights. Optional (`try_kernel`, 0 when
     /// absent); `glm_hc_pre` uses it when the site's `hc_fn_bf16` is set and the handle is not 0.
     pub hc_mix_bf16: KernelHandle,
+    /// 2026-10-01: `glm5next_hc_mix_bf16_tokmajor`: `hc_mix_bf16` with one block per token, grid
+    /// `(T, 1)`, same arguments and the same `mix` bytes. Optional (`try_kernel`, 0 when absent);
+    /// `glm_hc_pre_sliced` launches it under `METRALE_GLM_MHC_TOKMAJOR=1` (`mhc_tokmajor`).
+    pub hc_mix_bf16_tokmajor: KernelHandle,
     /// 2026-09-25: `glm5next_hc_finish`: from the mixes, `post`, `comb` (Sinkhorn) and the
     /// collapsed row `y`.
     pub hc_finish: KernelHandle,
@@ -49,6 +56,7 @@ pub const GLM5NEXT_MHC_MODULE: &str = "glm5next_mhc";
 impl Glm5NextMhcKernels {
     /// 2026-09-25: Resolve the kernels. A missing one is an error, except `hc_mix_bf16`, which is
     /// 0 when absent.
+    /// 2026-10-01: `hc_mix_bf16_tokmajor` is optional the same way.
     pub fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
         Ok(Self {
             hc_expand: gpu.kernel(GLM5NEXT_MHC_MODULE, "glm5next_hc_expand")?,
@@ -58,6 +66,11 @@ impl Glm5NextMhcKernels {
                 gpu,
                 GLM5NEXT_MHC_MODULE,
                 "glm5next_hc_mix_bf16",
+            ),
+            hc_mix_bf16_tokmajor: metrale_model_layers::layers::try_kernel(
+                gpu,
+                GLM5NEXT_MHC_MODULE,
+                "glm5next_hc_mix_bf16_tokmajor",
             ),
             hc_finish: gpu.kernel(GLM5NEXT_MHC_MODULE, "glm5next_hc_finish")?,
             hc_post: gpu.kernel(GLM5NEXT_MHC_MODULE, "glm5next_hc_post")?,
@@ -184,6 +197,54 @@ pub fn mhc_slices(num_tokens: u32, slice_rows: u32) -> impl Iterator<Item = (u32
     })
 }
 
+/// 2026-10-01: Fewest tokens a `glm_hc_pre` call needs before `METRALE_GLM_MHC_TOKMAJOR=1` takes
+/// effect. `hc_mix_bf16_tokmajor` launches `T` blocks where `hc_mix_bf16` launches `T * mix_hc`,
+/// each reading all `mix_hc` BF16 `hc_fn` rows, so a decode (1 row) or verify (a few rows) call
+/// would leave most of GB10's SMs idle; those keep `hc_mix_bf16`. The value is PROVISIONAL (not
+/// measured): `examples/mhc_tokmajor_bitparity_microtest.rs` times both kernels at 1, 7, 256 and
+/// 1000 rows. Every prefill sub-chunk at `METRALE_GLM_PREFILL_ROWS >= 64` (the staged recipe's
+/// 256 / 2048) clears it; the default 16-row prefill does not.
+pub const MHC_TOKMAJOR_MIN_ROWS: u32 = 64;
+
+/// 2026-10-01: `GLM_HC_MAX_MIX` in `glm5next_mhc.cu`, the accumulator count of
+/// `hc_mix_bf16_tokmajor`; a site with more mixing rows keeps `hc_mix_bf16`.
+pub const MHC_TOKMAJOR_MAX_MIX: u32 = 24;
+
+/// 2026-10-01: `METRALE_GLM_MHC_TOKMAJOR` as a switch: `1` (surrounding blanks ignored) is on;
+/// unset, `0` and anything else are off.
+pub(crate) fn parse_mhc_tokmajor(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// 2026-10-01: `METRALE_GLM_MHC_TOKMAJOR=1` runs the mHC mix of every `glm_hc_pre` call of at
+/// least `MHC_TOKMAJOR_MIN_ROWS` tokens through `hc_mix_bf16_tokmajor` (one block per token, the
+/// highway row read once) instead of `hc_mix_bf16`; byte-identical by construction. Off unless
+/// set to `1`; read once.
+pub fn mhc_tokmajor() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_MHC_TOKMAJOR").ok();
+        let on = parse_mhc_tokmajor(raw.as_deref());
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_MHC_TOKMAJOR=1 - GLM mHC prefill mix (calls of >= \
+                 {MHC_TOKMAJOR_MIN_ROWS} tokens) runs one block per token \
+                 (glm5next_hc_mix_bf16_tokmajor; byte-identical by construction)"
+            );
+        } else if let Some(r) = raw.as_deref().filter(|r| !r.is_empty() && r.trim() != "0") {
+            tracing::warn!("METRALE_GLM_MHC_TOKMAJOR={r} is not 0 or 1 - hc_mix_bf16 runs");
+        }
+        on
+    })
+}
+
+/// 2026-10-01: Whether a mix launch takes `hc_mix_bf16_tokmajor` for a `requested` one: only for
+/// a BF16 `hc_fn`, a resolved handle and at most `MHC_TOKMAJOR_MAX_MIX` mixing rows; otherwise
+/// the launcher's usual pick.
+pub(crate) fn tokmajor_for(requested: bool, hc_fn_bf16: bool, resolved: bool, mix_hc: u32) -> bool {
+    requested && hc_fn_bf16 && resolved && mix_hc <= MHC_TOKMAJOR_MAX_MIX
+}
+
 /// 2026-09-25: Collapse each token's `hc_mult` FP32 streams to one BF16 row in `y_out`, and write
 /// this site's `post` and `comb`, by launching `hc_mix` (or `hc_mix_bf16`) then `hc_finish`,
 /// once per `MHC_SLICE_ROWS`-row slice (`glm_hc_pre_sliced`). `streams` is read, not written, so
@@ -242,6 +303,11 @@ pub fn glm_hc_pre(
 ///   launches write only later slices' `mix` rows, so no launch reads a value another launch
 ///   changes afterwards. `y_out`, `post_out` and `comb_out` are written by `hc_finish` alone,
 ///   one row per token.
+///
+/// 2026-10-01: The mix kernel is `hc_mix_bf16_tokmajor` on grid `(k, 1)` when `mhc_tokmajor()`
+/// is on and the call has at least `MHC_TOKMAJOR_MIN_ROWS` tokens (`glm_hc_pre_sliced_mix`). It
+/// too uses `blockIdx.x` only as `t` and does not read `gridDim`, so the slicing argument above
+/// holds for it unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn glm_hc_pre_sliced(
     gpu: &dyn GpuBackend,
@@ -260,6 +326,51 @@ pub fn glm_hc_pre_sliced(
     slice_rows: u32,
     stream: u64,
 ) -> Result<()> {
+    glm_hc_pre_sliced_mix(
+        gpu,
+        kernels,
+        streams,
+        w,
+        y_out,
+        post_out,
+        comb_out,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        sinkhorn_iters,
+        norm_eps,
+        hc_eps,
+        slice_rows,
+        mhc_tokmajor() && num_tokens >= MHC_TOKMAJOR_MIN_ROWS,
+        stream,
+    )
+}
+
+/// 2026-10-01: `glm_hc_pre_sliced` with the mix kernel chosen by the caller: `tokmajor` asks for
+/// `hc_mix_bf16_tokmajor` (grid `(k, 1)` per slice), which runs when `tokmajor_for` admits it;
+/// otherwise, and when `tokmajor` is false, the mix is `hc_mix_bf16` (or `hc_mix`) on grid
+/// `(k, mix_hc)` as before. A request that falls back is logged once. `hc_finish` is launched
+/// the same way either way. `examples/mhc_tokmajor_bitparity_microtest.rs` runs both choices in
+/// one process, which the read-once lever cannot.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_hc_pre_sliced_mix(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextMhcKernels,
+    streams: DevicePtr,
+    w: &Glm5NextMhcSiteWeights,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    slice_rows: u32,
+    tokmajor: bool,
+    stream: u64,
+) -> Result<()> {
     let mix_hc = (2 + hc_mult) * hc_mult;
     let mix_cap = mhc_mix_max_tokens();
     if num_tokens as usize > mix_cap {
@@ -276,6 +387,28 @@ pub fn glm_hc_pre_sliced(
     } else {
         kernels.hc_mix
     };
+    // 2026-10-01: The token-major mix takes the same arguments as `hc_mix_bf16`; only the grid
+    // differs (one block per token).
+    let resolved = kernels.hc_mix_bf16_tokmajor.0 != 0;
+    let tok = tokmajor_for(tokmajor, w.hc_fn_bf16, resolved, mix_hc);
+    if tokmajor && !tok {
+        static FELL_BACK: std::sync::Once = std::sync::Once::new();
+        FELL_BACK.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_MHC_TOKMAJOR: glm5next_hc_mix_bf16_tokmajor not usable here (hc_fn \
+                 BF16: {}, handle resolved: {}, mix_hc {mix_hc} <= {MHC_TOKMAJOR_MAX_MIX}: {}) - \
+                 the per-(token, row) mix runs",
+                w.hc_fn_bf16,
+                resolved,
+                mix_hc <= MHC_TOKMAJOR_MAX_MIX
+            );
+        });
+    }
+    let (mix_kernel, mix_grid_y) = if tok {
+        (kernels.hc_mix_bf16_tokmajor, 1)
+    } else {
+        (mix_kernel, mix_hc)
+    };
     let (h, hc) = (hidden_size as usize, hc_mult as usize);
     for (t0, k) in mhc_slices(num_tokens, slice_rows) {
         let t0 = t0 as usize;
@@ -284,7 +417,7 @@ pub fn glm_hc_pre_sliced(
         let s_streams = streams.offset(t0 * hc * h * 4);
         let s_mix = w.mix.offset(t0 * mix_hc as usize * 4);
         KernelLaunch::new(gpu, mix_kernel)
-            .grid([k, mix_hc, 1])
+            .grid([k, mix_grid_y, 1])
             .block([256, 1, 1])
             .arg_ptr(s_streams)
             .arg_ptr(w.hc_fn)
@@ -441,6 +574,49 @@ mod mhc_shape_tests {
         assert_eq!(
             mhc_slices(1000, MHC_SLICE_ROWS).collect::<Vec<_>>(),
             vec![(0, 256), (256, 256), (512, 256), (768, 232)]
+        );
+    }
+
+    /// 2026-10-01: `METRALE_GLM_MHC_TOKMAJOR` is on only for `1`.
+    #[test]
+    fn tokmajor_lever_parses_one_as_on_and_everything_else_as_off() {
+        assert!(parse_mhc_tokmajor(Some("1")));
+        assert!(parse_mhc_tokmajor(Some(" 1 ")));
+        for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("true"), Some("01")] {
+            assert!(!parse_mhc_tokmajor(v), "{v:?}");
+        }
+    }
+
+    /// 2026-10-01: The token-major mix runs only when requested, for a BF16 `hc_fn`, with the
+    /// handle resolved and at most 24 mixing rows (GLM-5.3's `mix_hc(4)`).
+    #[test]
+    fn tokmajor_needs_request_bf16_handle_and_the_mix_bound() {
+        assert!(tokmajor_for(true, true, true, 24));
+        assert!(tokmajor_for(true, true, true, mix_hc(2) as u32));
+        assert!(!tokmajor_for(false, true, true, 24), "not requested");
+        assert!(!tokmajor_for(true, false, true, 24), "FP32 hc_fn");
+        assert!(!tokmajor_for(true, true, false, 24), "handle 0");
+        assert!(!tokmajor_for(true, true, true, mix_hc(5) as u32), "past GLM_HC_MAX_MIX");
+        assert!(MHC_TOKMAJOR_MIN_ROWS > 1 && MHC_TOKMAJOR_MIN_ROWS <= MHC_SLICE_ROWS);
+    }
+
+    /// 2026-10-01: `Glm5NextMhcKernels::resolve` asks for `glm5next_hc_mix_bf16_tokmajor`, and
+    /// `MHC_TOKMAJOR_MAX_MIX` mirrors the kernel's `GLM_HC_MAX_MIX`; a rename or a resize in the
+    /// `.cu` alone fails here instead of silently falling back at serve.
+    #[test]
+    fn tokmajor_entry_point_and_mix_bound_match_the_kernel_file() {
+        let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../kernels/gb10/common")
+            .join(format!("{GLM5NEXT_MHC_MODULE}.cu"));
+        let src = std::fs::read_to_string(&cu).expect("glm5next_mhc.cu readable");
+        assert!(
+            src.contains("extern \"C\" __global__ void glm5next_hc_mix_bf16_tokmajor("),
+            "{cu:?} no longer defines glm5next_hc_mix_bf16_tokmajor"
+        );
+        let define = format!("#define GLM_HC_MAX_MIX {MHC_TOKMAJOR_MAX_MIX}");
+        assert!(
+            src.lines().any(|l| l.trim() == define),
+            "GLM_HC_MAX_MIX in {cu:?} is not MHC_TOKMAJOR_MAX_MIX"
         );
     }
 

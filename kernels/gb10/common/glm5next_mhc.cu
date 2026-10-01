@@ -16,6 +16,9 @@
 //   hc_post and hc_expand.
 // - Every kernel assumes blockDim == GLM_HC_BLOCK (256) and hc_mult <= GLM_HC_MAX_MULT (4);
 //   the shared and local arrays are sized for that.
+// - 2026-10-01: glm5next_hc_mix_bf16_tokmajor (one block per token) writes the same mix bytes
+//   as glm5next_hc_mix_bf16 (argument above the kernel; checked on a GPU by model-arch
+//   examples/mhc_tokmajor_bitparity_microtest.rs).
 //
 // All of them resolve from the module glm5next_mhc (GLM5NEXT_MHC_MODULE in model-arch
 // glm5next_mhc.rs), so a target without the DeepSeek-V4 model directory has every GLM mHC
@@ -326,6 +329,89 @@ extern "C" __global__ void glm5next_hc_mix_bf16(
     __syncthreads();
     const float r = glm_hc_block_reduce(red, tid);
     if (tid == 0) mix_out[(size_t)t * mix_hc + m] = r * rsqrt;
+}
+
+
+// 2026-10-01: glm5next_hc_mix_bf16_tokmajor: glm5next_hc_mix_bf16 with one block per token
+// instead of one per (token, mixing row), so each token's hc*H highway row is read from memory
+// once instead of 2 * mix_hc times (the RMS loop and the dot loop of each of the mix_hc
+// blocks). Same arguments and the same mix_out [T, mix_hc]; grid (T, 1, 1). glm_hc_pre_sliced
+// (model-arch glm5next_mhc.rs) launches it under METRALE_GLM_MHC_TOKMAJOR=1. Every output bit
+// equals glm5next_hc_mix_bf16's:
+// - Ownership: thread tid handles k = tid + 256 j, j ascending, as there; it reads x[k] once and
+//   feeds the same value to the RMS chain and to every row's dot chain.
+// - Chains: the RMS partial is ss += v * v from 0.f, and row m's dot partial is
+//   acc[m] += __bfloat162float(hc_fn[m, k]) * v from 0.f, each in ascending j, one rounded
+//   multiply then one rounded add per term (common/ builds with --fmad=false, KERNEL.toml).
+//   The rows' chains are independent registers, so interleaving them changes no chain.
+// - Tree: red[a][e] += red[a][e + s] for e < s, s = 128 .. 1, one barrier per level, then
+//   red[a][0]: glm_hc_block_reduce's pairing on each of the 1 + mix_hc arrays. Which thread
+//   performs an add does not change its operands.
+// - RMS once: each glm5next_hc_mix_bf16 block computes ssum and rsqrt from the same x with the
+//   same code, so all mix_hc of them hold the same bits; computing it once is exact.
+// - Epilogue: mix_out[t, m] = r * rsqrtf(ssum / (float)hc_dim + norm_eps), the same expression,
+//   written once per (t, m).
+// Requires mix_hc <= GLM_HC_MAX_MIX (hc_mult <= 4); the host falls back past it. Registers:
+// GLM_HC_MAX_MIX accumulators plus the RMS partial, x and the loop state; x is not held across
+// iterations. Shared: (1 + GLM_HC_MAX_MIX) * GLM_HC_BLOCK floats, 25.6 KB.
+extern "C" __global__ void glm5next_hc_mix_bf16_tokmajor(
+    const float* __restrict__ streams,
+    const __nv_bfloat16* __restrict__ hc_fn,
+    float* __restrict__ mix_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const float norm_eps
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int hc_dim = hc_mult * hidden_size;
+    const unsigned int mix_hc = (2 + hc_mult) * hc_mult;
+
+    const float* x = streams + (size_t)t * hc_dim;
+    // 2026-10-01: Array 0 is the RMS partial, array 1 + m row m's dot partial.
+    __shared__ float red[1 + GLM_HC_MAX_MIX][GLM_HC_BLOCK];
+
+
+    float ss = 0.f;
+    float acc[GLM_HC_MAX_MIX];
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_MAX_MIX; ++m) acc[m] = 0.f;
+    for (unsigned int k = tid; k < hc_dim; k += GLM_HC_BLOCK) {
+        const float v = (float)x[k];
+        ss += v * v;
+#pragma unroll
+        for (unsigned int m = 0; m < GLM_HC_MAX_MIX; ++m) {
+            if (m < mix_hc) acc[m] += __bfloat162float(hc_fn[(size_t)m * hc_dim + k]) * v;
+        }
+    }
+    red[0][tid] = ss;
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_MAX_MIX; ++m) {
+        if (m < mix_hc) red[1 + m][tid] = acc[m];
+    }
+    __syncthreads();
+
+
+    // 2026-10-01: glm_hc_block_reduce on 1 + mix_hc arrays at once; at level s the block
+    // shares the (1 + mix_hc) * s adds. red[a][e] (e < s) is written by one thread and
+    // red[a][e + s] is not written at this level, so no add races.
+    const unsigned int nred = 1 + mix_hc;
+    for (unsigned int s = GLM_HC_BLOCK / 2; s > 0; s >>= 1) {
+        for (unsigned int i = tid; i < nred * s; i += GLM_HC_BLOCK) {
+            const unsigned int a = i / s;
+            const unsigned int e = i - a * s;
+            red[a][e] += red[a][e + s];
+        }
+        __syncthreads();
+    }
+
+
+    if (tid < mix_hc) {
+        const float ssum = red[0][0];
+        const float rsqrt = rsqrtf(ssum / (float)hc_dim + norm_eps);
+        const float r = red[1 + tid][0];
+        mix_out[(size_t)t * mix_hc + tid] = r * rsqrt;
+    }
 }
 
 

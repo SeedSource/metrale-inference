@@ -16,6 +16,7 @@ use metrale_model_layers::layer::{ForwardContext, LayerState};
 
 use super::super::select::{DsaSelectInputs, select_tokens};
 use super::super::state::Glm5NextDsaState;
+use super::row_batch::DsaRowBatch;
 use super::{Glm5NextDsaLayer, gemm};
 
 impl Glm5NextDsaLayer {
@@ -60,6 +61,10 @@ impl Glm5NextDsaLayer {
     /// The `wq_b` projection is one M = 1 GEMV per row, or one cuBLASLt GEMM for all rows
     /// when `METRALE_GLM_DSA_BATCH_QIDX=1` (`glm5next_layer::dsa_batch_qidx`, off by
     /// default).
+    ///
+    /// 2026-10-01: With `row_batch` (`METRALE_GLM_DSA_ROW_BATCH`), `q_pos` is the array
+    /// `decode_rows_batched` already uploaded (the same values as `q_pos_host`), and the
+    /// per-row GEMVs are the FP32-out batched GEMV, row for row the same bits.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn select_rows_batched(
         &self,
@@ -67,6 +72,7 @@ impl Glm5NextDsaLayer {
         k: usize,
         state: &Glm5NextDsaState,
         q_pos_host: &[i32],
+        row_batch: Option<&DsaRowBatch>,
         stream: u64,
     ) -> Result<()> {
         let w = &self.workspace;
@@ -89,6 +95,8 @@ impl Glm5NextDsaLayer {
                 self.cfg.q_lora_rank as u32,
                 stream,
             )?;
+        } else if let Some(rb) = row_batch {
+            self.qidx_rows_batched(gpu, rb, k, stream)?;
         } else {
             for row in 0..k {
                 gemm(
@@ -107,8 +115,14 @@ impl Glm5NextDsaLayer {
                 )?;
             }
         }
-        let q_pos_bytes: Vec<u8> = q_pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
-        gpu.copy_h2d(&q_pos_bytes, w.q_pos_rows)?;
+        let q_pos = match row_batch {
+            Some(rb) => rb.q_pos_dev(),
+            None => {
+                let bytes: Vec<u8> = q_pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
+                gpu.copy_h2d(&bytes, w.q_pos_rows)?;
+                w.q_pos_rows
+            }
+        };
         let inputs = DsaSelectInputs {
             k_normed: state.k_normed,
             gate: state.gate,
@@ -116,7 +130,7 @@ impl Glm5NextDsaLayer {
             ape: self.weights.ape,
             q: w.q_idx_rows,
             weights: w.head_weights_rows,
-            q_pos: w.q_pos_rows,
+            q_pos,
             q_mask: w.q_mask_rows,
             first_key: 0,
             // 2026-09-25: Host geometry only: `select_tokens` refuses the device-geometry

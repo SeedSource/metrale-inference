@@ -48,6 +48,7 @@ use metrale_model_layers::layer::{ForwardContext, LayerState, TransformerLayer};
 
 mod decode_k;
 mod proj_gemm;
+mod row_batch;
 mod rows;
 mod workspace;
 

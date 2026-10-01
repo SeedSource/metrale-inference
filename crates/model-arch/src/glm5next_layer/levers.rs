@@ -64,6 +64,26 @@ pub(crate) fn dsa_batch_qidx() -> bool {
     })
 }
 
+/// 2026-10-01: `METRALE_GLM_DSA_ROW_BATCH=1` runs the per-row part of a prefill sub-chunk's DSA
+/// block (`Glm5NextDsaLayer::decode_k`) for all rows at once: one metadata upload from pinned
+/// staging, one latent-write launch, the indexer projections through the batched GEMVs and
+/// one `k_norm` launch. Bit-identical to the per-row walk by construction
+/// (`glm5next_dsa/layer/row_batch.rs`, `docs/dsa-rowbatch-NOTES.md`). Off unless set to `1`;
+/// read once. Prefill only: it applies only where `batch_select_enabled` holds.
+pub(crate) fn dsa_row_batch() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_DSA_ROW_BATCH").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_DSA_ROW_BATCH=1 - prefill DSA latent/indexer writes run once per \
+                 sub-chunk instead of once per row"
+            );
+        }
+        on
+    })
+}
+
 /// 2026-09-25: `PREFILL_ROWS`, overridable at launch with `METRALE_GLM_PREFILL_ROWS` (values
 /// below 1 or unparsable are ignored). `1` selects the per-token walk: `Glm5NextLayer::prefill`
 /// takes the batched sub-chunk path only when `rows > 1`. A width above

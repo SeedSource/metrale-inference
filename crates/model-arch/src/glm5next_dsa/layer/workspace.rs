@@ -87,6 +87,9 @@ pub struct Glm5NextDsaWorkspace {
     /// for each row on the replay-safe path.
     pub(super) geom_dev: DevicePtr,
     pub(super) select: DsaSelectScratch,
+    /// 2026-10-01: `METRALE_GLM_DSA_ROW_BATCH` staging (`row_batch.rs`); `None` unless the
+    /// lever is on, `bt`/`sl` persist, the batched selector is on and `max_rows > 1`.
+    pub(super) row_batch: Option<super::row_batch::DsaRowBatch>,
 }
 
 impl Glm5NextDsaWorkspace {
@@ -104,6 +107,9 @@ impl Glm5NextDsaWorkspace {
         let bt_cap = super::super::state::max_dsa_context(cfg).max(1);
         let persist = std::env::var("METRALE_GLM_DSA_ALLOC_PER_STEP").as_deref() != Ok("1");
         let batch_select = dsa_select_rows_enabled();
+        // 2026-10-01: The row batch needs the persistent `bt`/`sl` and the batched selector.
+        let row_batch = persist && batch_select && rows > 1;
+        let row_batch = row_batch && crate::glm5next_layer::dsa_row_batch();
         Ok(Self {
             q_a: gpu.alloc(rows * (cfg.q_lora_rank * 2))?,
             q_resid: gpu.alloc(rows * (cfg.q_lora_rank * 2))?,
@@ -163,6 +169,11 @@ impl Glm5NextDsaWorkspace {
             stage_gate: gpu.alloc(cfg.index_head_dim * 2)?,
             geom_dev: gpu.alloc(5 * 4)?,
             select: DsaSelectScratch::alloc(gpu, cfg, &geom)?,
+            row_batch: if row_batch {
+                Some(super::row_batch::DsaRowBatch::new(gpu, rows, bt_cap)?)
+            } else {
+                None
+            },
         })
     }
 }

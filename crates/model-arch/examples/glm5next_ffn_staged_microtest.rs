@@ -138,7 +138,7 @@ fn main() -> Result<()> {
     c.validate()?;
     let kern = Glm5NextMlpKernels::resolve(gpu)?;
 
-    let tokens = env_list("GLM_STAGED_TOKENS", "5400,2072,1000");
+    let tokens = env_list("GLM_STAGED_TOKENS", "5400,2072,1000,8191");
     let w_attn = env_list("GLM_STAGED_ATTN", "256")
         .first()
         .copied()
@@ -195,11 +195,16 @@ fn main() -> Result<()> {
         let x = up(gpu, &x_host)?;
         let bytes = t_n * h * 2;
         let subs = sub_chunks(t_n, w_attn);
-        for &w_ffn in &ffns {
-            let win = ffn_windows(&subs, w_ffn, |k| {
+        // 2026-10-01: Both window rules: the tail alone, and the tail merged into the window
+        // before it (`METRALE_GLM_PREFILL_TAIL_MERGE`).
+        for (merge_tail, &w_ffn) in [false, true]
+            .into_iter()
+            .flat_map(|m| ffns.iter().map(move |f| (m, f)))
+        {
+            let win = ffn_windows(&subs, w_ffn, merge_tail, |k| {
                 grouped_prefill_selected(&kern, &c, &ws, k)
             });
-            let dense_win = ffn_windows(&subs, w_ffn, |_| true);
+            let dense_win = ffn_windows(&subs, w_ffn, merge_tail, |_| true);
             let (r, st, nv) = (g.alloc(bytes)?, g.alloc(bytes)?, g.alloc(bytes)?);
             let off = |p: DevicePtr, t: usize| p.offset(t * h * 2);
             for (site, windows) in [("moe", &win), ("dense", &dense_win)] {
@@ -259,7 +264,7 @@ fn main() -> Result<()> {
                 let (_, n_naive) = diff_rows(&rb, &nb, h);
                 let verdict = if n_bad == 0 { "IDENTICAL" } else { "DIFFERS" };
                 println!(
-                    "{site:5} T={t_n:5} W_attn={w_attn} W_ffn={w_ffn:4} windows={:?} \
+                    "{site:5} T={t_n:5} W_attn={w_attn} W_ffn={w_ffn:4} merge_tail={merge_tail} windows={:?} \
                      staged={verdict} ({n_bad} rows, first {first:?}) naive_unsliced={n_naive} \
                      rows differ; ref nonzero={nonzero}/{}",
                     windows.iter().map(|w| w.1).collect::<Vec<_>>(),

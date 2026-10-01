@@ -41,6 +41,11 @@ pub(super) fn assert_rank_levers_agree(
                 "METRALE_GLM_PREFILL_ROWS_FFN",
                 metrale_model_arch::glm5next_layer::prefill_rows_ffn() as u64,
             ),
+            // 2026-10-01: A merged tail drops one FFN window, and its all-reduce.
+            (
+                "METRALE_GLM_PREFILL_TAIL_MERGE",
+                u64::from(metrale_model_arch::glm5next_layer::prefill_tail_merge()),
+            ),
             (
                 "GLM staged-prefill merge levers (MOE_PREFILL_GEMM[_MIN_ROWS], HOST_DISPATCH, \
                  ROUTE_TRACE)",

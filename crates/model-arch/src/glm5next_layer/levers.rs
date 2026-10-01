@@ -165,6 +165,25 @@ pub fn prefill_rows_ffn() -> usize {
     })
 }
 
+/// 2026-10-01: `METRALE_GLM_PREFILL_TAIL_MERGE=1` (with `METRALE_GLM_PREFILL_STAGED=1`): the
+/// staged FFN pass lets a mergeable tail sub-chunk (narrower than `prefill_rows()`) join the
+/// window before it instead of taking a window, a routed grouped GEMM and an all-reduce of its
+/// own (`ffn_windows`). Byte-identical by the same argument as the staged pass. Off unless set
+/// to `1`; read once; inert when staging is off.
+pub fn prefill_tail_merge() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_PREFILL_TAIL_MERGE").as_deref() == Ok("1")
+            && std::env::var("METRALE_GLM_PREFILL_STAGED").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_TAIL_MERGE=1 - a mergeable prefill tail joins the last                  staged FFN window (byte-identical by construction; see steps/staged.rs)"
+            );
+        }
+        on
+    })
+}
+
 /// 2026-09-29: The env-read inputs that decide which sub-chunks the staged FFN pass merges
 /// (`grouped_prefill_selected`): the grouped-GEMM minimum rows and its switch, forced host
 /// dispatch and route tracing, packed into one value for the rank-agreement check. A skew

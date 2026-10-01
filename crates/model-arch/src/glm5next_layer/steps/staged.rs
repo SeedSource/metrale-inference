@@ -48,16 +48,22 @@ pub fn sub_chunks(num_tokens: usize, rows: usize) -> Vec<(usize, usize)> {
 /// `mergeable(rows)` is false gets a window of its own, and so does any sub-chunk narrower
 /// than the first one (the tail), so a window's inner slices at the first sub-chunk's width
 /// line up with its sub-chunks.
+///
+/// 2026-10-01: With `merge_tail`, a mergeable tail may join the window before it. Its slices
+/// still line up: every earlier sub-chunk in that window is full width, so `row_slices` at the
+/// first sub-chunk's width ends on exactly the tail's rows.
 pub fn ffn_windows(
     subs: &[(usize, usize)],
     max_rows: usize,
+    merge_tail: bool,
     mergeable: impl Fn(usize) -> bool,
 ) -> Vec<(usize, usize)> {
     let width = subs.first().map_or(0, |s| s.1);
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(subs.len());
     let mut open = false;
-    for &(t, k) in subs {
-        let joins = k == width && mergeable(k);
+    for (i, &(t, k)) in subs.iter().enumerate() {
+        let tail = merge_tail && i + 1 == subs.len() && k < width;
+        let joins = (k == width || tail) && mergeable(k);
         match out.last_mut() {
             Some(last) if open && joins && last.1 + k <= max_rows && last.0 + last.1 == t => {
                 last.1 += k;
@@ -118,7 +124,7 @@ impl Glm5NextLayer {
                 true,
             )?;
         }
-        for (t, k) in ffn_windows(&subs, rows_ffn, |k| self.ffn_mergeable(k)) {
+        for (t, k) in ffn_windows(&subs, rows_ffn, prefill_tail_merge(), |k| self.ffn_mergeable(k)) {
             self.ffn_half(hidden.offset(t * self.hidden * 2), k, ctx, stream, t, rows)?;
         }
         Ok(())
@@ -159,7 +165,7 @@ mod tests {
         for (n, rows) in CASES {
             let subs = sub_chunks(n, rows);
             assert_eq!(subs, unstaged(n, rows), "attention n={n} rows={rows}");
-            let win = ffn_windows(&subs, rows, |_| true);
+            let win = ffn_windows(&subs, rows, false, |_| true);
             assert_eq!(win, unstaged(n, rows), "ffn n={n} rows={rows}");
         }
     }
@@ -172,7 +178,7 @@ mod tests {
             for ffn in [rows, 2 * rows, 2048, 4096] {
                 let subs = sub_chunks(n, rows);
                 let bounds: Vec<usize> = subs.iter().map(|s| s.0).chain([n]).collect();
-                let win = ffn_windows(&subs, ffn, |_| true);
+                let win = ffn_windows(&subs, ffn, false, |_| true);
                 let mut next = 0;
                 for &(t, k) in &win {
                     assert_eq!(t, next, "contiguous n={n} rows={rows} ffn={ffn}");
@@ -185,8 +191,51 @@ mod tests {
                 if tail.1 < rows {
                     assert_eq!(*win.last().unwrap(), tail, "tail alone n={n} rows={rows}");
                 }
-                let alone = ffn_windows(&subs, ffn, |_| false);
+                let alone = ffn_windows(&subs, ffn, false, |_| false);
                 assert_eq!(alone, subs, "unmergeable n={n} rows={rows} ffn={ffn}");
+            }
+        }
+    }
+
+    /// 2026-10-01: `merge_tail`: a mergeable tail joins the window before it when that window
+    /// has room, and the windows still tile the chunk on sub-chunk boundaries; an unmergeable
+    /// tail, or one with no room, stays alone; nothing else changes.
+    #[test]
+    fn merged_tail_joins_the_last_window() {
+        let subs = sub_chunks(8191, 256);
+        assert_eq!(
+            ffn_windows(&subs, 4096, false, |_| true),
+            vec![(0, 4096), (4096, 3840), (7936, 255)]
+        );
+        assert_eq!(
+            ffn_windows(&subs, 4096, true, |_| true),
+            vec![(0, 4096), (4096, 4095)]
+        );
+        assert_eq!(
+            ffn_windows(&subs, 4096, true, |k| k >= 256),
+            vec![(0, 4096), (4096, 3840), (7936, 255)]
+        );
+        let full = sub_chunks(8192 + 100, 256);
+        assert_eq!(
+            ffn_windows(&full, 4096, true, |_| true),
+            vec![(0, 4096), (4096, 4096), (8192, 100)]
+        );
+        for (n, rows) in CASES {
+            for ffn in [rows, 2 * rows, 2048, 4096] {
+                let subs = sub_chunks(n, rows);
+                let a = ffn_windows(&subs, ffn, false, |_| true);
+                let b = ffn_windows(&subs, ffn, true, |_| true);
+                let bounds: Vec<usize> = subs.iter().map(|s| s.0).chain([n]).collect();
+                let mut next = 0;
+                for &(t, k) in &b {
+                    assert_eq!(t, next, "contiguous n={n} rows={rows} ffn={ffn}");
+                    assert!(bounds.contains(&t) && bounds.contains(&(t + k)));
+                    assert!(k <= ffn.max(rows));
+                    next = t + k;
+                }
+                assert_eq!(next, n);
+                assert!(b.len() == a.len() || b.len() + 1 == a.len());
+                assert_eq!(a[..a.len() - 2.min(a.len())], b[..a.len() - 2.min(a.len())]);
             }
         }
     }
@@ -196,7 +245,7 @@ mod tests {
     fn the_5400_token_recipe() {
         let subs = sub_chunks(5400, 256);
         assert_eq!(subs.len(), 22);
-        let win = ffn_windows(&subs, 2048, |_| true);
+        let win = ffn_windows(&subs, 2048, false, |_| true);
         assert_eq!(win, vec![(0, 2048), (2048, 2048), (4096, 1280), (5376, 24)]);
     }
 

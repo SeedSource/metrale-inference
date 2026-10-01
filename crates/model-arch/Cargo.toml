@@ -219,6 +219,10 @@ name = "kda_recurrent_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "kda_tokenloop_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kernel_probe"
 required-features = ["cuda", "gpu-examples"]
 

@@ -66,6 +66,14 @@ fn kda_no_smem() -> bool {
     *F.get_or_init(|| std::env::var("METRALE_GLM_KDA_NO_SMEM").as_deref() == Ok("1"))
 }
 
+/// 2026-10-01: `METRALE_GLM_KDA_TOKEN_LOOP=1`: a `decode_k` of more than one row that takes no
+/// snapshots runs the conv over all rows in one launch, then the recurrence over all rows in one
+/// launch, instead of two launches per row. Off by default. Read once per process.
+fn kda_token_loop() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("METRALE_GLM_KDA_TOKEN_LOOP").as_deref() == Ok("1"))
+}
+
 /// 2026-09-25: The per-sequence state a KDA layer carries. The kernels update both buffers in place.
 ///
 /// The conv buffer holds `conv_kernel` slots per channel. The conv kernels shift the window left

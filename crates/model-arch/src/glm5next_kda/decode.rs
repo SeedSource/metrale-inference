@@ -5,6 +5,8 @@
 //! Owner: model-arch (GLM-5.3-Flash KDA).
 //! Invariants:
 //! - The recurrent state advances one row at a time, in row order (`stateful_row`).
+//! - The opt-in token loop (`stateful_rows`) advances it over all rows in two launches, rows still
+//!   in order, and only for a `decode_k` that takes no snapshots.
 
 use super::*;
 
@@ -95,6 +97,87 @@ impl Glm5NextKdaLayer {
         Ok(())
     }
 
+    /// 2026-10-01: The opt-in token loop (`METRALE_GLM_KDA_TOKEN_LOOP=1`): rows `0..k` of
+    /// [`Self::stateful_row`] in two launches instead of `2 * k`. Returns `Ok(false)`, having
+    /// launched nothing, when the target lacks either kernel or the shared-memory recurrent
+    /// kernel would not be chosen for a single row; the caller then walks the rows.
+    ///
+    /// The conv over every row runs first, then the recurrence over every row. That equals the
+    /// interleaved walk because conv row `t + 1` reads only `qkv_proj` row `t + 1` and the conv
+    /// state, neither of which the recurrence touches, and recurrent row `t` reads only conv row
+    /// `t`. Each kernel computes its rows in order with the per-row kernel's arithmetic
+    /// (`causal_conv1d_update_l2norm_rows`, `kda_recurrent_prefill_bf16_smem`), so outputs and
+    /// both final states match the walk bit for bit; `kda_tokenloop_microtest` checks that.
+    /// Takes no snapshots: it never materialises the state after an interior row.
+    fn stateful_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        k: usize,
+        state: &KdaSeqState,
+        ws: &Glm5NextKdaWorkspace,
+        stream: u64,
+    ) -> Result<bool> {
+        let c = &self.cfg;
+        let qkv = c.qkv_dim();
+        let cd = c.conv_dim();
+        let d = c.head_dim;
+        let vpb = KDA_V_PER_BLOCK.min(d);
+        let smem_smem = (3 * d + vpb * (d + 1)) * 4;
+        // 2026-10-01: Only where `stateful_row` would launch the shared-memory recurrent kernel,
+        // the kernel whose arithmetic the row kernel copies. The conv-rows window holds 8 taps.
+        if self.kernels.conv_rows.0 == 0
+            || self.kernels.recurrent_rows.0 == 0
+            || self.kernels.recurrent_smem.0 == 0
+            || !d.is_multiple_of(vpb)
+            || smem_smem > KDA_SMEM_BUDGET
+            || kda_no_smem()
+            || c.conv_kernel > 8
+        {
+            return Ok(false);
+        }
+
+        KernelLaunch::new(gpu, self.kernels.conv_rows)
+            .grid([div_ceil(cd as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(state.conv)
+            .arg_ptr(ws.qkv_proj)
+            .arg_ptr(self.weights.conv.weight)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(ws.conv_out)
+            .arg_u32(k as u32)
+            .arg_u32(cd as u32)
+            .arg_u32(c.conv_kernel as u32)
+            .arg_u32(c.qk_channels() as u32)
+            .arg_u32(d as u32)
+            .arg_f32(c.l2_eps)
+            .arg_u32(cd as u32)
+            .arg_u32(cd as u32)
+            .launch(stream)?;
+
+        KernelLaunch::new(gpu, self.kernels.recurrent_rows)
+            .grid([c.heads as u32, (d / vpb) as u32, 1])
+            .block([vpb as u32, 1, 1])
+            .shared_mem(smem_smem as u32)
+            .arg_ptr(ws.conv_out)
+            .arg_ptr(ws.conv_out.offset(qkv * 2))
+            .arg_ptr(ws.conv_out.offset(qkv * 4))
+            .arg_ptr(ws.gate)
+            .arg_ptr(ws.beta)
+            .arg_ptr(state.recurrent)
+            .arg_ptr(ws.core)
+            .arg_u32(c.heads as u32)
+            .arg_u32(d as u32)
+            .arg_f32(1.0 / (d as f32).sqrt())
+            .arg_u32(vpb as u32)
+            .arg_u32(k as u32)
+            .arg_u32(cd as u32)
+            .arg_u32(qkv as u32)
+            .arg_u32(c.heads as u32)
+            .arg_u32(qkv as u32)
+            .launch(stream)?;
+        Ok(true)
+    }
+
     /// 2026-09-25: Single-token decode, carrying both states. The result lands in `ws.final_out`;
     /// `state` is updated in place.
     pub fn decode(
@@ -147,11 +230,19 @@ impl Glm5NextKdaLayer {
         self.front_end(gpu, hidden, k, ws, stream)?;
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
         let t_recur = profile::start();
-        for row in 0..k {
-            self.stateful_row(gpu, row, state, ws, stream)?;
-            if let Some((h_dst, conv_dst)) = snapshots.get(row) {
-                gpu.copy_d2d_async(state.recurrent, *h_dst, h_bytes, stream)?;
-                gpu.copy_d2d_async(state.conv, *conv_dst, conv_bytes, stream)?;
+        // 2026-10-01: Opt-in (`METRALE_GLM_KDA_TOKEN_LOOP=1`): two launches for all rows when no
+        // snapshot is asked for; otherwise, or when the target lacks the row kernels, the walk.
+        let looped = snapshots.is_empty()
+            && k > 1
+            && kda_token_loop()
+            && self.stateful_rows(gpu, k, state, ws, stream)?;
+        if !looped {
+            for row in 0..k {
+                self.stateful_row(gpu, row, state, ws, stream)?;
+                if let Some((h_dst, conv_dst)) = snapshots.get(row) {
+                    gpu.copy_d2d_async(state.recurrent, *h_dst, h_bytes, stream)?;
+                    gpu.copy_d2d_async(state.conv, *conv_dst, conv_bytes, stream)?;
+                }
             }
         }
         profile::end(profile::KDA_RECUR, t_recur, gpu, stream);

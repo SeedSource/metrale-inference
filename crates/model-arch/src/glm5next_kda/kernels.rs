@@ -4,8 +4,9 @@
 //!
 //! Owner: model-arch (GLM-5.3-Flash KDA).
 //! Invariants:
-//! - `resolve` fails if any entry point other than `dense_gemv_bf16_batchm` and
-//!   `kda_recurrent_decode_bf16_smem` is missing; those two resolve to handle 0 when absent.
+//! - `resolve` fails if any entry point other than `dense_gemv_bf16_batchm`,
+//!   `kda_recurrent_decode_bf16_smem`, `causal_conv1d_update_l2norm_rows` and
+//!   `kda_recurrent_prefill_bf16_smem` is missing; those four resolve to handle 0 when absent.
 
 use super::*;
 
@@ -29,6 +30,13 @@ pub struct Glm5NextKdaKernels {
     /// 2026-09-25: 1R+1W sibling of `recurrent`: the decayed state column stays in shared memory
     /// between the two passes. Resolved with `try_kernel`; `0` selects the 2R+2W kernel.
     pub recurrent_smem: KernelHandle,
+    /// 2026-10-01: `causal_conv1d_update_l2norm` over K rows of one sequence in one launch, for
+    /// the opt-in token loop (`METRALE_GLM_KDA_TOKEN_LOOP=1`). Resolved with `try_kernel`; `0`
+    /// keeps the per-row walk.
+    pub conv_rows: KernelHandle,
+    /// 2026-10-01: `recurrent_smem` over K rows in one launch, the state column kept on chip
+    /// across rows. Resolved with `try_kernel`; `0` keeps the per-row walk.
+    pub recurrent_rows: KernelHandle,
     pub o_norm: KernelHandle,
     pub split_widen: KernelHandle,
     pub sigmoid: KernelHandle,
@@ -59,6 +67,16 @@ impl Glm5NextKdaKernels {
                 gpu,
                 "kda_recurrent",
                 "kda_recurrent_decode_bf16_smem",
+            ),
+            conv_rows: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "causal_conv1d",
+                "causal_conv1d_update_l2norm_rows",
+            ),
+            recurrent_rows: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_recurrent",
+                "kda_recurrent_prefill_bf16_smem",
             ),
             o_norm: gpu.kernel("kda_layer_ops", "kda_o_norm_gated_bf16")?,
             split_widen: gpu.kernel("kda_layer_ops", "kda_split_widen")?,

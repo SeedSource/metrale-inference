@@ -406,6 +406,113 @@ extern "C" __global__ void causal_conv1d_update_l2norm(
     }
 }
 
+// 2026-10-01: causal_conv1d_update_l2norm_rows: `rows` consecutive tokens of ONE sequence in one
+// launch, in token order, with the same results as `rows` causal_conv1d_update_l2norm launches at
+// batch 1 (outputs and the final conv state). Grid (ceil(dim / 256), 1, 1), block 256; the same
+// L2 contract (256 threads, head_dim 128, qk_channels a multiple of 256). d_conv <= 8.
+//
+// Per token the arithmetic is causal_conv1d_update_l2norm's in the same order: window shift,
+// insert of the new BF16 input widened to FP32, bias (or 0) then the serial sum over k of
+// window[k] * weight[k], SiLU with __expf, then the per-warp __shfl_down tree (offsets 16..1),
+// the four warp partials added in warp order and rsqrtf(total + l2_eps). Thread ch keeps its
+// window in registers across tokens and writes it back once at the end; the window is FP32 in
+// both places, and the weights are widened once instead of per token, which gives the same
+// floats, so no value changes. The gb10 tree builds with --fmad=false (common/KERNEL.toml).
+// gdn_verify_fused_conv_kn (gdn_verify_fused_conv_kn.cu) is the same structure, checked byte
+// for byte against the per-token kernel by gdn_conv_kn_microtest.
+//
+// A third __syncthreads after the L2 apply keeps each token's read of warp_sums[base_warp] ahead
+// of the next token's lane-0 write to the same slot. Token t reads new_input at
+// t * input_stride and writes output at t * output_stride (BF16 elements).
+extern "C" __global__ void causal_conv1d_update_l2norm_rows(
+    float* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ new_input,
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output,
+    unsigned int rows,
+    unsigned int dim,
+    unsigned int d_conv,
+    unsigned int qk_channels,
+    unsigned int head_dim,
+    float l2_eps,
+    unsigned int input_stride,
+    unsigned int output_stride
+) {
+    const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int tid = threadIdx.x;
+
+    const unsigned int block_start = blockIdx.x * blockDim.x;
+    const bool block_needs_l2 = (block_start < qk_channels);
+
+    const bool valid = (ch < dim);
+
+    float win[8];
+    float wcoef[8];
+    if (valid) {
+        const float* state = conv_state + ch * d_conv;
+        for (unsigned int i = 0; i < d_conv; i++) win[i] = state[i];
+        const __nv_bfloat16* w = weight + ch * d_conv;
+        for (unsigned int k = 0; k < d_conv; k++) wcoef[k] = (float)w[k];
+    }
+
+    __shared__ float warp_sums[8];
+
+    for (unsigned int t = 0; t < rows; t++) {
+        float silu = 0.0f;
+
+        if (valid) {
+            for (unsigned int i = 0; i < d_conv - 1; i++)
+                win[i] = win[i + 1];
+            win[d_conv - 1] = (float)new_input[(size_t)t * input_stride + ch];
+
+            float acc = (bias != nullptr) ? bias[ch] : 0.0f;
+            for (unsigned int k = 0; k < d_conv; k++)
+                acc += win[k] * wcoef[k];
+
+            float sigmoid_acc = 1.0f / (1.0f + __expf(-acc));
+            silu = acc * sigmoid_acc;
+        }
+
+        if (block_needs_l2) {
+            float sq = valid ? (silu * silu) : 0.0f;
+
+            const unsigned int warp_id = tid / 32;
+            const unsigned int lane = tid % 32;
+            for (int offset = 16; offset >= 1; offset >>= 1)
+                sq += __shfl_down_sync(0xFFFFFFFF, sq, offset);
+
+            if (lane == 0) warp_sums[warp_id] = sq;
+            __syncthreads();
+
+            const unsigned int head_in_block = tid / head_dim;
+            const unsigned int base_warp = head_in_block * (head_dim / 32);
+
+            if (tid == 0 || tid == head_dim) {
+                float total = warp_sums[base_warp] + warp_sums[base_warp + 1]
+                            + warp_sums[base_warp + 2] + warp_sums[base_warp + 3];
+                warp_sums[base_warp] = rsqrtf(total + l2_eps);
+            }
+            __syncthreads();
+
+            if (valid) {
+                silu *= warp_sums[base_warp];
+            }
+            // 2026-10-01: Keeps the next token's lane-0 write to warp_sums behind this read.
+            __syncthreads();
+        }
+
+        if (valid) {
+            output[(size_t)t * output_stride + ch] = __float2bfloat16(silu);
+        }
+    }
+
+    if (valid) {
+        float* state = conv_state + ch * d_conv;
+        for (unsigned int i = 0; i < d_conv; i++) state[i] = win[i];
+    }
+}
+
 // 2026-09-25: causal_conv1d_update_l2norm with an FP32 output.
 
 

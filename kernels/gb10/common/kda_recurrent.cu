@@ -244,3 +244,110 @@ extern "C" __global__ void kda_recurrent_decode_bf16_smem(
     }
     out[hd + vi] = o;
 }
+
+// 2026-10-01: Token-loop form of kda_recurrent_decode_bf16_smem: T tokens of one sequence in
+// one launch, instead of T launches. Same grid (H, D / VPB), same block (VPB), same shared
+// memory request (3 * D + VPB * (D + 1) floats), same launcher contract (VPB divides D and
+// equals blockDim.x).
+//
+// Each thread loads its state column from global once, keeps it in its shared-memory column
+// across all T tokens, and writes it back once at the end. The state is FP32 in global and
+// FP32 in shared memory, so holding it on chip changes no value. Per token the arithmetic is
+// kda_recurrent_decode_bf16_smem's, expression for expression and in the same order (decay,
+// kv over kk = 0..D-1, delta, update, o over kk = 0..D-1); the only operand that differs is
+// where the pre-decay state value is read from (col[kk] here, S[kk * D + vi] there), which
+// holds the same float. The gb10 tree builds with --fmad=false (common/KERNEL.toml), so no
+// multiply-add is contracted in either kernel.
+//
+// Token t reads q/k/v at t * qkv_row_stride (BF16 elements; k and v are passed as their own
+// row-0 pointers, as stateful_row passes them), gate at t * gate_row_stride, beta at
+// t * beta_row_stride and writes out at t * out_row_stride (FP32 elements): exactly the
+// per-row pointers glm5next_kda's stateful_row hands the decode kernel.
+//
+// Synchronisation: a __syncthreads before each token's staging (t > 0) keeps every thread's
+// reads of sh_decay / sh_k / sh_q for token t - 1 ahead of the overwrite; one after the
+// staging publishes it. Threads past VPB (none under the launcher contract) take no column
+// but still reach every barrier.
+extern "C" __global__ void kda_recurrent_prefill_bf16_smem(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
+    float* __restrict__ state,
+    float* __restrict__ out,
+    unsigned int H,
+    unsigned int D,
+    float scale,
+    unsigned int VPB,
+    unsigned int T,
+    unsigned int qkv_row_stride,
+    unsigned int gate_row_stride,
+    unsigned int beta_row_stride,
+    unsigned int out_row_stride
+) {
+    extern __shared__ float sh[];
+    const unsigned int h = blockIdx.x;
+    if (h >= H) return;
+    const unsigned int v0 = blockIdx.y * VPB;
+    if (v0 >= D) return;
+
+    float* sh_decay = sh;
+    float* sh_k = sh + D;
+    float* sh_q = sh + 2u * D;
+    float* sh_s = sh + 3u * D;
+    const unsigned int col_stride = D + 1u;
+
+    const size_t hd = (size_t)h * D;
+    float* S = state + hd * D;
+    const unsigned int vi = v0 + threadIdx.x;
+    const bool owns = (threadIdx.x < VPB && vi < D);
+    float* col = sh_s + (size_t)threadIdx.x * col_stride;
+
+    if (owns) {
+        for (unsigned int kk = 0; kk < D; ++kk)
+            col[kk] = S[(size_t)kk * D + vi];
+    }
+
+    for (unsigned int t = 0; t < T; ++t) {
+        const __nv_bfloat16* qt = q + (size_t)t * qkv_row_stride;
+        const __nv_bfloat16* kt = k + (size_t)t * qkv_row_stride;
+        const __nv_bfloat16* vt = v + (size_t)t * qkv_row_stride;
+        const float* gt = gate + (size_t)t * gate_row_stride;
+        const float* bt = beta + (size_t)t * beta_row_stride;
+        float* ot = out + (size_t)t * out_row_stride;
+
+        if (t > 0) __syncthreads();
+        for (unsigned int i = threadIdx.x; i < D; i += blockDim.x) {
+            sh_decay[i] = expf(gt[hd + i]);
+            sh_k[i] = __bfloat162float(kt[hd + i]);
+            sh_q[i] = __bfloat162float(qt[hd + i]) * scale;
+        }
+        __syncthreads();
+
+        if (owns) {
+            const float b = bt[h];
+            float kv = 0.0f;
+            #pragma unroll 8
+            for (unsigned int kk = 0; kk < D; ++kk) {
+                const float s = col[kk] * sh_decay[kk];
+                col[kk] = s;
+                kv += s * sh_k[kk];
+            }
+            const float delta = (__bfloat162float(vt[hd + vi]) - kv) * b;
+            float o = 0.0f;
+            #pragma unroll 8
+            for (unsigned int kk = 0; kk < D; ++kk) {
+                const float s = col[kk] + sh_k[kk] * delta;
+                col[kk] = s;
+                o += s * sh_q[kk];
+            }
+            ot[hd + vi] = o;
+        }
+    }
+
+    if (owns) {
+        for (unsigned int kk = 0; kk < D; ++kk)
+            S[(size_t)kk * D + vi] = col[kk];
+    }
+}

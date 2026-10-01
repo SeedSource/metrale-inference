@@ -92,16 +92,42 @@ pub fn select_tokens(
         .launch(stream)?;
 
     if has_pools {
-        KernelLaunch::new(gpu, kernels.index_scores)
-            .grid([
-                ceiling.unwrap_or(geom.n_pools) as u32,
-                geom.q_rows as u32,
-                1,
-            ])
-            .block([SCORES_BLOCK, 1, 1])
-            // 2026-09-25: `dsa_index_scores` keeps one f32 per index head in shared memory and
-            // sums them in head order.
-            .shared_mem(SCORES_BLOCK.max((geom.index_heads * 4) as u32))
+        // 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED=1` swaps in `dsa_index_scores_tiled`
+        // (same arguments, same bytes) on an exact launch; see `scores_tiled_for`.
+        let requested = crate::glm5next_layer::levers::dsa_scores_tiled();
+        let tiled = scores_tiled_for(
+            requested,
+            kernels.index_scores_tiled.0 != 0,
+            ceiling.is_none() && gd.0 == 0,
+            d,
+            geom.index_heads,
+        );
+        log_scores_tiled(requested, tiled, kernels, ceiling.is_some(), geom);
+        let (handle, grid, block, smem) = if tiled {
+            (
+                kernels.index_scores_tiled,
+                scores_tiled_grid(geom.q_rows, geom.n_pools),
+                SCORES_TILED_BLOCK,
+                scores_tiled_smem(d) as u32,
+            )
+        } else {
+            (
+                kernels.index_scores,
+                [
+                    ceiling.unwrap_or(geom.n_pools) as u32,
+                    geom.q_rows as u32,
+                    1,
+                ],
+                SCORES_BLOCK,
+                // 2026-09-25: `dsa_index_scores` keeps one f32 per index head in shared
+                // memory and sums them in head order.
+                SCORES_BLOCK.max((geom.index_heads * 4) as u32),
+            )
+        };
+        KernelLaunch::new(gpu, handle)
+            .grid(grid)
+            .block([block, 1, 1])
+            .shared_mem(smem)
             .arg_ptr(inputs.q)
             .arg_ptr(scratch.pool_keys)
             .arg_ptr(inputs.weights)
@@ -159,4 +185,37 @@ pub fn select_tokens(
         .launch(stream)?;
 
     Ok(())
+}
+
+/// 2026-10-01: Log once whether `METRALE_GLM_DSA_SCORES_TILED=1` engaged, and once why a
+/// requested launch kept `dsa_index_scores`. A ceiling (graph-replay decode) launch is an
+/// expected fallback and logs nothing, so the warning names a prefill that did not engage.
+fn log_scores_tiled(
+    requested: bool,
+    tiled: bool,
+    kernels: &Glm5NextDsaKernels,
+    ceiling: bool,
+    geom: &DsaSelectGeometry,
+) {
+    let (d, heads) = (geom.index_head_dim, geom.index_heads);
+    if tiled {
+        static ENGAGED: std::sync::Once = std::sync::Once::new();
+        ENGAGED.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_DSA_SCORES_TILED=1: ENGAGED - dsa_index_scores_tiled scores \
+                 exact DSA selections (index_head_dim {d}, {heads} heads)"
+            );
+        });
+    } else if requested && !ceiling {
+        static FELL_BACK: std::sync::Once = std::sync::Once::new();
+        FELL_BACK.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_DSA_SCORES_TILED=1: NOT engaged, dsa_index_scores runs \
+                 (entry point resolved {}, index_head_dim {d}, {heads} heads; the tiled \
+                 kernel needs a multiple of 32 up to {SCORES_TILED_MAX_D} and up to \
+                 {SCORES_TILED_MAX_H} heads, host geometry)",
+                kernels.index_scores_tiled.0 != 0
+            );
+        });
+    }
 }

@@ -74,11 +74,17 @@ pub const KERNEL_MAX_KPOOL: usize = 8;
 ///
 /// All but `write_geom` and `indexer_store` are resolved with `kernel()`, so a missing
 /// entry point fails `resolve`; those two use `try_kernel` and may be `KernelHandle(0)`.
+/// 2026-10-01: So does `index_scores_tiled`.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
     pub compact_pools: KernelHandle,
     pub index_scores: KernelHandle,
+    /// 2026-10-01: `dsa_index_scores_tiled`: `index_scores` over 16-row x 64-pool tiles,
+    /// byte-identical by construction (argument in `dsa_indexer.cu`). `select_tokens`
+    /// launches it under `METRALE_GLM_DSA_SCORES_TILED=1` (`select::scores_tiled_for`);
+    /// `KernelHandle(0)` when the target lacks it, and `index_scores` runs.
+    pub index_scores_tiled: KernelHandle,
     pub topk_pools: KernelHandle,
     pub expand_selection: KernelHandle,
     /// 2026-09-25: `indexer.k_norm`, a LayerNorm with a bias: `nllb_layernorm_bf16`, in place,
@@ -113,6 +119,11 @@ impl Glm5NextDsaKernels {
             kpool_compress: gpu.kernel(DSA_MODULE, "dsa_kpool_compress")?,
             compact_pools: gpu.kernel(DSA_MODULE, "dsa_compact_pools")?,
             index_scores: gpu.kernel(DSA_MODULE, "dsa_index_scores")?,
+            index_scores_tiled: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_index_scores_tiled",
+            ),
             topk_pools: gpu.kernel(DSA_MODULE, "dsa_topk_pools")?,
             expand_selection: gpu.kernel(DSA_MODULE, "dsa_expand_selection")?,
             k_norm: gpu.kernel(LAYERNORM_MODULE, "nllb_layernorm_bf16")?,

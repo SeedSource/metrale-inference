@@ -84,6 +84,44 @@ pub(crate) fn dsa_row_batch() -> bool {
     })
 }
 
+/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED` as a switch: `1` (surrounding blanks ignored) is
+/// on; unset, `0` and anything else are off.
+pub(crate) fn parse_dsa_switch(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// 2026-10-01: Warn when a DSA switch holds something other than unset, empty, `0` or `1`.
+fn warn_unparsed_dsa_switch(name: &str, raw: Option<&str>) {
+    if let Some(r) = raw.filter(|r| !r.is_empty() && r.trim() != "0" && r.trim() != "1") {
+        tracing::warn!("{name}={r} is not 0 or 1 - treated as off");
+    }
+}
+
+/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED=1` scores an exact (host-geometry) DSA selection
+/// with `dsa_index_scores_tiled`, one block per 16-row x 64-pool tile, instead of
+/// `dsa_index_scores`, one block per (pool, row); byte-identical by construction (argument in
+/// `kernels/gb10/common/dsa_indexer.cu`, GPU gate
+/// `examples/dsa_indexer_tiled_bitparity_microtest.rs`). The ceiling (graph-replay decode)
+/// launch, an unresolved entry point or a shape outside the tiled envelope keeps
+/// `dsa_index_scores` (`glm5next_dsa::select::scores_tiled_for`, logged once). Off unless set
+/// to `1`; read once.
+pub(crate) fn dsa_scores_tiled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DSA_SCORES_TILED").ok();
+        let on = parse_dsa_switch(raw.as_deref());
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_DSA_SCORES_TILED=1 - exact DSA selections score pools with \
+                 dsa_index_scores_tiled (16 rows x 64 pools per block; byte-identical by \
+                 construction)"
+            );
+        }
+        warn_unparsed_dsa_switch("METRALE_GLM_DSA_SCORES_TILED", raw.as_deref());
+        on
+    })
+}
+
 /// 2026-09-25: `PREFILL_ROWS`, overridable at launch with `METRALE_GLM_PREFILL_ROWS` (values
 /// below 1 or unparsable are ignored). `1` selects the per-token walk: `Glm5NextLayer::prefill`
 /// takes the batched sub-chunk path only when `rows > 1`. A width above

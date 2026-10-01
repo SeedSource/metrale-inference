@@ -264,6 +264,196 @@ extern "C" __global__ void dsa_index_scores(
     }
 }
 
+// 2026-10-01: 2b. dsa_index_scores_tiled: the same scores and candidacy as dsa_index_scores,
+// byte-identical by construction, with one block per DSA_TILE_ROWS x DSA_TILE_POOLS tile
+// instead of one per (pool, query), so a row's q is read once per tile, not once per pool.
+// Opt-in (METRALE_GLM_DSA_SCORES_TILED=1); resolved with try_kernel; gated on a GPU by
+// crates/model-arch/examples/dsa_indexer_tiled_bitparity_microtest.rs.
+//
+// Why the bits match (the common build passes --fmad=false, so a * b + c is a rounded
+// multiply then a rounded add, as in dsa_index_scores):
+// - In dsa_index_scores, lane l of a head's warp sums qh[d] * pk[d] over d = l, l + 32, ...
+//   (d < D), ascending, from 0.0f. dsa_chain4 runs exactly that chain for lane l.
+// - __shfl_down_sync with offsets 16, 8, 4, 2, 1 leaves at lane 0 the tree
+//   x1[i] = x0[i] + x0[i + 16], x2[i] = x1[i] + x1[i + 8], ..., x5[0] = x4[0] + x4[1], x0
+//   the lane chains, each add with the lower lane on the left. (A lane above 31 - off reads
+//   its own value, but lane 0's result never depends on such a lane.) DsaTree4<I, K> is
+//   x_K[I] = x_(K-1)[I] + x_(K-1)[I + (32 >> K)], and DsaTree4<0, 5> is x5[0].
+// - The head term is weights[r * H + h] * fmaxf(scale * x5[0], 0.0f), and the score is
+//   0.0f + term(0) + term(1) + ... in ascending h, as thread 0 sums sh[] there.
+// - Candidacy, valid_cand and the -FLT_MAX store are dsa_index_scores' code, per output.
+// Staging q and the pool keys in shared memory changes where operands are read from, not
+// their values or the order they are combined in.
+//
+// Layout: DSA_TILE_THREADS threads (8 warps). Warp w owns tile rows 2w and 2w + 1, lane l
+// owns tile pools l and l + 32: four outputs per thread, which share every q and key load.
+// The tile's pool keys are staged once with row stride D + 1 (lane l reads bank
+// (l + d) % 32: conflict-free); q is staged per head (rows are warp-uniform, so its reads
+// broadcast). Dynamic shared memory: (DSA_TILE_POOLS * (D + 1) + DSA_TILE_ROWS * D) * 4
+// bytes, 41,216 at D = 128. The depth-first tree keeps at most five partial quads plus the
+// running chain live: about 24 accumulator registers for the four outputs (estimate, not a
+// ptxas report).
+//
+// Not supported: the device-geometry (ceiling) path dsa_index_scores serves from `geom` at
+// Q == 1. The host never selects this kernel with a non-NULL geom; a launch that does traps
+// instead of reading frozen scalars.
+
+#define DSA_TILE_ROWS 16u
+#define DSA_TILE_POOLS 64u
+#define DSA_TILE_THREADS 256u
+
+// 2026-10-01: Four (row, pool) values: rows 0/1 x pools 0/1 of one thread.
+struct DsaQuad {
+    float r0p0, r0p1, r1p0, r1p1;
+};
+
+// 2026-10-01: dsa_index_scores lane l's chain for four (row, pool) pairs at once: ascending
+// d from 0.0f, each product rounded before its add.
+__device__ __forceinline__ DsaQuad dsa_chain4(
+    const float* q0, const float* q1, const float* k0, const float* k1,
+    unsigned int l, unsigned int D
+) {
+    DsaQuad c = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (unsigned int d = l; d < D; d += 32u) {
+        const float a0 = q0[d];
+        const float a1 = q1[d];
+        const float b0 = k0[d];
+        const float b1 = k1[d];
+        c.r0p0 += a0 * b0;
+        c.r0p1 += a0 * b1;
+        c.r1p0 += a1 * b0;
+        c.r1p1 += a1 * b1;
+    }
+    return c;
+}
+
+// 2026-10-01: Node x_K[I] of the shfl_down tree (see the 2b header), left subtree first.
+template <unsigned int I, unsigned int K>
+struct DsaTree4 {
+    static __device__ __forceinline__ DsaQuad run(
+        const float* q0, const float* q1, const float* k0, const float* k1, unsigned int D
+    ) {
+        const DsaQuad lo = DsaTree4<I, K - 1u>::run(q0, q1, k0, k1, D);
+        const DsaQuad hi = DsaTree4<I + (32u >> K), K - 1u>::run(q0, q1, k0, k1, D);
+        DsaQuad s;
+        s.r0p0 = lo.r0p0 + hi.r0p0;
+        s.r0p1 = lo.r0p1 + hi.r0p1;
+        s.r1p0 = lo.r1p0 + hi.r1p0;
+        s.r1p1 = lo.r1p1 + hi.r1p1;
+        return s;
+    }
+};
+
+template <unsigned int I>
+struct DsaTree4<I, 0u> {
+    static __device__ __forceinline__ DsaQuad run(
+        const float* q0, const float* q1, const float* k0, const float* k1, unsigned int D
+    ) {
+        return dsa_chain4(q0, q1, k0, k1, I, D);
+    }
+};
+
+extern "C" __global__ void dsa_index_scores_tiled(
+    const float* __restrict__ q,
+    const float* __restrict__ pool_keys,
+    const float* __restrict__ weights,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ pool_valid,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    float* __restrict__ out,
+    unsigned char* __restrict__ valid_cand,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int H,
+    unsigned int D,
+    unsigned int KP,
+    unsigned int S,
+    float scale,
+    const int* __restrict__ geom
+) {
+    // 2026-10-01: No device-geometry path (see the 2b header); the host never passes one.
+    if (geom) __trap();
+    extern __shared__ float tsh[];
+    float* k_s = tsh;
+    float* q_s = tsh + DSA_TILE_POOLS * (D + 1u);
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int p_base = blockIdx.x * DSA_TILE_POOLS;
+    const unsigned int r_base = blockIdx.y * DSA_TILE_ROWS;
+
+    // 2026-10-01: This thread's outputs: tile rows (2 * warp, 2 * warp + 1) x tile pools
+    // (lane, lane + 32). Candidacy and its stores are dsa_index_scores' code, per output.
+    const unsigned int rows[2] = {r_base + 2u * warp, r_base + 2u * warp + 1u};
+    const unsigned int pools[2] = {p_base + lane, p_base + lane + 32u};
+    bool cand[2][2];
+    bool mine_any = false;
+    #pragma unroll
+    for (int a = 0; a < 2; ++a) {
+        #pragma unroll
+        for (int b = 0; b < 2; ++b) {
+            const unsigned int r = rows[a];
+            const unsigned int p = pools[b];
+            cand[a][b] = false;
+            if (r >= Q || p >= P) continue;
+            int end = pool_indices[p * KP + KP - 1];
+            int end_c = end < 0 ? 0 : (end >= (int)S ? (int)S - 1 : end);
+            bool vis = (end_c <= q_pos[r]) && (valid_keys[end_c] != 0);
+            bool c = (pool_valid[p] != 0) && vis;
+            cand[a][b] = c;
+            mine_any = mine_any || c;
+            valid_cand[(size_t)r * P + p] = c ? 1 : 0;
+            if (!c) out[(size_t)r * P + p] = -FLT_MAX;
+        }
+    }
+    // 2026-10-01: A tile with no candidate (e.g. wholly past the causal diagonal) is done.
+    if (!__syncthreads_or(mine_any ? 1 : 0)) return;
+
+    // 2026-10-01: The tile's pool keys, row stride D + 1; pools past P are staged as 0 and
+    // never stored.
+    const unsigned int ks = D + 1u;
+    for (unsigned int i = tid; i < DSA_TILE_POOLS * D; i += DSA_TILE_THREADS) {
+        const unsigned int pl = i / D;
+        const unsigned int d = i - pl * D;
+        const unsigned int p = p_base + pl;
+        k_s[pl * ks + d] = (p < P) ? pool_keys[(size_t)p * D + d] : 0.0f;
+    }
+
+    const float* q0 = q_s + (2u * warp) * D;
+    const float* q1 = q_s + (2u * warp + 1u) * D;
+    const float* k0 = k_s + lane * ks;
+    const float* k1 = k_s + (lane + 32u) * ks;
+    const bool r0_ok = rows[0] < Q;
+    const bool r1_ok = rows[1] < Q;
+    float acc00 = 0.0f, acc01 = 0.0f, acc10 = 0.0f, acc11 = 0.0f;
+    for (unsigned int h = 0; h < H; ++h) {
+        // 2026-10-01: Every read of the previous head's q_s (and, at h = 0, every key store)
+        // completes before q_s is rewritten.
+        __syncthreads();
+        for (unsigned int i = tid; i < DSA_TILE_ROWS * D; i += DSA_TILE_THREADS) {
+            const unsigned int rl = i / D;
+            const unsigned int d = i - rl * D;
+            const unsigned int r = r_base + rl;
+            q_s[rl * D + d] = (r < Q) ? q[((size_t)r * H + h) * D + d] : 0.0f;
+        }
+        __syncthreads();
+        if (mine_any) {
+            const DsaQuad x = DsaTree4<0u, 5u>::run(q0, q1, k0, k1, D);
+            const float w0 = r0_ok ? weights[(size_t)rows[0] * H + h] : 0.0f;
+            const float w1 = r1_ok ? weights[(size_t)rows[1] * H + h] : 0.0f;
+            acc00 += w0 * fmaxf(scale * x.r0p0, 0.0f);
+            acc01 += w0 * fmaxf(scale * x.r0p1, 0.0f);
+            acc10 += w1 * fmaxf(scale * x.r1p0, 0.0f);
+            acc11 += w1 * fmaxf(scale * x.r1p1, 0.0f);
+        }
+    }
+    if (cand[0][0]) out[(size_t)rows[0] * P + pools[0]] = acc00;
+    if (cand[0][1]) out[(size_t)rows[0] * P + pools[1]] = acc01;
+    if (cand[1][0]) out[(size_t)rows[1] * P + pools[0]] = acc10;
+    if (cand[1][1]) out[(size_t)rows[1] * P + pools[1]] = acc11;
+}
+
 // 2026-09-25: 3. Deterministic top-k over pools, one block per query. A tiled bitonic
 // select: the pool axis is walked in tiles of NP2 and a running best-NP2 list is kept in
 // shared memory (two tiles of [f32, i32], 16 * NP2 bytes, whatever the context). The order

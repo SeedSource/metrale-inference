@@ -385,3 +385,77 @@ fn the_first_complete_pool_switches_the_sparse_arm_on() {
     assert_eq!((g3.n_pools, g3.select_k), (0, 0));
     assert_eq!((g4.n_pools, g4.select_k), (1, 1));
 }
+
+/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED` takes the tiled kernel only when requested,
+/// resolved, on an exact host-geometry launch and inside the D/H envelope.
+#[test]
+fn dsa_tiled_scores_need_request_handle_exact_launch_and_envelope() {
+    assert!(scores_tiled_for(true, true, true, 128, 32), "GLM-5.3: D 128, 32 heads");
+    assert!(scores_tiled_for(true, true, true, 96, 64));
+    assert!(scores_tiled_for(true, true, true, 32, 1));
+    assert!(!scores_tiled_for(false, true, true, 128, 32), "not requested");
+    assert!(!scores_tiled_for(true, false, true, 128, 32), "handle 0");
+    assert!(!scores_tiled_for(true, true, false, 128, 32), "ceiling / geom_dev launch");
+    for d in [0, 16, 100, 160, 256] {
+        assert!(!scores_tiled_for(true, true, true, d, 32), "D {d}");
+    }
+    for h in [0, 65, 128] {
+        assert!(!scores_tiled_for(true, true, true, 128, h), "{h} heads");
+    }
+}
+
+/// 2026-10-01: The tiled launch's shared memory stays under the 48 KiB default across the
+/// envelope, and its grid covers every (row, pool) once.
+#[test]
+fn dsa_tiled_smem_and_grid_cover_the_envelope() {
+    assert_eq!(scores_tiled_smem(128), 41_216);
+    assert!(scores_tiled_smem(SCORES_TILED_MAX_D) <= TOPK_SMEM_CEILING);
+    assert_eq!(scores_tiled_grid(1, 1), [1, 1, 1]);
+    assert_eq!(scores_tiled_grid(16, 64), [1, 1, 1]);
+    assert_eq!(scores_tiled_grid(17, 65), [2, 2, 1]);
+    assert_eq!(scores_tiled_grid(8192, 2048), [32, 512, 1]);
+    assert_eq!(
+        SCORES_TILED_BLOCK as usize * 4,
+        SCORES_TILE_ROWS * SCORES_TILE_POOLS,
+        "four outputs per thread"
+    );
+}
+
+/// 2026-10-01: `dsa_indexer.cu` defines `dsa_index_scores_tiled` with `dsa_index_scores`'
+/// parameter list, and its tile defines mirror the Rust constants; a rename or a resize in
+/// the `.cu` alone fails here instead of silently falling back (or mis-launching) at serve.
+#[test]
+fn dsa_tiled_entry_point_and_tile_match_the_kernel_file() {
+    let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../kernels/gb10/common")
+        .join(format!("{}.cu", super::super::DSA_MODULE));
+    let src = std::fs::read_to_string(&cu).expect("dsa_indexer.cu readable");
+    let params = |name: &str| -> String {
+        let head = format!("extern \"C\" __global__ void {name}(");
+        let Some(at) = src.find(&head) else {
+            panic!("{cu:?} lacks {name}");
+        };
+        let start = at + head.len();
+        let len = src[start..].find(')').expect("parameter list closes");
+        src[start..start + len]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(
+        params("dsa_index_scores_tiled"),
+        params("dsa_index_scores"),
+        "the launcher passes one argument list to both kernels"
+    );
+    for (define, v) in [
+        ("DSA_TILE_ROWS", SCORES_TILE_ROWS),
+        ("DSA_TILE_POOLS", SCORES_TILE_POOLS),
+        ("DSA_TILE_THREADS", SCORES_TILED_BLOCK as usize),
+    ] {
+        let line = format!("#define {define} {v}u");
+        assert!(
+            src.lines().any(|l| l.trim() == line),
+            "{cu:?}: `{line}` does not match the Rust constant"
+        );
+    }
+}

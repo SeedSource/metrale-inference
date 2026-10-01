@@ -80,3 +80,14 @@ fn every_dispatch_arm_is_reachable() {
     assert!(combos.contains(&(false, false)), "DSA + routed");
     assert!(!combos.contains(&(false, true)), "no DSA + dense today");
 }
+
+/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED` is on only for `1`.
+#[test]
+fn dsa_tiled_lever_parses_one_as_on_and_everything_else_as_off() {
+    use super::levers::parse_dsa_switch;
+    assert!(parse_dsa_switch(Some("1")));
+    assert!(parse_dsa_switch(Some(" 1 ")));
+    for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("true"), Some("01")] {
+        assert!(!parse_dsa_switch(v), "{v:?}");
+    }
+}

@@ -49,6 +49,55 @@ const SCORES_BLOCK: u32 = 128;
 /// 2026-09-25: Threads per block for `dsa_topk_pools` and `dsa_expand_selection`.
 const ROW_BLOCK: u32 = 256;
 
+/// 2026-10-01: Query rows per `dsa_index_scores_tiled` block (`DSA_TILE_ROWS` in
+/// `kernels/gb10/common/dsa_indexer.cu`).
+pub const SCORES_TILE_ROWS: usize = 16;
+/// 2026-10-01: Pools per `dsa_index_scores_tiled` block (`DSA_TILE_POOLS`).
+pub const SCORES_TILE_POOLS: usize = 64;
+/// 2026-10-01: Threads per `dsa_index_scores_tiled` block (`DSA_TILE_THREADS`); the kernel's
+/// thread-to-output map assumes exactly this many.
+pub const SCORES_TILED_BLOCK: u32 = 256;
+/// 2026-10-01: Widest `index_head_dim` the tiled scores kernel is selected for: at 128 its
+/// shared memory ([`scores_tiled_smem`]) is 41,216 B, under the 48 KiB default.
+pub const SCORES_TILED_MAX_D: usize = 128;
+/// 2026-10-01: Most index heads the tiled scores kernel is selected for, the envelope
+/// `examples/dsa_indexer_tiled_bitparity_microtest.rs` is written for (the kernel itself has
+/// no per-head storage).
+pub const SCORES_TILED_MAX_H: usize = 64;
+
+/// 2026-10-01: Dynamic shared memory one `dsa_index_scores_tiled` block takes for head dim
+/// `d`, in bytes: the tile's pool keys at row stride `d + 1` plus one head's q rows.
+pub fn scores_tiled_smem(d: usize) -> usize {
+    (SCORES_TILE_POOLS * (d + 1) + SCORES_TILE_ROWS * d) * 4
+}
+
+/// 2026-10-01: `dsa_index_scores_tiled` grid for `q_rows` rows and `n_pools` pools: pool
+/// tiles on x, row tiles on y.
+pub fn scores_tiled_grid(q_rows: usize, n_pools: usize) -> [u32; 3] {
+    [
+        n_pools.div_ceil(SCORES_TILE_POOLS) as u32,
+        q_rows.div_ceil(SCORES_TILE_ROWS) as u32,
+        1,
+    ]
+}
+
+/// 2026-10-01: Whether a scores launch takes `dsa_index_scores_tiled`: only when requested
+/// (`METRALE_GLM_DSA_SCORES_TILED=1`), with the entry point resolved, on an exact launch
+/// with host geometry (the tiled kernel has no `geom_dev` path), and for `index_head_dim` a
+/// nonzero multiple of 32 up to [`SCORES_TILED_MAX_D`] with 1 to [`SCORES_TILED_MAX_H`]
+/// heads. Otherwise `dsa_index_scores` runs.
+pub(crate) fn scores_tiled_for(
+    requested: bool,
+    resolved: bool,
+    exact_host_geom: bool,
+    d: usize,
+    heads: usize,
+) -> bool {
+    let shape = d > 0 && d.is_multiple_of(32) && d <= SCORES_TILED_MAX_D;
+    let heads_ok = (1..=SCORES_TILED_MAX_H).contains(&heads);
+    requested && resolved && exact_host_geom && shape && heads_ok
+}
+
 /// 2026-09-25: Tile width `dsa_topk_pools` walks the pool axis in.
 ///
 /// The block holds two tiles, the running best list and the candidate tile, of `[f32, i32]`

@@ -35,6 +35,8 @@ pub mod tp_bind;
 mod config;
 mod decode;
 mod kernels;
+#[cfg(test)]
+mod lever_tests;
 mod prefill;
 pub use config::{Glm5NextKdaConfig, Glm5NextKdaWeights};
 pub use kernels::Glm5NextKdaKernels;
@@ -73,6 +75,63 @@ fn kda_token_loop() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("METRALE_GLM_KDA_TOKEN_LOOP").as_deref() == Ok("1"))
 }
+
+/// 2026-10-01: Staged elements per thread the generic body of `kda_recurrent_prefill_bf16_pf`
+/// holds per prefetched token (`KDA_PF_E_MAX` in kernels/gb10/common/kda_recurrent.cu): the
+/// kernel stages `head_dim` elements with `vpb` threads, so it needs `head_dim <= 8 * vpb`.
+const KDA_PF_ELEMS_MAX: usize = 8;
+/// 2026-10-01: `__launch_bounds__(32)` on `kda_recurrent_prefill_bf16_pf`.
+const KDA_PF_THREADS_MAX: usize = 32;
+
+/// 2026-10-01: Whether a `METRALE_GLM_KDA_PREFETCH` value asks for the prefetching kernel: `1`
+/// only.
+fn prefetch_requested(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// 2026-10-01: `METRALE_GLM_KDA_PREFETCH=1`: the opt-in token loop (`stateful_rows`, under
+/// `METRALE_GLM_KDA_TOKEN_LOOP=1`) launches `kda_recurrent_prefill_bf16_pf`, the prefetching
+/// twin of `kda_recurrent_prefill_bf16_smem` (byte-identical by construction; checked by
+/// `kda_tokenloop_microtest`). Off unless set to `1`. Read once per process.
+fn kda_prefetch() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = prefetch_requested(std::env::var("METRALE_GLM_KDA_PREFETCH").ok().as_deref());
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_KDA_PREFETCH=1 - the KDA token loop uses the prefetching recurrent \
+                 kernel (byte-identical by construction; see kernels/gb10/common/kda_recurrent.cu)"
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-01: Shared memory `kda_recurrent_prefill_bf16_pf` requests at this geometry,
+/// `(6 * d + vpb * (d + 1)) * 4` bytes (two staging buffers and the column scratch), or `None`
+/// when the geometry breaks its launcher contract or `KDA_SMEM_BUDGET`. At `head_dim = 128`,
+/// `vpb = 32`: 19,584 B.
+fn kda_pf_smem(d: usize, vpb: usize) -> Option<usize> {
+    let smem = (6 * d + vpb * (d + 1)) * 4;
+    ((1..=KDA_PF_THREADS_MAX).contains(&vpb)
+        && d.is_multiple_of(vpb)
+        && d <= KDA_PF_ELEMS_MAX * vpb
+        && smem <= KDA_SMEM_BUDGET)
+        .then_some(smem)
+}
+
+/// 2026-10-01: The one warning when `METRALE_GLM_KDA_PREFETCH=1` cannot be honoured and the
+/// token loop keeps `kda_recurrent_prefill_bf16_smem`.
+fn kda_prefetch_fallback(why: &str) {
+    static W: std::sync::Once = std::sync::Once::new();
+    W.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_KDA_PREFETCH=1 ignored ({why}); the KDA token loop keeps \
+             kda_recurrent_prefill_bf16_smem"
+        )
+    });
+}
+
 
 /// 2026-09-25: The per-sequence state a KDA layer carries. The kernels update both buffers in place.
 ///

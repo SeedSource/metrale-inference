@@ -7,6 +7,8 @@
 //! - The recurrent state advances one row at a time, in row order (`stateful_row`).
 //! - The opt-in token loop (`stateful_rows`) advances it over all rows in two launches, rows still
 //!   in order, and only for a `decode_k` that takes no snapshots.
+//! - `METRALE_GLM_KDA_PREFETCH=1` changes only which recurrent kernel the token loop launches,
+//!   never whether the loop runs.
 
 use super::*;
 
@@ -109,6 +111,10 @@ impl Glm5NextKdaLayer {
     /// (`causal_conv1d_update_l2norm_rows`, `kda_recurrent_prefill_bf16_smem`), so outputs and
     /// both final states match the walk bit for bit; `kda_tokenloop_microtest` checks that.
     /// Takes no snapshots: it never materialises the state after an interior row.
+    ///
+    /// 2026-10-01: Under `METRALE_GLM_KDA_PREFETCH=1` the recurrence launches
+    /// `kda_recurrent_prefill_bf16_pf` instead (same arguments, same per-element arithmetic, inputs
+    /// prefetched two tokens ahead); the microtest checks it against the same walk.
     fn stateful_rows(
         &self,
         gpu: &dyn GpuBackend,
@@ -154,10 +160,17 @@ impl Glm5NextKdaLayer {
             .arg_u32(cd as u32)
             .launch(stream)?;
 
-        KernelLaunch::new(gpu, self.kernels.recurrent_rows)
+        // 2026-10-01: `METRALE_GLM_KDA_PREFETCH=1` swaps in the prefetching twin, same arguments,
+        // when the target has it and the geometry meets its contract; otherwise the row kernel,
+        // with one warning per process.
+        let (rows_kernel, rows_smem) = match self.prefetch_rows(d, vpb) {
+            Some(smem) => (self.kernels.recurrent_pf, smem),
+            None => (self.kernels.recurrent_rows, smem_smem),
+        };
+        KernelLaunch::new(gpu, rows_kernel)
             .grid([c.heads as u32, (d / vpb) as u32, 1])
             .block([vpb as u32, 1, 1])
-            .shared_mem(smem_smem as u32)
+            .shared_mem(rows_smem as u32)
             .arg_ptr(ws.conv_out)
             .arg_ptr(ws.conv_out.offset(qkv * 2))
             .arg_ptr(ws.conv_out.offset(qkv * 4))
@@ -176,6 +189,25 @@ impl Glm5NextKdaLayer {
             .arg_u32(qkv as u32)
             .launch(stream)?;
         Ok(true)
+    }
+
+    /// 2026-10-01: Shared memory for `kda_recurrent_prefill_bf16_pf` when `stateful_rows` should
+    /// launch it: `METRALE_GLM_KDA_PREFETCH=1`, the handle resolved, and the geometry inside its
+    /// launcher contract (`kda_pf_smem`). `None` keeps `kda_recurrent_prefill_bf16_smem`; with the
+    /// lever on, that is warned about once.
+    fn prefetch_rows(&self, d: usize, vpb: usize) -> Option<usize> {
+        if !kda_prefetch() {
+            return None;
+        }
+        if self.kernels.recurrent_pf.0 == 0 {
+            kda_prefetch_fallback("the target has no kda_recurrent_prefill_bf16_pf");
+            return None;
+        }
+        let smem = kda_pf_smem(d, vpb);
+        if smem.is_none() {
+            kda_prefetch_fallback("head_dim / V-per-block outside the kernel's launcher contract");
+        }
+        smem
     }
 
     /// 2026-09-25: Single-token decode, carrying both states. The result lands in `ws.final_out`;

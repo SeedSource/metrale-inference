@@ -5,8 +5,9 @@
 //! Owner: model-arch (GLM-5.3-Flash KDA).
 //! Invariants:
 //! - `resolve` fails if any entry point other than `dense_gemv_bf16_batchm`,
-//!   `kda_recurrent_decode_bf16_smem`, `causal_conv1d_update_l2norm_rows` and
-//!   `kda_recurrent_prefill_bf16_smem` is missing; those four resolve to handle 0 when absent.
+//!   `kda_recurrent_decode_bf16_smem`, `causal_conv1d_update_l2norm_rows`,
+//!   `kda_recurrent_prefill_bf16_smem` and `kda_recurrent_prefill_bf16_pf` is missing; those five
+//!   resolve to handle 0 when absent.
 
 use super::*;
 
@@ -37,6 +38,10 @@ pub struct Glm5NextKdaKernels {
     /// 2026-10-01: `recurrent_smem` over K rows in one launch, the state column kept on chip
     /// across rows. Resolved with `try_kernel`; `0` keeps the per-row walk.
     pub recurrent_rows: KernelHandle,
+    /// 2026-10-01: The prefetching twin of `recurrent_rows` (same arguments), launched instead of
+    /// it under `METRALE_GLM_KDA_PREFETCH=1`. Resolved with `try_kernel`; `0` keeps
+    /// `recurrent_rows`.
+    pub recurrent_pf: KernelHandle,
     pub o_norm: KernelHandle,
     pub split_widen: KernelHandle,
     pub sigmoid: KernelHandle,
@@ -77,6 +82,11 @@ impl Glm5NextKdaKernels {
                 gpu,
                 "kda_recurrent",
                 "kda_recurrent_prefill_bf16_smem",
+            ),
+            recurrent_pf: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_recurrent",
+                "kda_recurrent_prefill_bf16_pf",
             ),
             o_norm: gpu.kernel("kda_layer_ops", "kda_o_norm_gated_bf16")?,
             split_widen: gpu.kernel("kda_layer_ops", "kda_split_widen")?,

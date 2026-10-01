@@ -259,7 +259,8 @@ mod tests {
         assert_eq!(resolve_rows_ffn(256, Some(2000)), 1792);
         assert_eq!(resolve_rows_ffn(256, Some(100)), 256);
         assert_eq!(resolve_rows_ffn(256, Some(0)), 256);
-        assert_eq!(resolve_rows_ffn(256, Some(9000)), 4096);
+        assert_eq!(resolve_rows_ffn(256, Some(9000)), 8192);
+        assert_eq!(resolve_rows_ffn(256, Some(4096)), 4096);
         assert_eq!(resolve_rows_ffn(3000, Some(9000)), 3000);
         assert_eq!(resolve_rows_ffn(8192, Some(2048)), 8192);
     }

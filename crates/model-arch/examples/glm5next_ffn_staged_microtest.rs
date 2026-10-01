@@ -143,7 +143,7 @@ fn main() -> Result<()> {
         .first()
         .copied()
         .unwrap_or(256);
-    let ffns = env_list("GLM_STAGED_FFN", "256,2048,4096");
+    let ffns = env_list("GLM_STAGED_FFN", "256,2048,4096,8192");
     let max_rows = ffns.iter().copied().max().unwrap_or(w_attn).max(w_attn);
     let ws = Glm5NextMlpWorkspace::new_sized(gpu, &c, max_rows, w_attn)?;
 

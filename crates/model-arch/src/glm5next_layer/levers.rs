@@ -104,7 +104,10 @@ pub fn prefill_rows() -> usize {
 }
 
 /// 2026-09-29: Ceiling of the staged prefill's FFN window (`prefill_rows_ffn`), in rows.
-pub const PREFILL_ROWS_FFN_MAX: usize = 4096;
+/// 2026-10-01: Raised from 4096 to 8192 (one window per 8192-token server prefill chunk); a
+/// request at or below 4096 resolves as before. The MLP scratch and the mHC `mix` scratch are
+/// sized from `prefill_rows_ffn()`, so only a request above 4096 allocates more.
+pub const PREFILL_ROWS_FFN_MAX: usize = 8192;
 
 /// 2026-09-29: `METRALE_GLM_PREFILL_STAGED=1` runs a prefill chunk as two passes per layer: the
 /// attention half over every `prefill_rows()` sub-chunk, then the FFN half over windows of up to

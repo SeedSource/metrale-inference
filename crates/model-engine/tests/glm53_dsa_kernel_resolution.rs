@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use metrale_model_arch::glm5next_dsa::KERNEL_KV_LORA_DIM;
-use metrale_model_arch::glm5next_dsa::attend::DSA_DECODE_MODULE;
+use metrale_model_arch::glm5next_dsa::attend::{DSA_DECODE_MODULE, DSA_MLA_HEADGROUPS};
 
 fn kernels_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -56,6 +56,23 @@ fn the_dsa_decode_entry_point_exists_in_the_glm_target() {
          for (`glm5next_dsa_mla_decode_fp8`). The module name is the file stem, so a rename \
          here is a load-time failure at serve."
     );
+}
+
+/// 2026-10-01: The head-grouped entry points `Glm5NextDsaDecodeKernel::resolve` looks up
+/// (optional, 0 when absent) live in the same file, so `METRALE_GLM_DSA_MLA_HEADGROUP` does not
+/// silently fall back to the per-head kernel after a rename.
+#[test]
+fn the_dsa_decode_headgroup_entry_points_exist_in_the_glm_target() {
+    let cu = kernels_root().join(format!("gb10/glm-5.3-flash/nvfp4/{DSA_DECODE_MODULE}.cu"));
+    let src = std::fs::read_to_string(&cu).expect("GLM DSA decode kernel readable");
+    for g in DSA_MLA_HEADGROUPS {
+        let entry = format!("glm5next_dsa_mla_decode_fp8_hg{g}");
+        assert!(
+            src.contains(&format!("{entry},")),
+            "{cu:?} no longer instantiates `{entry}`, which `Glm5NextDsaDecodeKernel::resolve` \
+             asks for when METRALE_GLM_DSA_MLA_HEADGROUP={g}"
+        );
+    }
 }
 
 /// 2026-09-25: `KERNEL_KV_LORA_DIM`, which `Glm5NextDsaConfig::validate` checks

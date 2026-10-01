@@ -67,18 +67,91 @@ pub fn mla_scale(cfg: &Glm5NextDsaConfig) -> f32 {
     mla_scale_for(cfg, mla_scale_author())
 }
 
+/// 2026-10-01: Head-group sizes with a `glm5next_dsa_mla_decode_fp8_hg{G}` entry point: one
+/// block per G consecutive heads of a row, byte-identical to the per-head kernel (argument in
+/// the `.cu`; checked on a GPU by `examples/dsa_mla_headgroup_bitparity_microtest.rs`).
+pub const DSA_MLA_HEADGROUPS: [usize; 3] = [2, 4, 8];
+
+/// 2026-10-01: `METRALE_GLM_DSA_MLA_HEADGROUP` as a head-group size: `2`, `4` or `8` select
+/// that variant; unset, `0` and anything else select the per-head kernel (0).
+pub(crate) fn parse_mla_headgroup(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        Some(t) => t
+            .parse::<usize>()
+            .ok()
+            .filter(|g| DSA_MLA_HEADGROUPS.contains(g))
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// 2026-10-01: `METRALE_GLM_DSA_MLA_HEADGROUP=2|4|8` launches the DSA MLA attention one block
+/// per G heads of a row instead of one per head, so each selected token is gathered and
+/// decoded once per G heads; byte-identical by construction. Every `decode_attention` call
+/// (prefill and decode) follows it. Off (0) unless set to 2, 4 or 8; read once.
+pub fn mla_headgroup() -> usize {
+    static E: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DSA_MLA_HEADGROUP").ok();
+        let g = parse_mla_headgroup(raw.as_deref());
+        if g != 0 {
+            tracing::warn!(
+                "METRALE_GLM_DSA_MLA_HEADGROUP={g} - DSA MLA attention runs one block per {g} \
+                 heads (glm5next_dsa_mla_decode_fp8_hg{g}; byte-identical by construction)"
+            );
+        } else if let Some(r) = raw.as_deref().filter(|r| !r.is_empty() && r.trim() != "0") {
+            tracing::warn!(
+                "METRALE_GLM_DSA_MLA_HEADGROUP={r} is not 0, 2, 4 or 8 - the per-head kernel runs"
+            );
+        }
+        g
+    })
+}
+
+/// 2026-10-01: The head-group size a launch takes for a `requested` one: `requested` when it
+/// divides `num_q_heads` and its entry point resolved, else 0 (the per-head kernel).
+pub(crate) fn headgroup_for(requested: usize, num_q_heads: usize, resolved: bool) -> usize {
+    if requested != 0 && num_q_heads.is_multiple_of(requested) && resolved {
+        requested
+    } else {
+        0
+    }
+}
+
 /// 2026-09-25: The selected-index MLA decode entry point.
+/// 2026-10-01: With the head-grouped variants, `KernelHandle(0)` where one did not resolve.
 #[derive(Clone, Copy)]
-pub struct Glm5NextDsaDecodeKernel(KernelHandle);
+pub struct Glm5NextDsaDecodeKernel {
+    base: KernelHandle,
+    headgroup: [KernelHandle; DSA_MLA_HEADGROUPS.len()],
+}
 
 impl Glm5NextDsaDecodeKernel {
     /// 2026-09-25: Resolved with `kernel()`, not `try_kernel`: a missing entry
     /// point is an error, with no dense fallback.
+    /// 2026-10-01: The head-grouped entry points are optional (`try_kernel`, 0 when absent).
     pub fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
-        Ok(Self(gpu.kernel(
-            DSA_DECODE_MODULE,
-            "glm5next_dsa_mla_decode_fp8",
-        )?))
+        let base = gpu.kernel(DSA_DECODE_MODULE, "glm5next_dsa_mla_decode_fp8")?;
+        let headgroup = DSA_MLA_HEADGROUPS.map(|g| {
+            metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_DECODE_MODULE,
+                &format!("glm5next_dsa_mla_decode_fp8_hg{g}"),
+            )
+        });
+        Ok(Self { base, headgroup })
+    }
+
+    /// 2026-10-01: The `_hg{g}` handle, `None` for a `g` without an entry point or one that
+    /// did not resolve.
+    fn headgroup_handle(&self, g: usize) -> Option<KernelHandle> {
+        let i = DSA_MLA_HEADGROUPS.iter().position(|&x| x == g)?;
+        Some(self.headgroup[i]).filter(|h| h.0 != 0)
+    }
+
+    /// 2026-10-01: Whether the `_hg{g}` entry point resolved.
+    pub fn has_headgroup(&self, g: usize) -> bool {
+        self.headgroup_handle(g).is_some()
     }
 }
 
@@ -158,9 +231,49 @@ impl DsaDecodePaging {
 /// `geom.q_rows` must equal `paging.num_seqs`: one query row per sequence. A
 /// mismatch would index the selection rows with the wrong stride, so it is an
 /// error.
+///
+/// 2026-10-01: The kernel is the per-head one unless `METRALE_GLM_DSA_MLA_HEADGROUP` selects a
+/// head group that divides `num_q_heads` and resolved; otherwise the per-head kernel runs and
+/// the fallback is logged once.
 pub fn decode_attention(
     gpu: &dyn GpuBackend,
     kernel: Glm5NextDsaDecodeKernel,
+    cfg: &Glm5NextDsaConfig,
+    geom: &DsaSelectGeometry,
+    paging: &DsaDecodePaging,
+    inputs: &DsaDecodeInputs,
+    stream: u64,
+) -> Result<()> {
+    let requested = mla_headgroup();
+    let g = headgroup_for(requested, paging.num_q_heads, kernel.has_headgroup(requested));
+    if g != requested {
+        static FELL_BACK: std::sync::Once = std::sync::Once::new();
+        FELL_BACK.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_DSA_MLA_HEADGROUP={requested}: {} - the per-head kernel runs",
+                if kernel.has_headgroup(requested) {
+                    format!(
+                        "{} q heads per rank is not a multiple of {requested}",
+                        paging.num_q_heads
+                    )
+                } else {
+                    format!("glm5next_dsa_mla_decode_fp8_hg{requested} did not resolve")
+                }
+            );
+        });
+    }
+    decode_attention_headgroup(gpu, kernel, g, cfg, geom, paging, inputs, stream)
+}
+
+/// 2026-10-01: [`decode_attention`] with the head-group size fixed by the caller: 0 for the
+/// per-head kernel, else one of [`DSA_MLA_HEADGROUPS`] that resolved and divides
+/// `num_q_heads` (anything else is an error). The bit-parity microtest runs both arms
+/// through it.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_attention_headgroup(
+    gpu: &dyn GpuBackend,
+    kernel: Glm5NextDsaDecodeKernel,
+    g: usize,
     cfg: &Glm5NextDsaConfig,
     geom: &DsaSelectGeometry,
     paging: &DsaDecodePaging,
@@ -188,8 +301,24 @@ pub fn decode_attention(
         );
     }
 
-    KernelLaunch::new(gpu, kernel.0)
-        .grid([paging.num_q_heads as u32, paging.num_seqs as u32, 1])
+    // 2026-10-01: The head-grouped kernels take the same arguments; only the grid's x shrinks.
+    let (handle, grid_x) = if g == 0 {
+        (kernel.base, paging.num_q_heads)
+    } else {
+        let Some(h) = kernel.headgroup_handle(g) else {
+            bail!("DSA decode: head group {g} has no resolved glm5next_dsa_mla_decode_fp8_hg{g}");
+        };
+        if !paging.num_q_heads.is_multiple_of(g) {
+            bail!(
+                "DSA decode: head group {g} does not divide {} q heads",
+                paging.num_q_heads
+            );
+        }
+        (h, paging.num_q_heads / g)
+    };
+
+    KernelLaunch::new(gpu, handle)
+        .grid([grid_x as u32, paging.num_seqs as u32, 1])
         .block([DECODE_BLOCK, 1, 1])
         .arg_ptr(inputs.q)
         .arg_ptr(inputs.k_cache)

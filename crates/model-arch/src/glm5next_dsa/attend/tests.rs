@@ -127,3 +127,32 @@ fn author_scale_arm_is_one_sixteenth_for_256_plus_0() {
         "the off arm is unchanged: kv_lora_rank^-0.5"
     );
 }
+
+/// 2026-10-01: `METRALE_GLM_DSA_MLA_HEADGROUP` selects a head group only for 2, 4 or 8; unset,
+/// 0 and any other value keep the per-head kernel.
+#[test]
+fn headgroup_lever_parses_only_two_four_eight() {
+    assert_eq!(parse_mla_headgroup(None), 0);
+    for (v, g) in [("2", 2), ("4", 4), ("8", 8), (" 4 ", 4)] {
+        assert_eq!(parse_mla_headgroup(Some(v)), g, "{v:?}");
+    }
+    for v in ["", "0", "1", "3", "16", "32", "-2", "two", "4x"] {
+        assert_eq!(parse_mla_headgroup(Some(v)), 0, "{v:?} must keep the per-head kernel");
+    }
+}
+
+/// 2026-10-01: A requested head group runs only when it divides the per-rank head count and its
+/// entry point resolved; otherwise the launch falls back to the per-head kernel (0).
+#[test]
+fn headgroup_falls_back_unless_it_divides_the_heads_and_resolved() {
+    assert_eq!(headgroup_for(0, 32, true), 0, "off stays off");
+    assert_eq!(headgroup_for(0, 32, false), 0);
+    for g in DSA_MLA_HEADGROUPS {
+        assert_eq!(headgroup_for(g, 32, true), g, "32 heads per rank take G = {g}");
+        assert_eq!(headgroup_for(g, 64, true), g);
+        assert_eq!(headgroup_for(g, 32, false), 0, "an unresolved G = {g} falls back");
+    }
+    assert_eq!(headgroup_for(4, 6, true), 0, "4 does not divide 6");
+    assert_eq!(headgroup_for(8, 12, true), 0, "8 does not divide 12");
+    assert_eq!(headgroup_for(2, 6, true), 2);
+}

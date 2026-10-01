@@ -98,12 +98,13 @@ fn warn_unparsed_dsa_switch(name: &str, raw: Option<&str>) {
 }
 
 /// 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED=1` scores an exact (host-geometry) DSA selection
-/// with `dsa_index_scores_tiled`, one block per 16-row x 64-pool tile, instead of
+/// with `dsa_index_scores_tiled`, one block per 32-row x 64-pool tile, instead of
 /// `dsa_index_scores`, one block per (pool, row); byte-identical by construction (argument in
 /// `kernels/gb10/common/dsa_indexer.cu`, GPU gate
 /// `examples/dsa_indexer_tiled_bitparity_microtest.rs`). The ceiling (graph-replay decode)
-/// launch, an unresolved entry point or a shape outside the tiled envelope keeps
-/// `dsa_index_scores` (`glm5next_dsa::select::scores_tiled_for`, logged once). Off unless set
+/// launch, fewer than `SCORES_TILED_MIN_POOLS` pools (PROVISIONAL), an unresolved entry
+/// point or a shape outside the tiled envelope keeps `dsa_index_scores`
+/// (`glm5next_dsa::select::scores_tiled_for`, logged once). Off unless set
 /// to `1`; read once.
 pub(crate) fn dsa_scores_tiled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -113,7 +114,7 @@ pub(crate) fn dsa_scores_tiled() -> bool {
         if on {
             tracing::warn!(
                 "METRALE_GLM_DSA_SCORES_TILED=1 - exact DSA selections score pools with \
-                 dsa_index_scores_tiled (16 rows x 64 pools per block; byte-identical by \
+                 dsa_index_scores_tiled (32 rows x 64 pools per block; byte-identical by \
                  construction)"
             );
         }

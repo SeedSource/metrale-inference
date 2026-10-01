@@ -101,6 +101,7 @@ pub fn select_tokens(
             ceiling.is_none() && gd.0 == 0,
             d,
             geom.index_heads,
+            geom.n_pools,
         );
         log_scores_tiled(requested, tiled, kernels, ceiling.is_some(), geom);
         let (handle, grid, block, smem) = if tiled {
@@ -188,8 +189,9 @@ pub fn select_tokens(
 }
 
 /// 2026-10-01: Log once whether `METRALE_GLM_DSA_SCORES_TILED=1` engaged, and once why a
-/// requested launch kept `dsa_index_scores`. A ceiling (graph-replay decode) launch is an
-/// expected fallback and logs nothing, so the warning names a prefill that did not engage.
+/// requested launch kept `dsa_index_scores`. A ceiling (graph-replay decode) launch and one
+/// below `SCORES_TILED_MIN_POOLS` pools are expected fallbacks and log nothing, so the
+/// warning names a prefill that did not engage.
 fn log_scores_tiled(
     requested: bool,
     tiled: bool,
@@ -203,10 +205,11 @@ fn log_scores_tiled(
         ENGAGED.call_once(|| {
             tracing::warn!(
                 "METRALE_GLM_DSA_SCORES_TILED=1: ENGAGED - dsa_index_scores_tiled scores \
-                 exact DSA selections (index_head_dim {d}, {heads} heads)"
+                 exact DSA selections of at least {SCORES_TILED_MIN_POOLS} pools \
+                 (index_head_dim {d}, {heads} heads)"
             );
         });
-    } else if requested && !ceiling {
+    } else if requested && !ceiling && geom.n_pools >= SCORES_TILED_MIN_POOLS {
         static FELL_BACK: std::sync::Once = std::sync::Once::new();
         FELL_BACK.call_once(|| {
             tracing::warn!(

@@ -80,7 +80,7 @@ pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
     pub compact_pools: KernelHandle,
     pub index_scores: KernelHandle,
-    /// 2026-10-01: `dsa_index_scores_tiled`: `index_scores` over 16-row x 64-pool tiles,
+    /// 2026-10-01: `dsa_index_scores_tiled`: `index_scores` over 32-row x 64-pool tiles,
     /// byte-identical by construction (argument in `dsa_indexer.cu`). `select_tokens`
     /// launches it under `METRALE_GLM_DSA_SCORES_TILED=1` (`select::scores_tiled_for`);
     /// `KernelHandle(0)` when the target lacks it, and `index_scores` runs.

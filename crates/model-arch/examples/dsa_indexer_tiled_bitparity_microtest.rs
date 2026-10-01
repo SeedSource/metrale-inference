@@ -2,9 +2,10 @@
 
 //! 2026-10-01: Byte-parity gate (and timing) for two opt-in DSA indexer prefill levers:
 //!
-//! * `METRALE_GLM_DSA_SCORES_TILED=1`: `dsa_index_scores_tiled` (16 rows x 64 pools per
-//!   block) against `dsa_index_scores` (one block per (pool, row)), with the arguments
-//!   `select_tokens` passes on an exact launch. Q in {1, 7, 16, 255, 256}, P in
+//! * `METRALE_GLM_DSA_SCORES_TILED=1`: `dsa_index_scores_tiled` (32 rows x 64 pools per
+//!   block since v2) against `dsa_index_scores` (one block per (pool, row)), with the
+//!   arguments `select_tokens` passes on an exact launch (the kernels are launched directly,
+//!   so `SCORES_TILED_MIN_POOLS` does not apply). Q in {1, 7, 16, 31, 33, 255, 256, 2048}, P in
 //!   {1, 63, 64, 65, 2048}, H = 32, D in {128, 96}, two `q_pos` layouts (causal spread and
 //!   prefill tail). The data has negative and zero (+0 and -0) weights, zero keys and zero q
 //!   heads (+-0 dots), duplicated pool keys (exact ties), invalid pools, invalid end tokens
@@ -20,7 +21,9 @@
 //! writes cannot compare equal. A negative control per lever (one flipped input bit in the
 //! new arm) must be detected, and a run that compared nothing fails. Timing is CUDA events
 //! around back-to-back launches (mean per launch, after one warm-up), printed for information;
-//! it does not decide PASS.
+//! it does not decide PASS. Scores timing sweeps P in {64, 128, 256, 512, 1024, 2048} at
+//! Q = 256 (the served `METRALE_GLM_PREFILL_ROWS=256` sub-chunk) and Q = 2048, D 128, to set
+//! `SCORES_TILED_MIN_POOLS` (PROVISIONAL).
 //!
 //! Owner: model-arch examples.
 //! Invariants: none beyond the types.
@@ -61,7 +64,7 @@ const OLD_BLOCK: u32 = 128;
 /// 2026-10-01: GLM-5.3 `index_n_heads` and `index_kpool`.
 const H: usize = 32;
 const KP: usize = 4;
-const QS: &[usize] = &[1, 7, 16, 255, 256];
+const QS: &[usize] = &[1, 7, 16, 31, 33, 255, 256, 2048];
 const PS: &[usize] = &[1, 63, 64, 65, 2048];
 const DS: &[usize] = &[128, 96];
 /// 2026-10-01: (N, K, FP32 out, label): the GLM-5.3 indexer GEMVs of the DSA row batch
@@ -77,6 +80,9 @@ const MAX_M: usize = ops::DENSE_GEMV_BATCHM_MAX_M as usize;
 const POISON_REF: u8 = 0xA5;
 const POISON_NEW: u8 = 0x5A;
 const ITERS: usize = 20;
+/// 2026-10-01: Scores timing grid (rows per selector call, pools).
+const TIMING_QS: &[usize] = &[256, 2048];
+const TIMING_PS: &[usize] = &[64, 128, 256, 512, 1024, 2048];
 
 struct Lcg(u64);
 impl Lcg {
@@ -444,10 +450,14 @@ fn scores_control(g: &dyn GpuBackend, ks: &Kernels) -> Result<bool> {
     Ok(fired)
 }
 
+/// 2026-10-01: Timing sweep; `TILED>=old` marks where the tiled kernel is no faster.
 fn scores_timing(g: &dyn GpuBackend, ks: &Kernels) -> Result<()> {
-    for p in [64usize, 512, 2048] {
+    for (q, p) in TIMING_QS
+        .iter()
+        .flat_map(|&q| TIMING_PS.iter().map(move |&p| (q, p)))
+    {
         let c = Case {
-            q: 256,
+            q,
             p,
             d: 128,
             tail: true,
@@ -457,9 +467,10 @@ fn scores_timing(g: &dyn GpuBackend, ks: &Kernels) -> Result<()> {
         let (out, vc) = (g.alloc(n * 4)?, g.alloc(n)?);
         let old = time_ms(g, || launch_scores(g, ks, false, &b, b.q, out, vc, c))?;
         let new = time_ms(g, || launch_scores(g, ks, true, &b, b.q, out, vc, c))?;
+        let flag = if new >= old { "  TILED>=old" } else { "" };
         println!(
-            "TIMING scores Q=256 P={p} D=128 H={H}: dsa_index_scores {old:.4} ms, \
-             dsa_index_scores_tiled {new:.4} ms ({:.2}x)",
+            "TIMING scores Q={q} P={p} D=128 H={H}: dsa_index_scores {old:.4} ms, \
+             dsa_index_scores_tiled {new:.4} ms ({:.2}x){flag}",
             old / new
         );
         g.free(out).ok();

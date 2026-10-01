@@ -390,34 +390,36 @@ fn the_first_complete_pool_switches_the_sparse_arm_on() {
 /// resolved, on an exact host-geometry launch and inside the D/H envelope.
 #[test]
 fn dsa_tiled_scores_need_request_handle_exact_launch_and_envelope() {
-    assert!(scores_tiled_for(true, true, true, 128, 32), "GLM-5.3: D 128, 32 heads");
-    assert!(scores_tiled_for(true, true, true, 96, 64));
-    assert!(scores_tiled_for(true, true, true, 32, 1));
-    assert!(!scores_tiled_for(false, true, true, 128, 32), "not requested");
-    assert!(!scores_tiled_for(true, false, true, 128, 32), "handle 0");
-    assert!(!scores_tiled_for(true, true, false, 128, 32), "ceiling / geom_dev launch");
+    let wide = SCORES_TILED_MIN_POOLS;
+    assert!(scores_tiled_for(true, true, true, 128, 32, wide), "GLM-5.3: D 128, 32 heads");
+    assert!(scores_tiled_for(true, true, true, 96, 64, 2048));
+    assert!(scores_tiled_for(true, true, true, 32, 1, wide));
+    assert!(!scores_tiled_for(false, true, true, 128, 32, wide), "not requested");
+    assert!(!scores_tiled_for(true, false, true, 128, 32, wide), "handle 0");
+    assert!(!scores_tiled_for(true, true, false, 128, 32, wide), "ceiling / geom_dev");
+    assert!(!scores_tiled_for(true, true, true, 128, 32, wide - 1), "below the pool floor");
     for d in [0, 16, 100, 160, 256] {
-        assert!(!scores_tiled_for(true, true, true, d, 32), "D {d}");
+        assert!(!scores_tiled_for(true, true, true, d, 32, wide), "D {d}");
     }
     for h in [0, 65, 128] {
-        assert!(!scores_tiled_for(true, true, true, 128, h), "{h} heads");
+        assert!(!scores_tiled_for(true, true, true, 128, h, wide), "{h} heads");
     }
 }
 
-/// 2026-10-01: The tiled launch's shared memory stays under the 48 KiB default across the
+/// 2026-10-01: The tiled launch's shared memory stays within the 48 KiB default across the
 /// envelope, and its grid covers every (row, pool) once.
 #[test]
 fn dsa_tiled_smem_and_grid_cover_the_envelope() {
-    assert_eq!(scores_tiled_smem(128), 41_216);
+    assert_eq!(scores_tiled_smem(128), 49_152);
     assert!(scores_tiled_smem(SCORES_TILED_MAX_D) <= TOPK_SMEM_CEILING);
     assert_eq!(scores_tiled_grid(1, 1), [1, 1, 1]);
-    assert_eq!(scores_tiled_grid(16, 64), [1, 1, 1]);
-    assert_eq!(scores_tiled_grid(17, 65), [2, 2, 1]);
-    assert_eq!(scores_tiled_grid(8192, 2048), [32, 512, 1]);
+    assert_eq!(scores_tiled_grid(32, 64), [1, 1, 1]);
+    assert_eq!(scores_tiled_grid(33, 65), [2, 2, 1]);
+    assert_eq!(scores_tiled_grid(256, 2048), [32, 8, 1]);
     assert_eq!(
-        SCORES_TILED_BLOCK as usize * 4,
+        SCORES_TILED_BLOCK as usize * 16,
         SCORES_TILE_ROWS * SCORES_TILE_POOLS,
-        "four outputs per thread"
+        "sixteen outputs (4 rows x 4 pools) per thread"
     );
 }
 
@@ -430,10 +432,9 @@ fn dsa_tiled_entry_point_and_tile_match_the_kernel_file() {
         .join("../../kernels/gb10/common")
         .join(format!("{}.cu", super::super::DSA_MODULE));
     let src = std::fs::read_to_string(&cu).expect("dsa_indexer.cu readable");
-    let params = |name: &str| -> String {
-        let head = format!("extern \"C\" __global__ void {name}(");
-        let Some(at) = src.find(&head) else {
-            panic!("{cu:?} lacks {name}");
+    let params = |head: &str| -> String {
+        let Some(at) = src.find(head) else {
+            panic!("{cu:?} lacks `{head}`");
         };
         let start = at + head.len();
         let len = src[start..].find(')').expect("parameter list closes");
@@ -442,9 +443,11 @@ fn dsa_tiled_entry_point_and_tile_match_the_kernel_file() {
             .collect::<Vec<_>>()
             .join(" ")
     };
+    let tiled = "extern \"C\" __global__ void __launch_bounds__(DSA_TILE_THREADS) \
+                 dsa_index_scores_tiled(";
     assert_eq!(
-        params("dsa_index_scores_tiled"),
-        params("dsa_index_scores"),
+        params(tiled),
+        params("extern \"C\" __global__ void dsa_index_scores("),
         "the launcher passes one argument list to both kernels"
     );
     for (define, v) in [

@@ -50,25 +50,35 @@ const SCORES_BLOCK: u32 = 128;
 const ROW_BLOCK: u32 = 256;
 
 /// 2026-10-01: Query rows per `dsa_index_scores_tiled` block (`DSA_TILE_ROWS` in
-/// `kernels/gb10/common/dsa_indexer.cu`).
-pub const SCORES_TILE_ROWS: usize = 16;
+/// `kernels/gb10/common/dsa_indexer.cu`; 32 since v2, 16 in v1).
+pub const SCORES_TILE_ROWS: usize = 32;
 /// 2026-10-01: Pools per `dsa_index_scores_tiled` block (`DSA_TILE_POOLS`).
 pub const SCORES_TILE_POOLS: usize = 64;
 /// 2026-10-01: Threads per `dsa_index_scores_tiled` block (`DSA_TILE_THREADS`); the kernel's
-/// thread-to-output map assumes exactly this many.
-pub const SCORES_TILED_BLOCK: u32 = 256;
+/// thread-to-output map (4 rows x 4 pools per thread) assumes exactly this many.
+pub const SCORES_TILED_BLOCK: u32 = 128;
 /// 2026-10-01: Widest `index_head_dim` the tiled scores kernel is selected for: at 128 its
-/// shared memory ([`scores_tiled_smem`]) is 41,216 B, under the 48 KiB default.
+/// shared memory ([`scores_tiled_smem`]) is 49,152 B, exactly the 48 KiB default (the
+/// launcher does not raise the dynamic shared-memory limit).
 pub const SCORES_TILED_MAX_D: usize = 128;
 /// 2026-10-01: Most index heads the tiled scores kernel is selected for, the envelope
 /// `examples/dsa_indexer_tiled_bitparity_microtest.rs` is written for (the kernel itself has
 /// no per-head storage).
 pub const SCORES_TILED_MAX_H: usize = 64;
 
+/// 2026-10-01: Fewest pools (`n_pools`) at which an exact launch takes the tiled kernel.
+/// PROVISIONAL (estimate, not measured): at Q = 256 a 32 x 64 tile grid has
+/// `8 * ceil(P / 64)` blocks, so below a few hundred pools most of GB10's 48 SMs idle and one
+/// block's fixed per-head work (about 75 us estimated) is not repaid, while `dsa_index_scores`
+/// costs about 0.08 ms per 64 pools there (measured 2026-10-01, n1). Tune from the P sweep in
+/// `examples/dsa_indexer_tiled_bitparity_microtest.rs`.
+pub const SCORES_TILED_MIN_POOLS: usize = 256;
+
 /// 2026-10-01: Dynamic shared memory one `dsa_index_scores_tiled` block takes for head dim
-/// `d`, in bytes: the tile's pool keys at row stride `d + 1` plus one head's q rows.
+/// `d`, in bytes: the tile's pool keys plus one head's q rows, both `[rows][d]` (swizzled,
+/// unpadded).
 pub fn scores_tiled_smem(d: usize) -> usize {
-    (SCORES_TILE_POOLS * (d + 1) + SCORES_TILE_ROWS * d) * 4
+    (SCORES_TILE_POOLS + SCORES_TILE_ROWS) * d * 4
 }
 
 /// 2026-10-01: `dsa_index_scores_tiled` grid for `q_rows` rows and `n_pools` pools: pool
@@ -86,16 +96,19 @@ pub fn scores_tiled_grid(q_rows: usize, n_pools: usize) -> [u32; 3] {
 /// with host geometry (the tiled kernel has no `geom_dev` path), and for `index_head_dim` a
 /// nonzero multiple of 32 up to [`SCORES_TILED_MAX_D`] with 1 to [`SCORES_TILED_MAX_H`]
 /// heads. Otherwise `dsa_index_scores` runs.
+/// 2026-10-01 (v2): and only at `n_pools >= SCORES_TILED_MIN_POOLS` (PROVISIONAL).
 pub(crate) fn scores_tiled_for(
     requested: bool,
     resolved: bool,
     exact_host_geom: bool,
     d: usize,
     heads: usize,
+    n_pools: usize,
 ) -> bool {
     let shape = d > 0 && d.is_multiple_of(32) && d <= SCORES_TILED_MAX_D;
     let heads_ok = (1..=SCORES_TILED_MAX_H).contains(&heads);
-    requested && resolved && exact_host_geom && shape && heads_ok
+    let wide = n_pools >= SCORES_TILED_MIN_POOLS;
+    requested && resolved && exact_host_geom && shape && heads_ok && wide
 }
 
 /// 2026-09-25: Tile width `dsa_topk_pools` walks the pool axis in.

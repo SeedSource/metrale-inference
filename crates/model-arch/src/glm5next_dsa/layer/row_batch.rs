@@ -149,6 +149,21 @@ impl Glm5NextDsaLayer {
             && rb.gemv_batchm_f32.0 != 0;
         let same_stream = stream == gpu.default_stream();
         let ok = batch_select && self.persist_bt && kernels && same_stream;
+        // 2026-10-01: Once per process, so a serve log proves whether the lever engaged on a
+        // prefill (it silently keeps the row loop otherwise).
+        if batch_select {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::warn!(
+                    "GLM DSA prefill row batch (METRALE_GLM_DSA_ROW_BATCH): {} \
+                     (persist_bt {}, kernels {}, default stream {})",
+                    if ok { "ENGAGED" } else { "NOT engaged, row loop kept" },
+                    self.persist_bt,
+                    kernels,
+                    same_stream
+                );
+            });
+        }
         ok.then_some(rb)
     }
 

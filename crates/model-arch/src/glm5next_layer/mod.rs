@@ -61,7 +61,7 @@ pub use state::alloc_kda_ssm_state;
 mod levers;
 mod steps;
 mod types;
-pub(crate) use levers::{PREFILL_ROWS, cublas_wide_proj, dsa_batch_qidx};
+pub(crate) use levers::{PREFILL_ROWS, cublas_wide_proj, dsa_batch_qidx, dsa_row_batch};
 pub use levers::{
     PREFILL_ROWS_FFN_MAX, prefill_rows, prefill_rows_ffn, prefill_staged, staged_merge_signature,
 };

@@ -43,12 +43,33 @@ fn the_layer_takes_the_vanilla_rmsnorm_not_the_plus_one_variant() {
         ("layer/rows.rs", include_str!("rows.rs")),
         ("layer/workspace.rs", include_str!("workspace.rs")),
         ("layer/proj_gemm.rs", include_str!("proj_gemm.rs")),
+        ("layer/row_batch.rs", include_str!("row_batch.rs")),
     ] {
         assert!(
             !text.contains(r#""rms_norm", "rms_norm""#),
             "the +1-offset RMSNorm must not appear in a GLM path ({file})"
         );
     }
+}
+
+/// 2026-10-01: `METRALE_GLM_DSA_ROW_BATCH` is reachable only where the batched selector runs,
+/// and its indexer projections stay on the batched GEMVs: `gemm` (whose arm above
+/// `DENSE_GEMV_BATCHM_MAX_M` is cuBLASLt) appears once in `row_batch.rs`, for `o_absorb`, which
+/// the row loop runs through the same call.
+#[test]
+fn the_row_batch_is_prefill_only_and_off_the_cublas_arm() {
+    let entry = "let select_rows =
+            batch_select_enabled(w.q_idx_rows.0 != 0, is_prefill, ctx.graph_capture, k);
+        if let Some(rb) = self.row_batch_ready(gpu, select_rows, stream) {";
+    assert!(
+        include_str!("decode_k.rs").contains(entry),
+        "the row batch must sit behind batch_select_enabled"
+    );
+    let rb = include_str!("row_batch.rs");
+    let gate = "let ok = batch_select && self.persist_bt && kernels && same_stream;";
+    assert!(rb.contains(gate), "row_batch_ready lost a condition");
+    assert_eq!(rb.matches("gemm(").count(), 1, "only o_absorb uses gemm");
+    assert!(rb.contains("self.weights.o_absorb"));
 }
 
 /// 2026-09-25: The indexer's `k_norm` is a LayerNorm with a bias: the layer launches the

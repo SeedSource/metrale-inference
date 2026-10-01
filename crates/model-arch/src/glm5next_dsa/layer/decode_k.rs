@@ -134,6 +134,30 @@ impl Glm5NextDsaLayer {
             self.cfg.hidden,
             stream,
         )?;
+        // 2026-10-01: `METRALE_GLM_DSA_ROW_BATCH=1`: everything below for all rows at once
+        // (`row_batch.rs`), only where the batched selector runs; otherwise the row loop.
+        let select_rows =
+            batch_select_enabled(w.q_idx_rows.0 != 0, is_prefill, ctx.graph_capture, k);
+        if let Some(rb) = self.row_batch_ready(gpu, select_rows, stream) {
+            let meta = if ctx.decode_step {
+                ctx.attn_metadata.as_ref()
+            } else {
+                rowwise_meta
+            };
+            return self.decode_rows_batched(
+                rb,
+                gpu,
+                hidden,
+                k,
+                st,
+                kv_cache,
+                seq_len,
+                block_table,
+                meta,
+                t_proj,
+                stream,
+            );
+        }
         let mut attend_bt = DevicePtr::NULL;
         let mut attend_sl = DevicePtr::NULL;
         // 2026-09-25: On the host path without `persist_bt`, row 0 allocates the shared bt/sl
@@ -321,7 +345,7 @@ impl Glm5NextDsaLayer {
         // write is in the cache. Row `r` only takes pools that end at or before `q_pos[r]`,
         // so the rows written after it do not change its selection.
         if batch_select && !batch_q_pos.is_empty() {
-            self.select_rows_batched(gpu, k, st, &batch_q_pos, stream)?;
+            self.select_rows_batched(gpu, k, st, &batch_q_pos, None, stream)?;
         }
 
         if let Some(paging) = attend_paging {

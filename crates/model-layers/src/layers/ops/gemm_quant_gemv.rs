@@ -129,6 +129,33 @@ pub fn dense_gemv_batchm(
         .launch(stream)
 }
 
+/// 2026-10-01: [`dense_gemv_batchm`] with FP32 output: `C[t] = A[t] @ B^T` for
+/// `t` in `[0, M)`, the FP32 accumulator stored unrounded. Each row is
+/// bit-identical to `dense_gemv_bf16_fp32out` on that row (the kernel is the
+/// BF16 batchm body with only the store changed).
+///
+/// `output`: M FP32 rows at `output + t * out_stride` (FP32 elements). Refuses
+/// `m` outside `1..=DENSE_GEMV_BATCHM_MAX_M`, like [`dense_gemv_batchm`].
+///
+/// Kernel: `dense_gemv_bf16_fp32out_batchm(A, B, C, M, N, K, out_stride)`
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batchm_fp32out(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    // 2026-10-01: The launch contract is `dense_gemv_bf16_batchm`'s; only the
+    // element type behind `output` (and so the unit of `out_stride`) differs.
+    dense_gemv_batchm(gpu, kernel, input, weight, output, m, n, k, out_stride, stream)
+}
+
 /// 2026-09-27: [`dense_gemv_batchm`] over `m` rows split into `y_blocks` block
 /// rows of `ceil(m / y_blocks)` rows each (at most `DENSE_GEMV_BATCHM_MAX_M`):
 /// more blocks for a narrow weight such as the MoE router, and one launch past

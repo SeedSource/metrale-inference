@@ -166,7 +166,7 @@ impl TransformerModel {
                 session_ok: eff_snapshot
                     .is_some_and(|s| self.ssm_snapshots.session_matches(s, seq.session_hash)),
                 needs_aux: self.requires_aux_state(),
-                has_aux: eff_snapshot.is_some_and(|s| self.ssm_snapshots.aux(s).is_some()),
+                has_aux: eff_snapshot.is_some_and(|s| self.ssm_snapshots.has_aux(s)),
             };
             let proposal = snap_agree::local_proposal(&gates);
             // 2026-09-25: Every rank of a multi-rank SSM world takes part, even with nothing

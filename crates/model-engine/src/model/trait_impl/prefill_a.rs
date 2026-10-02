@@ -141,7 +141,7 @@ impl TransformerModel {
                     .session_matches(snap_id, seq.session_hash)
                 // 2026-09-25: A model whose layers carry aux state declines a
                 // snapshot that has no aux blobs.
-                && (!self.requires_aux_state() || self.ssm_snapshots.aux(snap_id).is_some())
+                && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
             {
                 self.ssm_snapshots.restore(
                     snap_id,

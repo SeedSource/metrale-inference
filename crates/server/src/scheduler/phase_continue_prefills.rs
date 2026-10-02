@@ -263,7 +263,14 @@ pub(super) fn continue_in_progress_prefills(
         // longer than one chunk that has not started chunking. It runs the
         // whole prompt in one call with no decode fused, so under
         // `always_mixed` it runs only when no decode is active.
-        let use_twophase = (!always_mixed || active.is_empty())
+        // 2026-10-01: Never on a multi-rank world. Two-phase sends the workers no
+        // prefill command, and its prefix lookup (`prefill_c/marconi.rs`) skips the
+        // F83 match agreement and the A100 restore vote. EP heads reach here only
+        // with `chunk_offset > 0` today (`phase_start_prefills` never defers under
+        // EP), so this changes nothing now; it keeps a new deferral path from
+        // desyncing the ranks.
+        let use_twophase = !model.is_ep()
+            && (!always_mixed || active.is_empty())
             && p.chunk_offset == 0
             && p.prompt_tokens.len() > max_prefill_tokens;
         if use_twophase {

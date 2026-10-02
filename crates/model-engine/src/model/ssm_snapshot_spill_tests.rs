@@ -251,3 +251,20 @@ fn tier_survives_slot_recycling() {
     );
     assert_eq!(read_slot(&p, &gpu, 2), want_b, "key B recovered");
 }
+
+/// 2026-10-01: `has_aux` answers what `aux(..).is_some()` answered, without copying the
+/// blobs, through set, free and re-acquire, so the restore gates that switched to it decide
+/// the same way.
+#[test]
+fn has_aux_tracks_the_aux_table_through_set_free_and_reuse() {
+    let gpu = MockGpuBackend::new();
+    let p = pool(&gpu, 2, 2);
+    let s = p.try_pop_free_slot().expect("a fresh pool has a free slot");
+    assert!(!p.has_aux(s) && p.aux(s).is_none());
+    p.set_aux(s, vec![(3, vec![7u8; 64])]);
+    assert!(p.has_aux(s) && p.aux(s).is_some());
+    p.free(s);
+    assert!(!p.has_aux(s) && p.aux(s).is_none());
+    let again = p.try_pop_free_slot().expect("the freed slot is free again");
+    assert!(!p.has_aux(again), "a re-acquired slot carries no aux from its last holder");
+}

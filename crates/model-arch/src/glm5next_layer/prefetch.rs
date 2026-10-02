@@ -180,7 +180,7 @@ mod prefetch_tests {
         let s = [sp(0x1000, 1000), sp(0x2000, 50_000), sp(0x3000, 4096)];
         let c = clip_spans(&s, 20_000);
         assert_eq!(c, vec![sp(0x1000, 992), sp(0x2000, 19_008)]);
-        assert!(c.iter().zip(&s).all(|(a, b)| a.bytes <= b.bytes && a.bytes % 16 == 0));
+        assert!(c.iter().zip(&s).all(|(a, b)| a.bytes <= b.bytes && a.bytes.is_multiple_of(16)));
         assert!(c.iter().map(|x| x.bytes).sum::<usize>() <= 20_000);
     }
 

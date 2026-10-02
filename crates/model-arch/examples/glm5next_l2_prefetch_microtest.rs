@@ -369,9 +369,10 @@ fn main() -> Result<()> {
             identity_ok = false;
             println!("FAIL: a weight or input byte changed");
         }
-        // 2026-10-01: Negative control: one flipped mantissa bit of x[0] must change y.
+        // 2026-10-01: Negative control: flip the top mantissa bit of x[0] (byte 1, bit 6 of the
+        // little-endian BF16), a ~1.5x change of that input, which must change y.
         let mut x_flip = x_host.clone();
-        x_flip[0] ^= 0x01;
+        x_flip[1] ^= 0x40;
         g.copy_h2d(&x_flip, b.x)?;
         trial(g, &ks, &ev, &b, n, 0, 0)?;
         if down(g, b.y, n * 2)? == y_ref {

@@ -191,6 +191,10 @@ name = "glm5next_ffn_staged_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_multiseq_decode_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_hc_slice_microtest"
 required-features = ["cuda", "gpu-examples"]
 

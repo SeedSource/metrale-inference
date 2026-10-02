@@ -56,4 +56,11 @@ pub trait ModelEp {
     fn ep_broadcast_tokens(&self, _tokens: &[u32]) -> Result<Vec<u32>> {
         Ok(Vec::new())
     }
+
+    /// 2026-10-02: Batched-verify commit agreement (`verify_ep.rs`): one gather of every rank's
+    /// failure mask (bit i = sequence i's commit failed), returning their OR. Call it only after
+    /// the verdict words went out, on every path, as the workers do. Default: `local`.
+    fn ep_agree_verify_failures(&self, local: u32) -> Result<u32> {
+        Ok(local)
+    }
 }

@@ -247,6 +247,9 @@ pub(super) fn step_verify_k4_batched(
             for a in batch.iter_mut() {
                 a.finished = true;
             }
+            // 2026-10-02: the workers wait for this gather after real verdict words, on
+            // every path (`verify_ep.rs`); every sequence is failed here.
+            retire_failed_on_workers(model, batch, u32::MAX);
             return;
         }
     }
@@ -268,6 +271,10 @@ pub(super) fn step_verify_k4_batched(
             verify_us,
         );
     }
+
+    // 2026-10-02: multi-rank: the workers' commit failures (`verify_ep.rs`, one gather after
+    // their per-sequence commits); those sequences finish before any propose.
+    retire_failed_on_workers(model, batch, 0);
 
     // 2026-09-25: propose fresh drafts for the sequences still alive with no
     // drafts, in groups of up to `model.mtp_propose_batch_max()`. Groups of
@@ -410,4 +417,30 @@ pub(super) fn step_verify_k4_batched(
         .tel
         .mark(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
     // 2026-09-25: `_step_timer` records the step on drop.
+}
+
+/// 2026-10-02: Multi-rank batched verify: join the workers' commit-failure gather
+/// (`Model::ep_agree_verify_failures`, a no-op without EP) with `local_mask`, and finish every
+/// sequence whose bit (batch order) any rank set. Must run on every path that follows the
+/// verdict broadcast, since the workers block on the gather.
+fn retire_failed_on_workers(model: &dyn Model, batch: &mut [&mut ActiveSeq], local_mask: u32) {
+    if !model.is_ep() {
+        return;
+    }
+    match model.ep_agree_verify_failures(local_mask) {
+        Ok(mask) => {
+            for (i, a) in batch.iter_mut().enumerate().take(32) {
+                if (mask >> i) & 1 == 1 {
+                    tracing::error!("batched verify: worker commit failed, retiring seq {i}");
+                    a.finished = true;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("EP batched-verify failure gather: {e:#}");
+            for a in batch.iter_mut() {
+                a.finished = true;
+            }
+        }
+    }
 }

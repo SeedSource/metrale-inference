@@ -38,4 +38,8 @@ impl ModelEp for TransformerModel {
     fn ep_broadcast_tokens(&self, tokens: &[u32]) -> Result<Vec<u32>> {
         self.ep_broadcast_tokens_dispatch(tokens)
     }
+
+    fn ep_agree_verify_failures(&self, local: u32) -> Result<u32> {
+        self.ep_agree_verify_failures_impl(local)
+    }
 }

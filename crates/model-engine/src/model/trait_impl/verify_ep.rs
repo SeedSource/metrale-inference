@@ -12,8 +12,12 @@
 //! n                    (u32)
 //! slots[n] ++ ks[n]    (one bulk broadcast, `encode_verify_batch_meta`)
 //! tokens[Σ ks]         (one bulk broadcast, sequence-major)
+//! ok vote              (`ep_gather_u32`, every rank: 1 = preflight passed; any 0 refuses the
+//!                       batch: rank 0 sends n x EP_VERIFY_BATCH_ABORT, no forward runs)
 //!   ... both ranks run `decode_verify_batched_dispatch` (identical collectives) ...
 //! accepted[n]          (one bulk broadcast from the scheduler, or n x EP_VERIFY_BATCH_ABORT)
+//! failure mask         (`ep_gather_u32`, every rank, only after real verdict words: bit i = the
+//!                       commit of sequence i failed; rank 0 retires the OR of the masks)
 //! ```
 //!
 //! After the verdict the worker stashes each sequence's accepted hidden row and applies the
@@ -28,6 +32,10 @@
 //!   `decode_verify_batched` on `Err`). The abort is clean only for a failure both ranks hit at
 //!   the same collective (the shape-determined refusals `verify_n_seqs` raises before any launch
 //!   do); a rank-0-only failure mid-forward desyncs the ranks, as on the per-sequence path.
+//! - The worker always consumes the whole payload, votes, and reads the verdict words, so a
+//!   worker-side preflight failure refuses the batch on both ranks before any forward collective.
+//!   After real verdict words both ranks make the failure-mask gather (even when the worker's
+//!   forward failed or the plan was refused: it then reports every sequence failed).
 //! - The worker orders its sequences as `slots[]`, so batch row `i` is the same sequence on
 //!   both ranks.
 
@@ -157,7 +165,44 @@ pub(in crate::model) fn verify_batch_commit_plan(
         .collect()
 }
 
+/// 2026-10-02: Preflight vote merge: the batch runs only when every rank voted 1.
+pub(in crate::model) fn merge_ok_votes(votes: &[u32]) -> bool {
+    !votes.is_empty() && votes.iter().all(|&v| v == 1)
+}
+
+/// 2026-10-02: Failure-mask merge: bit `i` set when any rank failed sequence `i`.
+pub(in crate::model) fn merge_failure_masks(votes: &[u32]) -> u32 {
+    votes.iter().fold(0, |acc, &v| acc | v)
+}
+
+/// 2026-10-02: Mask with the first `n` sequences' bits set (all of them failed).
+pub(in crate::model) fn all_seqs_mask(n: usize) -> u32 {
+    if n >= 32 { u32::MAX } else { (1u32 << n) - 1 }
+}
+
+/// 2026-10-02: The batch positions a merged failure mask retires, in order, within `0..n`.
+pub(in crate::model) fn retire_set(mask: u32, n: usize) -> Vec<usize> {
+    (0..n.min(32)).filter(|&i| (mask >> i) & 1 == 1).collect()
+}
+
+const _: () = assert!(VERIFY_WY_TABLE_SEQS <= 32, "the failure mask is one u32");
+
 impl TransformerModel {
+    /// 2026-10-02: Every rank's preflight vote for one batch; true when all passed. One
+    /// `ep_gather_u32`, so both ranks must call it at the same point.
+    pub(super) fn ep_verify_batch_agree_ok(&self, ok: bool) -> Result<bool> {
+        Ok(merge_ok_votes(&self.ep_gather_u32(u32::from(ok))?))
+    }
+
+    /// 2026-10-02: The OR of every rank's failure mask (bit i = sequence i's commit failed).
+    /// One `ep_gather_u32`; without the multi-rank protocol it returns `local`.
+    pub(super) fn ep_agree_verify_failures_impl(&self, local: u32) -> Result<u32> {
+        if !self.multi_rank_protocol_active() {
+            return Ok(local);
+        }
+        Ok(merge_failure_masks(&self.ep_gather_u32(local)?))
+    }
+
     /// 2026-10-02: Whether any layer drives its own verify state
     /// (`decode_verify_multi_own_states`).
     pub(super) fn any_verify_own_states(&self) -> bool {
@@ -213,6 +258,12 @@ impl TransformerModel {
         self.ep_broadcast_u32(ks.len() as u32)?;
         self.ep_broadcast_tokens(&meta)?;
         self.ep_broadcast_tokens(tokens)?;
+        // 2026-10-02: Rank 0's preflight (validation above, rollback support in the caller)
+        // passed. A worker that could not run the batch votes 0: both ranks skip the forward.
+        if !self.ep_verify_batch_agree_ok(true)? {
+            self.ep_send_verify_batch_abort(ks.len());
+            bail!("multi-rank batched verify refused by a worker (slots={slots:?})");
+        }
         tracing::debug!("EP batched verify sent: slots={slots:?} ks={ks:?}");
         Ok(true)
     }
@@ -240,10 +291,94 @@ impl TransformerModel {
             "ep_worker_verify_batch: n={n} outside 2..={VERIFY_WY_TABLE_SEQS}"
         );
         let meta = self.ep_broadcast_tokens(&vec![0u32; 2 * n])?;
-        let (slot_ids, ks) = decode_verify_batch_meta(&meta, slots.len())?;
+        // 2026-10-02: Rank 0 validated with no slot bound; the slot checks are preflight.
+        let (slot_ids, ks) = decode_verify_batch_meta(&meta, usize::MAX)?;
         let r_total: usize = ks.iter().sum();
         let tokens = self.ep_broadcast_tokens(&vec![0u32; r_total])?;
 
+        // 2026-10-02: Preflight without an early return: the vote below is the next collective
+        // rank 0 makes, so every outcome reaches it.
+        let pre = self.verify_batch_preflight(slots, &slot_ids);
+        let all_ok = self.ep_verify_batch_agree_ok(pre.is_ok())?;
+        let mut refs = match pre {
+            Ok(r) if all_ok => r,
+            other => {
+                // 2026-10-02: Refused: rank 0 sends the abort words, and the forward is skipped.
+                let _ = self.ep_broadcast_tokens(&vec![0u32; n])?;
+                return match other {
+                    Err(e) => Err(e),
+                    Ok(_) => bail!("ep_worker_verify_batch: refused by another rank"),
+                };
+            }
+        };
+        let opts = VerifyBatchedOpts {
+            write_on_accept: true,
+        };
+        let fwd = self.decode_verify_batched_dispatch(&tokens, &ks, &mut refs, 0, opts);
+        let fwd = self.release_verify_capture_on_err(fwd);
+        // 2026-10-02: Read the verdict whatever the forward returned: rank 0 sends it either way,
+        // and leaving it unread would make it the next command.
+        let words = self.ep_broadcast_tokens(&vec![0u32; n])?;
+        if words.iter().all(|&w| w == EP_VERIFY_BATCH_ABORT) {
+            // 2026-10-02: Rank 0 made no failure-mask gather after abort words.
+            fwd?;
+            bail!("ep_worker_verify_batch: rank 0 abandoned the batch (slots={slot_ids:?})");
+        }
+        // 2026-10-02: Real verdict words: rank 0 makes the failure-mask gather whatever happens
+        // here. Attempt every sequence's commit (never an early exit), record failures, then
+        // gather; a failed forward or refused plan reports every sequence failed.
+        let mut fail_mask = 0u32;
+        let mut err: Option<anyhow::Error> = None;
+        match fwd.and_then(|_| verify_batch_commit_plan(&ks, &words)) {
+            Ok(plan) => {
+                for (i, (seq, v)) in refs.iter_mut().zip(&plan).enumerate() {
+                    if let Err(e) = self.verify_batch_commit_seq(seq, v) {
+                        tracing::error!("ep_worker_verify_batch: sequence {i} commit: {e:#}");
+                        fail_mask |= 1 << i;
+                    }
+                }
+                // 2026-10-02: The accepted hidden rows into stash slots `0..n` before any
+                // propose overwrites them; the head's `step_verify_k4_batched` stashes the same
+                // rows. After the bookkeeping, so a stash error cannot leave this rank's
+                // lengths behind rank 0's; it fails every sequence.
+                let mut row = 0usize;
+                let mut stash_rows = Vec::with_capacity(n);
+                for (k, v) in ks.iter().zip(&plan) {
+                    stash_rows.push(row + v.accepted);
+                    row += k;
+                }
+                if let Err(e) = self.stash_verify_hidden_rows_dispatch(&stash_rows, 0) {
+                    fail_mask = all_seqs_mask(n);
+                    err = Some(e);
+                }
+            }
+            Err(e) => {
+                fail_mask = all_seqs_mask(n);
+                err = Some(e);
+            }
+        }
+        // 2026-10-02: Rank 0 retires the sequences in the merged mask; this rank only logs them.
+        let merged = self.ep_agree_verify_failures_impl(fail_mask)?;
+        if merged != 0 {
+            tracing::error!(
+                "ep_worker_verify_batch: sequences {:?} failed to commit (slots={slot_ids:?})",
+                retire_set(merged, n)
+            );
+        }
+        match err {
+            Some(e) => Err(e),
+            None => Ok(true),
+        }
+    }
+
+    /// 2026-10-02: Preflight of one batch on a worker: the addressed slots exist and are
+    /// disjoint, the rollback is supported, and the previous step's rollback copies are ordered
+    /// (as the K=4 worker arm does). Returns the refs ordered as rank 0's `slots[]`.
+    fn verify_batch_preflight<'a>(
+        &self,
+        slots: &'a mut [Option<SequenceState>],
+        slot_ids: &[usize],
+    ) -> Result<Vec<&'a mut SequenceState>> {
         // 2026-10-02: Disjoint `&mut` refs ordered as the head's `slots[]`, by the
         // `swap_remove` walk `ep_worker_decode_batch` uses.
         let mut slot_refs: Vec<(usize, &mut SequenceState)> = slots
@@ -251,8 +386,8 @@ impl TransformerModel {
             .enumerate()
             .filter_map(|(i, opt)| opt.as_mut().map(|s| (i, s)))
             .collect();
-        let mut refs: Vec<&mut SequenceState> = Vec::with_capacity(n);
-        for &idx in &slot_ids {
+        let mut refs: Vec<&mut SequenceState> = Vec::with_capacity(slot_ids.len());
+        for &idx in slot_ids {
             let pos = slot_refs
                 .iter()
                 .position(|(i, _)| *i == idx)
@@ -261,49 +396,25 @@ impl TransformerModel {
                 })?;
             refs.push(slot_refs.swap_remove(pos).1);
         }
-
-        // 2026-10-02: As the K=4 worker arm: order the previous step's rollback copies first.
+        self.ssm_pool.require_verify_rollback_supported()?;
         self.sync_secondary()?;
-        let opts = VerifyBatchedOpts {
-            write_on_accept: true,
-        };
-        let fwd = self
-            .ssm_pool
-            .require_verify_rollback_supported()
-            .and_then(|()| self.decode_verify_batched_dispatch(&tokens, &ks, &mut refs, 0, opts));
-        let fwd = self.release_verify_capture_on_err(fwd);
-        // 2026-10-02: Read the verdict whatever the forward returned: rank 0 sends it either way,
-        // and leaving it unread would make it the next command.
-        let words = self.ep_broadcast_tokens(&vec![0u32; n])?;
-        fwd?;
-        if words.iter().all(|&w| w == EP_VERIFY_BATCH_ABORT) {
-            bail!("ep_worker_verify_batch: rank 0 abandoned the batch (slots={slot_ids:?})");
-        }
-        let plan = verify_batch_commit_plan(&ks, &words)?;
+        Ok(refs)
+    }
 
-        for (seq, v) in refs.iter_mut().zip(&plan) {
-            self.trim_proposer_state(seq, v.accepted, 0)?;
-            if v.rewind == 0 {
-                self.start_checkpoint_async(seq)?;
-            } else {
-                seq.seq_len -= v.rewind;
-                for _ in 0..v.rewind {
-                    seq.tokens.pop();
-                }
-                self.start_rollback_and_checkpoint_async(seq, v.accepted + 1)?;
+    /// 2026-10-02: One sequence's worker-side commit: proposer trim, then the checkpoint (no
+    /// rewind) or the rewind plus rollback-and-checkpoint, as the per-sequence K=4 arm does.
+    fn verify_batch_commit_seq(&self, seq: &mut SequenceState, v: &SeqVerdict) -> Result<()> {
+        self.trim_proposer_state(seq, v.accepted, 0)?;
+        if v.rewind == 0 {
+            self.start_checkpoint_async(seq)?;
+        } else {
+            seq.seq_len -= v.rewind;
+            for _ in 0..v.rewind {
+                seq.tokens.pop();
             }
+            self.start_rollback_and_checkpoint_async(seq, v.accepted + 1)?;
         }
-        // 2026-10-02: The accepted hidden rows into stash slots `0..n` before any propose
-        // overwrites them; the head's `step_verify_k4_batched` stashes the same rows. After the
-        // bookkeeping, so a stash error cannot leave this rank's lengths behind rank 0's.
-        let mut row = 0usize;
-        let mut stash_rows = Vec::with_capacity(n);
-        for (k, v) in ks.iter().zip(&plan) {
-            stash_rows.push(row + v.accepted);
-            row += k;
-        }
-        self.stash_verify_hidden_rows_dispatch(&stash_rows, 0)?;
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -352,5 +463,31 @@ mod tests {
         assert!(verify_batch_commit_plan(&[4, 4], &[4, 0]).is_err());
         assert!(verify_batch_commit_plan(&[4, 4], &[1]).is_err());
         assert!(verify_batch_commit_plan(&[4, 4], &[EP_VERIFY_BATCH_ABORT; 2]).is_err());
+    }
+
+    #[test]
+    fn ok_votes_pass_only_when_every_rank_voted_one() {
+        assert!(merge_ok_votes(&[1, 1]));
+        assert!(!merge_ok_votes(&[1, 0]));
+        assert!(!merge_ok_votes(&[0, 1]));
+        assert!(!merge_ok_votes(&[]));
+    }
+
+    #[test]
+    fn failure_masks_or_and_retire_the_named_sequences() {
+        let merged = merge_failure_masks(&[0b001, 0b100]);
+        assert_eq!(merged, 0b101);
+        assert_eq!(retire_set(merged, 3), [0, 2]);
+        assert_eq!(retire_set(0, 4), Vec::<usize>::new());
+        // 2026-10-02: bits past `n` are not sequences.
+        assert_eq!(retire_set(0b1100, 2), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn all_seqs_mask_covers_exactly_n_sequences() {
+        assert_eq!(all_seqs_mask(2), 0b11);
+        assert_eq!(retire_set(all_seqs_mask(5), 5), [0, 1, 2, 3, 4]);
+        assert_eq!(all_seqs_mask(32), u32::MAX);
+        assert_eq!(retire_set(all_seqs_mask(32), 32).len(), 32);
     }
 }

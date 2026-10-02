@@ -9,25 +9,6 @@
 
 use super::*;
 
-/// 2026-09-25: `METRALE_GLM_KDA_CHUNK_PREFILL=1` sends a prefill sub-chunk's KDA mixer through
-/// the chunked scan (`Glm5NextKdaLayer::prefill`) instead of `decode_k`'s per-token recurrence.
-/// Off unless set to `1`; read once. The chunked scan computes the recurrence chunk by chunk, in
-/// a different order, so its output is not bit-identical to the per-token walk.
-fn kda_chunk_prefill() -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| {
-        let on = std::env::var("METRALE_GLM_KDA_CHUNK_PREFILL").as_deref() == Ok("1");
-        if on {
-            tracing::warn!(
-                "METRALE_GLM_KDA_CHUNK_PREFILL=1 - GLM prefill KDA uses the CHUNKED scan \
-                 (kda_chunk_prepare + kda_chunk_scan). Not bit-identical to the per-token \
-                 recurrent walk."
-            );
-        }
-        on
-    })
-}
-
 impl Glm5NextLayer {
     /// 2026-09-25: One token through the whole layer, using highway slot `slot`.
     #[allow(clippy::too_many_arguments)]
@@ -233,6 +214,8 @@ impl Glm5NextLayer {
             take_snapshots,
             slot_base,
             is_prefill,
+            // 2026-10-01: The DSA core over all `k` rows, as before the full-width lever.
+            k,
         )?;
         // 2026-09-29: One slice as wide as the call: the MLP's dense GEMMs run over all `k` rows
         // at once, as before the split.
@@ -261,6 +244,11 @@ impl Glm5NextLayer {
         // the DSA batched selector (`batch_select_enabled`) and, with
         // `METRALE_GLM_KDA_CHUNK_PREFILL=1`, the KDA chunked scan, both prefill-only.
         is_prefill: bool,
+        // 2026-10-01: Rows per DSA selection and gather-attend. `k` (every caller but the
+        // full-width staged pass) runs `decode_k` over all rows as before; fewer, on a prefill,
+        // runs `decode_k_wide`: the projections over all `k` rows, the selection and attend per
+        // `core_rows` rows (`METRALE_GLM_PREFILL_FULLWIDTH_GEMM`). KDA ignores it.
+        core_rows: usize,
     ) -> Result<()> {
         let gpu = ctx.gpu;
         let h = self.hidden;
@@ -363,17 +351,32 @@ impl Glm5NextLayer {
             (Glm5NextMixer::Dsa(layer), _) => {
                 // 2026-09-25: DSA's `decode_k` writes its output projection over its input
                 // buffer.
-                layer.decode_k(
-                    normed,
-                    k,
-                    state,
-                    kv_cache,
-                    seq_len,
-                    block_table,
-                    ctx,
-                    stream,
-                    is_prefill,
-                )?;
+                // 2026-10-01: So does `decode_k_wide`, over all `k` rows.
+                if is_prefill && core_rows < k {
+                    layer.decode_k_wide(
+                        normed,
+                        k,
+                        core_rows,
+                        state,
+                        kv_cache,
+                        seq_len,
+                        block_table,
+                        ctx,
+                        stream,
+                    )?;
+                } else {
+                    layer.decode_k(
+                        normed,
+                        k,
+                        state,
+                        kv_cache,
+                        seq_len,
+                        block_table,
+                        ctx,
+                        stream,
+                        is_prefill,
+                    )?;
+                }
                 normed
             }
             (Glm5NextMixer::Kda { .. }, None) => {

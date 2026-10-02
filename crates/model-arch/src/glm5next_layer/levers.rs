@@ -249,6 +249,82 @@ pub fn prefill_tail_merge() -> bool {
     })
 }
 
+/// 2026-09-25: `METRALE_GLM_KDA_CHUNK_PREFILL=1` sends a prefill sub-chunk's KDA mixer through
+/// the chunked scan (`Glm5NextKdaLayer::prefill`) instead of `decode_k`'s per-token recurrence.
+/// Off unless set to `1`; read once. The chunked scan computes the recurrence chunk by chunk, in
+/// a different order, so its output is not bit-identical to the per-token walk.
+///
+/// 2026-10-01: Moved here from `steps/forward.rs`; the loader also reads it, to size the KDA
+/// workspace's chunked-scan buffers under `METRALE_GLM_PREFILL_FULLWIDTH_GEMM`.
+pub(crate) fn kda_chunk_prefill() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_KDA_CHUNK_PREFILL").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_KDA_CHUNK_PREFILL=1 - GLM prefill KDA uses the CHUNKED scan \
+                 (kda_chunk_prepare + kda_chunk_scan). Not bit-identical to the per-token \
+                 recurrent walk."
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-01: Whether a `METRALE_GLM_PREFILL_FULLWIDTH_GEMM` value turns the lever on: `1`
+/// (surrounding blanks ignored) only.
+pub(crate) fn parse_fullwidth_switch(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// 2026-10-01: `METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1` (with `METRALE_GLM_PREFILL_STAGED=1`):
+/// the staged prefill runs its dense projections as one GEMM per window of
+/// `prefill_rows_ffn()` rows instead of one per `prefill_rows()` sub-chunk
+/// (`Glm5NextLayer::prefill_staged_run`):
+/// - the attention pass covers a whole window per call, so the mHC, the norm, every KDA
+///   projection and the DSA q/kv/o and indexer (`wq_b`, `wk`, `compress_gate`,
+///   `weights_proj`) projections see M = the window; the DSA selection and gather-attend
+///   still run per `prefill_rows()` sub-chunk (`Glm5NextDsaLayer::decode_k_wide`);
+/// - the FFN pass hands the MLP `dense_slice = window`, so the router, shared-expert and
+///   dense-MLP GEMMs run once per window.
+///
+/// NOT byte-identical: cuBLASLt picks its algorithm per M and the indexer projections leave
+/// the per-row GEMV for a tensor-core GEMM, so the sums are taken in another order. Quality is
+/// gated at model level. Off unless set to `1`; read once; inert when staging is off. The
+/// loader sizes the KDA workspace and the shared DSA wide arena from the window only when
+/// this is on.
+pub fn prefill_fullwidth_gemm() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_PREFILL_FULLWIDTH_GEMM").ok();
+        let asked = parse_fullwidth_switch(raw.as_deref());
+        let on = asked && std::env::var("METRALE_GLM_PREFILL_STAGED").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1 - staged GLM prefill projections run as \
+                 one GEMM per {}-row window (DSA selection and attend still per {} rows); NOT \
+                 byte-identical to the sliced path",
+                prefill_rows_ffn(),
+                prefill_rows()
+            );
+        } else if asked {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1 ignored: it needs \
+                 METRALE_GLM_PREFILL_STAGED=1"
+            );
+        }
+        warn_unparsed_dsa_switch("METRALE_GLM_PREFILL_FULLWIDTH_GEMM", raw.as_deref());
+        on
+    })
+}
+
+/// 2026-10-01: The window the full-width GEMMs cover, `prefill_rows_ffn()`, when
+/// [`prefill_fullwidth_gemm`] is on; `None` otherwise. The loader sizes the KDA workspace and
+/// the DSA wide arena from it.
+pub fn fullwidth_rows() -> Option<usize> {
+    prefill_fullwidth_gemm().then(prefill_rows_ffn)
+}
+
 /// 2026-09-29: The env-read inputs that decide which sub-chunks the staged FFN pass merges
 /// (`grouped_prefill_selected`): the grouped-GEMM minimum rows and its switch, forced host
 /// dispatch and route tracing, packed into one value for the rank-agreement check. A skew

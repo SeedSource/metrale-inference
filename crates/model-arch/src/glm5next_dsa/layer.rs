@@ -50,9 +50,11 @@ mod decode_k;
 mod proj_gemm;
 mod row_batch;
 mod rows;
+mod wide;
 mod workspace;
 
 use proj_gemm::gemm;
+pub use wide::DsaWideArena;
 pub use workspace::Glm5NextDsaWorkspace;
 pub(crate) use workspace::batch_select_enabled;
 

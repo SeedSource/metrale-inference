@@ -5,6 +5,8 @@
 //! Owner: model-arch (GLM-5.3-Flash KDA).
 //! Invariants:
 //! - A call covers `1..=ws.max_tokens()` tokens; any other count is refused before a launch.
+//!   2026-10-01: also any count above `ws.chunk_tokens()`, which equals `max_tokens()` unless
+//!   the workspace came from `Glm5NextKdaWorkspace::new_split`.
 
 use super::*;
 
@@ -43,6 +45,15 @@ impl Glm5NextKdaLayer {
             bail!(
                 "prefill of {t} tokens does not fit a workspace built for {}",
                 ws.max_tokens
+            );
+        }
+        // 2026-10-01: The chunked-scan buffers may be narrower than the rest (`new_split`).
+        if t > ws.chunk_tokens {
+            bail!(
+                "chunked KDA prefill of {t} tokens does not fit the {}-token chunk buffers \
+                 (METRALE_GLM_PREFILL_FULLWIDTH_GEMM sizes them only for \
+                 METRALE_GLM_KDA_CHUNK_PREFILL=1)",
+                ws.chunk_tokens
             );
         }
         let nchunks = t.div_ceil(c.chunk);

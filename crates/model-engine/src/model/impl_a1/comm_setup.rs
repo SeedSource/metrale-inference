@@ -46,6 +46,12 @@ pub(super) fn assert_rank_levers_agree(
                 "METRALE_GLM_PREFILL_TAIL_MERGE",
                 u64::from(metrale_model_arch::glm5next_layer::prefill_tail_merge()),
             ),
+            // 2026-10-01: The full-width staged prefill runs the attention pass per FFN window,
+            // so it issues one attention all-reduce per window instead of one per sub-chunk.
+            (
+                "METRALE_GLM_PREFILL_FULLWIDTH_GEMM",
+                u64::from(metrale_model_arch::glm5next_layer::prefill_fullwidth_gemm()),
+            ),
             (
                 "GLM staged-prefill merge levers (MOE_PREFILL_GEMM[_MIN_ROWS], HOST_DISPATCH, \
                  ROUTE_TRACE)",

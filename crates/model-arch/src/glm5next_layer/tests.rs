@@ -104,3 +104,63 @@ fn dsa_tiled_gemv_split_lever_shares_the_switch_parser() {
     assert!(body.contains("std::env::var(\"METRALE_GLM_DSA_GEMV_SPLIT\")"));
     assert!(body.contains("parse_dsa_switch(raw.as_deref())"));
 }
+
+/// 2026-10-01: `METRALE_GLM_PREFILL_FULLWIDTH_GEMM` is on only for `1`, and the staged pass
+/// takes its full-width arm only when the FFN window is wider than the attention sub-chunk.
+#[test]
+fn fullwidth_lever_parses_one_as_on_and_needs_a_wider_window() {
+    use super::levers::parse_fullwidth_switch;
+    use super::steps::staged::full_width_attn;
+    assert!(parse_fullwidth_switch(Some("1")));
+    assert!(parse_fullwidth_switch(Some(" 1 ")));
+    for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("true"), Some("01")] {
+        assert!(!parse_fullwidth_switch(v), "{v:?}");
+    }
+    assert!(full_width_attn(true, 256, 4096));
+    assert!(full_width_attn(true, 256, 512));
+    assert!(!full_width_attn(true, 256, 256), "equal widths: nothing to widen");
+    assert!(!full_width_attn(false, 256, 4096), "lever off: the sliced pass");
+}
+
+/// 2026-10-01: The full-width lever needs the staged prefill: its reader requires
+/// `METRALE_GLM_PREFILL_STAGED=1` before it reports on.
+#[test]
+fn fullwidth_lever_is_inert_without_staging() {
+    let src = include_str!("levers.rs");
+    let start = src
+        .find("pub fn prefill_fullwidth_gemm()")
+        .expect("prefill_fullwidth_gemm defined");
+    let body = &src[start..];
+    let body = &body[..body.find("\n}\n").expect("fn closes")];
+    assert!(body.contains("std::env::var(\"METRALE_GLM_PREFILL_FULLWIDTH_GEMM\")"));
+    assert!(
+        body.contains("std::env::var(\"METRALE_GLM_PREFILL_STAGED\").as_deref() == Ok(\"1\")")
+    );
+}
+
+/// 2026-10-01: `Glm5NextKdaWorkspace::bytes_split` at equal widths is the unsplit size, and
+/// narrower chunk buffers save exactly 24 bytes per padded token per `qkv` channel (GLM-5.3
+/// TP2 geometry: 32 heads x 128, hidden 4096, chunk 32).
+#[test]
+fn kda_split_workspace_saves_only_the_chunk_buffers() {
+    use crate::glm5next_kda::{Glm5NextKdaConfig, Glm5NextKdaWorkspace};
+    let cfg = Glm5NextKdaConfig {
+        hidden: 4096,
+        heads: 32,
+        head_dim: 128,
+        conv_kernel: 4,
+        gate_lower_bound: -5.0,
+        rms_norm_eps: 1e-5,
+        l2_eps: 1e-6,
+        chunk: 32,
+    };
+    let qkv = cfg.qkv_dim();
+    let full = Glm5NextKdaWorkspace::bytes_split(&cfg, 4096, 4096);
+    let split = Glm5NextKdaWorkspace::bytes_split(&cfg, 4096, 256);
+    assert_eq!(full - split, 24 * (4096 - 256) * qkv);
+    assert_eq!(
+        Glm5NextKdaWorkspace::bytes_split(&cfg, 256, 4096),
+        Glm5NextKdaWorkspace::bytes_split(&cfg, 256, 256),
+        "chunk_tokens is clamped to max_tokens"
+    );
+}

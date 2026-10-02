@@ -90,6 +90,10 @@ pub struct Glm5NextDsaWorkspace {
     /// 2026-10-01: `METRALE_GLM_DSA_ROW_BATCH` staging (`row_batch.rs`); `None` unless the
     /// lever is on, `bt`/`sl` persist, the batched selector is on and `max_rows > 1`.
     pub(super) row_batch: Option<super::row_batch::DsaRowBatch>,
+    /// 2026-10-01: `METRALE_GLM_PREFILL_FULLWIDTH_GEMM` scratch for `decode_k_wide`
+    /// (`wide.rs`), one arena shared by every DSA layer; `None` unless the loader attached it
+    /// with [`Glm5NextDsaWorkspace::with_wide`].
+    pub(super) wide: Option<std::sync::Arc<super::wide::DsaWideArena>>,
 }
 
 impl Glm5NextDsaWorkspace {
@@ -174,6 +178,15 @@ impl Glm5NextDsaWorkspace {
             } else {
                 None
             },
+            wide: None,
         })
+    }
+
+    /// 2026-10-01: This workspace with the shared full-width arena attached, so `decode_k_wide`
+    /// can run its projections over a whole prefill window (`METRALE_GLM_PREFILL_FULLWIDTH_GEMM`).
+    /// The arena is shared: the layers run one after another on one stream.
+    pub fn with_wide(mut self, arena: std::sync::Arc<super::wide::DsaWideArena>) -> Self {
+        self.wide = Some(arena);
+        self
     }
 }

@@ -368,6 +368,7 @@ pub(crate) fn kv_cache(
         layer_dtypes: Vec::new(),
         layer_dims: Vec::new(),
         cache_blocks_per_seq: None,
+        v_aliases_k: false,
     };
     PagedKvCache::new(c, blocks, g)
 }

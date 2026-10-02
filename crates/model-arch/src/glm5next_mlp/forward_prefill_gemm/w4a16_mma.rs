@@ -301,7 +301,7 @@ mod tests {
                 for i in 0..te {
                     s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                     // 2026-10-01: Half the rows on expert 0, the rest spread: a hot expert.
-                    let e = if i % 2 == 0 { 0 } else { (s >> 33) as usize % experts };
+                    let e = if i.is_multiple_of(2) { 0 } else { (s >> 33) as usize % experts };
                     counts[e] += 1;
                 }
                 let exact: usize = counts.iter().map(|c| c.div_ceil(tile.m_tile)).sum();

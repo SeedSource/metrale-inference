@@ -14,7 +14,10 @@
 use std::path::{Path, PathBuf};
 
 use metrale_model_arch::glm5next_dsa::KERNEL_KV_LORA_DIM;
-use metrale_model_arch::glm5next_dsa::attend::{DSA_DECODE_MODULE, DSA_MLA_HEADGROUPS};
+use metrale_model_arch::glm5next_dsa::attend::{
+    DSA_DECODE_MODULE, DSA_MLA_HEADGROUPS, MLA_PREFILL_TC_ENTRY, MLA_PREFILL_TC_HEADS,
+    MLA_PREFILL_TC_MAX_SEL, MLA_PREFILL_TC_MODULE, MLA_PREFILL_TC_SMEM_BYTES,
+};
 
 fn kernels_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -73,6 +76,30 @@ fn the_dsa_decode_headgroup_entry_points_exist_in_the_glm_target() {
              asks for when METRALE_GLM_DSA_MLA_HEADGROUP={g}"
         );
     }
+}
+
+/// 2026-10-01: `METRALE_GLM_MLA_PREFILL_TC` resolves `MLA_PREFILL_TC_ENTRY` from the file whose
+/// stem is `MLA_PREFILL_TC_MODULE`, and the launcher's mirrors of the kernel's heads per block,
+/// selection cap, latent width and dynamic shared memory match its defines. A drift would launch
+/// with too little shared memory or let a selection overrun the compacted index list.
+#[test]
+fn the_dsa_prefill_tc_entry_point_and_mirrors_match_the_glm_kernel() {
+    let cu = kernels_root().join(format!("gb10/glm-5.3-flash/nvfp4/{MLA_PREFILL_TC_MODULE}.cu"));
+    let src = std::fs::read_to_string(&cu).unwrap_or_else(|e| {
+        panic!("the DSA prefill TC kernel is missing at {cu:?} ({e}); the lever would never engage")
+    });
+    assert!(
+        src.contains(&format!("{MLA_PREFILL_TC_ENTRY}(")),
+        "{cu:?} no longer defines `{MLA_PREFILL_TC_ENTRY}`"
+    );
+    let whose = "glm5next_dsa_mla_prefill_tc.cu";
+    assert_eq!(define(&src, "TC_HEADS", whose), MLA_PREFILL_TC_HEADS);
+    assert_eq!(define(&src, "TC_MAX_SEL", whose), MLA_PREFILL_TC_MAX_SEL);
+    assert_eq!(define(&src, "TC_D", whose), KERNEL_KV_LORA_DIM);
+    assert_eq!(
+        define(&src, "TC_SMEM_BYTES", whose),
+        MLA_PREFILL_TC_SMEM_BYTES as usize
+    );
 }
 
 /// 2026-09-25: `KERNEL_KV_LORA_DIM`, which `Glm5NextDsaConfig::validate` checks

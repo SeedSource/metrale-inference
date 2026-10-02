@@ -237,7 +237,7 @@ impl SsmSnapshotPool {
     /// from its previous holder. `save` and `reserve_tail_slot` acquire through here;
     /// `try_pop_free_slot` (`ssm_snapshot_spill.rs`) pops and clears the same way. A
     /// stale `aux_blobs` entry would not be caught later: the restore gate checks
-    /// only `aux(snap_id).is_some()` (`trait_impl/prefill_a.rs`).
+    /// only `has_aux(snap_id)` (`trait_impl/prefill_a.rs`).
     fn claim_free_slot(&self) -> Option<usize> {
         let snap_slot = self.free_slots.lock().pop()?;
         self.clear_slot_bookkeeping(snap_slot);
@@ -266,6 +266,13 @@ impl SsmSnapshotPool {
 
     pub(super) fn aux(&self, snap_slot: usize) -> Option<Vec<(u32, Vec<u8>)>> {
         self.aux_blobs.lock().get(&snap_slot).cloned()
+    }
+
+    /// 2026-10-01: Whether `snap_slot` carries aux blobs, equal to `aux(snap_slot).is_some()`
+    /// without copying them. The restore gates ask only this; [`Self::aux`] copies the blobs
+    /// (5,643 B/token for GLM-5.3, ~170 MB at 30K) and is left to the restore itself.
+    pub(super) fn has_aux(&self, snap_slot: usize) -> bool {
+        self.aux_blobs.lock().contains_key(&snap_slot)
     }
 
     /// 2026-09-25: Whether any tagged slot carries the non-zero `session_hash`. The

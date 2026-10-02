@@ -146,6 +146,36 @@ pub(crate) fn dsa_gemv_split() -> bool {
     })
 }
 
+/// 2026-10-01: `METRALE_GLM_DSA_INDEX_SPLIT=1` (with `METRALE_GLM_DSA_ROW_BATCH=1`, and
+/// `METRALE_GLM_DSA_BATCH_QIDX` off): on two tensor-parallel ranks the replicated DSA indexer's
+/// query side of a prefill sub-chunk (the `wq_b` and `weights_proj` GEMVs, index scores, pool
+/// top-k, expansion) runs for half the rows on each rank, and the ranks swap their halves of
+/// the token output (`glm5next_dsa::select::split`). Byte-identical by construction (each row
+/// gets the inputs and output slot it had in the full pass); adds one grouped send/recv per
+/// DSA sub-chunk, so the ranks must agree on it (startup check). Inert without a two-rank
+/// communicator or below two rows. Off unless set to `1`; read once.
+pub fn dsa_index_split() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DSA_INDEX_SPLIT").ok();
+        let asked = parse_dsa_switch(raw.as_deref());
+        warn_unparsed_dsa_switch("METRALE_GLM_DSA_INDEX_SPLIT", raw.as_deref());
+        let on = asked && dsa_row_batch() && !dsa_batch_qidx();
+        if asked {
+            tracing::warn!(
+                "METRALE_GLM_DSA_INDEX_SPLIT=1 - {} (needs METRALE_GLM_DSA_ROW_BATCH=1 and \
+                 METRALE_GLM_DSA_BATCH_QIDX off; byte-identical by construction)",
+                if on {
+                    "two ranks split the DSA prefill index selection by rows"
+                } else {
+                    "NOT engaged"
+                }
+            );
+        }
+        on
+    })
+}
+
 /// 2026-09-25: `PREFILL_ROWS`, overridable at launch with `METRALE_GLM_PREFILL_ROWS` (values
 /// below 1 or unparsable are ignored). `1` selects the per-token walk: `Glm5NextLayer::prefill`
 /// takes the batched sub-chunk path only when `rows > 1`. A width above

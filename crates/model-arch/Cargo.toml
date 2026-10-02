@@ -181,6 +181,10 @@ name = "glm5next_comm_overlap_2rank"
 required-features = ["cuda", "nccl-examples"]
 
 [[example]]
+name = "glm5next_dsa_index_split_2rank"
+required-features = ["cuda", "nccl-examples"]
+
+[[example]]
 name = "glm5next_ffn_microtest"
 required-features = ["cuda", "gpu-examples"]
 

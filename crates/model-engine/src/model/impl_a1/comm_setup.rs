@@ -51,6 +51,12 @@ pub(super) fn assert_rank_levers_agree(
                  ROUTE_TRACE)",
                 metrale_model_arch::glm5next_layer::staged_merge_signature(),
             ),
+            // 2026-10-01: Each DSA prefill sub-chunk swaps its index-selection halves with
+            // one grouped send/recv; a rank without it would leave the peer waiting.
+            (
+                "METRALE_GLM_DSA_INDEX_SPLIT (with DSA_ROW_BATCH, DSA_BATCH_QIDX)",
+                u64::from(metrale_model_arch::glm5next_layer::dsa_index_split()),
+            ),
             // 2026-09-25: Performance only (the MLP reduces once per site
             // whichever arm runs); checked because the check is free.
             (

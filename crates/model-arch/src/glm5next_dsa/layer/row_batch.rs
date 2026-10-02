@@ -47,6 +47,7 @@ use metrale_model_layers::layers::ops::{
 use metrale_model_layers::weight_map::DenseWeight;
 
 use super::super::attend::DsaDecodePaging;
+use super::super::select::split::RowSplit;
 use super::super::state::Glm5NextDsaState;
 use super::decode_k::bt_entries_needed;
 use super::{Glm5NextDsaLayer, gemm};
@@ -191,6 +192,8 @@ impl Glm5NextDsaLayer {
     /// 2026-10-01: `decode_k` from the latent write to the output projection, for all `k`
     /// rows at once; the caller has run the shared projections and checked `k` and the
     /// lockstep. `meta` is what the row loop would read per row (`None` on a prefill pass).
+    /// 2026-10-01: `comm` is the layer's communicator; with two ranks and
+    /// `METRALE_GLM_DSA_INDEX_SPLIT` the indexer's query side runs for this rank's rows only.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn decode_rows_batched(
         &self,
@@ -204,9 +207,13 @@ impl Glm5NextDsaLayer {
         block_table: &[u32],
         meta: Option<&AttnMetadataDev>,
         t_proj: Option<std::time::Instant>,
+        comm: Option<&dyn metrale_comm::CommBackend>,
         stream: u64,
     ) -> Result<()> {
         use crate::glm5next_layer::profile;
+        let split = comm
+            .filter(|c| c.world_size() == 2 && crate::glm5next_layer::dsa_index_split())
+            .and_then(|c| RowSplit::new(k, c.rank()).map(|s| (s, c)));
         let w = &self.workspace;
         let block_size = kv_cache.config().block_size;
         let bt_block_size = kv_cache.block_size().max(1);
@@ -306,11 +313,12 @@ impl Glm5NextDsaLayer {
         profile::end(profile::DSA_PROJ, t_proj, gpu, stream);
 
         let t = profile::start();
-        self.indexer_rows_batched(gpu, rb, hidden, k, st, stream)?;
+        let own = split.map(|(s, _)| s);
+        self.indexer_rows_batched(gpu, rb, hidden, k, own, st, stream)?;
         profile::end(profile::DSA_INDEXER, t, gpu, stream);
 
         let q_pos_host: Vec<i32> = (0..k).map(|r| (seq_len + r) as i32).collect();
-        self.select_rows_batched(gpu, k, st, &q_pos_host, Some(rb), stream)?;
+        self.select_rows_batched(gpu, k, st, &q_pos_host, Some(rb), split, stream)?;
 
         let (bt_dev, sl_dev, max_blocks_per_seq) = match meta {
             Some(m) => (m.block_table, m.seq_len, m.max_blocks_per_seq as usize),
@@ -347,12 +355,16 @@ impl Glm5NextDsaLayer {
     /// 2026-10-01: `k` calls of `indexer_forward` (host-offset placement, no `pos_dev`) in
     /// one pass: rows `[len, len + k)` of `k_normed` and `gate`, their validity marks, the
     /// selector head weights straight into `head_weights_rows`, then `advance(k)`.
+    /// 2026-10-01: Under `split` only this rank's rows of the head weights (the selector
+    /// reads no others); the key side is written for all rows on both ranks.
+    #[allow(clippy::too_many_arguments)]
     fn indexer_rows_batched(
         &self,
         gpu: &dyn GpuBackend,
         rb: &DsaRowBatch,
         hidden: DevicePtr,
         k: usize,
+        split: Option<RowSplit>,
         st: &mut Glm5NextDsaState,
         stream: u64,
     ) -> Result<()> {
@@ -385,10 +397,12 @@ impl Glm5NextDsaLayer {
         let w_gate = self.weights.compress_gate;
         batchm_rows(gpu, bm, 2, hidden, w_gate, gate, k, d, h, stream)?;
         let heads = self.cfg.index_heads;
-        let hw = self.workspace.head_weights_rows;
+        let (r0, rows) = split.map_or((0, k), |s| (s.r0, s.rows));
+        let hw = self.workspace.head_weights_rows.offset(r0 * heads * 4);
+        let x = hidden.offset(r0 * h * 2);
         let f32k = rb.gemv_batchm_f32;
         let w_wp = self.weights.weights_proj;
-        batchm_rows(gpu, f32k, 4, hidden, w_wp, hw, k, heads, h, stream)?;
+        batchm_rows(gpu, f32k, 4, x, w_wp, hw, rows, heads, h, stream)?;
         gpu.memset_async(st.valid.offset(pos0), 1, k, stream)?;
         st.advance(k)
     }
@@ -396,17 +410,20 @@ impl Glm5NextDsaLayer {
     /// 2026-10-01: The selector's `wq_b` for `k` rows, `q_resid` row `r` into `q_idx_rows`
     /// row `r`, through the FP32-out batched GEMV: `select_rows_batched` under the row batch,
     /// unless `METRALE_GLM_DSA_BATCH_QIDX` picked cuBLASLt.
+    /// 2026-10-01: Rows `[r0, r0 + rows)` only (all `k` rows unless the index split is on).
     pub(super) fn qidx_rows_batched(
         &self,
         gpu: &dyn GpuBackend,
         rb: &DsaRowBatch,
-        k: usize,
+        r0: usize,
+        rows: usize,
         stream: u64,
     ) -> Result<()> {
         let w = &self.workspace;
         let n = self.cfg.index_heads * self.cfg.index_head_dim;
         let f32k = rb.gemv_batchm_f32;
-        let (a, out, kk) = (w.q_resid, w.q_idx_rows, self.cfg.q_lora_rank);
-        batchm_rows(gpu, f32k, 4, a, self.weights.wq_b, out, k, n, kk, stream)
+        let kk = self.cfg.q_lora_rank;
+        let (a, out) = (w.q_resid.offset(r0 * kk * 2), w.q_idx_rows.offset(r0 * n * 4));
+        batchm_rows(gpu, f32k, 4, a, self.weights.wq_b, out, rows, n, kk, stream)
     }
 }

@@ -74,7 +74,7 @@ pub const KERNEL_MAX_KPOOL: usize = 8;
 ///
 /// All but `write_geom` and `indexer_store` are resolved with `kernel()`, so a missing
 /// entry point fails `resolve`; those two use `try_kernel` and may be `KernelHandle(0)`.
-/// 2026-10-01: So does `index_scores_tiled`.
+/// 2026-10-01: So do `index_scores_tiled` and `index_scores_tc`.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
@@ -85,6 +85,11 @@ pub struct Glm5NextDsaKernels {
     /// launches it under `METRALE_GLM_DSA_SCORES_TILED=1` (`select::scores_tiled_for`);
     /// `KernelHandle(0)` when the target lacks it, and `index_scores` runs.
     pub index_scores_tiled: KernelHandle,
+    /// 2026-10-01: `dsa_index_scores_tc`: `index_scores` on tensor cores (BF16 MMA, FP32
+    /// accumulate; NOT byte-identical, precision chosen by its `mode` argument). `select_tokens`
+    /// launches it under `METRALE_GLM_DSA_SCORES_TC` (`select::scores_tc_for`);
+    /// `KernelHandle(0)` when the target lacks it, and the FP32 scorer runs.
+    pub index_scores_tc: KernelHandle,
     pub topk_pools: KernelHandle,
     pub expand_selection: KernelHandle,
     /// 2026-09-25: `indexer.k_norm`, a LayerNorm with a bias: `nllb_layernorm_bf16`, in place,
@@ -123,6 +128,11 @@ impl Glm5NextDsaKernels {
                 gpu,
                 DSA_MODULE,
                 "dsa_index_scores_tiled",
+            ),
+            index_scores_tc: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_index_scores_tc",
             ),
             topk_pools: gpu.kernel(DSA_MODULE, "dsa_topk_pools")?,
             expand_selection: gpu.kernel(DSA_MODULE, "dsa_expand_selection")?,

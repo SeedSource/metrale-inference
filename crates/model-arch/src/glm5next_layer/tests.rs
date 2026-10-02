@@ -104,3 +104,25 @@ fn dsa_tiled_gemv_split_lever_shares_the_switch_parser() {
     assert!(body.contains("std::env::var(\"METRALE_GLM_DSA_GEMV_SPLIT\")"));
     assert!(body.contains("parse_dsa_switch(raw.as_deref())"));
 }
+
+/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TC` maps `split3`/`1` to 3, `split2` to 2, `bf16` to 1
+/// (blanks and case ignored) and everything else, unset included, to 0 (off).
+#[test]
+fn dsa_scores_tc_lever_parses_modes_and_defaults_off() {
+    use super::levers::parse_dsa_scores_tc;
+    for (v, want) in [
+        (Some("1"), 3),
+        (Some("split3"), 3),
+        (Some(" SPLIT3 "), 3),
+        (Some("split2"), 2),
+        (Some("bf16"), 1),
+        (Some("BF16"), 1),
+    ] {
+        assert_eq!(parse_dsa_scores_tc(v), want, "{v:?}");
+    }
+    let off = [None, Some(""), Some("0"), Some("off")];
+    let unknown = [Some("2"), Some("3"), Some("fp8"), Some("on")];
+    for v in off.into_iter().chain(unknown) {
+        assert_eq!(parse_dsa_scores_tc(v), 0, "{v:?}");
+    }
+}

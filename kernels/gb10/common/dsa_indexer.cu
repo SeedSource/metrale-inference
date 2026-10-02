@@ -590,6 +590,201 @@ extern "C" __global__ void __launch_bounds__(DSA_TILE_THREADS) dsa_index_scores_
     }
 }
 
+// 2026-10-01: 2c. dsa_index_scores_tc: the per-(row, pool) scores of dsa_index_scores on
+// tensor cores (mma.sync m16n8k16, BF16 operands, FP32 accumulate), for long prompts where
+// the O(rows x pools) indexer dominates prefill. Opt-in (METRALE_GLM_DSA_SCORES_TC, default
+// off); resolved with try_kernel; gated on a GPU by
+// crates/model-arch/examples/dsa_indexer_tc_microtest.rs (accuracy against dsa_index_scores,
+// selection recall, planted-needle recall, timing at 32K / 64K).
+//
+// NOT byte-identical to dsa_index_scores: the dots are formed from BF16 pieces and summed in
+// the tensor core's order. The precision is chosen by `mode` (the q split is the in-repo
+// qsa_score_rows_tc pattern, kernels/gb10/qwen3.8-flash-next/nvfp4/qsa_indexer.cu):
+//   mode 1 ("bf16"):   q.k ~ bf16(q).bf16(k)                                  1 MMA
+//   mode 2 ("split2"): q ~ q_hi + q_lo;  q.k ~ q_hi.k_hi + q_lo.k_hi            2 MMAs
+//   mode 3 ("split3"): k ~ k_hi + k_lo too; q.k ~ q_hi.k_hi + q_lo.k_hi + q_hi.k_lo  3 MMAs
+// with x_hi = bf16(x), x_lo = bf16(x - x_hi). split3 drops only q_lo.k_lo and the BF16
+// rounding of the lo parts (both about 2^-16 relative to the dot), so it is FP32-class;
+// bf16 and split2 are about 2^-9 relative. Everything after the dot is dsa_index_scores'
+// arithmetic per output: term = weights[r * H + h] * fmaxf(scale * dot, 0), summed over
+// ascending h from 0.0f; candidacy, valid_cand and the -FLT_MAX store are its code.
+//
+// Layout: DSA_TC_THREADS threads (4 warps); a block covers DSA_TC_ROWS (16) rows x
+// DSA_TC_POOLS (64) pools, warp w the pools [16 w, 16 w + 16) as two 8-pool n-tiles. The
+// MMA is M = rows, N = pools, K = head dims; lane (g, t) = (lane >> 2, lane & 3) owns
+// C elements (row g | g + 8, pool 2 t | 2 t + 1) of each n-tile, so a (row, pool) score
+// accumulates across heads in one thread's registers. The warp's pool keys are read once
+// from global (float2, FP32) into B fragments that stay in registers for every head (32
+// registers hi, 32 lo at D = 128); q is read per head straight into A fragments (the four
+// warps of a block read the same q rows, so they hit L1). No shared memory, no barriers;
+// a warp whose pools all lie past P returns at once.
+// Registers (estimate, not a ptxas report): 64 B-fragment + 8 accumulator + 8 score + 16
+// transient A = about 110.
+//
+// Not supported: the device-geometry (ceiling) path, D not a multiple of 16, D > 128, mode
+// outside 1..3. The host never selects this kernel there; a launch that does traps.
+
+#define DSA_TC_ROWS 16u
+#define DSA_TC_POOLS 64u
+#define DSA_TC_THREADS 128u
+#define DSA_TC_MAX_KSTEP 8u
+
+// 2026-10-01: Two BF16 values as one 32-bit MMA operand register, `lo` in the low half (the
+// lower K index), as the PTX fragment layout requires.
+__device__ __forceinline__ unsigned int dsa_tc_pack(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    return (unsigned int)__bfloat16_as_ushort(lo) | ((unsigned int)__bfloat16_as_ushort(hi) << 16);
+}
+
+// 2026-10-01: x_hi = bf16(x), x_lo = bf16(x - x_hi) for a K-adjacent pair (x, y).
+__device__ __forceinline__ void dsa_tc_split(float x, float y, unsigned int& hi, unsigned int& lo) {
+    const __nv_bfloat16 hx = __float2bfloat16_rn(x);
+    const __nv_bfloat16 hy = __float2bfloat16_rn(y);
+    const __nv_bfloat16 lx = __float2bfloat16_rn(x - __bfloat162float(hx));
+    const __nv_bfloat16 ly = __float2bfloat16_rn(y - __bfloat162float(hy));
+    hi = dsa_tc_pack(hx, hy);
+    lo = dsa_tc_pack(lx, ly);
+}
+
+// 2026-10-01: c += A(16x16, row) . B(16x8, col), BF16 in, FP32 accumulate.
+__device__ __forceinline__ void dsa_tc_mma(float (&c)[4], unsigned int a0, unsigned int a1,
+                                           unsigned int a2, unsigned int a3, unsigned int b0,
+                                           unsigned int b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// 2026-10-01: (x, y) = src[k], src[k + 1] when `ok`, else zeros. `src + k` is 8-byte aligned:
+// k is even, D is a multiple of 16, and the buffers are allocation-aligned.
+__device__ __forceinline__ float2 dsa_tc_ld2(const float* __restrict__ src, unsigned int k, bool ok) {
+    if (!ok) return make_float2(0.0f, 0.0f);
+    return *reinterpret_cast<const float2*>(src + k);
+}
+
+extern "C" __global__ void __launch_bounds__(DSA_TC_THREADS) dsa_index_scores_tc(
+    const float* __restrict__ q,
+    const float* __restrict__ pool_keys,
+    const float* __restrict__ weights,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ pool_valid,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    float* __restrict__ out,
+    unsigned char* __restrict__ valid_cand,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int H,
+    unsigned int D,
+    unsigned int KP,
+    unsigned int S,
+    float scale,
+    const int* __restrict__ geom,
+    unsigned int mode
+) {
+    if (geom || D == 0u || (D & 15u) != 0u || D > 16u * DSA_TC_MAX_KSTEP || mode < 1u || mode > 3u)
+        __trap();
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int g = lane >> 2;
+    const unsigned int t = lane & 3u;
+    const unsigned int pw = blockIdx.x * DSA_TC_POOLS + warp * 16u;
+    // 2026-10-01: Warp-uniform, and nothing below synchronises the block.
+    if (pw >= P) return;
+    const unsigned int r0 = blockIdx.y * DSA_TC_ROWS;
+    const unsigned int ra = r0 + g;
+    const unsigned int rb = r0 + g + 8u;
+    const bool va = ra < Q;
+    const bool vb = rb < Q;
+    const unsigned int nks = D >> 4;
+
+    // 2026-10-01: B fragments of the warp's two n-tiles for every K step: register b of
+    // n-tile j at step s holds K indices 16 s + 8 b + 2 t, + 1 of pool pw + 8 j + g.
+    unsigned int bh[2][DSA_TC_MAX_KSTEP][2];
+    unsigned int bl[2][DSA_TC_MAX_KSTEP][2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const unsigned int p = pw + 8u * (unsigned int)j + g;
+        const bool vp = p < P;
+        const float* __restrict__ pk = pool_keys + (size_t)(vp ? p : 0u) * D;
+#pragma unroll
+        for (int s = 0; s < (int)DSA_TC_MAX_KSTEP; ++s) {
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+                const unsigned int k = 16u * (unsigned int)s + 8u * (unsigned int)b + 2u * t;
+                const float2 v = dsa_tc_ld2(pk, k, vp && (unsigned int)s < nks);
+                dsa_tc_split(v.x, v.y, bh[j][s][b], bl[j][s][b]);
+            }
+        }
+    }
+
+    float sum[2][4];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        sum[j][0] = 0.0f; sum[j][1] = 0.0f; sum[j][2] = 0.0f; sum[j][3] = 0.0f;
+    }
+
+    for (unsigned int h = 0; h < H; ++h) {
+        float acc[2][4];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            acc[j][0] = 0.0f; acc[j][1] = 0.0f; acc[j][2] = 0.0f; acc[j][3] = 0.0f;
+        }
+        const float* __restrict__ qa = q + ((size_t)(va ? ra : 0u) * H + h) * D;
+        const float* __restrict__ qb = q + ((size_t)(vb ? rb : 0u) * H + h) * D;
+#pragma unroll
+        for (int s = 0; s < (int)DSA_TC_MAX_KSTEP; ++s) {
+            if ((unsigned int)s >= nks) break;
+            // 2026-10-01: A fragment: a0 (row g, K 16 s + 2 t), a1 (row g + 8, same K),
+            // a2 (row g, K + 8), a3 (row g + 8, K + 8).
+            const unsigned int k0 = 16u * (unsigned int)s + 2u * t;
+            const unsigned int k1 = k0 + 8u;
+            const float2 x0 = dsa_tc_ld2(qa, k0, va);
+            const float2 x1 = dsa_tc_ld2(qb, k0, vb);
+            const float2 x2 = dsa_tc_ld2(qa, k1, va);
+            const float2 x3 = dsa_tc_ld2(qb, k1, vb);
+            unsigned int ah0, ah1, ah2, ah3, al0, al1, al2, al3;
+            dsa_tc_split(x0.x, x0.y, ah0, al0);
+            dsa_tc_split(x1.x, x1.y, ah1, al1);
+            dsa_tc_split(x2.x, x2.y, ah2, al2);
+            dsa_tc_split(x3.x, x3.y, ah3, al3);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                dsa_tc_mma(acc[j], ah0, ah1, ah2, ah3, bh[j][s][0], bh[j][s][1]);
+                if (mode >= 2u) dsa_tc_mma(acc[j], al0, al1, al2, al3, bh[j][s][0], bh[j][s][1]);
+                if (mode == 3u) dsa_tc_mma(acc[j], ah0, ah1, ah2, ah3, bl[j][s][0], bl[j][s][1]);
+            }
+        }
+        const float wa = va ? weights[(size_t)ra * H + h] : 0.0f;
+        const float wb = vb ? weights[(size_t)rb * H + h] : 0.0f;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            sum[j][0] += wa * fmaxf(scale * acc[j][0], 0.0f);
+            sum[j][1] += wa * fmaxf(scale * acc[j][1], 0.0f);
+            sum[j][2] += wb * fmaxf(scale * acc[j][2], 0.0f);
+            sum[j][3] += wb * fmaxf(scale * acc[j][3], 0.0f);
+        }
+    }
+
+    // 2026-10-01: Candidacy and stores, dsa_index_scores' code per owned (row, pool).
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const unsigned int r = (e < 2) ? ra : rb;
+            const unsigned int p = pw + 8u * (unsigned int)j + 2u * t + (unsigned int)(e & 1);
+            if (r >= Q || p >= P) continue;
+            const int end = pool_indices[(size_t)p * KP + KP - 1];
+            const int end_c = end < 0 ? 0 : (end >= (int)S ? (int)S - 1 : end);
+            const bool vis = (end_c <= q_pos[r]) && (valid_keys[end_c] != 0);
+            const bool cand = (pool_valid[p] != 0) && vis;
+            valid_cand[(size_t)r * P + p] = cand ? 1 : 0;
+            out[(size_t)r * P + p] = cand ? sum[j][e] : -FLT_MAX;
+        }
+    }
+}
+
 // 2026-09-25: 3. Deterministic top-k over pools, one block per query. A tiled bitonic
 // select: the pool axis is walked in tiles of NP2 and a running best-NP2 list is kept in
 // shared memory (two tiles of [f32, i32], 16 * NP2 bytes, whatever the context). The order

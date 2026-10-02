@@ -145,7 +145,9 @@ impl Glm5NextLayer {
             hct,
             stream,
         )?;
-        if self.is_last {
+        // 2026-10-01: DFlash tap layer: the same collapse over rows `0..k` (see `forward_one`).
+        // Row-local, so staged FFN windows and multi-seq rows collapse exactly their own rows.
+        if self.is_last || self.dflash_tap {
             hc_head_mean(
                 gpu,
                 mhc.kernels.hc_head,

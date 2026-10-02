@@ -7,7 +7,9 @@
 //! it returns.
 //!
 //! Owner: model-engine.
-//! Invariants: none beyond the types.
+//! Invariants:
+//! - 2026-10-01: A cached graph is launched only after every layer's `check_replay_room`
+//!   passed, and a successful launch is followed by every layer's `sync_replayed_step`.
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
@@ -167,7 +169,17 @@ impl TransformerModel {
             == Some("1");
         // 2026-09-25: The `lora_eager` lever runs LoRA verifies without graphs.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let use_graphs = self.comm.is_none()
+        // 2026-10-01: Under a communicator the K=γ verify is captured only with
+        // `METRALE_GLM_DFLASH=1` and unless `METRALE_GLM_VERIFY_GRAPHS=0`, the switch the
+        // GLM K=3/K=4 verify graphs use. Every rank runs this verify (`EP_CMD_VERIFY_KGAMMA`),
+        // so both capture and replay the same per-(slot, K) graph and its collectives pair up.
+        // Read once per process, so a captured graph cannot outlive a changed value.
+        static EP_GRAPHS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ep_graphs = *EP_GRAPHS.get_or_init(|| {
+            metrale_model_layers::speculative::glm_dflash::glm_dflash_enabled()
+                && std::env::var("METRALE_GLM_VERIFY_GRAPHS").ok().as_deref() != Some("0")
+        });
+        let use_graphs = (self.comm.is_none() || ep_graphs)
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -215,7 +227,17 @@ impl TransformerModel {
         if let Some(graph) = cached_for_slot
             && graph.0 != 0
         {
+            // 2026-10-01: As in the K=3/K=4 verify: refuse a replay whose GLM-5.3 DSA indexer
+            // rows would run past the buffer before it launches, and after it reconcile the
+            // host-side indexer length to `seq_len + k` (a replay runs only kernels, and the
+            // previous verify kept only its accepted prefix).
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;
+            }
             self.gpu.launch_graph(graph, stream)?;
+            for (i, layer) in self.layers.iter().enumerate() {
+                layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;
+            }
         }
         let need_run = cached_for_slot.is_none();
         if need_run {

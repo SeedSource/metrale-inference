@@ -12,6 +12,8 @@
 //! - 2026-10-01: `decode_multi_seq` gives sequence row `i` slot `ctx.hc_row_offset + i` and
 //!   metadata row `i` (`steps/multi_seq.rs`).
 //! - The last text layer collapses the highway with `hc_head_mean`, which takes no weights.
+//! - 2026-10-01: A DFlash tap layer (`dflash_tap`) also collapses its highway into `hidden`
+//!   after its FFN-site `hc_post`; the highway itself is unchanged, so the next layer is too.
 //! - Any all-reduce of a mixer or MLP output happens before `hc_post` folds that output into
 //!   the highway.
 //!

@@ -160,7 +160,11 @@ impl Glm5NextLayer {
             stream,
         )?;
 
-        if self.is_last {
+        // 2026-10-01: A DFlash tap layer (`dflash_tap`) collapses its completed highway into
+        // `hidden` the same way, so the engine's capture after this layer reads the drafter's
+        // tap (the unweighted mean of the `hc_mult` streams) instead of the FFN-site `hc_pre`
+        // scratch. Nothing reads `hidden` between here and the next layer's `hc_pre`.
+        if self.is_last || self.dflash_tap {
             hc_head_mean(
                 gpu,
                 mhc.kernels.hc_head,

@@ -79,12 +79,22 @@ pub fn prefill_comm_overlap() -> bool {
 /// so the ranks must agree on it (startup check). Supersedes
 /// `METRALE_GLM_PREFILL_COMM_OVERLAP` while engaged. Inert under graph capture, without a
 /// two-rank send/recv all-reduce, or when the chunk outgrows the norm buffer. Off unless set
-/// to `1`; read once.
+/// to `1`; read once. Off under `METRALE_GLM_DFLASH=1` (startup warning): rank 0's DFlash
+/// capture reads every row of a tap layer's `hidden`, and `sp_back` collapses only the
+/// rank's own rows.
 pub fn prefill_seq_parallel() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {
         let on = std::env::var("METRALE_GLM_PREFILL_SEQ_PARALLEL").as_deref() == Ok("1")
             && std::env::var("METRALE_GLM_PREFILL_STAGED").as_deref() == Ok("1");
+        if on && metrale_model_layers::speculative::glm_dflash::glm_dflash_enabled() {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_SEQ_PARALLEL=1 IGNORED: METRALE_GLM_DFLASH=1 is set and \
+                 the DFlash tap capture needs every row of a tap layer on rank 0 (mutually \
+                 exclusive)"
+            );
+            return false;
+        }
         if on {
             tracing::warn!(
                 "METRALE_GLM_PREFILL_SEQ_PARALLEL=1 - staged GLM prefill splits mHC and norms \

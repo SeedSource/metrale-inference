@@ -125,6 +125,8 @@ pub fn load_glm5next_mtp_module(
             is_last: false,
             // 2026-10-01: No decode L2 prefetch plan: the MTP block runs the plain path.
             prefetch: Default::default(),
+            // 2026-10-01: The MTP block is never a DFlash tap.
+            dflash_tap: false,
         },
         eh_proj: DenseWeight {
             weight: store.get(&format!("{prefix}eh_proj.weight"))?.ptr,

@@ -346,6 +346,8 @@ pub(crate) fn build_stack(
             mixer_all_reduce: false,
             is_first: idx == 0,
             is_last: idx == 2,
+            prefetch: Default::default(),
+            dflash_tap: false,
         });
     }
     Ok(layers)

@@ -196,6 +196,25 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         let mut built: Vec<(Glm5NextLayer, Vec<crate::glm5next_layer::L2Span>)> =
             Vec::with_capacity(skeleton.layers.len());
 
+        // 2026-10-01: DFlash tap layers (`config.dflash_capture_layers`, the drafter's
+        // `target_layer_ids`) collapse their highway into `hidden` for the engine's capture.
+        // Only under `METRALE_GLM_DFLASH=1`; the factory refuses a GLM drafter without it
+        // (`glm_dflash_gate`). An out-of-range tap fails the load.
+        let dflash_taps = if metrale_model_layers::speculative::glm_dflash::glm_dflash_enabled() {
+            metrale_model_layers::speculative::glm_dflash::glm_dflash_tap_flags(
+                &config.dflash_capture_layers,
+                skeleton.layers.len(),
+            )?
+        } else {
+            vec![false; skeleton.layers.len()]
+        };
+        if dflash_taps.iter().any(|&t| t) {
+            tracing::info!(
+                "glm5_next: DFlash tap collapse (hc_head_mean) at layers {:?}",
+                config.dflash_capture_layers
+            );
+        }
+
         // 2026-09-25: The KV pool has `num_attention_layers()` slots, which counts
         // the sparse-attention layers only, so a DSA layer addresses it by its
         // ordinal among DSA layers, not by its model index.
@@ -371,6 +390,7 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                 },
                 is_first: idx == 0,
                 is_last: idx == last,
+                dflash_tap: dflash_taps.get(idx).copied().unwrap_or(false),
                 prefetch: crate::glm5next_layer::Glm5NextPrefetch {
                     kernel: l2pf_kernel,
                     ffn_head,

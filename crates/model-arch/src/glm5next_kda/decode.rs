@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! 2026-09-25: The KDA recurrent path: single-token `decode` and K-row `decode_k`.
+//! 2026-10-01: Plus `decode_n_seqs`, one token for each of N sequences.
 //!
 //! Owner: model-arch (GLM-5.3-Flash KDA).
 //! Invariants:
@@ -280,6 +281,52 @@ impl Glm5NextKdaLayer {
         profile::end(profile::KDA_RECUR, t_recur, gpu, stream);
         let t_back = profile::start();
         let r = self.back_end(gpu, k, ws, stream);
+        profile::end(profile::KDA_BACK, t_back, gpu, stream);
+        r
+    }
+
+    /// 2026-10-01: One token for each of `n` sequences: `front_end` and `back_end` once over all
+    /// `n` rows (the KDA projection weights read once per step instead of once per sequence),
+    /// and `stateful_row(i, &states[i])` for row `i`. The rows' recurrences are independent, so
+    /// the order of the loop cannot matter; the token-axis ordering argument on `stateful_row`
+    /// does not apply across sequences. Row `i` of `ws.final_out` holds sequence `i`'s output.
+    ///
+    /// For `2 <= n <= DENSE_GEMV_BATCHM_MAX_M` on a target with `dense_gemv_bf16_batchm` the
+    /// output and every state match `n` separate [`Self::decode`] calls bit for bit, by the
+    /// argument on [`Self::decode_k`]. Takes no snapshots: plain decode is never rolled back.
+    /// Refuses `n == 0`, `n` above the workspace, or `states.len() != n`. Ported from rsafier's
+    /// Atlas `Glm5NextKdaLayer::decode_n_seqs` (Atlas acf792e28).
+    pub fn decode_n_seqs(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        n: usize,
+        states: &[KdaSeqState],
+        ws: &Glm5NextKdaWorkspace,
+        stream: u64,
+    ) -> Result<()> {
+        if n == 0 || n > ws.max_tokens {
+            bail!(
+                "KDA decode_n_seqs of {n} sequences does not fit a workspace built for {}",
+                ws.max_tokens
+            );
+        }
+        // 2026-10-01: A short slice means the caller and this layer disagree about the batch;
+        // advancing another sequence's state would be a silent, compounding wrong answer.
+        if states.len() != n {
+            bail!("KDA decode_n_seqs: {n} sequences but {} states", states.len());
+        }
+        use crate::glm5next_layer::profile;
+        let t_front = profile::start();
+        self.front_end(gpu, hidden, n, ws, stream)?;
+        profile::end(profile::KDA_FRONT, t_front, gpu, stream);
+        let t_recur = profile::start();
+        for (row, state) in states.iter().enumerate() {
+            self.stateful_row(gpu, row, state, ws, stream)?;
+        }
+        profile::end(profile::KDA_RECUR, t_recur, gpu, stream);
+        let t_back = profile::start();
+        let r = self.back_end(gpu, n, ws, stream);
         profile::end(profile::KDA_BACK, t_back, gpu, stream);
         r
     }

@@ -41,6 +41,32 @@ pub trait LayerCapabilities {
         false
     }
 
+    /// 2026-10-01: True when this layer's batched `decode_multi_seq` runs sparse-attention
+    /// selection per sequence (each row against its own indexer state, page table and length),
+    /// so a batch may stay batched once some sequence passes the index budget. `decode_a2.rs`
+    /// requires it of every layer before ignoring `qsa_active`. Default false: past the budget
+    /// the batch runs per sequence, because a batched path that shared one selection would
+    /// attend with another sequence's chosen blocks. From rsafier's Atlas 04beaac1f.
+    fn decode_multi_seq_selection_per_seq(&self) -> bool {
+        false
+    }
+
+    /// 2026-10-01: True when a batched multi-sequence decode step must run eagerly and unpadded.
+    /// `decode_a2.rs` then captures no graph and runs exactly `n` rows. GLM-5.3 answers true:
+    /// its DSA state is allocated per sequence (a padding row would allocate one every step),
+    /// and the indexer's host-side length advances only when the layer code runs, not on a
+    /// graph replay of the batch.
+    fn decode_multi_seq_eager_only(&self) -> bool {
+        false
+    }
+
+    /// 2026-10-01: True when this layer cannot share the fused decode + prefill forward
+    /// (`decode_b.rs`), where the prefill chunk's highway rows start at `hc_row_offset`. GLM-5.3
+    /// answers true: its prefill numbers highway slots from 0, over the decode rows' slots.
+    fn fused_decode_prefill_unsupported(&self) -> bool {
+        false
+    }
+
     /// 2026-09-25: True when this layer keeps per-sequence state that lowering the
     /// sequence's KV cursor does not rewind, such as a monotonic cache count or an n-gram
     /// history. The model ORs it across layers, and the scheduler's `rollback_to_boundary`

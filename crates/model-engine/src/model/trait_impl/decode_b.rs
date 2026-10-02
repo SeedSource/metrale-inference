@@ -70,7 +70,12 @@ impl TransformerModel {
         // arm. The veto is needed here as well: this is the single-GPU fused
         // caller, and it keeps a declining layer away from `prefill_ctx`, the one
         // context built with a non-zero `hc_row_offset`.
-        let ms_layer_veto = self.layers.iter().any(|l| l.decode_multi_seq_unsupported());
+        // 2026-10-01: `fused_decode_prefill_unsupported` joins it (GLM-5.3's prefill numbers
+        // highway slots from 0, over the decode rows).
+        let ms_layer_veto = self
+            .layers
+            .iter()
+            .any(|l| l.decode_multi_seq_unsupported() || l.fused_decode_prefill_unsupported());
         let hc_qsa_perseq = ms_layer_veto
             || (self.config.hc_mult > 0 && self.config.index_topk > 0 && {
                 let bound = self.config.index_topk + self.config.index_compress_ratio - 1;

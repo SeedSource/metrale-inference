@@ -207,3 +207,27 @@ fn decode_l2_prefetch_levers_parse() {
         assert_eq!(parse_l2_prefetch_mib(v), None, "{v:?}");
     }
 }
+
+/// 2026-10-01: The batched multi-sequence decode keeps both row aliases removed: row `i` takes
+/// highway slot `ctx.hc_row_offset + i` and `row_view(i)` metadata in the per-row arm, and the
+/// DSA arm of `forward_n_seqs` hands each row its own metadata row. The route stays default-off
+/// behind `METRALE_GLM_DECODE_MULTI_SEQ`.
+#[test]
+fn multi_seq_decode_indexes_each_row_and_stays_behind_its_lever() {
+    let ms = include_str!("steps/multi_seq.rs");
+    assert!(ms.contains("ctx.hc_row_offset + i,"), "per-row highway slot");
+    assert_eq!(
+        ms.matches("m.row_view(i)").count(),
+        2,
+        "both per-row arms read their own metadata row"
+    );
+    assert!(ms.contains("layer.decode_n_seqs(gpu, normed, n, &seq_states, ws, stream)"));
+    let m = include_str!("mod.rs");
+    let start = m
+        .find("fn decode_multi_seq_unsupported(&self) -> bool {")
+        .expect("override present");
+    let body = &m[start..start + 120];
+    assert!(body.contains("!levers::decode_multi_seq()"), "{body}");
+    let l = include_str!("levers.rs");
+    assert!(l.contains("std::env::var(\"METRALE_GLM_DECODE_MULTI_SEQ\").as_deref() == Ok(\"1\")"));
+}

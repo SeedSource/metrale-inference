@@ -219,6 +219,10 @@ name = "glm5next_moe_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_multiseq_decode_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "attn_prefill_fa128_microtest"
 required-features = ["cuda", "gpu-examples"]
 

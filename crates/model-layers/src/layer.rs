@@ -142,6 +142,38 @@ pub struct AttnMetadataDev {
     pub moe_row_adapter: DevicePtr,
 }
 
+impl AttnMetadataDev {
+    /// 2026-10-01: This metadata seen from decode row `base`: every per-row array advanced by
+    /// `base` rows at its own element width (positions u32, slot i64, seq_len i32, block table
+    /// `max_blocks_per_seq` i32 entries, seq_slot and moe_row_adapter i32), `num_seqs` reduced to
+    /// the rows left from `base`, and every null pointer left null. A layer that serves the rows
+    /// of a batched decode one at a time hands row `i` `row_view(i)`; with the unadvanced block
+    /// it would attend with row 0's positions, KV slot, length and page table. Ported from
+    /// rsafier's Atlas `AttnMetadataDev::row_view` (Atlas e69446eee).
+    #[must_use]
+    pub fn row_view(&self, base: usize) -> Self {
+        let off = |p: DevicePtr, stride: usize| {
+            if p.0 == 0 {
+                p
+            } else {
+                p.offset(base * stride)
+            }
+        };
+        Self {
+            positions: off(self.positions, 4),
+            positions_h: off(self.positions_h, 4),
+            positions_w: off(self.positions_w, 4),
+            slot: off(self.slot, 8),
+            seq_len: off(self.seq_len, 4),
+            block_table: off(self.block_table, self.max_blocks_per_seq as usize * 4),
+            max_blocks_per_seq: self.max_blocks_per_seq,
+            num_seqs: self.num_seqs.saturating_sub(base as u32),
+            seq_slot: off(self.seq_slot, 4),
+            moe_row_adapter: off(self.moe_row_adapter, 4),
+        }
+    }
+}
+
 /// 2026-09-25: Device metadata for one kernel-batched prefill chunk over several streams,
 /// built by `stage_batched_attn_metadata` (model-engine `prefill_b/stage_batched.rs`) and
 /// passed to `prefill_attn_batched_layer` and `prefill_ssm_batched_layer`. Positions and
@@ -215,6 +247,10 @@ pub struct GdnPrefillBuffers {
 
 /// 2026-09-25: What one forward pass hands every layer: the GPU, buffers, config, the
 /// model's switches and the pass's metadata.
+///
+/// 2026-10-01: `Copy` (every field is a reference, a scalar or a `Copy` value), so a layer that
+/// serves a batched decode row by row can build `ForwardContext { attn_metadata, ..*ctx }`.
+#[derive(Clone, Copy)]
 pub struct ForwardContext<'a> {
     pub buffers: &'a BufferArena,
     /// 2026-09-25: First mHC highway row of this pass. The prefill chunk of a fused
@@ -300,6 +336,9 @@ pub struct ForwardContext<'a> {
 ///
 /// Each SSM layer's prefill takes one ordinal from `ssm_layer_counter`, in model order, and
 /// uses it to index `h_dsts`/`conv_dsts`.
+///
+/// 2026-10-01: `Copy`, because `ForwardContext` carries it and is `Copy`.
+#[derive(Clone, Copy)]
 pub struct MidchunkCapture<'a> {
     /// 2026-09-25: Capture the state after this many tokens of the pass
     /// (`tb - proc_start`).

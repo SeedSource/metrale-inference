@@ -90,6 +90,11 @@ mod tests {
             !Plain.decode_verify_multi_unsupported(),
             "default must be false"
         );
+        // 2026-10-01: The three predicates the batched GLM decode added keep every other
+        // model on its old route.
+        assert!(!Plain.decode_multi_seq_selection_per_seq());
+        assert!(!Plain.decode_multi_seq_eager_only());
+        assert!(!Plain.fused_decode_prefill_unsupported());
     }
 
     #[test]

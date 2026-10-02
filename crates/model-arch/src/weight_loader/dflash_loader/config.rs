@@ -56,6 +56,54 @@ pub struct DflashConfig {
     /// false, the hidden state only. True when absent.
     #[serde(default = "default_true")]
     pub confidence_head_with_markov: bool,
+
+    /// 2026-10-01: The drafter's RMSNorm epsilon, when its `config.json`
+    /// states it. Read only under `METRALE_DFLASH_CKPT_ARCH=1`
+    /// ([`DflashConfig::resolved_rms_norm_eps`]); otherwise the head keeps
+    /// its built-in 1e-6. Both GLM-5.3 DFlash2 drafters (incoai, canada-quant
+    /// G) state 1e-5.
+    #[serde(default)]
+    pub rms_norm_eps: Option<f32>,
+    /// 2026-10-01: Sliding-window size, when the config states one. Logged
+    /// only: the paged drafter attention does not window (see
+    /// `ckpt_arch::log_arch_summary`).
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    /// 2026-10-01: `use_sliding_window`; false when absent.
+    #[serde(default)]
+    pub use_sliding_window: bool,
+    /// 2026-10-01: Per-layer attention kinds (`"full_attention"`,
+    /// `"sliding_attention"`); empty when absent. Logged only.
+    #[serde(default)]
+    pub layer_types: Vec<String>,
+    /// 2026-10-01: The exporter's block (canada-quant `export`), when present.
+    /// `ships_mask_embedding` marks a drafter trained with a learned mask
+    /// embedding that lives outside the safetensors, in `mask_embedding.pt`.
+    #[serde(default)]
+    pub export: Option<DflashExport>,
+    /// 2026-10-01: The learned mask embedding as BF16 little-endian bytes
+    /// (`hidden_size * 2`), loaded from the drafter directory by
+    /// `ckpt_arch::attach_mask_embedding` under `METRALE_DFLASH_CKPT_ARCH=1`.
+    /// Never read from `config.json`. `None` means the mask rows embed the
+    /// target's `embed_tokens[mask_token_id]`, as before.
+    #[serde(skip)]
+    pub mask_embedding_bf16: Option<Vec<u8>>,
+}
+
+/// 2026-10-01: The `export` block a canada-quant DFlash2 checkpoint carries.
+/// Unknown keys are ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DflashExport {
+    /// 2026-10-01: The drafter was trained with a learned mask embedding that
+    /// ships as `mask_embedding.pt` next to the weights.
+    #[serde(default)]
+    pub ships_mask_embedding: bool,
+    /// 2026-10-01: The checkpoint carries its own `embed_tokens.weight`.
+    #[serde(default)]
+    pub ships_embed_tokens: bool,
+    /// 2026-10-01: The checkpoint carries its own `lm_head.weight`.
+    #[serde(default)]
+    pub ships_lm_head: bool,
 }
 
 fn default_true() -> bool {
@@ -81,6 +129,12 @@ pub struct DflashRopeScaling {
     pub beta_slow: Option<f32>,
     #[serde(default)]
     pub original_max_position_embeddings: Option<f32>,
+    /// 2026-10-01: RoPE θ nested in the block, the transformers 5.x layout
+    /// (`"rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}`),
+    /// which carries no top-level `rope_theta`. Read only under
+    /// `METRALE_DFLASH_CKPT_ARCH=1` ([`DflashConfig::resolved_rope_theta`]).
+    #[serde(default)]
+    pub rope_theta: Option<f32>,
 }
 
 fn default_block_size() -> usize {
@@ -132,5 +186,39 @@ impl DflashConfig {
             .as_ref()
             .and_then(|c| c.block_size)
             .unwrap_or(self.block_size)
+    }
+
+    /// 2026-10-01: The RoPE θ the head uses. With `ckpt_arch` (the
+    /// `METRALE_DFLASH_CKPT_ARCH=1` lever) a θ nested in
+    /// `rope_parameters`/`rope_scaling` wins over the top-level field, whose
+    /// serde default (10,000,000) is what a transformers 5.x config without a
+    /// top-level `rope_theta` otherwise gets. Without `ckpt_arch` it is the
+    /// top-level field, unchanged.
+    pub fn resolved_rope_theta(&self, ckpt_arch: bool) -> f32 {
+        if ckpt_arch && let Some(t) = self.nested_rope_theta() {
+            return t;
+        }
+        self.rope_theta
+    }
+
+    /// 2026-10-01: The θ nested in `rope_parameters`/`rope_scaling`, if any.
+    pub fn nested_rope_theta(&self) -> Option<f32> {
+        self.rope_scaling.as_ref().and_then(|r| r.rope_theta)
+    }
+
+    /// 2026-10-01: The RMSNorm epsilon the head uses: the config's
+    /// `rms_norm_eps` with `ckpt_arch`, else (or when absent) the head's
+    /// built-in 1e-6.
+    pub fn resolved_rms_norm_eps(&self, ckpt_arch: bool) -> f32 {
+        if ckpt_arch && let Some(e) = self.rms_norm_eps {
+            return e;
+        }
+        1e-6
+    }
+
+    /// 2026-10-01: True when the exporter states the drafter needs a learned
+    /// mask embedding (`export.ships_mask_embedding`).
+    pub fn needs_mask_embedding(&self) -> bool {
+        self.export.as_ref().is_some_and(|e| e.ships_mask_embedding)
     }
 }

@@ -124,6 +124,15 @@ pub struct BlockDiffusionDraftHead {
     /// 2026-09-25: Widest cross-sequence batch the scratch bands can hold.
     pub(super) max_batch: usize,
     pub mask_token_id: u32,
+    /// 2026-10-01: The drafter's learned mask embedding, replicated
+    /// `mask_rows_count` times as contiguous BF16 rows `[mask_rows_count,
+    /// hidden_size]`. `Some` only under `METRALE_DFLASH_CKPT_ARCH=1` with a
+    /// `mask_embedding.pt`; `block_embed` then writes it over each draft
+    /// block's mask rows instead of the target's `embed_tokens[mask_token_id]`.
+    pub mask_rows: Option<DevicePtr>,
+    /// 2026-10-01: Rows in `mask_rows`: `gamma - 1`, at least 1; 0 when
+    /// `mask_rows` is `None`.
+    pub mask_rows_count: usize,
     pub window_size: Option<usize>,
     /// 2026-09-25: The target layers whose hidden states the drafter is
     /// conditioned on, from the drafter config's `dflash_config.target_layer_ids`.

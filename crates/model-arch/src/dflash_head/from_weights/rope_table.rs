@@ -60,6 +60,16 @@ pub(super) fn rope_inv_freq_table(
                 );
                 rope_kind = "yarn";
             }
+            // 2026-10-01: transformers 5.x writes `rope_type: "default"` for plain
+            // RoPE (both GLM-5.3 DFlash2 drafters); the table above is already plain.
+            Some("default") => {
+                tracing::info!(
+                    target: "metrale_model_arch::dflash_head::from_weights",
+                    "DFlash RoPE = plain (rope_type \"default\"), theta={rope_theta}, \
+                     {n_pairs} pairs",
+                );
+                rope_kind = "plain";
+            }
             Some(other) => {
                 tracing::warn!(
                     target: "metrale_model_arch::dflash_head::from_weights",

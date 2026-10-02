@@ -16,6 +16,7 @@ use metrale_model_weights::weights::WeightStore;
 
 use metrale_model_layers::weight_map::{DenseWeight, dense};
 
+pub mod ckpt_arch;
 mod config;
 pub use config::*;
 

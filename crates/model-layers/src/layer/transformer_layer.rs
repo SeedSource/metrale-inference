@@ -253,6 +253,28 @@ pub trait TransformerLayer:
         anyhow::bail!("decode_verify_multi: unsupported for this layer type")
     }
 
+    /// 2026-10-02: The batched verify for a layer that answers
+    /// [`LayerCapabilities::decode_verify_multi_own_states`]: `ks[i]` rows for each of
+    /// `ks.len()` sequences, sequence-major in `hidden`/`residual`, with each sequence's
+    /// pre-verify length `seq_lens[i]` and page table `block_tables[i]` (the per-sequence
+    /// state such a layer drives itself) and no WY tables. `ctx.attn_metadata` holds one row
+    /// per verify row. The default returns an error.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_verify_multi_seqs<'a, 'b: 'a>(
+        &self,
+        _hidden: DevicePtr,
+        _residual: DevicePtr,
+        _ks: &[usize],
+        _states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _seq_lens: &[usize],
+        _block_tables: &[Vec<u32>],
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("decode_verify_multi_seqs: unsupported for this layer type")
+    }
+
     /// 2026-09-25: Allocate this layer's per-sequence state. Sequence setup (model-engine
     /// `trait_impl/meta.rs`) calls it for every layer except a linear-attention layer that
     /// uses the SSM pool, which gets pool addresses instead.

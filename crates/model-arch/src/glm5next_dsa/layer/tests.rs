@@ -237,9 +237,8 @@ fn the_composite_layer_implements_the_room_check_too() {
     );
 }
 
-/// 2026-09-25: The replay pre-check adds the context "DSA replay pre-check" to its error in
-/// both layers, so a log shows which check refused; the eager check raises the same base
-/// text.
+/// 2026-09-25: The replay pre-check adds the context "DSA replay pre-check" to its error in both
+/// layers, so a log shows which check refused; the eager check raises the same base text.
 #[test]
 fn the_replay_refusal_is_distinguishable_from_the_prefill_one() {
     for src in [
@@ -254,9 +253,8 @@ fn the_replay_refusal_is_distinguishable_from_the_prefill_one() {
 }
 
 // 2026-09-25: Which passes may take the batched selector (`batch_select_enabled`): a prefill
-// sub-chunk of more than one row, never a decode step or a speculative verify, eager or
-// graphed. `verify_a` sets `graph_capture` false, so `!graph_capture` alone would let an
-// eager verify in.
+// sub-chunk of more than one row, never a decode step or a speculative verify, eager or graphed.
+// `verify_a` sets `graph_capture` false, so `!graph_capture` alone would let an eager verify in.
 
 use super::super::layer::batch_select_enabled;
 
@@ -354,6 +352,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
         include_str!("../../glm5next_layer/steps/multi_seq.rs"),
         include_str!("../../glm5next_layer/steps/staged.rs"),
         include_str!("../../glm5next_layer/steps/staged/sp.rs"),
+        include_str!("../../glm5next_layer/steps/verify_multi.rs"),
         include_str!("../../glm5next_layer/types.rs"),
     );
     assert_eq!(
@@ -375,6 +374,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
             "steps/multi_seq.rs",
             "steps/staged.rs",
             "steps/staged/sp.rs",
+            "steps/verify_multi.rs",
             "tests.rs",
             "types.rs",
         ],

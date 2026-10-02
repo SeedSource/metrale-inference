@@ -14,6 +14,7 @@ mod forward;
 mod mixer;
 mod multi_seq;
 pub(super) mod staged;
+mod verify_multi;
 
 impl Glm5NextLayer {
     /// 2026-09-25: `rms_norm_vanilla` over `rows` contiguous `[hidden]` rows in one launch. The

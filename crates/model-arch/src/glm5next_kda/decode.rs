@@ -2,6 +2,7 @@
 
 //! 2026-09-25: The KDA recurrent path: single-token `decode` and K-row `decode_k`.
 //! 2026-10-01: Plus `decode_n_seqs`, one token for each of N sequences.
+//! 2026-10-02: Plus `decode_verify_n_seqs`, `ks[i]` verify rows for each of N sequences.
 //!
 //! Owner: model-arch (GLM-5.3-Flash KDA).
 //! Invariants:
@@ -329,5 +330,65 @@ impl Glm5NextKdaLayer {
         let r = self.back_end(gpu, n, ws, stream);
         profile::end(profile::KDA_BACK, t_back, gpu, stream);
         r
+    }
+
+    /// 2026-10-02: The batched MTP verify of `ks.len()` sequences (`METRALE_GLM_BATCHED_VERIFY`):
+    /// `front_end` and `back_end` once over all `R = Σ ks` rows, and for sequence `i` the
+    /// [`Self::decode_k`] walk over its rows `off_i..off_i + ks[i]` (sequence-major, `off_i` the
+    /// prefix sum of `ks`) on `states[i]`, writing the state after its row `t` to
+    /// `snapshots[i][t]` for `t < snapshots[i].len()`. Each sequence's walk is the one
+    /// `decode_k` runs for it alone, and the sequences' recurrences are independent; only the
+    /// projection launches change width, so up to `DENSE_GEMV_BATCHM_MAX_M` rows the outputs match
+    /// per-sequence `decode_k` calls by the argument on [`Self::decode_k`], and above it the
+    /// projections take another kernel (numerics-changing). Refuses an empty batch, a zero
+    /// `ks[i]`, `R` above the workspace, or a slice length that disagrees with `ks`.
+    pub fn decode_verify_n_seqs(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        ks: &[usize],
+        states: &[KdaSeqState],
+        snapshots: &[Vec<(DevicePtr, DevicePtr)>],
+        ws: &Glm5NextKdaWorkspace,
+        stream: u64,
+    ) -> Result<()> {
+        let r: usize = ks.iter().sum();
+        if ks.is_empty() || ks.contains(&0) || r > ws.max_tokens {
+            bail!(
+                "KDA decode_verify_n_seqs of ks={ks:?} does not fit a workspace built for {}",
+                ws.max_tokens
+            );
+        }
+        if states.len() != ks.len() || snapshots.len() != ks.len() {
+            bail!(
+                "KDA decode_verify_n_seqs: {} sequences but {} states and {} snapshot lists",
+                ks.len(),
+                states.len(),
+                snapshots.len()
+            );
+        }
+        use crate::glm5next_layer::profile;
+        let c = &self.cfg;
+        let (h_bytes, conv_bytes) = (c.recurrent_state_elems() * 4, c.conv_state_elems() * 4);
+        let t_front = profile::start();
+        self.front_end(gpu, hidden, r, ws, stream)?;
+        profile::end(profile::KDA_FRONT, t_front, gpu, stream);
+        let t_recur = profile::start();
+        let mut base = 0usize;
+        for ((&k, state), snaps) in ks.iter().zip(states).zip(snapshots) {
+            for t in 0..k {
+                self.stateful_row(gpu, base + t, state, ws, stream)?;
+                if let Some((h_dst, conv_dst)) = snaps.get(t) {
+                    gpu.copy_d2d_async(state.recurrent, *h_dst, h_bytes, stream)?;
+                    gpu.copy_d2d_async(state.conv, *conv_dst, conv_bytes, stream)?;
+                }
+            }
+            base += k;
+        }
+        profile::end(profile::KDA_RECUR, t_recur, gpu, stream);
+        let t_back = profile::start();
+        let res = self.back_end(gpu, r, ws, stream);
+        profile::end(profile::KDA_BACK, t_back, gpu, stream);
+        res
     }
 }

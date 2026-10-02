@@ -83,6 +83,26 @@ pub trait LayerCapabilities {
         false
     }
 
+    /// 2026-10-02: True when this layer serves the batched verify through
+    /// `TransformerLayer::decode_verify_multi_seqs` instead of `decode_multi_seq` /
+    /// `decode_verify_multi`: it owns per-sequence state the engine cannot stage (GLM-5.3's DSA
+    /// indexer cache), runs eager, reads no WY pointer tables and takes no write-on-accept
+    /// carry. The batched verify (`verify_e.rs`) then stages no WY tables, captures no graph,
+    /// and routes the layer to `decode_verify_multi_seqs` whatever its `LayerType`. When every
+    /// layer answers true, the multi-rank batched verify (`verify_ep.rs`) may run: the layer's
+    /// collectives depend only on the batch shape and per-sequence lengths, which every rank
+    /// holds identically. Consulted only where `decode_verify_multi_unsupported` is false.
+    fn decode_verify_multi_own_states(&self) -> bool {
+        false
+    }
+
+    /// 2026-10-02: Most verify rows (`R = Σ ks`) one `decode_verify_multi_seqs` call takes;
+    /// `can_batch_verify_dispatch` refuses a wider batch, which the scheduler then verifies in
+    /// narrower chunks. Unbounded unless the layer's scratch is sized for fewer rows.
+    fn decode_verify_multi_max_rows(&self) -> usize {
+        usize::MAX
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// 2026-09-25: True when a captured decode graph goes stale once a new sequence takes
     /// this slot. Decode graphs are keyed by `slot_idx`, which is safe only while every

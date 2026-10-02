@@ -111,7 +111,8 @@ pub fn mlp_ws_shared() -> bool {
 
 impl Glm5NextMlpWorkspace {
     /// 2026-09-25: Widest row group this scratch serves.
-    pub(super) fn max_rows(&self) -> usize {
+    /// 2026-10-02: `pub(crate)` for the batched verify's row cap (`steps/verify_multi.rs`).
+    pub(crate) fn max_rows(&self) -> usize {
         self.max_rows
     }
     /// 2026-09-25: `max_rows * top_k`, the routed-slot count the grouped buffers hold.

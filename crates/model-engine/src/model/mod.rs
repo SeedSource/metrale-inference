@@ -31,6 +31,7 @@ mod impl_lora_rotate;
 pub(crate) mod impl_lora_swap;
 mod impl_ngram;
 pub(crate) mod lm_head_q6k;
+pub(crate) mod mtp_stage;
 pub(crate) mod pinned_pack;
 pub(crate) mod seq_memtrace;
 pub(crate) mod ssm_batched_copy;

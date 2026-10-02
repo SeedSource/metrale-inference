@@ -238,6 +238,8 @@ pub struct TransformerModel {
     /// leaves it short, and the propose-site coverage check then skips the
     /// drafter prefill.
     pub(super) mtp_prefill_capture_len: std::sync::atomic::AtomicUsize,
+    /// 2026-10-01: Prompt row at staging row 0 under the chunked capture (`mtp_stage`).
+    pub(super) mtp_stage_start: std::sync::atomic::AtomicUsize,
     /// 2026-09-25: Generation of the single-slot capture above. A chunk-0
     /// prefill bumps it and stamps the new value on its sequence
     /// (`SequenceState::mtp_capture_gen`). Appends and the drafter-prefill

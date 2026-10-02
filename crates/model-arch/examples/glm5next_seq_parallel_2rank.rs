@@ -5,8 +5,8 @@
 //! (`glm5next_layer::seq_parallel::reduce_item`) and owned-row exchange (`swap_owned`) against
 //! today's all-reduce (`all_reduce_async` on the two-rank send/recv + `bf16_add_inplace` path),
 //! on a real `NcclBackend`, over the item sequence one staged layer issues: every attention
-//! sub-chunk, then every FFN window (`sub_chunks`, `ffn_windows`; the default 5400 tokens at
-//! 256 / 2048 has a window straddling the ownership boundary, so both directions run).
+//! sub-chunk, then every FFN window (`sub_chunks`, `ffn_windows`, 5400 tokens at 256 / 2048
+//! by default; each rank owns half of every sub-chunk, so every exchange runs both ways).
 //!
 //! Each rank holds a seeded BF16 partial for all `tokens` rows of `[tokens, 4096]`. Per item
 //! both arms first copy the item's partial rows into a work buffer (where a mixer or the MLP
@@ -152,9 +152,9 @@ fn timed(g: &dyn GpuBackend, stream: u64, f: impl Fn() -> Result<()>) -> Result<
     Ok(ms)
 }
 
-/// 2026-10-01: Byte offsets in `a` and `b` (same length) where they differ.
-fn diffs(a: &[u8], b: &[u8], range: std::ops::Range<usize>) -> Vec<usize> {
-    range.filter(|&i| a[i] != b[i]).collect()
+/// 2026-10-01: The offsets among `at` where `a` and `b` (same length) differ.
+fn diffs(a: &[u8], b: &[u8], at: impl Iterator<Item = usize>) -> Vec<usize> {
+    at.filter(|&i| a[i] != b[i]).collect()
 }
 
 fn main() -> Result<()> {
@@ -181,12 +181,20 @@ fn main() -> Result<()> {
         .copied()
         .chain(ffn_windows(&subs, a.ffn.max(a.rows), false, |_| true))
         .collect();
-    let plan = SpPlan::new(&subs).context("needs at least two sub-chunks")?;
-    let (own, peer) = (plan.owned(a.rank), plan.owned(1 - a.rank));
-    let own_bytes = own.0 * rb..(own.0 + own.1) * rb;
+    let plan = SpPlan::new(&subs).context("no sub-chunks")?;
+    let chunk = (0, a.tokens);
+    let (own, peer) = (plan.spans(a.rank, chunk), plan.spans(1 - a.rank, chunk));
+    // 2026-10-01: Byte offsets of a rank's rows.
+    let bytes_of = |spans: &[(usize, usize)]| {
+        let v: Vec<std::ops::Range<usize>> =
+            spans.iter().map(|&(t, n)| t * rb..(t + n) * rb).collect();
+        v.into_iter().flatten()
+    };
+    let own_rows: usize = own.iter().map(|s| s.1).sum();
 
-    // 2026-10-01: Control: rank 1 flips the sign of element 7 of the middle row rank 0 owns.
-    let ctrl_row = plan.owned(0).1 / 2;
+    // 2026-10-01: Control: rank 1 flips the sign of element 7 of a row rank 0 owns (the
+    // middle sub-chunk's first row).
+    let ctrl_row = subs[subs.len() / 2].0;
     let ctrl_elem = ctrl_row * rb + 7 * 2;
     let ctrl_byte = ctrl_elem + 1;
     let mine = partial(a.rank, a.tokens * H);
@@ -237,21 +245,21 @@ fn main() -> Result<()> {
     timed(g, stream, || arm_a(out_a))?;
     timed(g, stream, || arm_b(src, out_b))?;
     timed(g, stream, || arm_b(src_ctrl, out_c))?;
-    let (ha, hb, hc) = (down(g, out_a, total)?, down(g, out_b, total)?, down(g, out_c, total)?);
+    let (ha, hb) = (down(g, out_a, total)?, down(g, out_b, total)?);
+    let hc = down(g, out_c, total)?;
 
     // 2026-10-01: The swap: arm A's own rows, the peer's rows poisoned.
     g.memset(swapped, POISON, total)?;
-    let (from, to) = (out_a.offset(own.0 * rb), swapped.offset(own.0 * rb));
-    g.copy_d2d_async(from, to, own.1 * rb, stream)?;
-    timed(g, stream, || swap_owned(&comm, plan, swapped, rb, stream))?;
+    for &(t, n) in &own {
+        g.copy_d2d_async(out_a.offset(t * rb), swapped.offset(t * rb), n * rb, stream)?;
+    }
+    timed(g, stream, || swap_owned(&comm, plan, swapped, chunk, rb, stream))?;
     let hs = down(g, swapped, total)?;
 
-    let ab_own = diffs(&ha, &hb, own_bytes.clone()).len();
-    let b_peer_written = (peer.0 * rb..(peer.0 + peer.1) * rb)
-        .filter(|&i| hb[i] != POISON)
-        .count();
+    let ab_own = diffs(&ha, &hb, bytes_of(&own)).len();
+    let b_peer_written = bytes_of(&peer).filter(|&i| hb[i] != POISON).count();
     let swap_diff = diffs(&ha, &hs, 0..total).len();
-    let c_diff = diffs(&ha, &hc, own_bytes);
+    let c_diff = diffs(&ha, &hc, bytes_of(&own));
     let control_fired = if a.rank == 0 {
         !c_diff.is_empty() && c_diff.iter().all(|&i| i == ctrl_elem || i == ctrl_byte)
     } else {
@@ -266,15 +274,14 @@ fn main() -> Result<()> {
     let (ma, mb) = (median(ta), median(tb));
 
     println!(
-        "rank {} tokens {} rows {} ffn {}: {} items, split at row {}, own rows {:?}; \
+        "rank {} tokens {} rows {} ffn {}: {} items, {own_rows} own rows in {} spans; \
          send/recv+add all-reduce: {send_recv_add}",
         a.rank,
         a.tokens,
         a.rows,
         a.ffn,
         items.len(),
-        plan.split,
-        own
+        own.len()
     );
     println!(
         "timing (median of {}): all-reduce {ma:.3} ms | reduce-scatter {mb:.3} ms per layer's \
@@ -284,10 +291,10 @@ fn main() -> Result<()> {
     println!(
         "own bytes {}: A vs B differ {ab_own}; B wrote {b_peer_written} peer bytes; swap vs A \
          differ {swap_diff} of {total}; control differs at {c_diff:?} (fired: {control_fired})",
-        own.1 * rb
+        own_rows * rb
     );
     let ok = send_recv_add && ab_own == 0 && b_peer_written == 0 && swap_diff == 0;
-    if ok && control_fired && own.1 > 0 {
+    if ok && control_fired && own_rows > 0 {
         println!("PASS");
         Ok(())
     } else {

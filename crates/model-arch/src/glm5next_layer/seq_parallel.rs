@@ -1,109 +1,106 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 2026-10-01: Row ownership for the sequence-parallel staged prefill
-//! (`METRALE_GLM_PREFILL_SEQ_PARALLEL=1`, driver `steps/staged/sp.rs`): of a chunk's
-//! sub-chunks, rank 0 owns the first `ceil(n / 2)` and rank 1 the rest, so the boundary is a
-//! sub-chunk boundary and every owned launch keeps the width it has unsplit.
+//! 2026-10-01: Row ownership and the collectives of the sequence-parallel staged prefill
+//! (`METRALE_GLM_PREFILL_SEQ_PARALLEL=1`, driver `steps/staged/sp.rs`): in every sub-chunk
+//! (`sub_chunks` at the attention width) rank 0 owns the first `ceil(k / 2)` rows and rank 1
+//! the rest. Splitting inside each sub-chunk, rather than giving each rank whole sub-chunks,
+//! keeps every exchange two-way: a reduce-scatter then moves half an item each way at once,
+//! so with the normed-row exchange it costs what the all-reduce did on a full-duplex link.
 //!
 //! Owner: model-arch (GLM-5.3).
 //! Invariants:
-//! - The two ranks' rows tile `[0, n)`, with rank 0's first.
-//! - `split_item` gives the two parts of any row range; what one rank sends is what the
-//!   other receives, so both post matching send/recv pairs (or both skip an empty one).
+//! - The two ranks' rows of any item (a sub-chunk or an FFN window, a run of whole
+//!   sub-chunks) tile it; `spans` lists them in row order and without empty spans, and both
+//!   ranks compute both lists, so the k-th send of one rank meets the k-th receive of the
+//!   other with the same size.
 
 use anyhow::Result;
 use metrale_comm::CommBackend;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
+use super::sub_chunks;
+
 /// 2026-10-01: A row range, `(first row, rows)`.
 pub type Span = (usize, usize);
 
-/// 2026-10-01: The ownership of one chunk of `n` rows: rank 0 owns `[0, split)`, rank 1
-/// `[split, n)`.
+/// 2026-10-01: Send/recv pairs per NCCL group; longer exchanges run as several groups.
+const MAX_PAIRS: usize = 32;
+
+/// 2026-10-01: The ownership of a staged prefill chunk whose sub-chunks are `width` rows
+/// (the last may be narrower).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpPlan {
-    pub split: usize,
-    pub n: usize,
+    pub width: usize,
 }
 
 impl SpPlan {
-    /// 2026-10-01: The plan over `subs` (consecutive, as from `sub_chunks`): the boundary is
-    /// the first row of sub-chunk `ceil(len / 2)`. `None` below two sub-chunks.
+    /// 2026-10-01: The plan over `subs` (from `sub_chunks`, starting at row 0). `None` for an
+    /// empty list.
     pub fn new(subs: &[(usize, usize)]) -> Option<Self> {
-        if subs.len() < 2 {
-            return None;
-        }
-        let last = subs[subs.len() - 1];
-        Some(Self {
-            split: subs[subs.len().div_ceil(2)].0,
-            n: last.0 + last.1,
-        })
+        subs.first().map(|s| Self { width: s.1 })
     }
 
-    /// 2026-10-01: The rows `rank` (0 or 1) owns.
-    pub fn owned(&self, rank: usize) -> Span {
-        if rank == 0 {
-            (0, self.split)
-        } else {
-            (self.split, self.n - self.split)
-        }
+    /// 2026-10-01: `rank`'s rows of sub-chunk `[t, t + k)`: rank 0 the first `ceil(k / 2)`.
+    pub fn half(rank: usize, (t, k): Span) -> Span {
+        let a = k.div_ceil(2);
+        if rank == 0 { (t, a) } else { (t + a, k - a) }
     }
 
-    /// 2026-10-01: Whether `rank` owns row `t`.
-    pub fn owns(&self, rank: usize, t: usize) -> bool {
-        (t < self.split) == (rank == 0)
-    }
-
-    /// 2026-10-01: The rows of `[t, t + k)` that `rank` owns, then those its peer owns.
-    pub fn split_item(&self, rank: usize, t: usize, k: usize) -> (Span, Span) {
-        let mid = self.split.clamp(t, t + k);
-        let (lo, hi) = ((t, mid - t), (mid, t + k - mid));
-        if rank == 0 { (lo, hi) } else { (hi, lo) }
+    /// 2026-10-01: `rank`'s non-empty spans of item `[t, t + k)` (which starts on a sub-chunk
+    /// boundary and holds whole sub-chunks), in row order.
+    pub fn spans(&self, rank: usize, (t, k): Span) -> Vec<Span> {
+        sub_chunks(k, self.width)
+            .into_iter()
+            .map(|(s, n)| Self::half(rank, (t + s, n)))
+            .filter(|s| s.1 > 0)
+            .collect()
     }
 }
 
-/// 2026-10-01: One grouped exchange with the peer of a two-rank `comm`: send `send.1` rows of
-/// `row_bytes` at `send.0`, receive `recv.1` rows into `recv.0`, on `stream`. An empty side is
-/// not posted (the peer's matching side is empty too); the group is closed even when posting
-/// fails.
-pub fn swap(
+/// 2026-10-01: Exchange with the peer of a two-rank `comm`: post a send of each
+/// `(ptr, rows)` in `sends` and a receive of each in `recvs` (rows of `row_bytes`), in order,
+/// at most `MAX_PAIRS` of each per NCCL group, on `stream`. Each group is closed even when
+/// posting fails.
+pub fn exchange(
     comm: &dyn CommBackend,
-    send: (DevicePtr, usize),
-    recv: (DevicePtr, usize),
+    sends: &[(DevicePtr, usize)],
+    recvs: &[(DevicePtr, usize)],
     row_bytes: usize,
     stream: u64,
 ) -> Result<()> {
-    if send.1 == 0 && recv.1 == 0 {
-        return Ok(());
-    }
     let peer = 1 - comm.rank();
-    comm.group_start()?;
-    let mut posted = Ok(());
-    if send.1 > 0 {
-        posted = comm.send_to(send.0.0, send.1 * row_bytes, peer, stream);
+    for b in (0..sends.len().max(recvs.len())).step_by(MAX_PAIRS) {
+        comm.group_start()?;
+        let mut posted = Ok(());
+        for &(p, rows) in sends.iter().skip(b).take(MAX_PAIRS) {
+            let bytes = rows * row_bytes;
+            posted = posted.and_then(|()| comm.send_to(p.0, bytes, peer, stream));
+        }
+        for &(p, rows) in recvs.iter().skip(b).take(MAX_PAIRS) {
+            let bytes = rows * row_bytes;
+            posted = posted.and_then(|()| comm.recv_from(p.0, bytes, peer, stream));
+        }
+        let closed = comm.group_end();
+        posted.and(closed)?;
     }
-    if recv.1 > 0 {
-        let bytes = recv.1 * row_bytes;
-        posted = posted.and_then(|()| comm.recv_from(recv.0.0, bytes, peer, stream));
-    }
-    let closed = comm.group_end();
-    posted.and(closed)
+    Ok(())
 }
 
-/// 2026-10-01: Swap the owned rows of a row-indexed buffer (`row_bytes` per row): send this
-/// rank's rows, receive the peer's into their own rows.
+/// 2026-10-01: Swap the owned rows of item `item` in a row-indexed buffer (`row_bytes` per
+/// row): send this rank's rows, receive the peer's into their own rows.
 pub fn swap_owned(
     comm: &dyn CommBackend,
     plan: SpPlan,
     base: DevicePtr,
+    item: Span,
     row_bytes: usize,
     stream: u64,
 ) -> Result<()> {
-    let (own, peer) = (plan.owned(comm.rank()), plan.owned(1 - comm.rank()));
-    let send = (base.offset(own.0 * row_bytes), own.1);
-    let recv = (base.offset(peer.0 * row_bytes), peer.1);
-    swap(comm, send, recv, row_bytes, stream)
+    let at = |s: Span| (base.offset(s.0 * row_bytes), s.1);
+    let sends: Vec<_> = plan.spans(comm.rank(), item).into_iter().map(at).collect();
+    let recvs: Vec<_> = plan.spans(1 - comm.rank(), item).into_iter().map(at).collect();
+    exchange(comm, &sends, &recvs, row_bytes, stream)
 }
 
 /// 2026-10-01: The reduce-scatter of item `[t, t + k)` of `[*, hidden]` BF16 rows, whose
@@ -126,28 +123,31 @@ pub fn reduce_item(
     stream: u64,
 ) -> Result<()> {
     let rb = hidden * 2;
-    let (mine, theirs) = plan.split_item(comm.rank(), t, k);
+    let mine = plan.spans(comm.rank(), (t, k));
     // 2026-10-01: `p` row `r - t` holds token `r`.
-    let (own_p, own_out) = (p.offset((mine.0 - t) * rb), out.offset(mine.0 * rb));
+    let in_p = |s: Span| p.offset((s.0 - t) * rb);
+    let in_out = |s: Span| out.offset(s.0 * rb);
     if !reduce {
-        if mine.1 > 0 {
-            gpu.copy_d2d_async(own_p, own_out, mine.1 * rb, stream)?;
+        for &s in &mine {
+            gpu.copy_d2d_async(in_p(s), in_out(s), s.1 * rb, stream)?;
         }
         return Ok(());
     }
-    let send = (p.offset((theirs.0 - t) * rb), theirs.1);
-    swap(comm, send, (own_out, mine.1), rb, stream)?;
-    if mine.1 > 0 {
-        anyhow::ensure!(
-            add_k.0 != 0,
-            "sequence-parallel reduce needs bf16_add_inplace"
-        );
-        let n = mine.1 * hidden;
+    let theirs = plan.spans(1 - comm.rank(), (t, k));
+    let sends: Vec<_> = theirs.iter().map(|&s| (in_p(s), s.1)).collect();
+    let recvs: Vec<_> = mine.iter().map(|&s| (in_out(s), s.1)).collect();
+    exchange(comm, &sends, &recvs, rb, stream)?;
+    anyhow::ensure!(
+        add_k.0 != 0,
+        "sequence-parallel reduce needs bf16_add_inplace"
+    );
+    for &s in &mine {
+        let n = s.1 * hidden;
         KernelLaunch::new(gpu, add_k)
             .grid([(n as u32).div_ceil(256), 1, 1])
             .block([256, 1, 1])
-            .arg_ptr(own_out)
-            .arg_ptr(own_p)
+            .arg_ptr(in_out(s))
+            .arg_ptr(in_p(s))
             .arg_i32(n as i32)
             .launch(stream)?;
     }
@@ -157,45 +157,44 @@ pub fn reduce_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glm5next_layer::{ffn_windows, sub_chunks};
+    use crate::glm5next_layer::ffn_windows;
 
-    #[test]
-    fn halves_tile_the_chunk_on_a_sub_chunk_boundary() {
-        for (n, rows) in [(512, 256), (513, 256), (5400, 256), (8192, 256), (8191, 256)] {
-            let subs = sub_chunks(n, rows);
-            let p = SpPlan::new(&subs).unwrap();
-            let (a, b) = (p.owned(0), p.owned(1));
-            assert_eq!((a.0, a.0 + a.1, b.0, b.0 + b.1), (0, p.split, p.split, n));
-            assert!(subs.iter().any(|s| s.0 == p.split), "n={n}");
-            assert!(a.1 >= b.1, "rank 0 takes the larger half n={n}");
-            for &(t, k) in &subs {
-                assert_eq!(p.owns(0, t), p.owns(0, t + k - 1), "sub-chunk is whole n={n}");
-                assert_ne!(p.owns(0, t), p.owns(1, t));
-            }
-        }
-        assert_eq!(SpPlan::new(&sub_chunks(8192, 256)).unwrap().split, 4096);
-        assert_eq!(SpPlan::new(&sub_chunks(5400, 256)).unwrap().split, 2816);
-        assert_eq!(SpPlan::new(&sub_chunks(256, 256)), None);
+    /// 2026-10-01: Rows of `spans`, expanded.
+    fn rows(spans: &[Span]) -> Vec<usize> {
+        spans.iter().flat_map(|&(t, n)| t..t + n).collect()
     }
 
     #[test]
-    fn item_parts_match_across_ranks() {
-        let subs = sub_chunks(5400, 256);
-        let p = SpPlan::new(&subs).unwrap();
-        let wins = ffn_windows(&subs, 2048, false, |_| true);
-        for &(t, k) in subs.iter().chain(&wins) {
-            let (m0, t0) = p.split_item(0, t, k);
-            let (m1, t1) = p.split_item(1, t, k);
-            assert_eq!((m0, t0), (t1, m1), "what 0 sends 1 receives t={t}");
-            assert_eq!(m0.1 + m1.1, k);
-            for r in [m0, m1] {
-                assert!(r.0 >= t && r.0 + r.1 <= t + k);
+    fn halves_tile_every_item_and_match_across_ranks() {
+        let cases = [(5400, 256, 2048), (8192, 256, 4096), (8191, 256, 4096), (257, 256, 256)];
+        for (n, w, ffn) in cases {
+            let subs = sub_chunks(n, w);
+            let plan = SpPlan::new(&subs).unwrap();
+            let wins = ffn_windows(&subs, ffn, true, |_| true);
+            for &(t, k) in subs.iter().chain(&wins).chain(&[(0, n)]) {
+                let (a, b) = (plan.spans(0, (t, k)), plan.spans(1, (t, k)));
+                let mut all = [rows(&a), rows(&b)].concat();
+                all.sort_unstable();
+                assert_eq!(all, (t..t + k).collect::<Vec<_>>(), "n={n} item ({t}, {k})");
+                assert!(a.iter().chain(&b).all(|s| s.1 > 0));
+                assert!(a.windows(2).all(|p| p[0].0 < p[1].0), "row order");
             }
-            assert!(m0.1 == 0 || p.owns(0, m0.0));
-            assert!(m1.1 == 0 || p.owns(1, m1.0));
+            // 2026-10-01: Each rank's spans of the chunk are its spans of the sub-chunks.
+            for r in 0..2 {
+                let per_sub: Vec<Span> = subs.iter().flat_map(|&s| plan.spans(r, s)).collect();
+                assert_eq!(plan.spans(r, (0, n)), per_sub);
+            }
         }
-        // 2026-10-01: The window (2048, 2048) straddles the boundary 2816.
-        assert_eq!(p.split_item(0, 2048, 2048), ((2048, 768), (2816, 1280)));
-        assert_eq!(p.split_item(1, 2048, 2048), ((2816, 1280), (2048, 768)));
+    }
+
+    #[test]
+    fn halves_of_a_sub_chunk() {
+        assert_eq!(SpPlan::half(0, (512, 256)), (512, 128));
+        assert_eq!(SpPlan::half(1, (512, 256)), (640, 128));
+        assert_eq!(SpPlan::half(0, (8192, 1)), (8192, 1));
+        assert_eq!(SpPlan::half(1, (8192, 1)), (8193, 0));
+        let plan = SpPlan::new(&sub_chunks(257, 256)).unwrap();
+        assert_eq!(plan.spans(1, (0, 257)), vec![(128, 128)]);
+        assert_eq!(SpPlan::new(&[]), None);
     }
 }

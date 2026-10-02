@@ -309,15 +309,15 @@ pub fn prefill_comm_overlap() -> bool {
 /// 2026-10-01: `METRALE_GLM_PREFILL_SEQ_PARALLEL=1` (with `METRALE_GLM_PREFILL_STAGED=1`):
 /// on two tensor-parallel ranks the staged prefill splits the replicated row-local work by
 /// rows: rank 0 runs the hyper-connection (`hc_expand`, `hc_pre`, `hc_post`, `hc_head_mean`)
-/// and the RMSNorms for the first half of the chunk's sub-chunks, rank 1 for the rest. The
+/// and the RMSNorms for the first half of every sub-chunk's rows, rank 1 for the rest. The
 /// normed rows are exchanged before each mixer / MLP pass, and each partial goes only to the
 /// owner of its rows, which adds it with the all-reduce's own kernel (a reduce-scatter in
 /// place of the all-reduce); the last layer exchanges the final hidden rows
 /// (`steps/staged/sp.rs`). Byte-identical by construction; changes the collective sequence,
 /// so the ranks must agree on it (startup check). Supersedes
 /// `METRALE_GLM_PREFILL_COMM_OVERLAP` while engaged. Inert under graph capture, without a
-/// two-rank send/recv all-reduce, below two sub-chunks, or when the chunk outgrows the
-/// norm buffer. Off unless set to `1`; read once.
+/// two-rank send/recv all-reduce, or when the chunk outgrows the norm buffer. Off unless set
+/// to `1`; read once.
 pub fn prefill_seq_parallel() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {

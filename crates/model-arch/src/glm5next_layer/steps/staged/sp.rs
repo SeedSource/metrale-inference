@@ -3,26 +3,26 @@
 //! 2026-10-01: The sequence-parallel staged prefill (`METRALE_GLM_PREFILL_SEQ_PARALLEL=1`):
 //! `prefill_staged_run`'s two passes with the replicated row-local work split by rows across
 //! the two tensor-parallel ranks (ownership: `glm5next_layer::seq_parallel::SpPlan`, rank 0
-//! the first half of the sub-chunks).
+//! the first half of every sub-chunk, rank 1 the second).
 //!
 //! Per pass (attention, then FFN):
-//! 1. Front, owned sub-chunks only: (`hc_expand` on layer 0,) `hc_pre`, the norm into the
-//!    sub-chunk's own rows of `norm_output` (whole-chunk sized; checked by the caller).
-//! 2. One grouped send/recv: each rank sends its normed rows, receives the peer's.
+//! 1. Front, owned rows only (half of each sub-chunk): (`hc_expand` on layer 0,) `hc_pre`,
+//!    the norm into those rows of `norm_output` (whole-chunk sized; checked by the caller).
+//! 2. Grouped send/recv: each rank sends its normed rows, receives the peer's.
 //! 3. The mixer per sub-chunk (attention) or the MLP per FFN window, over ALL rows, exactly
 //!    the launches `prefill_staged_run` issues, reading the same normed rows.
 //! 4. Per item, a reduce-scatter in place of the all-reduce: the partial rows the peer owns
 //!    go to the peer; the peer's partial of my rows arrives in my (dead) `hidden` rows, and I
 //!    add my partial into it with `bf16_add_inplace`.
-//! 5. Back, owned sub-chunks only, after the pass: `hc_post` from `hidden` (and on the last
+//! 5. Back, owned rows only, after the pass: `hc_post` from `hidden` (and on the last
 //!    layer `hc_head_mean`). The last layer then swaps the final `hidden` rows, so both ranks
 //!    leave with the whole output, as today.
 //!
 //! Why this is byte-identical to `prefill_staged_run` (its module notes give the base case):
 //! - `hc_expand`, `hc_pre`, the RMSNorm, `hc_post` and `hc_head_mean` are one block (or one
 //!   grid row) per token and read only that token's highway slot, `post`/`comb` and row, so
-//!   running them for a subset of rows, at sub-chunk width, writes those rows' bytes as the
-//!   full launch does (`hc_pre`'s two mix kernels are byte-identical at any row count). The
+//!   running them for a subset of rows (half-sub-chunk launches) writes those rows' bytes as
+//!   the full launch does (`hc_pre`'s two mix kernels are byte-identical at any row count). The
 //!   highway was identical on both ranks before (every rank ran the same replicated launches
 //!   on the same all-reduced values), so the normed rows a rank receives are the bytes it would
 //!   have computed. Each rank's highway is valid only on its own rows from layer 0 on, and only
@@ -44,7 +44,7 @@
 //! Owner: model-arch (GLM-5.3).
 //! Invariants:
 //! - Both ranks issue the same collectives in the same order (the plan is a function of the
-//!   sub-chunks alone); an empty send or receive is skipped on both sides.
+//!   sub-chunk width alone); an empty send or receive is skipped on both sides.
 
 use super::*;
 use crate::glm5next_layer::seq_parallel::{SpPlan, Span, reduce_item, swap_owned};
@@ -52,8 +52,8 @@ use crate::glm5next_layer::seq_parallel::{SpPlan, Span, reduce_item, swap_owned}
 impl Glm5NextLayer {
     /// 2026-10-01: The plan when this staged prefill of `num_tokens` rows in `subs` takes the
     /// sequence-parallel path: lever on, eager, a two-rank communicator whose all-reduce is
-    /// the send/recv + add exchange, the add kernel loaded, the chunk within `norm_output`, at
-    /// least two sub-chunks. Every input is the same on both ranks.
+    /// the send/recv + add exchange, the add kernel loaded, the chunk within `norm_output`.
+    /// Every input is the same on both ranks.
     pub(in crate::glm5next_layer) fn sp_plan(
         &self,
         num_tokens: usize,
@@ -86,8 +86,8 @@ impl Glm5NextLayer {
         ENGAGED.call_once(|| {
             tracing::warn!(
                 "METRALE_GLM_PREFILL_SEQ_PARALLEL=1: ENGAGED (first prefill: {num_tokens} rows, \
-                 rank 0 owns rows 0..{})",
-                plan.split
+                 each rank owns half of every {}-row sub-chunk)",
+                plan.width
             );
         });
         Some(plan)
@@ -121,16 +121,16 @@ impl Glm5NextLayer {
         let (gpu, add_k, rank) = (ctx.gpu, self.add_k, comm.rank());
         let (h, rb) = (self.hidden, self.hidden * 2);
         let normed = ctx.buffers.norm_output();
-        let owned = |&(t, _): &(usize, usize)| plan.owns(rank, t);
-        let mine: Vec<(usize, usize)> = subs.iter().copied().filter(owned).collect();
+        let chunk = subs.last().map_or((0, 0), |&(t, k)| (0, t + k));
+        let mine = plan.spans(rank, chunk);
 
         // 2026-10-01: Attention pass.
         let (attn, input_norm) = (&mhc.attn, self.input_norm);
-        for &(t, k) in &mine {
-            self.sp_front(hidden, (t, k), attn, input_norm, self.is_first, ctx, stream)?;
+        for &s in &mine {
+            self.sp_front(hidden, s, attn, input_norm, self.is_first, ctx, stream)?;
         }
         let t_x = profile::start();
-        swap_owned(comm, plan, normed, rb, stream)?;
+        swap_owned(comm, plan, normed, chunk, rb, stream)?;
         profile::end(profile::REDUCE_ATTN, t_x, gpu, stream);
         for &(t, k) in subs {
             let p = self.attn_mixer(
@@ -163,17 +163,17 @@ impl Glm5NextLayer {
             )?;
             profile::end(profile::REDUCE_ATTN, t_x, gpu, stream);
         }
-        for &(t, k) in &mine {
-            self.sp_back(hidden, t, k, false, ctx, stream)?;
+        for &s in &mine {
+            self.sp_back(hidden, s, false, ctx, stream)?;
         }
 
         // 2026-10-01: FFN pass, over the windows `prefill_staged_run` uses.
         let (ffn, post_norm) = (&mhc.ffn, self.post_attn_norm);
-        for &(t, k) in &mine {
-            self.sp_front(hidden, (t, k), ffn, post_norm, false, ctx, stream)?;
+        for &s in &mine {
+            self.sp_front(hidden, s, ffn, post_norm, false, ctx, stream)?;
         }
         let t_x = profile::start();
-        swap_owned(comm, plan, normed, rb, stream)?;
+        swap_owned(comm, plan, normed, chunk, rb, stream)?;
         profile::end(profile::REDUCE_MLP, t_x, gpu, stream);
         let ffn_out = ctx.buffers.moe_output();
         let reduce = self.mlp_cfg.needs_all_reduce();
@@ -195,18 +195,18 @@ impl Glm5NextLayer {
             )?;
             profile::end(profile::REDUCE_MLP, t_x, gpu, stream);
         }
-        for &(t, k) in &mine {
-            self.sp_back(hidden, t, k, self.is_last, ctx, stream)?;
+        for &s in &mine {
+            self.sp_back(hidden, s, self.is_last, ctx, stream)?;
         }
         if self.is_last {
             // 2026-10-01: Both ranks leave with every final row, as `prefill_staged_run` does.
-            swap_owned(comm, plan, hidden, rb, stream)?;
+            swap_owned(comm, plan, hidden, chunk, rb, stream)?;
             profile::step();
         }
         Ok(())
     }
 
-    /// 2026-10-01: The front of owned sub-chunk `[t, t + k)`: `hc_expand` when `expand`,
+    /// 2026-10-01: The front of owned rows `[t, t + k)`: `hc_expand` when `expand`,
     /// `hc_pre` of `site` into `hidden` rows, then the norm with `norm_w` into the same rows of
     /// `norm_output`, the launches `attn_half` / `ffn_half` issue before the mixer / MLP.
     #[allow(clippy::too_many_arguments)]
@@ -260,13 +260,12 @@ impl Glm5NextLayer {
         Ok(())
     }
 
-    /// 2026-10-01: The back of owned sub-chunk `[t, t + k)`: `hc_post` of the reduced partial
+    /// 2026-10-01: The back of owned rows `[t, t + k)`: `hc_post` of the reduced partial
     /// in its `hidden` rows, then (`last`) `hc_head_mean` into the same rows.
     fn sp_back(
         &self,
         hidden: DevicePtr,
-        t: usize,
-        k: usize,
+        (t, k): Span,
         last: bool,
         ctx: &ForwardContext,
         stream: u64,

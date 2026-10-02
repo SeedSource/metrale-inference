@@ -213,7 +213,7 @@ fn main() -> Result<()> {
     // 2026-10-01: Control weights: rank 1 negates the head weights of its own row 3 (or its
     // last row); rank 0's copy is unchanged.
     let peer1 = RowSplit::new(a.rows, 1).context("split")?;
-    let ctrl_row = peer1.r0 + 3.min(peer1.rows - 1);
+    let ctrl_row = peer1.r0 + 3usize.min(peer1.rows - 1);
     let mut w_ctrl = w_host.clone();
     if a.rank == 1 {
         for h in 0..heads {

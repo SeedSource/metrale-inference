@@ -12,6 +12,11 @@
 
 use anyhow::Result;
 
+/// 2026-10-01: Completion slots of [`CommBackend::all_reduce_deferred`]: at most this many
+/// deferred all-reduces may be outstanding (issued, not yet joined) at once, each under its own
+/// slot index `0..ALL_REDUCE_DEFERRED_SLOTS`.
+pub const ALL_REDUCE_DEFERRED_SLOTS: usize = 2;
+
 // 2026-09-26: Gated on `nccl` because the bindings link libnccl. The release
 // targets built with `--features cuda` alone, such as the AMD SCALE one, have
 // no NCCL library.
@@ -69,6 +74,41 @@ pub trait CommBackend: Send + Sync {
     fn all_reduce_async(&self, ptr: u64, bytes: usize, compute_stream: u64) -> Result<()> {
         let _ = compute_stream;
         self.all_reduce(ptr, bytes)
+    }
+
+    /// 2026-10-01: All-reduce ordered after the work already queued on `compute_stream`, like
+    /// `all_reduce_async`, but `compute_stream` does NOT wait for it: later work there runs
+    /// concurrently until `all_reduce_join(compute_stream, slot)` adds that wait. `slot` must be
+    /// below [`ALL_REDUCE_DEFERRED_SLOTS`] and must not belong to another deferred all-reduce
+    /// that has not been joined yet. The caller must not touch `ptr..ptr + bytes` on any
+    /// stream, nor issue `all_reduce` (the blocking form) on another stream, until the join.
+    /// The collective sequence and the arithmetic are those of `all_reduce_async`; only the
+    /// point where the compute stream waits moves. The default calls `all_reduce_async`
+    /// (already joined), so `all_reduce_join` has nothing left to wait for.
+    fn all_reduce_deferred(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        compute_stream: u64,
+        slot: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            slot < ALL_REDUCE_DEFERRED_SLOTS,
+            "deferred all-reduce slot {slot} out of range (< {ALL_REDUCE_DEFERRED_SLOTS})"
+        );
+        self.all_reduce_async(ptr, bytes, compute_stream)
+    }
+
+    /// 2026-10-01: Make `compute_stream` wait for the deferred all-reduce issued under `slot`.
+    /// Joining a slot with nothing outstanding is a no-op. The default does nothing beyond the
+    /// range check, matching the default `all_reduce_deferred`.
+    fn all_reduce_join(&self, compute_stream: u64, slot: usize) -> Result<()> {
+        let _ = compute_stream;
+        anyhow::ensure!(
+            slot < ALL_REDUCE_DEFERRED_SLOTS,
+            "deferred all-reduce slot {slot} out of range (< {ALL_REDUCE_DEFERRED_SLOTS})"
+        );
+        Ok(())
     }
 
     /// 2026-09-26: Register a device buffer with the backend and return an
@@ -199,6 +239,10 @@ mod tests {
         assert_eq!(comm.world_size(), 1);
         comm.all_reduce(0x1000, 1024).unwrap();
         comm.all_reduce_async(0x1000, 1024, 0x3000).unwrap();
+        for slot in 0..ALL_REDUCE_DEFERRED_SLOTS {
+            comm.all_reduce_deferred(0x1000, 1024, 0x3000, slot).unwrap();
+            comm.all_reduce_join(0x3000, slot).unwrap();
+        }
         comm.all_gather(0x1000, 0x2000, 512).unwrap();
         comm.reduce_scatter(0x1000, 0x2000, 512).unwrap();
         comm.broadcast(0x1000, 256, 0).unwrap();
@@ -213,6 +257,15 @@ mod tests {
         comm.set_add_kernel(0x4000);
         assert!(comm.is_healthy());
         comm.attempt_reconnect().unwrap();
+    }
+
+    /// 2026-10-01: The default deferred all-reduce and join refuse a slot outside
+    /// `0..ALL_REDUCE_DEFERRED_SLOTS`.
+    #[test]
+    fn test_deferred_slot_range() {
+        let comm = SingleGpuBackend;
+        assert!(comm.all_reduce_deferred(0x1000, 2, 0, ALL_REDUCE_DEFERRED_SLOTS).is_err());
+        assert!(comm.all_reduce_join(0, ALL_REDUCE_DEFERRED_SLOTS).is_err());
     }
 
     #[test]

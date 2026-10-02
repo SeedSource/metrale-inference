@@ -79,6 +79,9 @@ pub struct NcclBackend {
     compute_done_event: u64,
     /// 2026-09-26: Recorded on `comm_stream` after an async all-reduce.
     comm_done_event: u64,
+    /// 2026-10-01: One per deferred-all-reduce slot: recorded on `comm_stream` after the
+    /// deferred all-reduce issued under that slot, waited on by `all_reduce_join`.
+    deferred_done_events: [u64; crate::ALL_REDUCE_DEFERRED_SLOTS],
     /// 2026-09-26: The caller's stream from `new`, used by every operation
     /// that takes no stream argument.
     legacy_stream: u64,
@@ -156,6 +159,10 @@ impl NcclBackend {
         let comm_stream = nccl::create_stream()?;
         let compute_done_event = nccl::create_event()?;
         let comm_done_event = nccl::create_event()?;
+        let mut deferred_done_events = [0u64; crate::ALL_REDUCE_DEFERRED_SLOTS];
+        for ev in &mut deferred_done_events {
+            *ev = nccl::create_event()?;
+        }
 
         let mut recv_buffer: u64 = 0;
         if world_size == 2 {
@@ -194,6 +201,7 @@ impl NcclBackend {
             comm_stream,
             compute_done_event,
             comm_done_event,
+            deferred_done_events,
             legacy_stream: stream,
             recv_buffer,
             recv_capacity: if world_size == 2 { recv_capacity } else { 0 },
@@ -527,6 +535,9 @@ impl Drop for NcclBackend {
         }
         nccl::destroy_event(self.compute_done_event);
         nccl::destroy_event(self.comm_done_event);
+        for ev in self.deferred_done_events {
+            nccl::destroy_event(ev);
+        }
         nccl::destroy_stream(self.comm_stream);
         if !comm.is_null() {
             unsafe { nccl::ncclCommDestroy(comm) };

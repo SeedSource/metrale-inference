@@ -12,6 +12,10 @@ mod drafter;
 mod forward;
 pub(super) mod staged;
 
+// 2026-10-01: The loader reads it to size the KDA workspace's chunked-scan buffers under
+// `METRALE_GLM_PREFILL_FULLWIDTH_GEMM`.
+pub(crate) use forward::kda_chunk_prefill;
+
 impl Glm5NextLayer {
     /// 2026-09-25: `rms_norm_vanilla` over `rows` contiguous `[hidden]` rows in one launch. The
     /// kernel runs one block per row (`token = blockIdx.x`) and the blocks share nothing, so the

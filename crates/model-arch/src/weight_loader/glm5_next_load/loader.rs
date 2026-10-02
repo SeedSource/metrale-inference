@@ -99,8 +99,33 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         let verify_k = (metrale_model_layers::layers::ops::DENSE_GEMV_BATCHM_MAX_M as usize)
             .max(crate::glm5next_layer::PREFILL_ROWS)
             .max(crate::glm5next_layer::prefill_rows());
-        let kda_ws = std::sync::Arc::new(crate::glm5next_kda::Glm5NextKdaWorkspace::new(
-            gpu, &kda_cfg, verify_k,
+        // 2026-10-01: `METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1` runs a KDA layer's `decode_k`
+        // over a whole staged window (`fullwidth_rows()`, the FFN window), so the workspace
+        // holds that many rows. Its chunked-scan buffers stay at `verify_k` rows unless
+        // `METRALE_GLM_KDA_CHUNK_PREFILL=1` sends the window through the chunked scan. GLM-5.3
+        // TP2 (32 heads x 128, hidden 4096): 139,712 B per row without the chunk buffers (98,304 B
+        // more with them), so ~0.54 GB more than at 256 rows at a 4096-row window. Lever off,
+        // `kda_rows == kda_chunk_rows == verify_k`: the allocation `new` made before.
+        let wide_rows = crate::glm5next_layer::fullwidth_rows();
+        let kda_rows = verify_k.max(wide_rows.unwrap_or(0));
+        let kda_chunk_rows = if crate::glm5next_layer::kda_chunk_prefill() {
+            kda_rows
+        } else {
+            verify_k
+        };
+        if wide_rows.is_some() {
+            let b = |t: usize, c: usize| {
+                crate::glm5next_kda::Glm5NextKdaWorkspace::bytes_split(&kda_cfg, t, c) as f64
+            };
+            tracing::warn!(
+                "GLM KDA workspace (METRALE_GLM_PREFILL_FULLWIDTH_GEMM): {kda_rows} rows, chunk \
+                 buffers {kda_chunk_rows} rows, {:.1} MB ({:+.1} MB against {verify_k} rows)",
+                b(kda_rows, kda_chunk_rows) / 1e6,
+                (b(kda_rows, kda_chunk_rows) - b(verify_k, verify_k)) / 1e6,
+            );
+        }
+        let kda_ws = std::sync::Arc::new(crate::glm5next_kda::Glm5NextKdaWorkspace::new_split(
+            gpu, &kda_cfg, kda_rows, kda_chunk_rows,
         )?);
 
         // 2026-09-25: Unless `METRALE_GLM_MLP_WS_SHARED=0`, one MLP workspace serves
@@ -140,6 +165,24 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
             config.tp_world_size.max(1),
             &dsa_cfg,
         )?;
+        // 2026-10-01: `METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1`: one window-wide DSA arena for
+        // `decode_k_wide`, shared by every DSA layer (they run one after another on one
+        // stream), allocated here, at load, before the KV pool is sized. GLM-5.3 TP2:
+        // 89,232 B per row, 365.5 MB at a 4096-row window (`DsaWideArena` doc).
+        let dsa_wide = match wide_rows {
+            Some(r) => {
+                let per_row = crate::glm5next_dsa::layer::DsaWideArena::bytes_per_row(&dsa_cfg);
+                tracing::warn!(
+                    "GLM DSA wide arena (METRALE_GLM_PREFILL_FULLWIDTH_GEMM): 1 x {:.1} MB for \
+                     {r} rows, shared by the DSA layers",
+                    (per_row * r) as f64 / 1e6
+                );
+                Some(std::sync::Arc::new(
+                    crate::glm5next_dsa::layer::DsaWideArena::new(gpu, &dsa_cfg, r)?,
+                ))
+            }
+            None => None,
+        };
         let last = skeleton.layers.len() - 1;
         let mut out: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(skeleton.layers.len());
 
@@ -177,9 +220,15 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                         select_kernels: dsa_kernels,
                         decode_kernel:
                             crate::glm5next_dsa::attend::Glm5NextDsaDecodeKernel::resolve(gpu)?,
-                        workspace: crate::glm5next_dsa::layer::Glm5NextDsaWorkspace::new(
-                            gpu, &dsa_cfg, verify_k,
-                        )?,
+                        workspace: {
+                            let ws = crate::glm5next_dsa::layer::Glm5NextDsaWorkspace::new(
+                                gpu, &dsa_cfg, verify_k,
+                            )?;
+                            match &dsa_wide {
+                                Some(a) => ws.with_wide(a.clone()),
+                                None => ws,
+                            }
+                        },
                         layer_idx: idx,
                         attn_layer_idx: {
                             let a = attn_layer_idx;

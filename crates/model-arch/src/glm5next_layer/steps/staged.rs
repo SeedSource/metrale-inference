@@ -92,6 +92,15 @@ impl Glm5NextLayer {
     /// `sub_chunks(num_tokens, rows)` sub-chunk, then `ffn_half` over each `ffn_windows` window
     /// of up to `rows_ffn` rows with dense slices of `rows`. See the module notes for why the
     /// result equals the unstaged loop's.
+    ///
+    /// 2026-10-01: With `METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1` (`full_width_attn`), the
+    /// attention pass instead calls `attn_half` once per `sub_chunks(num_tokens, rows_ffn)`
+    /// window with the DSA core at `rows` rows, and the FFN pass hands each window's MLP a
+    /// dense slice as wide as the window. NOT byte-identical to the sliced pass: every dense
+    /// projection runs at another M (see `levers::prefill_fullwidth_gemm`). The row order is
+    /// the same: a window's rows go through the attention half in order (KDA walks its
+    /// recurrence row by row; DSA writes the window's latents and indexer keys first, which no
+    /// earlier row reads, then selects and attends sub-chunk by sub-chunk).
     #[allow(clippy::too_many_arguments)]
     pub(in crate::glm5next_layer) fn prefill_staged_run(
         &self,
@@ -107,7 +116,16 @@ impl Glm5NextLayer {
         stream: u64,
     ) -> Result<()> {
         let subs = sub_chunks(num_tokens, rows);
-        for &(t, k) in &subs {
+        let wide = full_width_attn(prefill_fullwidth_gemm(), rows, rows_ffn);
+        // 2026-10-01: The attention calls: the sub-chunks, or under the full-width lever the
+        // windows of `rows_ffn` rows (whole sub-chunks, since `rows_ffn` is a multiple of
+        // `rows`), each with its DSA core at `rows`.
+        let attn_calls = if wide {
+            sub_chunks(num_tokens, rows_ffn)
+        } else {
+            subs.clone()
+        };
+        for &(t, k) in &attn_calls {
             self.attn_half(
                 hidden.offset(t * self.hidden * 2),
                 k,
@@ -122,13 +140,25 @@ impl Glm5NextLayer {
                 t,
                 // This IS a prefill sub-chunk (staged attention pass).
                 true,
+                // 2026-10-01: `core_rows`: the DSA selection and attend width.
+                if wide { rows.min(k) } else { k },
             )?;
         }
-        for (t, k) in ffn_windows(&subs, rows_ffn, prefill_tail_merge(), |k| self.ffn_mergeable(k)) {
-            self.ffn_half(hidden.offset(t * self.hidden * 2), k, ctx, stream, t, rows)?;
+        let merge_tail = prefill_tail_merge();
+        for (t, k) in ffn_windows(&subs, rows_ffn, merge_tail, |k| self.ffn_mergeable(k)) {
+            let x = hidden.offset(t * self.hidden * 2);
+            // 2026-10-01: Full width: the window's dense GEMMs in one slice.
+            let dense_slice = if wide { k } else { rows };
+            self.ffn_half(x, k, ctx, stream, t, dense_slice)?;
         }
         Ok(())
     }
+}
+
+/// 2026-10-01: Whether the staged pass takes the full-width arm: the lever is on and the FFN
+/// window is wider than the attention sub-chunk (at equal widths there is nothing to widen).
+pub(crate) fn full_width_attn(lever: bool, rows: usize, rows_ffn: usize) -> bool {
+    lever && rows_ffn > rows
 }
 
 #[cfg(test)]

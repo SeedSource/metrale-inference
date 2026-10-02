@@ -44,6 +44,7 @@ fn the_layer_takes_the_vanilla_rmsnorm_not_the_plus_one_variant() {
         ("layer/workspace.rs", include_str!("workspace.rs")),
         ("layer/proj_gemm.rs", include_str!("proj_gemm.rs")),
         ("layer/row_batch.rs", include_str!("row_batch.rs")),
+        ("layer/wide.rs", include_str!("wide.rs")),
     ] {
         assert!(
             !text.contains(r#""rms_norm", "rms_norm""#),

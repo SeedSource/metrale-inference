@@ -65,9 +65,10 @@ mod steps;
 mod types;
 pub(crate) use levers::{PREFILL_ROWS, cublas_wide_proj, dsa_batch_qidx, dsa_row_batch};
 pub use levers::{
-    PREFILL_ROWS_FFN_MAX, prefill_rows, prefill_rows_ffn, prefill_staged, prefill_tail_merge,
-    staged_merge_signature,
+    PREFILL_ROWS_FFN_MAX, fullwidth_rows, prefill_fullwidth_gemm, prefill_rows, prefill_rows_ffn,
+    prefill_staged, prefill_tail_merge, staged_merge_signature,
 };
+pub(crate) use steps::kda_chunk_prefill;
 pub use steps::staged::{ffn_windows, sub_chunks};
 pub use types::{Glm5NextLayer, Glm5NextMhc, Glm5NextMixer, Glm5NextMlpSite};
 

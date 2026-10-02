@@ -186,10 +186,30 @@ pub struct Glm5NextKdaWorkspace {
     chunk_w: DevicePtr,
     max_tokens: usize,
     t_pad: usize,
+    /// 2026-10-01: The most tokens the chunked scan (`prefill`) accepts; `q_f32`, `k_f32`,
+    /// `v_f32` and `chunk_gc`/`chunk_u`/`chunk_w` are sized for it. `max_tokens` unless the
+    /// workspace was built by [`Glm5NextKdaWorkspace::new_split`].
+    chunk_tokens: usize,
 }
 
 impl Glm5NextKdaWorkspace {
     pub fn new(gpu: &dyn GpuBackend, cfg: &Glm5NextKdaConfig, max_tokens: usize) -> Result<Self> {
+        Self::new_split(gpu, cfg, max_tokens, max_tokens)
+    }
+
+    /// 2026-10-01: [`Self::new`] with the chunked scan's six prefill-only buffers (`q_f32`,
+    /// `k_f32`, `v_f32`, `chunk_gc`, `chunk_u`, `chunk_w`, 24 bytes per token per `qkv`
+    /// channel) sized for `chunk_tokens` (clamped to `1..=max_tokens`) instead of
+    /// `max_tokens`. `decode_k` never reads them, so a workspace that only `decode_k` uses at
+    /// its full width (`METRALE_GLM_PREFILL_FULLWIDTH_GEMM` without
+    /// `METRALE_GLM_KDA_CHUNK_PREFILL`) need not pay for them; `prefill` then refuses more
+    /// than `chunk_tokens` tokens. `new_split(.., t, t)` allocates exactly what `new` did.
+    pub fn new_split(
+        gpu: &dyn GpuBackend,
+        cfg: &Glm5NextKdaConfig,
+        max_tokens: usize,
+        chunk_tokens: usize,
+    ) -> Result<Self> {
         cfg.validate()?;
         if max_tokens == 0 {
             bail!("workspace needs max_tokens >= 1");
@@ -198,13 +218,16 @@ impl Glm5NextKdaWorkspace {
         let t = max_tokens;
         let t_pad = t.div_ceil(cfg.chunk) * cfg.chunk;
         let n = t_pad * qkv;
+        let chunk_tokens = chunk_tokens.clamp(1, t);
+        // 2026-10-01: Equal to `n` unless `chunk_tokens < max_tokens`.
+        let n_chunk = chunk_tokens.div_ceil(cfg.chunk) * cfg.chunk * qkv;
         Ok(Self {
             qkv_parts: gpu.alloc(3 * t * qkv * 2)?,
             qkv_proj: gpu.alloc(t * cd * 2)?,
             conv_out: gpu.alloc(t * cd * 2)?,
-            q_f32: gpu.alloc(n * 4)?,
-            k_f32: gpu.alloc(n * 4)?,
-            v_f32: gpu.alloc(n * 4)?,
+            q_f32: gpu.alloc(n_chunk * 4)?,
+            k_f32: gpu.alloc(n_chunk * 4)?,
+            v_f32: gpu.alloc(n_chunk * 4)?,
             gate: gpu.alloc(n * 4)?,
             beta: gpu.alloc(t_pad * h * 4)?,
             core: gpu.alloc(n * 4)?,
@@ -214,16 +237,39 @@ impl Glm5NextKdaWorkspace {
             final_out: gpu.alloc(t * cfg.hidden * 2)?,
             lowrank: gpu.alloc(t * hd * 2)?,
             beta_bf16: gpu.alloc(t * h * 2)?,
-            chunk_gc: gpu.alloc(n * 4)?,
-            chunk_u: gpu.alloc(n * 4)?,
-            chunk_w: gpu.alloc(n * 4)?,
+            chunk_gc: gpu.alloc(n_chunk * 4)?,
+            chunk_u: gpu.alloc(n_chunk * 4)?,
+            chunk_w: gpu.alloc(n_chunk * 4)?,
             max_tokens: t,
             t_pad,
+            chunk_tokens,
         })
+    }
+
+    /// 2026-10-01: Device bytes [`Self::new_split`] allocates for these widths, for the
+    /// loader's log line.
+    pub fn bytes_split(cfg: &Glm5NextKdaConfig, max_tokens: usize, chunk_tokens: usize) -> usize {
+        let (qkv, cd, hd, h) = (cfg.qkv_dim(), cfg.conv_dim(), cfg.head_dim, cfg.heads);
+        let t = max_tokens.max(1);
+        let t_pad = t.div_ceil(cfg.chunk) * cfg.chunk;
+        let n_chunk = chunk_tokens.clamp(1, t).div_ceil(cfg.chunk) * cfg.chunk * qkv;
+        3 * t * qkv * 2
+            + 2 * t * cd * 2
+            + 6 * n_chunk * 4
+            + 2 * t_pad * qkv * 4
+            + t_pad * h * 4
+            + 3 * t * qkv * 2
+            + t * cfg.hidden * 2
+            + t * hd * 2
+            + t * h * 2
     }
 
     pub fn max_tokens(&self) -> usize {
         self.max_tokens
+    }
+    /// 2026-10-01: The most tokens `prefill` (the chunked scan) accepts.
+    pub fn chunk_tokens(&self) -> usize {
+        self.chunk_tokens
     }
     pub fn t_pad(&self) -> usize {
         self.t_pad

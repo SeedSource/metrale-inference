@@ -82,7 +82,7 @@ fn warm_32k_dense_restores_at_the_tail_split_point() {
     let (matched, snap) = cold_then_warm(32772, 8193, 8192, 16);
     assert_eq!(matched, 32768);
     assert_eq!(snap, tail_split_point(32772, BS).unwrap());
-    assert_eq!(snap, 32752);
+    assert_eq!(snap, 32512, "2026-10-02: 32772 - 256 rows, block-aligned");
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn warm_restores_within_two_blocks_of_the_match_for_every_length() {
     for (first, cont) in [(67, 64), (65, 64), (72, 64), (64, 64), (130, 96)] {
         for total in (2 * BS + 1)..=2600 {
             let (matched, snap) = cold_then_warm(total, first, cont, 0);
-            let cut = tail_split_point(total, BS).unwrap();
+            let cut = tail_split_point(total, BS).unwrap_or(0);
             assert!(
                 snap >= cut && snap <= matched,
                 "total={total} first={first}: snap {snap}, cut {cut}, matched {matched}"
@@ -154,9 +154,29 @@ fn tail_split_point_matches_the_dispatch_formula() {
     assert_eq!(tail_split_point(33, BS), Some(16));
     assert_eq!(tail_split_point(48, BS), Some(16));
     assert_eq!(tail_split_point(49, BS), Some(32));
-    assert_eq!(tail_split_point(32772, BS), Some(32752));
-    assert_eq!(tail_split_point(32768, BS), Some(32736));
-    assert_eq!(tail_split_point(100, 0), None);
+    assert_eq!(tail_split_point_min(32772, BS, 0), Some(32752));
+    assert_eq!(tail_split_point_min(32768, BS, 0), Some(32736));
+    assert_eq!(tail_split_point_min(100, 0, 256), None);
+}
+
+#[test]
+fn tail_split_point_leaves_min_tail_rows() {
+    // 2026-10-02: race #69. 32251 with min 256 -> 31984 (last pass 267 rows).
+    assert_eq!(tail_split_point_min(32251, BS, 256), Some(31984));
+    assert_eq!(32251 - 31984, 267);
+    assert_eq!(tail_split_point_min(512, BS, 256), Some(256));
+    assert_eq!(tail_split_point_min(511, BS, 256), Some(240));
+    assert_eq!(tail_split_point_min(256, BS, 256), None);
+    assert_eq!(tail_split_point_min(200, BS, 256), None);
+    assert_eq!(tail_split_point_min(271, BS, 256), None);
+    assert_eq!(tail_split_point_min(272, BS, 256), Some(16));
+    assert_eq!(tail_split_point_min(32772, BS, 4), Some(32752));
+    for total in 1..3000usize {
+        if let Some(c) = tail_split_point_min(total, BS, 256) {
+            assert_eq!(c % BS, 0);
+            assert!(total - c >= 256);
+        }
+    }
 }
 
 #[test]

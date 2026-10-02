@@ -19,13 +19,33 @@
 //! - `plan_chunk_len` returns a length in `1..=proposed` for a non-empty `proposed`,
 //!   and returns `proposed` unchanged for a last chunk.
 
-/// 2026-09-27: The tail split point of a `total`-token prompt: one block below the last
-/// block boundary strictly under `total`, or `None` when that is not above token 0. A
-/// warm next turn's block-floored match lands at or one block below that boundary, so a
-/// snapshot here is restorable by both.
+/// 2026-10-02: Default minimum rows in the last prefill pass after a tail split
+/// (race #69: a 27-row last pass after a 32K history lost the final question).
+pub const DEFAULT_MIN_TAIL_ROWS: usize = 256;
+
+/// 2026-10-02: Minimum last-pass rows, `METRALE_PREFIX_MIN_TAIL_ROWS` (default 256).
+pub fn min_tail_rows() -> usize {
+    std::env::var("METRALE_PREFIX_MIN_TAIL_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_MIN_TAIL_ROWS)
+}
+
+/// 2026-10-02: The tail split point of a `total`-token prompt with the env minimum tail.
 pub fn tail_split_point(total: usize, block_size: usize) -> Option<usize> {
+    tail_split_point_min(total, block_size, min_tail_rows())
+}
+
+/// 2026-10-02: The tail split point: the largest block-aligned position that leaves at
+/// least `min_tail` rows in the last pass, and is never above the old point (one block
+/// below the last block boundary strictly under `total`, so a warm next turn's
+/// block-floored match still restores it). `None` when that is not above token 0, i.e.
+/// the prompt is too short to split without a short last pass.
+pub fn tail_split_point_min(total: usize, block_size: usize, min_tail: usize) -> Option<usize> {
     let tb = metrale_gpu_runtime::ssm_tail_boundary(total, block_size)?;
-    let cut = tb - block_size;
+    let old = tb - block_size;
+    let by_min = total.checked_sub(min_tail)? / block_size * block_size;
+    let cut = old.min(by_min);
     (cut > 0).then_some(cut)
 }
 
@@ -91,7 +111,9 @@ pub fn is_prompt_tail_end(end_token: usize, total: usize, block_size: usize) -> 
         return false;
     }
     let tail = (total.saturating_sub(1) / block_size) * block_size;
-    end_token == tail || (tail >= block_size && end_token == tail - block_size)
+    end_token == tail
+        || (tail >= block_size && end_token == tail - block_size)
+        || tail_split_point(total, block_size) == Some(end_token)
 }
 
 #[cfg(test)]

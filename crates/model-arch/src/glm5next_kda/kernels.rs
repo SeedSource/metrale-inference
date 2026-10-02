@@ -8,6 +8,8 @@
 //!   `kda_recurrent_decode_bf16_smem`, `causal_conv1d_update_l2norm_rows`,
 //!   `kda_recurrent_prefill_bf16_smem` and `kda_recurrent_prefill_bf16_pf` is missing; those five
 //!   resolve to handle 0 when absent.
+//! - 2026-10-01: The four `kda_chunk_tc` entry points also resolve to handle 0 when absent;
+//!   [`Glm5NextKdaKernels::has_chunked_tc`] is false unless all four resolved.
 
 use super::*;
 
@@ -42,6 +44,14 @@ pub struct Glm5NextKdaKernels {
     /// it under `METRALE_GLM_KDA_PREFETCH=1`. Resolved with `try_kernel`; `0` keeps
     /// `recurrent_rows`.
     pub recurrent_pf: KernelHandle,
+    /// 2026-10-01: The tensor-core chunked prefill (`METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1`,
+    /// prefill_tc.rs), kernels/gb10/common/kda_chunk_tc.cu: the row-parallel conv, the conv-state
+    /// tail, the per-chunk prepare and the cross-chunk scan. Resolved with `try_kernel`; any `0`
+    /// sends the prefill to `decode_k`.
+    pub tc_conv: KernelHandle,
+    pub tc_conv_tail: KernelHandle,
+    pub tc_prepare: KernelHandle,
+    pub tc_scan: KernelHandle,
     pub o_norm: KernelHandle,
     pub split_widen: KernelHandle,
     pub sigmoid: KernelHandle,
@@ -88,11 +98,39 @@ impl Glm5NextKdaKernels {
                 "kda_recurrent",
                 "kda_recurrent_prefill_bf16_pf",
             ),
+            tc_conv: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_chunk_tc",
+                "kda_tc_conv_rows",
+            ),
+            tc_conv_tail: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_chunk_tc",
+                "kda_tc_conv_state_tail",
+            ),
+            tc_prepare: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_chunk_tc",
+                "kda_tc_prepare",
+            ),
+            tc_scan: metrale_model_layers::layers::try_kernel(gpu, "kda_chunk_tc", "kda_tc_scan"),
             o_norm: gpu.kernel("kda_layer_ops", "kda_o_norm_gated_bf16")?,
             split_widen: gpu.kernel("kda_layer_ops", "kda_split_widen")?,
             sigmoid: gpu.kernel("kda_layer_ops", "kda_sigmoid_bf16_f32")?,
             fill: gpu.kernel("kda_layer_ops", "kda_fill_f32")?,
             pack: gpu.kernel("kda_layer_ops", "kda_pack_qkv_bf16")?,
         })
+    }
+
+    /// 2026-10-01: Whether all four tensor-core chunked-prefill kernels resolved.
+    pub fn has_chunked_tc(&self) -> bool {
+        [
+            self.tc_conv,
+            self.tc_conv_tail,
+            self.tc_prepare,
+            self.tc_scan,
+        ]
+        .iter()
+        .all(|h| h.0 != 0)
     }
 }

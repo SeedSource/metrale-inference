@@ -12,6 +12,7 @@
 //! ```text
 //! q|k|v_proj -> pack -> conv1d + SiLU -> L2(q,k only) -> kda_gate / sigmoid(b_proj)
 //!            -> kda_chunk (prefill) | kda_recurrent (decode)
+//!            |  kda_chunk_tc (prefill, opt-in `METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1`)
 //!            -> sigmoid-gated RMSNorm(o_norm, g_b(g_a(h))) -> o_proj
 //! ```
 //!
@@ -38,6 +39,7 @@ mod kernels;
 #[cfg(test)]
 mod lever_tests;
 mod prefill;
+mod prefill_tc;
 pub use config::{Glm5NextKdaConfig, Glm5NextKdaWeights};
 pub use kernels::Glm5NextKdaKernels;
 
@@ -132,6 +134,90 @@ fn kda_prefetch_fallback(why: &str) {
     });
 }
 
+/// 2026-10-01: Whether a `METRALE_GLM_KDA_PREFILL_CHUNKED_TC` value asks for the tensor-core
+/// chunked prefill: `1` only.
+fn chunked_tc_requested(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// 2026-10-01: `METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1`: a prefill sub-chunk's KDA mixer runs
+/// [`Glm5NextKdaLayer::prefill_chunked_tc`] (kernels/gb10/common/kda_chunk_tc.cu) instead of
+/// `decode_k`'s per-token recurrence (`glm5next_layer/steps/forward.rs`). The chunked form sums
+/// in another order and feeds BF16 tensor-core MMAs, so it is not bit-identical to the per-token
+/// walk. Off unless set to `1`. Read once per process.
+pub(crate) fn kda_prefill_chunked_tc() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = chunked_tc_requested(
+            std::env::var("METRALE_GLM_KDA_PREFILL_CHUNKED_TC")
+                .ok()
+                .as_deref(),
+        );
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1 - GLM prefill KDA uses the tensor-core \
+                 chunked prefill (kda_chunk_tc). Not bit-identical to the per-token recurrent walk."
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-01: Chunk width of the tensor-core prefill (`KDA_TC_C` in kda_chunk_tc.cu).
+const KDA_TC_C: usize = 16;
+/// 2026-10-01: head_dim the tensor-core prefill is compiled for (`KDA_TC_D`).
+const KDA_TC_D: usize = 128;
+/// 2026-10-01: Rows per `kda_tc_conv_rows` block (`KDA_TC_CONV_ROWS`).
+const KDA_TC_CONV_ROWS: usize = 16;
+/// 2026-10-01: Warps per `kda_tc_scan` block (`KDA_TC_SCAN_WARPS`); each owns 16 V columns.
+const KDA_TC_SCAN_WARPS: usize = 2;
+/// 2026-10-01: `kda_tc_scan`'s dynamic shared memory: two 16,128 B stages (`KDA_TC_STAGE`).
+const KDA_TC_SCAN_SMEM: usize = 2 * 16_128;
+/// 2026-10-01: Lowest `gate_lower_bound` the tensor-core prefill admits. Its prepare kernel
+/// factors `exp(gc[i] - gc[j])` through row 7 of a 16-row chunk, so each factor's exponent is
+/// below `9 * |bound|`; at -9 that is 81, inside FP32's ~88.7. GLM-5.3-Flash uses -5.
+const KDA_TC_GATE_FLOOR: f32 = -9.0;
+/// 2026-10-01: Bytes per (16-row chunk, head) record in each of the four workspace buffers the
+/// tensor-core prefill borrows (see `prefill_tc.rs`): Q' + W, K'^T, u, M + decay.
+const KDA_TC_REC_BYTES: [usize; 4] = [8192, 4096, 8192, 1024];
+
+/// 2026-10-01: Why [`Glm5NextKdaLayer::prefill_chunked_tc`] cannot take `k` rows on this geometry
+/// and workspace, or `None` when it can. `t_pad` is the workspace's padded row count; `kernels` is
+/// [`Glm5NextKdaKernels::has_chunked_tc`].
+fn chunked_tc_refusal(
+    cfg: &Glm5NextKdaConfig,
+    k: usize,
+    t_pad: usize,
+    kernels: bool,
+) -> Option<&'static str> {
+    // 2026-10-01: Each borrowed buffer holds `t_pad * qkv_dim()` FP32 (`Glm5NextKdaWorkspace`).
+    let buf_bytes = t_pad * cfg.qkv_dim() * 4;
+    let recs = k.div_ceil(KDA_TC_C) * cfg.heads;
+    if !kernels {
+        Some("the target lacks a kda_chunk_tc kernel")
+    } else if cfg.head_dim != KDA_TC_D {
+        Some("head_dim is not 128")
+    } else if cfg.conv_kernel > 8 || !cfg.qk_channels().is_multiple_of(256) {
+        Some("the conv geometry breaks kda_tc_conv_rows' contract")
+    } else if !(KDA_TC_GATE_FLOOR..=0.0).contains(&cfg.gate_lower_bound) {
+        Some("gate_lower_bound is outside [-9, 0]")
+    } else if k == 0 || KDA_TC_REC_BYTES.iter().any(|b| recs * b > buf_bytes) {
+        Some("the workspace cannot hold the chunk records")
+    } else {
+        None
+    }
+}
+
+/// 2026-10-01: The one warning when `METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1` cannot be honoured and
+/// the prefill takes `decode_k`.
+fn kda_chunked_tc_fallback(why: &str) {
+    static W: std::sync::Once = std::sync::Once::new();
+    W.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1 ignored ({why}); the KDA prefill keeps decode_k"
+        )
+    });
+}
 
 /// 2026-09-25: The per-sequence state a KDA layer carries. The kernels update both buffers in place.
 ///

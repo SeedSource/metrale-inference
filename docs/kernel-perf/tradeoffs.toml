@@ -800,6 +800,12 @@ prs = []
 source = "kernels/gb10/common/kda_chunk.cu:118"
 
 [[t]]
+match = "kernels/gb10/common/kda_chunk_tc.cu"
+text = "Opt-in (METRALE_GLM_KDA_PREFILL_CHUNKED_TC): 16-row chunks so exp of the in-chunk decay stays in FP32/BF16 range at gate_lower_bound >= -9 (host-checked); the scan's MMA operands are BF16 with the state and v_new split hi + lo, so outputs are not bit-identical to the token loop. Chunk records reuse the FP32 chunked scan's workspace buffers instead of allocating."
+prs = []
+source = "kernels/gb10/common/kda_chunk_tc.cu:39; kernels/gb10/common/kda_chunk_tc.cu:47"
+
+[[t]]
 match = "kernels/gb10/common/kda_layer_ops.cu::kda_pack_qkv_bf16"
 text = "Extra interleave pass because q, k and v are separate GEMMs: dense_gemm_bf16 has no output stride, so aiming it inside one [T, 3*qkv] buffer would overwrite rows for T > 1 (and a T = 1 decode test would not see it)."
 prs = []

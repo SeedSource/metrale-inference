@@ -347,7 +347,13 @@ impl Glm5NextLayer {
                 // one row that asked for no intermediates: it never materialises the state
                 // after an interior row, and its order differs from `decode_k`'s, which a
                 // verify must match.
-                if is_prefill && k > 1 && snaps.is_empty() && kda_chunk_prefill() {
+                // 2026-10-01: `METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1` takes the same sub-chunks
+                // through the tensor-core chunked prefill, ahead of the FP32 chunked scan when
+                // both levers are set; it falls back to `decode_k` itself when it cannot run.
+                let chunkable = is_prefill && k > 1 && snaps.is_empty();
+                if chunkable && crate::glm5next_kda::kda_prefill_chunked_tc() {
+                    layer.prefill_chunked_tc(gpu, normed, k, kda, ws, stream)?;
+                } else if chunkable && kda_chunk_prefill() {
                     layer.prefill(gpu, normed, k, kda, ws, stream)?;
                 } else {
                     layer.decode_k(gpu, normed, k, kda, ws, snaps, stream)?;

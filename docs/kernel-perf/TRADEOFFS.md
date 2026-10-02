@@ -411,6 +411,12 @@ Known trade-offs, limits and dated measurements per kernel source, curated in [`
 - *whole file*: Shared memory is prepare (C\*D + C\*C + C)\*4 and scan (2\*C\*D + C\*C)\*4 bytes; the host refuses chunks over the 49,152 B ceiling (D = 128, C = 32 scan needs 36,864 B). The scan is one block per head walking chunks serially. — source: kernels/gb10/common/kda_chunk.cu:37
 - *kda_chunk_prepare*: Pad positions are read as zero regardless of buffer contents: a non-zero gate there would move gc[C-1] and decay the whole carried state while this prefill's own outputs stayed correct. — source: kernels/gb10/common/kda_chunk.cu:118
 
+<a id="to-kernels-gb10-common-kda-chunk-tc-cu"></a>
+
+### [kernels/gb10/common/kda_chunk_tc.cu](../../kernels/gb10/common/kda_chunk_tc.cu)
+
+- *whole file*: Opt-in (METRALE_GLM_KDA_PREFILL_CHUNKED_TC): 16-row chunks so exp of the in-chunk decay stays in FP32/BF16 range at gate_lower_bound >= -9 (host-checked); the scan's MMA operands are BF16 with the state and v_new split hi + lo, so outputs are not bit-identical to the token loop. Chunk records reuse the FP32 chunked scan's workspace buffers instead of allocating. — source: kernels/gb10/common/kda_chunk_tc.cu:39; kernels/gb10/common/kda_chunk_tc.cu:47
+
 <a id="to-kernels-gb10-common-kda-layer-ops-cu"></a>
 
 ### [kernels/gb10/common/kda_layer_ops.cu](../../kernels/gb10/common/kda_layer_ops.cu)

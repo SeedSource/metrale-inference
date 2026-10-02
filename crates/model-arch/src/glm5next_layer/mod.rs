@@ -9,6 +9,8 @@
 //!   `1 + w`.
 //! - Highway slots are per token: `decode` uses slot 0, `prefill` gives prompt token `t` slot
 //!   `t`, and `decode_batched` gives verify row `t` slot `t`.
+//! - 2026-10-01: `decode_multi_seq` gives sequence row `i` slot `ctx.hc_row_offset + i` and
+//!   metadata row `i` (`steps/multi_seq.rs`).
 //! - The last text layer collapses the highway with `hc_head_mean`, which takes no weights.
 //! - Any all-reduce of a mixer or MLP output happens before `hc_post` folds that output into
 //!   the highway.
@@ -65,8 +67,8 @@ mod steps;
 mod types;
 pub(crate) use levers::{PREFILL_ROWS, cublas_wide_proj, dsa_batch_qidx, dsa_row_batch};
 pub use levers::{
-    PREFILL_ROWS_FFN_MAX, prefill_rows, prefill_rows_ffn, prefill_staged, prefill_tail_merge,
-    staged_merge_signature,
+    PREFILL_ROWS_FFN_MAX, decode_multi_seq, prefill_rows, prefill_rows_ffn, prefill_staged,
+    prefill_tail_merge, staged_merge_signature,
 };
 pub use steps::staged::{ffn_windows, sub_chunks};
 pub use types::{Glm5NextLayer, Glm5NextMhc, Glm5NextMixer, Glm5NextMlpSite};
@@ -276,14 +278,66 @@ impl TransformerLayer for Glm5NextLayer {
             false,
         )
     }
+
+    /// 2026-10-01: Row `i` at highway slot `ctx.hc_row_offset + i` with `row_view(i)` metadata,
+    /// and above one row a single weight sweep over all rows (`steps/multi_seq.rs`). Runs
+    /// whenever the dispatcher selects it, lever or not, so EP ranks always agree on the
+    /// collectives; `METRALE_GLM_DECODE_MULTI_SEQ` decides only the route.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_n_seqs(
+            hidden,
+            residual,
+            num_seqs,
+            states,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+        )
+    }
 }
 
 impl LayerCapabilities for Glm5NextLayer {
-    /// 2026-09-25: True. `decode` runs every sequence through highway slot 0, and the trait's
-    /// default `decode_multi_seq` calls `decode` once per sequence with one shared
-    /// `ForwardContext`, so every sequence would read and write the same highway slot. The DSA
-    /// mixer's single-row `decode` also reads `attn_metadata` row 0 on a decode step.
+    /// 2026-09-25: True by default. The trait's `decode_multi_seq` would call `decode` (highway
+    /// slot 0, DSA `attn_metadata` row 0) for every sequence.
+    /// 2026-10-01: This layer's own `decode_multi_seq` removes both aliases; with
+    /// `METRALE_GLM_DECODE_MULTI_SEQ=1` this answers false and a batch runs it.
     fn decode_multi_seq_unsupported(&self) -> bool {
+        !levers::decode_multi_seq()
+    }
+
+    /// 2026-10-01: True: the batched decode runs the DSA mixer per sequence against that
+    /// sequence's own `Glm5NextDsaState`, page table, `seq_len` and metadata row, so selection is
+    /// per sequence and a batch past the index budget may stay batched. If the DSA arm of
+    /// `forward_n_seqs` is ever collapsed into one batched attention call, this must become false
+    /// in the same change unless that call carries per-row indexer state.
+    fn decode_multi_seq_selection_per_seq(&self) -> bool {
+        true
+    }
+
+    /// 2026-10-01: True: DSA state is allocated per sequence (a padding row would allocate one
+    /// each step) and the indexer's host-side length advances only when this code runs, so the
+    /// batched decode runs eager and unpadded.
+    fn decode_multi_seq_eager_only(&self) -> bool {
+        true
+    }
+
+    /// 2026-10-01: True: `prefill` numbers highway slots from 0, not from `ctx.hc_row_offset`,
+    /// so in a fused decode + prefill forward it would overwrite the decode rows' highway.
+    fn fused_decode_prefill_unsupported(&self) -> bool {
         true
     }
 

@@ -10,6 +10,7 @@ use super::*;
 
 mod drafter;
 mod forward;
+mod multi_seq;
 pub(super) mod staged;
 
 impl Glm5NextLayer {

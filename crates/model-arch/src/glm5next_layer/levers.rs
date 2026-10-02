@@ -2,6 +2,7 @@
 
 //! 2026-09-25: GLM-5.3-Flash layer launch levers: the prefill sub-chunk width, cuBLASLt for
 //! wide projections, and the batched DSA indexer query.
+//! 2026-10-01: Plus the batched multi-sequence decode (`decode_multi_seq`).
 //!
 //! Owner: model-arch (GLM-5.3).
 //! Invariants:
@@ -142,6 +143,29 @@ pub(crate) fn dsa_gemv_split() -> bool {
             );
         }
         warn_unparsed_dsa_switch("METRALE_GLM_DSA_GEMV_SPLIT", raw.as_deref());
+        on
+    })
+}
+
+/// 2026-10-01: `METRALE_GLM_DECODE_MULTI_SEQ=1` lets a multi-sequence decode step run as ONE
+/// batched forward (`Glm5NextLayer::decode_multi_seq`: mHC, norms, MLP/MoE and the KDA
+/// projections over all N rows; the KDA recurrence and the DSA attention per sequence) instead
+/// of one full forward per sequence. It flips `decode_multi_seq_unsupported` to false, which is
+/// the only routing input; the batched override itself runs whenever the dispatcher selects it.
+/// Eager and unpadded (`decode_multi_seq_eager_only`); the batched MTP verify is not covered.
+/// Off unless set to `1`; read once. Port of rsafier's Atlas research/glm-exl3 multi-sequence
+/// decode (e69446eee, acf792e28, 04beaac1f).
+pub fn decode_multi_seq() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_DECODE_MULTI_SEQ").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_DECODE_MULTI_SEQ=1 - GLM multi-sequence decode runs one batched \
+                 forward per step (eager, unpadded); KDA recurrence and DSA attention stay per \
+                 sequence"
+            );
+        }
         on
     })
 }

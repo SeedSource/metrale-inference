@@ -24,6 +24,7 @@ use metrale_model_layers::layers::ops;
 
 mod pad_states;
 mod perseq;
+mod route;
 
 /// 2026-09-25: Multi-sequence decode CUDA graphs: on unless
 /// `METRALE_NO_DECODE_GRAPHS_MULTISEQ` is exactly `1`. Read once per process.
@@ -76,8 +77,11 @@ impl TransformerModel {
         // per-sequence only once `qsa_active` holds, i.e. correct on long contexts
         // and wrong on short ones.
         let ms_layer_veto = self.layers.iter().any(|l| l.decode_multi_seq_unsupported());
+        // 2026-10-01: Active selection forces the loop only when some layer shares one.
+        let qsa_shared = qsa_active && !self.ms_selection_per_seq();
         let hc_perseq = ms_layer_veto
-            || (self.config.hc_mult > 0 && (qsa_active || self.levers.hc_perseq_decode));
+            || (self.config.hc_mult > 0 && (qsa_shared || self.levers.hc_perseq_decode));
+        self.log_multi_seq_route(n, hc_perseq, ms_layer_veto, qsa_active);
         // 2026-09-25: The per-sequence decision is made before the EP branch, so an
         // EP batch that needs the per-sequence path takes it too.
         if self.comm.is_some() && !(mla_perseq_fallback || hc_perseq) {
@@ -164,7 +168,13 @@ impl TransformerModel {
         let residual = self.buffers.residual();
 
         // 2026-09-25: Pad to the graph ladder in `traits::padded_batch_n`.
-        let padded_n = crate::traits::padded_batch_n(n);
+        // 2026-10-01: An eager-only layer stack (`ms_eager_only`) runs exactly `n` rows.
+        let ms_eager = self.ms_eager_only();
+        let padded_n = if ms_eager {
+            n
+        } else {
+            crate::traits::padded_batch_n(n)
+        };
 
         // 2026-09-25: SSM state pointers are baked into the captured kernel
         // arguments, so batched graphs are keyed by the per-row SSM slot vector
@@ -177,7 +187,12 @@ impl TransformerModel {
         // 2026-09-25: The per-layer graph veto, as in `decode_a` (QSA's host top-k,
         // PLE's host hash on the hc multi-seq path).
         let layer_veto = self.decode_graph_veto;
-        let graph_key = if !ms_profile && !lora_eager && !layer_veto && multiseq_graphs_enabled() {
+        let graph_key = if !ms_profile
+            && !lora_eager
+            && !layer_veto
+            && !ms_eager
+            && multiseq_graphs_enabled()
+        {
             self.batch_decode_graph_key(&*seqs, padded_n)
         } else {
             None

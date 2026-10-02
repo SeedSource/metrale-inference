@@ -20,9 +20,11 @@
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::DevicePtr;
 
+use super::super::mtp_stage;
 use super::super::types::TransformerModel;
 use crate::traits::SequenceState;
 use metrale_model_layers::layer::ForwardContext;
+use metrale_model_layers::speculative::{DraftProposer, ProposerState};
 
 /// 2026-09-25: True when `METRALE_NO_MTP_EAGER_DRAFTER` is set, to any value: the capture is
 /// then consumed only at the first propose. Read once per process.
@@ -71,7 +73,8 @@ impl TransformerModel {
             return Ok(());
         }
         use std::sync::atomic::Ordering;
-        if chunk_start + proc_count > self.mtp_prefill_capacity {
+        let chunked = self.mtp_chunked();
+        if !chunked && chunk_start + proc_count > self.mtp_prefill_capacity {
             return Ok(());
         }
         let len = self.mtp_prefill_capture_len.load(Ordering::Relaxed);
@@ -99,11 +102,31 @@ impl TransformerModel {
         if contiguous_from_zero.is_none() && !carry_on {
             return Ok(());
         }
+        // 2026-10-01: Under the chunked capture the rows land in the staging window
+        // (`mtp_stage`). A chunk that overflows it truncates the capture at `chunk_start`, so
+        // the coverage check skips the rest instead of reading a stale length.
+        let dst_row = if chunked {
+            if chunk_start == 0 {
+                self.mtp_stage_start.store(0, Ordering::Relaxed);
+            }
+            let stage_start = self.mtp_stage_start.load(Ordering::Relaxed);
+            let cap = self.mtp_prefill_capacity;
+            match mtp_stage::stage_offset(chunk_start, proc_count, stage_start, cap) {
+                Some(off) => off,
+                None => {
+                    self.mtp_prefill_capture_len
+                        .store(chunk_start, Ordering::Relaxed);
+                    return Ok(());
+                }
+            }
+        } else {
+            chunk_start
+        };
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         self.gpu.copy_d2d_async(
             src,
-            self.mtp_prefill_hidden.offset(chunk_start * h * bf16),
+            self.mtp_prefill_hidden.offset(dst_row * h * bf16),
             proc_count * h * bf16,
             stream,
         )?;
@@ -197,5 +220,86 @@ impl TransformerModel {
                  can build drafter KV over its own prompt"
             );
         }
+    }
+
+    /// 2026-10-01: Whether the chunked capture is on (`mtp_stage::glm_mtp_chunked_capture`).
+    /// Fixed for the process: the env is read once and the levers do not change.
+    pub(super) fn mtp_chunked(&self) -> bool {
+        let carry_on = metrale_model_layers::mtp_carry::mtp_carry_drafter_enabled(&self.levers);
+        mtp_stage::glm_mtp_chunked_capture(&self.config.model_type, carry_on)
+    }
+
+    /// 2026-10-01: After a non-last `prefill_chunk`, drain the staged rows into the drafter
+    /// (`mtp_stage`), so the next chunk's rows go to staging row 0. Runs on every rank (the EP
+    /// worker calls the same wrapper) and needs no collective: a context row is a norm, the
+    /// `eh_proj` GEMV and the DSA cache writes. Never fails a prefill.
+    pub(super) fn try_chunked_drafter_drain(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        is_last: bool,
+        stream: u64,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if is_last || self.mtp_prefill_hidden.is_null() || !self.mtp_chunked() {
+            return;
+        }
+        let Some(proposer) = self.proposer.clone() else {
+            return;
+        };
+        let gen_now = self.mtp_prefill_capture_gen.load(Relaxed);
+        if seq.mtp_capture_gen == 0 || seq.mtp_capture_gen != gen_now {
+            return;
+        }
+        let Some(state) = seq.proposer_state.as_mut() else {
+            return;
+        };
+        let stage_start = self.mtp_stage_start.load(Relaxed);
+        let captured = self.mtp_prefill_capture_len.load(Relaxed);
+        let rows = proposer.drafter_rows(state.as_mut());
+        let len = tokens.len();
+        let Some((lo, hi)) = mtp_stage::drain_range(stage_start, captured, len, rows, None) else {
+            return;
+        };
+        let ctx = self.mtp_propose_ctx();
+        let drained = proposer.catchup_drafter(
+            &tokens[lo..hi],
+            self.mtp_prefill_hidden,
+            lo,
+            lo + 1,
+            state.as_mut(),
+            &ctx,
+            stream,
+        );
+        match drained {
+            Ok(n) if n == hi - lo - 1 => self.mtp_stage_start.store(captured, Relaxed),
+            Ok(n) => tracing::warn!("MTP chunked capture: drained {n} of {} rows", hi - lo - 1),
+            Err(e) => tracing::warn!("MTP chunked capture drain failed (drafter short): {e:#}"),
+        }
+    }
+
+    /// 2026-10-01: The first-propose drain of the chunked capture: the rows still staged
+    /// after the last chunk, as `prefill_drafter(prompt)` would write them. Returns the rows
+    /// written.
+    pub(super) fn drain_stage_at_propose(
+        &self,
+        proposer: &dyn DraftProposer,
+        prompt: &[u32],
+        captured: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stage_start = self.mtp_stage_start.load(Relaxed);
+        let rows = proposer.drafter_rows(state);
+        let p = prompt.len();
+        let Some((lo, hi)) = mtp_stage::drain_range(stage_start, captured, p, rows, Some(p)) else {
+            return Ok(0);
+        };
+        let hid = self.mtp_prefill_hidden;
+        let n = proposer.catchup_drafter(&prompt[lo..hi], hid, lo, lo + 1, state, ctx, stream)?;
+        self.mtp_stage_start.store(captured, Relaxed);
+        Ok(n)
     }
 }

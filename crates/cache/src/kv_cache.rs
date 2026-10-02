@@ -180,6 +180,22 @@ pub struct KvCacheConfig {
     /// sequence's window at `N` blocks (`ensure_blocks_through_decode`);
     /// `None` means no cap.
     pub cache_blocks_per_seq: Option<u32>,
+    /// 2026-10-01: Every layer's V pool is its K pool: no V memory is
+    /// allocated and `block_bytes_kv_all_layers` prices K only. Only for a
+    /// model that never reads or writes V (GLM-5.3's DSA layers cache the
+    /// MLA latent in K alone); see `glm_kv_v_alias`.
+    pub v_aliases_k: bool,
+}
+
+/// 2026-10-01: Whether a `model_type` KV cache aliases V onto K
+/// (`KvCacheConfig::v_aliases_k`). Only `glm5_next`: its DSA layers write
+/// and read `k_pool_ptr` alone, so the V pool is dead memory, as much again
+/// as the K pool. On by default (memory-only, byte-identical: nothing reads
+/// V); `METRALE_GLM_KV_V_ALIAS=0` restores the separate V pool. Read once.
+pub fn glm_kv_v_alias(model_type: &str) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = || std::env::var("METRALE_GLM_KV_V_ALIAS").as_deref() != Ok("0");
+    model_type == "glm5_next" && *ON.get_or_init(on)
 }
 
 impl KvCacheConfig {
@@ -310,9 +326,18 @@ impl KvCacheConfig {
 
     /// 2026-09-25: K plus V bytes of one block index summed over all
     /// layers, per layer's own dims and K and V formats.
+    ///
+    /// 2026-10-01: K only under `v_aliases_k`: the V pool costs nothing.
     pub fn block_bytes_kv_all_layers(&self) -> usize {
         (0..self.num_layers)
-            .map(|i| self.k_block_bytes_for_layer(i) + self.v_block_bytes_for_layer(i))
+            .map(|i| {
+                let v = if self.v_aliases_k {
+                    0
+                } else {
+                    self.v_block_bytes_for_layer(i)
+                };
+                self.k_block_bytes_for_layer(i) + v
+            })
             .sum()
     }
 
@@ -388,6 +413,9 @@ struct LayerPool {
     v_block_stride: usize,
     /// 2026-09-25: This layer's format.
     dtype: KvCacheDtype,
+    /// 2026-10-01: `v_pool` is `k_pool` (`KvCacheConfig::v_aliases_k`), so
+    /// V-side writes are skipped and the pool is freed once.
+    v_aliased: bool,
 }
 
 /// 2026-09-25: Paged KV cache across all attention layers: the pools and
@@ -421,7 +449,8 @@ impl metrale_core::scope::ModelResource<dyn metrale_gpu_runtime::gpu::GpuBackend
     fn release(&mut self, gpu: &dyn metrale_gpu_runtime::gpu::GpuBackend) -> anyhow::Result<()> {
         let mut first_error = None;
         for layer in self.layers.drain(..) {
-            for ptr in [layer.k_pool, layer.v_pool] {
+            let n = if layer.v_aliased { 1 } else { 2 };
+            for &ptr in &[layer.k_pool, layer.v_pool][..n] {
                 if let Err(e) = gpu.free(ptr)
                     && first_error.is_none()
                 {
@@ -444,3 +473,6 @@ mod tests;
 
 #[cfg(test)]
 mod tests_tq_plus;
+
+#[cfg(test)]
+mod tests_v_alias;

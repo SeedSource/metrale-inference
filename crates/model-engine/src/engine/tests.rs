@@ -66,6 +66,7 @@ impl MockModel {
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
+            v_aliases_k: false,
         };
         let kv_cache = PagedKvCache::new(kv_config, 10, &gpu).unwrap();
 

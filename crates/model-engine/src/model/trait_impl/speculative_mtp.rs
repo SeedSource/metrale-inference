@@ -142,7 +142,7 @@ impl TransformerModel {
     }
 
     /// 2026-09-25: The `ForwardContext` of the batched MTP propose and the batched catch-up.
-    fn mtp_propose_ctx(&self) -> ForwardContext<'_> {
+    pub(super) fn mtp_propose_ctx(&self) -> ForwardContext<'_> {
         ForwardContext {
             buffers: &self.buffers,
             hc_row_offset: 0,

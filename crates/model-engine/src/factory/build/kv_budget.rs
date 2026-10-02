@@ -194,3 +194,36 @@ pub(super) fn mtp_pool_reserve_bytes(
         0
     }
 }
+
+/// 2026-10-01: A59: the GLM-5.3 MTP head allocates its capture, its private KV pool and a
+/// drafter indexer cache after the KV pool is sized, unreserved. Under the chunked capture
+/// (`METRALE_GLM_MTP_CHUNKED_CAPTURE=1`, `model::mtp_stage`) they are reserved here, priced
+/// by `mtp_stage::glm_mtp_reserve_bytes`; with the lever off this returns 0, the old sizing.
+pub(super) fn glm_mtp_reserve(
+    config: &ModelConfig,
+    has_glm_mtp: bool,
+    max_seq_len: usize,
+    stage_rows: usize,
+) -> usize {
+    let levers = metrale_model_layers::layers::ops::ModelLevers::get();
+    let carry_on = metrale_model_layers::mtp_carry::mtp_carry_drafter_enabled(levers);
+    let mt = &config.model_type;
+    if !has_glm_mtp || !crate::model::mtp_stage::glm_mtp_chunked_capture(mt, carry_on) {
+        return 0;
+    }
+    let bytes = crate::model::mtp_stage::glm_mtp_reserve_bytes(
+        config.hidden_size,
+        config.kv_lora_rank,
+        config.index_head_dim,
+        max_seq_len,
+        stage_rows,
+        metrale_cache::kv_cache::glm_kv_v_alias(mt),
+    );
+    tracing::info!(
+        "KV budget: reserving {:.2} GB for the GLM MTP head (staging capture of {} rows, \
+         drafter KV and indexer; A59)",
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        stage_rows.min(max_seq_len),
+    );
+    bytes
+}

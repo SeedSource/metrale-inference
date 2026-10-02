@@ -123,6 +123,7 @@ impl DeepseekV4MtpHead {
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
+            v_aliases_k: false,
         };
         let mtp_num_blocks = max_seq_len / kv_config.block_size + 1;
         let kv_cache = PagedKvCache::new(kv_config, mtp_num_blocks, gpu)?;

@@ -177,6 +177,7 @@ fn run_batched_verify(
         layer_dtypes: vec![],
         layer_dims: vec![],
         cache_blocks_per_seq: None,
+        v_aliases_k: false,
     };
     let mut kv = metrale_cache::kv_cache::PagedKvCache::new(kv_config, 8, gpu).unwrap();
     let mut states_own: Vec<SsmLayerState> = ks.iter().map(|_| mk_state(gpu, layer, 4)).collect();

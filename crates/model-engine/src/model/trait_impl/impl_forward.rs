@@ -46,6 +46,7 @@ impl ModelForward for TransformerModel {
             is_last_chunk,
             stream,
         )?;
+        self.try_chunked_drafter_drain(tokens, seq, is_last_chunk, stream);
         self.try_eager_drafter_prefill(seq, is_last_chunk, stream);
         Ok(logits)
     }

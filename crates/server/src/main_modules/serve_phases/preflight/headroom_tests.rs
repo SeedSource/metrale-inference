@@ -139,6 +139,21 @@ fn the_kv_floor_is_the_cache_s_own_bytes_per_token() {
     );
 }
 
+/// 2026-10-01: `glm5_next` aliases V onto K (`METRALE_GLM_KV_V_ALIAS`, on by
+/// default), so the preflight prices K alone, as the engine's pool does.
+#[test]
+fn glm_kv_prices_k_only() {
+    let mut c = qwen38_27b();
+    c.model_type = "glm5_next".to_string();
+    if std::env::var("METRALE_GLM_KV_V_ALIAS").as_deref() == Ok("0") {
+        return;
+    }
+    assert_eq!(
+        kv_bytes_per_token(&args(16), &c, KvCacheDtype::Fp8),
+        16 * 4 * 256,
+    );
+}
+
 /// 2026-09-26: `--max-seq-len` below the floor's token count caps the floor.
 #[test]
 fn the_floor_never_exceeds_max_seq_len() {

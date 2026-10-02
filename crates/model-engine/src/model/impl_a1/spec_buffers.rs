@@ -144,6 +144,7 @@ pub(super) fn alloc_prefill_capture(
     mtp_quant_fwd: MtpQuantization,
     levers: &ModelLevers,
     mtp_quant: MtpQuantization,
+    stage_rows: usize,
     gpu: &dyn GpuBackend,
 ) -> Result<(usize, DevicePtr)> {
     // 2026-09-25: Whole-prompt hidden capture buffer, `[rows, hidden_size]`
@@ -170,6 +171,15 @@ pub(super) fn alloc_prefill_capture(
     } else {
         mtp_prefill_rows
     };
+    // 2026-10-01: Under the chunked capture (`mtp_stage`, A59) the buffer is a staging
+    // window of one arena (`stage_rows`), drained into the drafter after every chunk.
+    let carry_on = metrale_model_layers::mtp_carry::mtp_carry_drafter_enabled(levers);
+    let chunked = crate::model::mtp_stage::glm_mtp_chunked_capture(&config.model_type, carry_on);
+    let capture_rows = if chunked {
+        capture_rows.min(stage_rows)
+    } else {
+        capture_rows
+    };
     let mtp_prefill_hidden = if has_mtp
         && mtp_quant_fwd.supports_drafter_prefill()
         && metrale_model_layers::layers::mtp_drafter_prefill_enabled(levers)
@@ -183,7 +193,9 @@ pub(super) fn alloc_prefill_capture(
             bytes as f64 / 1e6,
             capture_rows,
             config.hidden_size,
-            if capture_rows < max_seq_len {
+            if chunked {
+                " — chunked staging window (METRALE_GLM_MTP_CHUNKED_CAPTURE, A59)".to_string()
+            } else if capture_rows < max_seq_len {
                 format!(
                     " — capped from --max-seq-len {max_seq_len} to the reachable \
                      context (proposer ceiling A59 and/or the DFlash ctx cap)"

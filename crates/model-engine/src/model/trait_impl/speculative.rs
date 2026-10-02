@@ -158,13 +158,23 @@ impl TransformerModel {
                 if carry_on && let Some(old) = self.mtp_carry.lock().take() {
                     proposer.free_drafter_kv(&old.block_table);
                 }
-                if let Err(e) = proposer.prefill_drafter(
-                    &seq_tokens[..p],
-                    self.mtp_prefill_hidden,
-                    prop_state.as_mut(),
-                    ctx,
-                    stream,
-                ) {
+                // 2026-10-01: Under the chunked capture (`mtp_stage`) the earlier chunks are
+                // already drafter rows; only the staged rest is drained.
+                let prompt = &seq_tokens[..p];
+                let hid = self.mtp_prefill_hidden;
+                let done = if self.mtp_chunked() {
+                    self.drain_stage_at_propose(
+                        proposer,
+                        prompt,
+                        captured,
+                        prop_state.as_mut(),
+                        ctx,
+                        stream,
+                    )
+                } else {
+                    proposer.prefill_drafter(prompt, hid, prop_state.as_mut(), ctx, stream)
+                };
+                if let Err(e) = done {
                     tracing::warn!("MTP drafter prefill failed (continuing without): {e:#}");
                 }
             } else if carry_on && first_propose && p >= 2 {

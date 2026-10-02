@@ -41,6 +41,9 @@ impl Glm5NextMtpHead {
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
+            // 2026-10-01: The drafter block, like the target's DSA layers,
+            // touches only the K pool (`write_kv_row`, the paged gather).
+            v_aliases_k: metrale_cache::kv_cache::glm_kv_v_alias("glm5_next"),
         };
         let blocks = max_seq_len / kv_config.block_size + 2;
         let kv_cache = PagedKvCache::new(kv_config, blocks, gpu)?;

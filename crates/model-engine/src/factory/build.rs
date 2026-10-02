@@ -294,6 +294,7 @@ pub fn build_model(
         layer_dtypes: layer_dtypes.clone(),
         layer_dims: config.kv_layer_dims.clone(),
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
+        v_aliases_k: metrale_cache::kv_cache::glm_kv_v_alias(&config.model_type),
     };
 
     if hss_cache_blocks_per_seq.is_some() {
@@ -355,6 +356,12 @@ pub fn build_model(
             gib(mtp_pool_reserve),
         );
     }
+    // 2026-10-01: A59: the GLM MTP head's post-sizing allocations, under the
+    // chunked capture (0 otherwise).
+    let has_glm_mtp = use_speculative && glm_mtp_module.is_some();
+    let glm_rows = buffers.max_batch_tokens();
+    let glm_reserve = kv_budget::glm_mtp_reserve(&config, has_glm_mtp, max_seq_len, glm_rows);
+    let kv_budget = kv_budget.saturating_sub(glm_reserve);
     // 2026-09-25: With `--high-speed-swap` the pool is sized from the cap, not
     // from the budget.
     let num_kv_blocks = match hss_cache_blocks_per_seq {

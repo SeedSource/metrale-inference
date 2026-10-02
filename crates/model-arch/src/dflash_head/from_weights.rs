@@ -91,6 +91,7 @@ impl BlockDiffusionDraftHead {
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
+            v_aliases_k: false,
         };
         // 2026-09-25: Each sequence's lazy block allocation in propose.rs takes
         // `ceil((max_ctx_len + gamma + 1) / 16)` blocks, and `max_ctx_len <=

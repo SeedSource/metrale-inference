@@ -24,19 +24,31 @@ impl PagedKvCache {
         for i in 0..config.num_layers {
             // 2026-09-25: K and V are sized separately: for `Bf16KTurbo3V` the
             // K pool is BF16-sized and the V pool Turbo3-sized.
+            // 2026-10-01: Under `v_aliases_k` the V pool is the K pool with
+            // the K stride; nothing is allocated for it.
             let k_block_bytes = config.k_block_bytes_for_layer(i);
-            let v_block_bytes = config.v_block_bytes_for_layer(i);
+            let v_block_bytes = if config.v_aliases_k {
+                k_block_bytes
+            } else {
+                config.v_block_bytes_for_layer(i)
+            };
             let k_pool_bytes = num_blocks * k_block_bytes;
-            let v_pool_bytes = num_blocks * v_block_bytes;
             let k_pool = gpu.alloc(k_pool_bytes)?;
-            let v_pool = gpu.alloc(v_pool_bytes)?;
-            total_bytes += k_pool_bytes + v_pool_bytes;
+            let v_pool = if config.v_aliases_k {
+                k_pool
+            } else {
+                let v_pool_bytes = num_blocks * v_block_bytes;
+                total_bytes += v_pool_bytes;
+                gpu.alloc(v_pool_bytes)?
+            };
+            total_bytes += k_pool_bytes;
             layers.push(LayerPool {
                 k_pool,
                 v_pool,
                 k_block_stride: k_block_bytes,
                 v_block_stride: v_block_bytes,
                 dtype: config.dtype_for_layer(i),
+                v_aliased: config.v_aliases_k,
             });
         }
 
@@ -56,6 +68,15 @@ impl PagedKvCache {
                 num_blocks,
                 config.num_layers,
                 hp_count,
+                total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        } else if config.v_aliases_k {
+            tracing::info!(
+                "KV cache: {} blocks × {} layers × {} bytes/block = {:.1} GB total \
+                 (V aliased onto K: no V pool)",
+                num_blocks,
+                config.num_layers,
+                config.block_bytes(),
                 total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             );
         } else {
@@ -112,12 +133,14 @@ impl PagedKvCache {
                 layer.k_block_stride,
                 stream,
             )?;
-            gpu.memset_async(
-                layer.v_pool.offset(v_offset),
-                0,
-                layer.v_block_stride,
-                stream,
-            )?;
+            if !layer.v_aliased {
+                gpu.memset_async(
+                    layer.v_pool.offset(v_offset),
+                    0,
+                    layer.v_block_stride,
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }
@@ -141,12 +164,14 @@ impl PagedKvCache {
                 layer.k_block_stride,
                 stream,
             )?;
-            gpu.memset_async(
-                layer.v_pool.offset(v_offset),
-                0xFF,
-                layer.v_block_stride,
-                stream,
-            )?;
+            if !layer.v_aliased {
+                gpu.memset_async(
+                    layer.v_pool.offset(v_offset),
+                    0xFF,
+                    layer.v_block_stride,
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }
@@ -429,7 +454,10 @@ impl PagedKvCache {
         let k_ptr = self.k_cache_ptr(layer_idx, block_idx);
         let v_ptr = self.v_cache_ptr(layer_idx, block_idx);
         gpu.copy_h2d(k_data, k_ptr)?;
-        gpu.copy_h2d(v_data, v_ptr)?;
+        // 2026-10-01: An aliased V is the K block just written.
+        if !self.layers[layer_idx].v_aliased {
+            gpu.copy_h2d(v_data, v_ptr)?;
+        }
         Ok(())
     }
 

@@ -296,6 +296,27 @@ pub(crate) fn prefill_gemm_permute() -> bool {
     })
 }
 
+/// 2026-10-01: Whether the routed-expert prefill runs the register-dequant grouped W4A16 path
+/// (`w4a16_mma.rs`, `moe_w4a16_prefill_mma.cu`: compact tile list, gate+up+SwiGLU fused, then
+/// down) instead of the `moe_w4a16_grouped_gemm_ptrtable_*` tile:
+/// `METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1`. NOT byte-identical to the production path (the k
+/// order inside each MMA differs; dequantised weights and the SwiGLU expression are the same),
+/// so it is quality-gated. UNMEASURED on GPU as of 2026-10-01. Off by default. Read once.
+pub(crate) fn prefill_gemm_grouped_w4a16() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_MOE_PREFILL_GROUPED_W4A16").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "GLM routed-MoE prefill: GROUPED W4A16 register-dequant path \
+                 (METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1) — fused gate/up/SwiGLU + down, \
+                 not byte-identical to the production grouped GEMM; UNMEASURED as of 2026-10-01"
+            );
+        }
+        on
+    })
+}
+
 /// 2026-09-25: Grid height of the grouped GEMM: tiles of `m_tile` rows that the busiest expert
 /// in the host copy of `expert_offsets` needs, at least 1 and at most `worst_case`.
 pub(crate) fn max_m_tiles_from_offsets(offsets: &[i32], worst_case: u32, m_tile: usize) -> u32 {

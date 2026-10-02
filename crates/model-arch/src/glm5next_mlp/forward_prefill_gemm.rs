@@ -20,8 +20,10 @@
 
 mod dispatch;
 mod tile;
+mod w4a16_mma;
 
 pub(crate) use tile::*;
+pub(crate) use w4a16_mma::PrefillMmaKernels;
 
 pub(super) use dispatch::forward_moe_grouped_prefill;
 pub use dispatch::grouped_prefill_selected;

@@ -150,6 +150,11 @@ impl Glm5NextMlpWorkspace {
     pub(super) fn moe_perm(&self) -> DevicePtr {
         self.moe_perm
     }
+    /// 2026-10-01: `u_eid` (`max_total_expanded` I32) lent to the grouped-W4A16 prefill's tile
+    /// list; only the row-batched path, never taken in the same call, uses it otherwise.
+    pub(super) fn prefill_tile_scratch(&self) -> DevicePtr {
+        self.u_eid
+    }
 }
 
 /// 2026-09-25: `METRALE_NO_GLM_MOE_ROW_BATCH=1` turns the row-batched routed path off; each row

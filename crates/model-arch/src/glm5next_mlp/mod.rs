@@ -135,6 +135,9 @@ pub struct Glm5NextMlpKernels {
     /// (`forward_prefill_gemm::prefill_gemm_permute`). When 0, the dispatch never takes the
     /// lever even if the env var is set.
     pub moe_permute_tokens: KernelHandle,
+    /// 2026-10-01: `METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1`: the register-dequant grouped W4A16
+    /// prefill (`forward_prefill_gemm/w4a16_mma.rs`). All handles 0 when the lever is off.
+    pub(crate) moe_prefill_mma: forward_prefill_gemm::PrefillMmaKernels,
 }
 
 impl Glm5NextMlpKernels {
@@ -253,6 +256,7 @@ impl Glm5NextMlpKernels {
                 MOE_MODULE,
                 "moe_permute_tokens",
             ),
+            moe_prefill_mma: forward_prefill_gemm::PrefillMmaKernels::resolve(gpu),
         })
     }
 }

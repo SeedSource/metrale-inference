@@ -154,6 +154,7 @@ impl TransformerModel {
     ///   broadcast, then the accept count (DFlash K=γ verify)
     /// - 0xFFFFFFF8 (`EP_CMD_DECODE_CKPT`): decode-time Marconi checkpoint →
     ///   `EP_CKPT_WORDS` words in one bulk broadcast
+    /// - 0xFFFFFFF9 (`EP_CMD_VERIFY_BATCH`): batched MTP verify → `verify_ep.rs`
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored)
     /// - any other value: a token id, decoded in the addressed slot
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
@@ -184,6 +185,12 @@ impl TransformerModel {
         // reads.
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
+        }
+
+        // 2026-10-02: Batched MTP verify: the preamble seq_id is 0 and the per-row slots arrive
+        // in its payload (`trait_impl/verify_ep.rs`).
+        if cmd == crate::model::trait_impl::verify_ep::EP_CMD_VERIFY_BATCH {
+            return self.ep_worker_verify_batch(slots);
         }
 
         let slot_idx = seq_id as usize;
@@ -299,7 +306,15 @@ impl TransformerModel {
                 // 2026-09-25: Save the hidden row the head saved
                 // (`save_hidden_for_mtp`), so both ranks feed the drafter the same
                 // input and its all-reduce sums partials of one vector.
-                if let Err(e) = self.save_hidden_for_mtp(hidden_idx, stream) {
+                // 2026-10-02: With `MTP_HIDDEN_FROM_STASH` set the head loaded batched-verify
+                // stash slot `hidden_idx & !flag` (`verify_ep.rs`), which this rank stashed too.
+                let flag = crate::model::trait_impl::verify_ep::MTP_HIDDEN_FROM_STASH as usize;
+                let saved = if hidden_idx & flag != 0 {
+                    self.save_hidden_for_mtp_from_stash(hidden_idx & !flag, stream)
+                } else {
+                    self.save_hidden_for_mtp(hidden_idx, stream)
+                };
+                if let Err(e) = saved {
                     tracing::warn!("EP worker save_hidden_for_mtp({hidden_idx}) failed: {e:#}");
                 }
                 if let Err(e) =

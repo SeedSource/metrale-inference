@@ -73,7 +73,13 @@ impl ModelVerify for TransformerModel {
         opts: crate::traits::VerifyBatchedOpts,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        // 2026-10-02: Multi-rank (`verify_ep.rs`): the workers get the whole batch first, and
+        // after a failure the abort verdict they wait for; a no-op on one GPU.
+        let sent = self.ep_send_verify_batch(tokens, ks, &*seqs)?;
         let r = self.decode_verify_batched_dispatch(tokens, ks, seqs, _stream, opts);
+        if sent && r.is_err() {
+            self.ep_send_verify_batch_abort(ks.len());
+        }
         self.release_verify_capture_on_err(r)
     }
 

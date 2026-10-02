@@ -372,6 +372,14 @@ impl TransformerModel {
         let src = self.verify_hidden_stash.offset(idx * h * bf16);
         self.gpu
             .copy_d2d_async(src, self.mtp_hidden_save, h * bf16, stream)?;
+        // 2026-10-02: Multi-rank: latch the stash slot, flagged, so the next propose tells the
+        // worker to load the same slot (`verify_ep.rs` `MTP_HIDDEN_FROM_STASH`).
+        if self.multi_rank_protocol_active() {
+            self.last_mtp_hidden_idx.store(
+                super::verify_ep::MTP_HIDDEN_FROM_STASH as usize | idx,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Ok(())
     }
 

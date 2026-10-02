@@ -59,7 +59,7 @@ impl TransformerModel {
     /// one at a time when it returns false.
     ///
     /// It requires `2 <= n <= VERIFY_WY_TABLE_SEQS`, `Σ ks <= VERIFY_ROW_CAP`,
-    /// no EP comm backend, a verify hidden stash (allocated only with a
+    /// no comm backend unless `batched_verify_ep_ok`, a verify hidden stash (allocated only with a
     /// proposer), no layer that declines `decode_verify_multi`, no HSS
     /// (`cache_blocks_per_seq`), and, with an adapter loaded, no
     /// `METRALE_LORA_NO_BATCH_VERIFY=1`. Without DFlash every `ks[i]` must be
@@ -81,13 +81,20 @@ impl TransformerModel {
         (2..=metrale_model_layers::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
             && shape_ok
             && ks.iter().sum::<usize>() <= super::verify_e2::VERIFY_ROW_CAP
-            && self.comm.is_none()
+            // 2026-10-02: With a comm backend only through the multi-rank batched verify
+            // (`verify_ep.rs`): EP protocol v2, every layer `decode_verify_multi_own_states`.
+            && (self.comm.is_none() || self.batched_verify_ep_ok())
             && !(self.lora.is_some() && metrale_model_layers::lora::no_batch_verify())
             && !self.verify_hidden_stash.is_null()
             && !self
                 .layers
                 .iter()
                 .any(|l| l.decode_verify_multi_unsupported())
+            // 2026-10-02: A GLM-5.3 layer takes as many rows as its KDA and MLP scratch hold.
+            && self.layers.iter().all(|l| {
+                !l.decode_verify_multi_own_states()
+                    || ks.iter().sum::<usize>() <= l.decode_verify_multi_max_rows()
+            })
             // 2026-09-25: HSS: `decode_multi_seq` takes no disk block ids, so
             // history offloaded to disk would be missing.
             && self
@@ -195,7 +202,14 @@ impl TransformerModel {
         // replay, at the batch's widest row count `k_max`. Table strides do
         // not depend on k (`VERIFY_WY_LAYER_STRIDE_BYTES`). NULL means no
         // tables were staged, and the layers get a NULL slice below.
-        let wy_tables_base = self.upload_verify_wy_tables(&*seqs, k_max, &[], stream)?;
+        // 2026-10-02: A layer that owns its verify state (`decode_verify_multi_own_states`,
+        // GLM-5.3) reads no tables: none are staged, so no carry, write-on-accept or graph.
+        let own_states = self.any_verify_own_states();
+        let wy_tables_base = if own_states {
+            DevicePtr::NULL
+        } else {
+            self.upload_verify_wy_tables(&*seqs, k_max, &[], stream)?
+        };
         // 2026-09-25: A write-on-accept request is honoured only with the WY
         // tables staged, since the fold reads them. `gdn_woa_bind` allocates
         // and binds the stash on the first request, before any capture.
@@ -221,7 +235,7 @@ impl TransformerModel {
         // WY entries. Each ghost slot must be free and, with WY tables, its
         // intermediate pool must cover the ghost's depth (the closure in
         // `pick_verify_graph`).
-        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag;
+        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag && !own_states;
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(
                 &*seqs,
@@ -314,7 +328,12 @@ impl TransformerModel {
             // allocated before `begin_capture`.
             let mut attn_dummy_states: Vec<Vec<Box<dyn LayerState>>> = Vec::new();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                if self.config.layer_type(layer_idx) == LayerType::FullAttention {
+                if self.config.layer_type(layer_idx) == LayerType::FullAttention
+                    && layer.decode_verify_multi_own_states()
+                {
+                    // 2026-10-02: Keeps `attn_idx` aligned; this layer never reads it.
+                    attn_dummy_states.push(Vec::new());
+                } else if self.config.layer_type(layer_idx) == LayerType::FullAttention {
                     attn_dummy_states.push(
                         (0..r_total)
                             .map(|_| layer.alloc_state(self.gpu.as_ref()))

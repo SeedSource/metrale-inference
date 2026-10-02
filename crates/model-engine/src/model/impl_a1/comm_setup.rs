@@ -83,6 +83,12 @@ pub(super) fn assert_rank_levers_agree(
                 "METRALE_GLM_MLA_SCALE_AUTHOR",
                 u64::from(metrale_model_arch::glm5next_dsa::attend::mla_scale_author()),
             ),
+            // 2026-10-02: The GLM batched MTP verify changes which collectives a decode step
+            // issues (one batch-wide forward instead of one per sequence).
+            (
+                "METRALE_GLM_BATCHED_VERIFY",
+                u64::from(metrale_model_arch::glm5next_layer::batched_verify()),
+            ),
             // 2026-09-25: The EP command protocol (`ep_protocol_v2`), which
             // both ranks must share.
             (

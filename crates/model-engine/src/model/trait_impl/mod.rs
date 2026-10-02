@@ -73,6 +73,8 @@ mod verify_c2;
 mod verify_d;
 mod verify_e;
 pub(in crate::model) mod verify_e2;
+// 2026-10-02: The multi-rank batched MTP verify (`EP_CMD_VERIFY_BATCH`).
+pub(in crate::model) mod verify_ep;
 mod verify_fused;
 
 impl Model for TransformerModel {}

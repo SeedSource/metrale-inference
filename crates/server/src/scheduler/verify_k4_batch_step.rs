@@ -179,6 +179,19 @@ pub(super) fn step_verify_k4_batched(
         .io
         .tel
         .mark(crate::scheduler::mtp_timing::Phase::PipelineProc, t_phase1);
+    // 2026-10-02: Multi-rank (`METRALE_GLM_BATCHED_VERIFY`, model-engine `verify_ep.rs`): the
+    // worker ranks wait for every sequence's accepted count, in batch order, then stash and roll
+    // back as this rank does below. It goes out before anything else this step sends.
+    if model.is_ep() {
+        let words: Vec<u32> = verdicts.iter().map(|&(_, na, _)| na as u32).collect();
+        if let Err(e) = model.ep_broadcast_tokens(&words) {
+            tracing::error!("EP broadcast batched-verify verdict (n={n}): {e:#}");
+            for a in batch.iter_mut() {
+                a.finished = true;
+            }
+            return;
+        }
+    }
     let t_stash = sched.io.clock.now();
     // 2026-09-25: stash each sequence's accepted-position hidden row
     // (`off[i] + num_accepted`) into stash slot i before any propose

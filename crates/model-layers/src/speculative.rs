@@ -7,6 +7,7 @@
 //! Owner: model-layers (speculative).
 //! Invariants: none beyond the types.
 
+pub mod glm_dflash;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;

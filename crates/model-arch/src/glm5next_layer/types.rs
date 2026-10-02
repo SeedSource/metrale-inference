@@ -72,4 +72,9 @@ pub struct Glm5NextLayer {
     pub is_first: bool,
     /// 2026-09-25: Collapse the highway in this layer; true for the last text layer only.
     pub is_last: bool,
+    /// 2026-10-01: This layer is a DFlash drafter tap (`config.dflash_capture_layers`, under
+    /// `METRALE_GLM_DFLASH=1`): after its FFN-site `hc_post` it also writes `hc_head_mean` of the
+    /// highway into `hidden`, the tensor the drafter was trained on (mean of the `hc_mult`
+    /// streams of the layer's completed output). False for the MTP block and without DFlash.
+    pub dflash_tap: bool,
 }

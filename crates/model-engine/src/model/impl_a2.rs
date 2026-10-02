@@ -150,6 +150,8 @@ impl TransformerModel {
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then the accept count
     /// - 0xFFFFFFF5 (`EP_CMD_MTP_PROPOSE`): last_token, position, num_drafts,
     ///   hidden_idx
+    /// - 0xFFFFFFF6 (`EP_CMD_VERIFY_KGAMMA`): k, then k tokens in one bulk
+    ///   broadcast, then the accept count (DFlash K=γ verify)
     /// - 0xFFFFFFF8 (`EP_CMD_DECODE_CKPT`): decode-time Marconi checkpoint →
     ///   `EP_CKPT_WORDS` words in one bulk broadcast
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored)
@@ -368,6 +370,32 @@ impl TransformerModel {
                         self.start_rollback_and_checkpoint_async(seq, 1)?;
                     }
                 }
+            }
+            metrale_model_layers::speculative::glm_dflash::EP_CMD_VERIFY_KGAMMA => {
+                // 2026-10-01: DFlash K=γ verify (`step_verify_dflash` on rank 0): `k`, the `k`
+                // tokens in one bulk broadcast, the verify, then `num_accepted`. The worker
+                // mirrors rank 0's bookkeeping: keep the pre-verify prefix + anchor + accepted
+                // drafts, and commit the SSM state to that row. Its drafter state is unused
+                // (the DFlash drafter proposes on rank 0 alone), so it is not trimmed.
+                use metrale_model_layers::speculative::glm_dflash::{KGAMMA_MAX_K, kgamma_keep_len};
+                let k = self.ep_broadcast_u32(0)? as usize;
+                if k == 0 || k > KGAMMA_MAX_K {
+                    bail!("EP_CMD_VERIFY_KGAMMA: k={k} outside 1..={KGAMMA_MAX_K}");
+                }
+                let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
+                self.sync_secondary()?;
+                self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                let keep = kgamma_keep_len(seq.seq_len, k, num_accepted)?;
+                let drop = seq.seq_len - keep;
+                seq.seq_len = keep;
+                for _ in 0..drop.min(seq.tokens.len()) {
+                    seq.tokens.pop();
+                }
+                self.commit_accepted_prefix(seq, num_accepted + 1, k)?;
+                // 2026-10-01: The commit runs on the secondary stream; order it before whatever
+                // this rank runs next (the next verify syncs too, a plain decode does not).
+                self.sync_secondary()?;
             }
             token => {
                 self.decode(token, seq, stream)?;

@@ -282,9 +282,24 @@ pub(crate) fn load_dflash_drafter(
 
     let mut loader = metrale_model_weights::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
-    let drafter_store = loader
+    let mut drafter_store = loader
         .load(&drafter_dir, gpu, 0)
         .context("Failed to load DFlash drafter weights")?;
+    // 2026-10-01: Under `METRALE_GLM_DFLASH=1`, free the drafter's own
+    // `embed_tokens` / `lm_head`: the head always drafts through the target's
+    // tables (`install_dflash_drafter`) and nothing reads these. For
+    // canada-quant GLM-5.3-Flash-DFlash2-G they are byte-identical to the
+    // target's and 2.54 GB, on every rank.
+    if metrale_model_layers::speculative::glm_dflash::glm_dflash_enabled() {
+        let (n, bytes) = drafter_store.free_matching(gpu, |name| {
+            name.ends_with("embed_tokens.weight") || name.ends_with("lm_head.weight")
+        })?;
+        tracing::info!(
+            "DFlash drafter: freed {n} unread table(s) (embed_tokens/lm_head), {:.2} GB; \
+             the head uses the target's",
+            bytes as f64 / 1e9
+        );
+    }
     tracing::info!(
         "DFlash drafter store: {} tensors, {} bytes",
         drafter_store.len(),

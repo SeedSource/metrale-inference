@@ -10,6 +10,8 @@
 //! - Highway slots are per token: `decode` uses slot 0, `prefill` gives prompt token `t` slot
 //!   `t`, and `decode_batched` gives verify row `t` slot `t`.
 //! - The last text layer collapses the highway with `hc_head_mean`, which takes no weights.
+//! - 2026-10-01: A DFlash tap layer (`dflash_tap`) also collapses its highway into `hidden`
+//!   after its FFN-site `hc_post`; the highway itself is unchanged, so the next layer is too.
 //! - Any all-reduce of a mixer or MLP output happens before `hc_post` folds that output into
 //!   the highway.
 //!

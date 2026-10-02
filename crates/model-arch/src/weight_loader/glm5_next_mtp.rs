@@ -123,6 +123,8 @@ pub fn load_glm5next_mtp_module(
             // 2026-09-25: No mHC highway to expand or collapse.
             is_first: false,
             is_last: false,
+            // 2026-10-01: The MTP block is never a DFlash tap.
+            dflash_tap: false,
         },
         eh_proj: DenseWeight {
             weight: store.get(&format!("{prefix}eh_proj.weight"))?.ptr,

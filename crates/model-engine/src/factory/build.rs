@@ -132,6 +132,13 @@ pub fn build_model(
     // 2026-09-25: With DFlash, the target's capture layers are the drafter's
     // `dflash_config.target_layer_ids`, used as they are, set before
     // `TransformerModel::new` so it allocates the capture buffer.
+    // 2026-10-01: DFlash on glm5_next is opt-in (`METRALE_GLM_DFLASH=1`); refuse before any
+    // weight is loaded.
+    metrale_model_layers::speculative::glm_dflash::glm_dflash_gate(
+        &config.model_type,
+        dflash_args.is_some(),
+        metrale_model_layers::speculative::glm_dflash::glm_dflash_enabled(),
+    )?;
     weights_prep::apply_dflash_capture_config(&mut config, &dflash_args);
 
     // 2026-09-25: Step 2: load the weights.

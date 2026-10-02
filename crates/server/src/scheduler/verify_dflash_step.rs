@@ -5,11 +5,26 @@
 //!
 //! Owner: scheduler.
 //! Invariants:
-//! - No EP broadcast: this step issues no worker command, unlike the
-//!   single-sequence K=2/3/4 steps.
+//! - 2026-10-01: On a multi-rank serve (`model.is_ep()`) the worker ranks run
+//!   the same verify (`EP_CMD_VERIFY_KGAMMA`: the command and the tokens go
+//!   out before the verify, `num_accepted` right after the accept walk and
+//!   before any emit can finish the sequence). Single-rank serves send
+//!   nothing, as before.
 //! - No logprobs: tokens are emitted with `None`.
 
 use super::*;
+use metrale_model_layers::speculative::glm_dflash::{AcceptStats, EP_CMD_VERIFY_KGAMMA};
+
+/// 2026-10-01: Serve-wide DFlash acceptance (`AcceptStats`), logged every
+/// `ACCEPT_SUMMARY_EVERY` verify steps as `DFLASH ACCEPT SUMMARY ...`
+/// (parsed by `scripts/race/dflash-glm-check.sh`).
+static DFLASH_ACCEPT: std::sync::Mutex<AcceptStats> = std::sync::Mutex::new(AcceptStats {
+    steps: 0,
+    drafted: 0,
+    accepted: 0,
+    hist: Vec::new(),
+});
+const ACCEPT_SUMMARY_EVERY: u64 = 32;
 
 /// 2026-09-25: verify `[last_token, drafts..]` with
 /// `model.decode_verify_dflash`. Drafts are accepted up to the first one
@@ -35,6 +50,22 @@ pub fn step_verify_dflash(
     let mut tokens = Vec::with_capacity(drafts.len() + 1);
     tokens.push(a.last_token);
     tokens.extend_from_slice(drafts);
+
+    // 2026-10-01: Multi-rank: the workers run `decode_verify_graphed_kgamma`
+    // for this command (the model's EP worker loop). The command, `k` and the
+    // tokens go out before this rank enters the verify's first collective.
+    let ep = model.is_ep();
+    if ep {
+        let sent = model
+            .ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, EP_CMD_VERIFY_KGAMMA)
+            .and_then(|_| model.ep_broadcast_cmd(tokens.len() as u32))
+            .and_then(|_| model.ep_broadcast_tokens(&tokens).map(|_| ()));
+        if let Err(e) = sent {
+            tracing::error!("EP broadcast verify_kgamma: {e:#}");
+            a.finished = true;
+            return;
+        }
+    }
 
     // 2026-09-25: `METRALE_DFLASH_STEP_TIMING=1` logs the verify and propose
     // walls separately at the end of the step.
@@ -96,6 +127,20 @@ pub fn step_verify_dflash(
             num_accepted += 1;
         } else {
             break;
+        }
+    }
+
+    // 2026-10-01: Multi-rank: the workers block on this count after their
+    // verify, so it goes out before any emit below can finish the sequence.
+    if ep && let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
+        tracing::error!("EP broadcast verify_kgamma result: {e:#}");
+        a.finished = true;
+        return;
+    }
+    if let Ok(mut st) = DFLASH_ACCEPT.lock() {
+        st.record(drafts.len(), num_accepted);
+        if st.steps % ACCEPT_SUMMARY_EVERY == 0 {
+            tracing::info!("DFLASH ACCEPT SUMMARY {}", st.summary());
         }
     }
 

@@ -73,6 +73,26 @@ impl TransformerModel {
                 ),
             }
         }
+        // 2026-10-02: `TransformerModel::new` allocates the batched-verify hidden stash
+        // (and MTP-catchup stash) only when it built a proposer itself
+        // (`spec_buffers::alloc_verify_buffers`). GLM-5.3 / V4 install their MTP head here,
+        // after construction, so the stash stayed NULL and `can_batch_verify_dispatch`
+        // (`!verify_hidden_stash.is_null()`) refused every batch. Allocate them now.
+        // A failure leaves them NULL: the batched route stays refused, the serve runs.
+        let hs = self.config.hidden_size;
+        let seqs = metrale_model_layers::layer::VERIFY_WY_TABLE_SEQS;
+        if self.verify_hidden_stash.is_null() {
+            match self.gpu.alloc(seqs * hs * 2) {
+                Ok(p) => self.verify_hidden_stash = p,
+                Err(e) => tracing::warn!("verify hidden stash alloc failed ({e:#}); batched verify stays off"),
+            }
+        }
+        if self.verify_catchup_stash.is_null() && self.levers.mtp_kv_exact {
+            match self.gpu.alloc(seqs * metrale_model_layers::layer::MTP_CATCHUP_MAX * hs * 2) {
+                Ok(p) => self.verify_catchup_stash = p,
+                Err(e) => tracing::warn!("verify catchup stash alloc failed ({e:#})"),
+            }
+        }
         self.proposer = Some(proposer);
     }
 

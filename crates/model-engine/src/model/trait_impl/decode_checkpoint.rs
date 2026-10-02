@@ -38,6 +38,9 @@ use metrale_model_layers::weight_map::{DenseWeight, MtpWeights, QuantizedWeight}
 // because `impl_a2.rs` and `snap_agree_tests.rs` name them as `decode_checkpoint::X`.
 mod plan;
 pub(in crate::model) use plan::*;
+// 2026-10-01: Which snapshot families are saved (`METRALE_MARCONI_PREFILL_ONLY`).
+mod policy;
+use policy::{decode_ckpt_enabled, snapshot_policy};
 
 impl TransformerModel {
     /// 2026-09-25: Save a Marconi SSM snapshot during decode, each time `seq.tokens` completes
@@ -45,7 +48,13 @@ impl TransformerModel {
     /// can restore near the end of this turn instead of replaying its decode tokens.
     /// The caller must call it after the step's SSM state is committed.
     pub(super) fn decode_marconi_checkpoint_dispatch(&self, seq: &mut SequenceState) {
-        let enabled = self.ssm_snapshots.is_enabled() && self.prefix_cache.is_active();
+        // 2026-10-01: `METRALE_MARCONI_PREFILL_ONLY=1` turns decode checkpoints off; rank 0
+        // then sends no `EP_CMD_DECODE_CKPT` either (`policy`).
+        let enabled = decode_ckpt_enabled(
+            self.ssm_snapshots.is_enabled(),
+            self.prefix_cache.is_active(),
+            snapshot_policy(),
+        );
         // 2026-09-25: The cheap preconditions run before the env read and the KV lock.
         if !ckpt_preconditions(
             enabled,
@@ -295,6 +304,11 @@ impl TransformerModel {
     /// model has no SSM layers, the sequence has no slot, or the save fails. No hidden row is
     /// stashed, so an exact hit on this snapshot is declined at restore.
     pub(super) fn finish_leaf_snapshot(&self, seq: &SequenceState) -> Option<usize> {
+        // 2026-10-01: `METRALE_MARCONI_PREFILL_ONLY=1` turns the finish leaf off; the caller
+        // then inserts the tokens without a snapshot (`policy`).
+        if !snapshot_policy().saves_finish_leaf() {
+            return None;
+        }
         if self.config.num_ssm_layers() == 0 || seq.slot_idx == usize::MAX {
             return None;
         }

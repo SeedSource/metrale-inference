@@ -156,3 +156,123 @@ fn headgroup_falls_back_unless_it_divides_the_heads_and_resolved() {
     assert_eq!(headgroup_for(8, 12, true), 0, "8 does not divide 12");
     assert_eq!(headgroup_for(2, 6, true), 2);
 }
+
+/// 2026-10-01: Inputs the tensor-core prefill kernel takes: one 16-byte-aligned pool as K and V,
+/// one scale, aligned Q and O.
+fn tc_inputs() -> DsaDecodeInputs {
+    let pool = DevicePtr(0x10_0000);
+    DsaDecodeInputs {
+        q: DevicePtr(0x20_0000),
+        k_cache: pool,
+        v_cache: pool,
+        out: DevicePtr(0x30_0000),
+        block_tables: DevicePtr(0x40_0000),
+        seq_lens: DevicePtr(0x50_0000),
+        sel_indices: DevicePtr(0x60_0000),
+        k_scale: 0.0173,
+        v_scale: 0.0173,
+    }
+}
+
+/// 2026-10-01: Whether a resolved tensor-core kernel refuses this launch.
+fn tc_refused(
+    c: &Glm5NextDsaConfig,
+    g: &DsaSelectGeometry,
+    p: &DsaDecodePaging,
+    i: &DsaDecodeInputs,
+) -> bool {
+    super::prefill_tc::prefill_tc_refusal(true, c, g, p, i).is_some()
+}
+
+/// 2026-10-01: The GLM-5.3 TP2 prefill launch (32 heads per rank, selection 2051) and the TP1 one
+/// (64 heads) take the tensor-core kernel once it resolved.
+#[test]
+fn prefill_tc_takes_the_glm_shapes() {
+    use super::prefill_tc::prefill_tc_refusal;
+    let (c, g, i) = (
+        cfg(),
+        DsaSelectGeometry::plan(&cfg(), 8_192, 1).unwrap(),
+        tc_inputs(),
+    );
+    assert!(g.out_width <= MLA_PREFILL_TC_MAX_SEL, "width {}", g.out_width);
+    for heads in [32, 64] {
+        let p = DsaDecodePaging {
+            num_q_heads: heads,
+            ..paging()
+        };
+        assert_eq!(prefill_tc_refusal(true, &c, &g, &p, &i), None, "{heads} heads");
+    }
+    let unresolved = prefill_tc_refusal(false, &c, &g, &paging(), &i).unwrap();
+    assert!(unresolved.contains("did not resolve"), "{unresolved}");
+}
+
+/// 2026-10-01: Every shape or layout the tensor-core kernel does not handle is refused, so the
+/// launch falls back to the decode kernel instead of reading past a buffer.
+#[test]
+fn prefill_tc_refuses_what_the_kernel_does_not_handle() {
+    let (c, g, i, p) = (
+        cfg(),
+        DsaSelectGeometry::plan(&cfg(), 8_192, 1).unwrap(),
+        tc_inputs(),
+        paging(),
+    );
+    for heads in [16, 48, 6] {
+        let p = DsaDecodePaging {
+            num_q_heads: heads,
+            ..paging()
+        };
+        assert!(tc_refused(&c, &g, &p, &i), "{heads} heads is not a multiple of 32");
+    }
+    let kv8 = DsaDecodePaging {
+        num_kv_heads: 8,
+        ..paging()
+    };
+    assert!(tc_refused(&c, &g, &kv8, &i));
+    let mut wide = g;
+    wide.out_width = MLA_PREFILL_TC_MAX_SEL + 1;
+    assert!(tc_refused(&c, &wide, &p, &i));
+    let mut kvl = cfg();
+    kvl.kv_lora_rank = 256;
+    assert!(tc_refused(&kvl, &g, &p, &i));
+    let distinct_v = DsaDecodeInputs {
+        v_cache: DevicePtr(0x70_0000),
+        ..i
+    };
+    assert!(tc_refused(&c, &g, &p, &distinct_v));
+    let distinct_scale = DsaDecodeInputs {
+        v_scale: 0.0291,
+        ..i
+    };
+    assert!(tc_refused(&c, &g, &p, &distinct_scale));
+    let misaligned = DsaDecodeInputs {
+        k_cache: i.k_cache.offset(1),
+        v_cache: i.k_cache.offset(1),
+        ..i
+    };
+    assert!(tc_refused(&c, &g, &p, &misaligned));
+    let odd_stride = DsaDecodePaging {
+        cache_stride_bytes: 64 * 512 + 8,
+        ..paging()
+    };
+    assert!(tc_refused(&c, &g, &odd_stride, &i));
+}
+
+/// 2026-10-01: The tensor-core module and entry names are the ones the `.cu` file defines (the
+/// module is its file stem), and the shared-memory mirror covers the kernel's layout.
+#[test]
+fn prefill_tc_names_and_mirrors_are_consistent() {
+    assert_eq!(MLA_PREFILL_TC_MODULE, "glm5next_dsa_mla_prefill_tc");
+    assert!(MLA_PREFILL_TC_ENTRY.starts_with(MLA_PREFILL_TC_MODULE));
+    // 2026-10-01: Q and K tiles (32 x 512 BF16 each), the four FP32 S partials and the BF16 P
+    // tile (row stride 40), the compacted index list, alpha, 1/l and the warp counts.
+    let layout = 32 * 512 * 2 * 2
+        + 4 * 32 * 40 * 4
+        + 32 * 40 * 2
+        + MLA_PREFILL_TC_MAX_SEL * 4
+        + 32 * 4 * 2
+        + 8 * 4;
+    assert_eq!(MLA_PREFILL_TC_SMEM_BYTES as usize, layout);
+    // 2026-10-01: GB10's shared memory per SM (metrale_core::device::sm121::SMEM_PER_SM).
+    const _: () = assert!(MLA_PREFILL_TC_SMEM_BYTES <= 101_376);
+    const _: () = assert!(MLA_PREFILL_TC_HEADS == 32);
+}

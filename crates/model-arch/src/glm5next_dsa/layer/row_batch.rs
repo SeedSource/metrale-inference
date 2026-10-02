@@ -324,7 +324,7 @@ impl Glm5NextDsaLayer {
             block_size,
             cache_stride_bytes: (block_size * self.cfg.kv_lora_rank) as u64,
         };
-        self.attend_rows(gpu, k, st, kv_cache, bt_dev, sl_dev, &paging, stream)?;
+        self.attend_rows(gpu, k, st, kv_cache, bt_dev, sl_dev, &paging, true, stream)?;
 
         let t_proj = profile::start();
         gemm(

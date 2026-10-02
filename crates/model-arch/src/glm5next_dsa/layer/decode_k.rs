@@ -349,7 +349,17 @@ impl Glm5NextDsaLayer {
         }
 
         if let Some(paging) = attend_paging {
-            self.attend_rows(gpu, k, st, kv_cache, attend_bt, attend_sl, &paging, stream)?;
+            self.attend_rows(
+                gpu,
+                k,
+                st,
+                kv_cache,
+                attend_bt,
+                attend_sl,
+                &paging,
+                is_prefill,
+                stream,
+            )?;
         }
         // 2026-09-25: Freed after the attend, which reads both buffers.
         if owns_scratch {

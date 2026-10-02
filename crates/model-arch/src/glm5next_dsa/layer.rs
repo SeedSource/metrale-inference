@@ -40,7 +40,7 @@ use metrale_cache::kv_cache::PagedKvCache;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
-use super::attend::{DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, decode_attention};
+use super::attend::{DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, attention};
 use super::select::{DsaSelectInputs, select_tokens};
 use super::state::Glm5NextDsaState;
 use super::{Glm5NextDsaConfig, Glm5NextDsaKernels};
@@ -333,7 +333,8 @@ impl Glm5NextDsaLayer {
     ///
     /// Grid y is the row. Each row reads the paged latent cache through its own `q_abs` row,
     /// selection row and `seq_lens` entry, and the block-table row at stride
-    /// `max_blocks_per_seq` (0 when the rows share one table).
+    /// `max_blocks_per_seq` (0 when the rows share one table). 2026-10-01: `is_prefill` lets
+    /// `METRALE_GLM_MLA_PREFILL_TC=1` take the tensor-core kernel (`attend::attention`).
     #[allow(clippy::too_many_arguments)]
     fn attend_rows(
         &self,
@@ -344,6 +345,7 @@ impl Glm5NextDsaLayer {
         block_table_dev: DevicePtr,
         seq_lens_dev: DevicePtr,
         paging: &DsaDecodePaging,
+        is_prefill: bool,
         stream: u64,
     ) -> Result<()> {
         use crate::glm5next_layer::profile;
@@ -356,7 +358,7 @@ impl Glm5NextDsaLayer {
         };
         let t = profile::start();
         let pool = kv_cache.k_pool_ptr(self.attn_layer_idx);
-        decode_attention(
+        attention(
             gpu,
             self.decode_kernel,
             &self.cfg,
@@ -373,6 +375,7 @@ impl Glm5NextDsaLayer {
                 k_scale: self.kv_scale,
                 v_scale: self.kv_scale,
             },
+            is_prefill,
             stream,
         )?;
         profile::end(profile::DSA_ATTEND, t, gpu, stream);

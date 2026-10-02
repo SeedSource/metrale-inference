@@ -32,6 +32,12 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
 use super::{Glm5NextDsaConfig, select::DsaSelectGeometry};
 
+pub mod prefill_tc;
+pub use prefill_tc::{
+    MLA_PREFILL_TC_ENTRY, MLA_PREFILL_TC_HEADS, MLA_PREFILL_TC_MAX_SEL, MLA_PREFILL_TC_MODULE,
+    MLA_PREFILL_TC_SMEM_BYTES, attention, prefill_attention_tc,
+};
+
 /// 2026-09-25: Module name the DSA decode kernel resolves from. An unlisted `.cu`
 /// takes its file stem, and this one lives in the `glm-5.3-flash` target.
 pub const DSA_DECODE_MODULE: &str = "glm5next_dsa_mla_decode";
@@ -120,16 +126,20 @@ pub(crate) fn headgroup_for(requested: usize, num_q_heads: usize, resolved: bool
 
 /// 2026-09-25: The selected-index MLA decode entry point.
 /// 2026-10-01: With the head-grouped variants, `KernelHandle(0)` where one did not resolve.
+/// 2026-10-01: And the tensor-core prefill kernel (`METRALE_GLM_MLA_PREFILL_TC`, see
+/// [`prefill_tc`]), `KernelHandle(0)` when it did not resolve.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaDecodeKernel {
     base: KernelHandle,
     headgroup: [KernelHandle; DSA_MLA_HEADGROUPS.len()],
+    prefill_tc: KernelHandle,
 }
 
 impl Glm5NextDsaDecodeKernel {
     /// 2026-09-25: Resolved with `kernel()`, not `try_kernel`: a missing entry
     /// point is an error, with no dense fallback.
     /// 2026-10-01: The head-grouped entry points are optional (`try_kernel`, 0 when absent).
+    /// 2026-10-01: So is the tensor-core prefill kernel.
     pub fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
         let base = gpu.kernel(DSA_DECODE_MODULE, "glm5next_dsa_mla_decode_fp8")?;
         let headgroup = DSA_MLA_HEADGROUPS.map(|g| {
@@ -139,7 +149,21 @@ impl Glm5NextDsaDecodeKernel {
                 &format!("glm5next_dsa_mla_decode_fp8_hg{g}"),
             )
         });
-        Ok(Self { base, headgroup })
+        let prefill_tc = metrale_model_layers::layers::try_kernel(
+            gpu,
+            MLA_PREFILL_TC_MODULE,
+            MLA_PREFILL_TC_ENTRY,
+        );
+        Ok(Self {
+            base,
+            headgroup,
+            prefill_tc,
+        })
+    }
+
+    /// 2026-10-01: Whether `glm5next_dsa_mla_prefill_tc_fp8` resolved.
+    pub fn has_prefill_tc(&self) -> bool {
+        self.prefill_tc.0 != 0
     }
 
     /// 2026-10-01: The `_hg{g}` handle, `None` for a `g` without an entry point or one that

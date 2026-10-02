@@ -95,6 +95,23 @@ pub(crate) fn forward_moe_grouped_prefill(
         .arg_u32(cfg.top_k as u32)
         .launch(stream)?;
 
+    // 2026-10-01: `METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1`: tile list + fused gate/up/SwiGLU +
+    // down (`w4a16_mma.rs`), writing `ws.a_act` and `ws.expert_out` as below. Off (default), or
+    // a contract miss: `usable` is false and everything below runs unchanged.
+    if super::w4a16_mma::usable(&k.moe_prefill_mma, cfg, w, x, te, ws) {
+        return super::w4a16_mma::forward(
+            gpu,
+            &k.moe_prefill_mma,
+            cfg,
+            w,
+            x,
+            ws.sorted_token_ids(),
+            te,
+            ws,
+            stream,
+        );
+    }
+
     // 2026-09-25: With `prefill_gemm_exact_tiles()`, the grid height comes from the real expert
     // histogram; `copy_d2h_on_stream` synchronises the stream first, so the read sees the sort's
     // output. Otherwise it is the worst case, `ceil(rows * top_k / m_tile)`.

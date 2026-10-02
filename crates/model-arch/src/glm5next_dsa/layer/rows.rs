@@ -14,6 +14,7 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_layers::layer::{ForwardContext, LayerState};
 
+use super::super::select::split::{RowSplit, select_tokens_split};
 use super::super::select::{DsaSelectInputs, select_tokens};
 use super::super::state::Glm5NextDsaState;
 use super::row_batch::DsaRowBatch;
@@ -65,6 +66,10 @@ impl Glm5NextDsaLayer {
     /// 2026-10-01: With `row_batch` (`METRALE_GLM_DSA_ROW_BATCH`), `q_pos` is the array
     /// `decode_rows_batched` already uploaded (the same values as `q_pos_host`), and the
     /// per-row GEMVs are the FP32-out batched GEMV, row for row the same bits.
+    ///
+    /// 2026-10-01: With `split` (`METRALE_GLM_DSA_INDEX_SPLIT`, row batch only), `wq_b` and
+    /// the selection run for this rank's rows and the ranks swap their token rows
+    /// (`select::split`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn select_rows_batched(
         &self,
@@ -73,6 +78,7 @@ impl Glm5NextDsaLayer {
         state: &Glm5NextDsaState,
         q_pos_host: &[i32],
         row_batch: Option<&DsaRowBatch>,
+        split: Option<(RowSplit, &dyn metrale_comm::CommBackend)>,
         stream: u64,
     ) -> Result<()> {
         let w = &self.workspace;
@@ -96,7 +102,8 @@ impl Glm5NextDsaLayer {
                 stream,
             )?;
         } else if let Some(rb) = row_batch {
-            self.qidx_rows_batched(gpu, rb, k, stream)?;
+            let (r0, rows) = split.map_or((0, k), |(s, _)| (s.r0, s.rows));
+            self.qidx_rows_batched(gpu, rb, r0, rows, stream)?;
         } else {
             for row in 0..k {
                 gemm(
@@ -140,16 +147,30 @@ impl Glm5NextDsaLayer {
         let t = crate::glm5next_layer::profile::start();
         // 2026-09-25: The base of the `[max_rows, out_width]` output, not a row slice: the
         // kernels index rows themselves, so rows 0..k land in their own slots.
-        select_tokens(
-            gpu,
-            &self.select_kernels,
-            &self.cfg,
-            &geom,
-            &inputs,
-            &w.select,
-            super::super::select::DsaSelectLaunch::Exact,
-            stream,
-        )?;
+        let (kernels, cfg) = (&self.select_kernels, &self.cfg);
+        match split {
+            Some((s, comm)) => select_tokens_split(
+                gpu,
+                kernels,
+                cfg,
+                &geom,
+                &inputs,
+                &w.select,
+                s,
+                comm,
+                stream,
+            )?,
+            None => select_tokens(
+                gpu,
+                kernels,
+                cfg,
+                &geom,
+                &inputs,
+                &w.select,
+                super::super::select::DsaSelectLaunch::Exact,
+                stream,
+            )?,
+        }
         crate::glm5next_layer::profile::end(
             crate::glm5next_layer::profile::DSA_SELECT,
             t,

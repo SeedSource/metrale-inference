@@ -228,7 +228,7 @@ impl Glm5NextKdaLayer {
 
     /// 2026-09-25: `k` tokens of one sequence: the projections batched, the recurrence one row at a
     /// time. Used for the speculative verify, and for prefill sub-chunks that do not take the
-    /// chunked arm (`glm5next_layer/steps/forward.rs`).
+    /// chunked arm (`glm5next_layer/steps/mixer.rs`).
     ///
     /// `front_end` and `back_end` run once over all `k` rows. For `2 <= k <=
     /// DENSE_GEMV_BATCHM_MAX_M` on a target with `dense_gemv_bf16_batchm`, the output matches `k`

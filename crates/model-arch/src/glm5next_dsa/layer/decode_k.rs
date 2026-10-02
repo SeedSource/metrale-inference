@@ -155,6 +155,7 @@ impl Glm5NextDsaLayer {
                 block_table,
                 meta,
                 t_proj,
+                ctx.comm,
                 stream,
             );
         }
@@ -345,7 +346,7 @@ impl Glm5NextDsaLayer {
         // write is in the cache. Row `r` only takes pools that end at or before `q_pos[r]`,
         // so the rows written after it do not change its selection.
         if batch_select && !batch_q_pos.is_empty() {
-            self.select_rows_batched(gpu, k, st, &batch_q_pos, None, stream)?;
+            self.select_rows_batched(gpu, k, st, &batch_q_pos, None, None, stream)?;
         }
 
         if let Some(paging) = attend_paging {

@@ -31,7 +31,10 @@
 //!   run per sub-chunk. The all-reduce is elementwise across the two ranks.
 
 use super::*;
+use crate::glm5next_layer::comm_overlap::{OverlapStep, overlap_schedule};
 use crate::glm5next_mlp::forward_prefill_gemm::grouped_prefill_selected;
+
+mod sp;
 
 /// 2026-09-29: The unstaged loop's sub-chunks of a `num_tokens`-token chunk at width `rows`,
 /// as `(first token, rows)`.
@@ -117,6 +120,48 @@ impl Glm5NextLayer {
     ) -> Result<()> {
         let subs = sub_chunks(num_tokens, rows);
         let wide = full_width_attn(prefill_fullwidth_gemm(), rows, rows_ffn);
+        // 2026-10-01: The full-width arm and the byte-identical restructurings below are
+        // mutually exclusive: SEQ_PARALLEL and COMM_OVERLAP assume per-sub-chunk attention
+        // calls and `rows`-wide dense slices, which the full-width arm replaces. Full width wins;
+        // the other two stay inert (one warning per process).
+        if wide {
+            warn_fullwidth_excludes();
+        } else {
+            // 2026-10-01: `METRALE_GLM_PREFILL_SEQ_PARALLEL=1`: the same two passes with the
+            // row-local work split by rows across the two ranks (`sp.rs`).
+            if let Some(plan) = self.sp_plan(num_tokens, &subs, ctx) {
+                return self.prefill_staged_sp(
+                    hidden,
+                    &subs,
+                    plan,
+                    rows,
+                    rows_ffn,
+                    state,
+                    kv_cache,
+                    seq_len_start,
+                    block_table,
+                    ctx,
+                    stream,
+                );
+            }
+            // 2026-10-01: `METRALE_GLM_PREFILL_COMM_OVERLAP=1`: the same two passes with each
+            // all-reduce overlapped with the next item's compute (`prefill_staged_overlapped`).
+            if prefill_comm_overlap() && ctx.comm.is_some() && !ctx.graph_capture && !profile::on()
+            {
+                return self.prefill_staged_overlapped(
+                    hidden,
+                    &subs,
+                    rows,
+                    rows_ffn,
+                    state,
+                    kv_cache,
+                    seq_len_start,
+                    block_table,
+                    ctx,
+                    stream,
+                );
+            }
+        }
         // 2026-10-01: The attention calls: the sub-chunks, or under the full-width lever the
         // windows of `rows_ffn` rows (whole sub-chunks, since `rows_ffn` is a multiple of
         // `rows`), each with its DSA core at `rows`.
@@ -152,6 +197,110 @@ impl Glm5NextLayer {
             self.ffn_half(x, k, ctx, stream, t, dense_slice)?;
         }
         Ok(())
+    }
+
+    /// 2026-10-01: `prefill_staged_run` with each all-reduce overlapped
+    /// (`METRALE_GLM_PREFILL_COMM_OVERLAP=1`): both passes follow `overlap_schedule`, so
+    /// sub-chunk `j + 1`'s attention front (`hc_pre`, norm, mixer) runs while sub-chunk `j`'s
+    /// mixer all-reduce is on the comm stream, and FFN window `w + 1`'s front (`hc_pre`, norm,
+    /// MLP) while window `w`'s MLP all-reduce is.
+    ///
+    /// Why this is byte-identical to `prefill_staged_run`:
+    /// - Each partial is copied into its own item's rows of `hidden` and reduced there by the
+    ///   same `all_reduce_2rank` (`bf16_add_inplace`, own partial + the peer's) as before; the
+    ///   back (`hc_post`, and `hc_head_mean` on the last layer) reads it from there. Those rows
+    ///   are written by the item's `hc_pre` and read only by its norm before the copy, and by
+    ///   nothing else until the next pass's `hc_pre` writes them.
+    /// - Moving item `i`'s back after item `i + 1`'s front changes no input: the front of
+    ///   `i + 1` reads its own rows' highway slots (`streams`, `post`, `comb`), the weights, the
+    ///   mixer state and KV written by earlier fronts, and scratch (`norm_output`,
+    ///   `moe_output`, the KDA `final_out`, the MLP workspace, the `mix` scratch) that it writes
+    ///   before it reads; the back of `i` writes only row-`i` slots and row-`i` `hidden`, and
+    ///   reads only what its own front wrote (the scratch partial is already copied out).
+    /// - The collective sequence (count, sizes, order) is that of `prefill_staged_run`, because
+    ///   `overlap_schedule` issues the all-reduces in item order on one comm stream; every item
+    ///   is finished before each pass ends, so the FFN pass starts on a fully posted highway and
+    ///   the layer returns with nothing outstanding.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_staged_overlapped(
+        &self,
+        hidden: DevicePtr,
+        subs: &[(usize, usize)],
+        rows: usize,
+        rows_ffn: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len_start: usize,
+        block_table: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let row_bytes = self.hidden * 2;
+        for step in overlap_schedule(subs.len()) {
+            match step {
+                OverlapStep::Issue { item, slot } => {
+                    let (t, k) = subs[item];
+                    self.attn_half_inner(
+                        hidden.offset(t * row_bytes),
+                        k,
+                        state,
+                        kv_cache,
+                        seq_len_start + t,
+                        block_table,
+                        ctx,
+                        stream,
+                        // 2026-10-01: No KDA snapshots and a prefill sub-chunk, as
+                        // `prefill_staged_run` passes.
+                        false,
+                        t,
+                        true,
+                        // 2026-10-01: The DSA core over all `k` rows (never full width here).
+                        k,
+                        Some(slot),
+                    )?;
+                }
+                OverlapStep::Finish { item, slot } => {
+                    let (t, k) = subs[item];
+                    self.attn_finish(hidden.offset(t * row_bytes), k, t, slot, ctx, stream)?;
+                }
+            }
+        }
+        let wins = ffn_windows(subs, rows_ffn, prefill_tail_merge(), |k| self.ffn_mergeable(k));
+        for step in overlap_schedule(wins.len()) {
+            match step {
+                OverlapStep::Issue { item, slot } => {
+                    let (t, k) = wins[item];
+                    self.ffn_half_inner(
+                        hidden.offset(t * row_bytes),
+                        k,
+                        ctx,
+                        stream,
+                        t,
+                        rows,
+                        Some(slot),
+                    )?;
+                }
+                OverlapStep::Finish { item, slot } => {
+                    let (t, k) = wins[item];
+                    self.ffn_finish(hidden.offset(t * row_bytes), k, t, slot, ctx, stream)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 2026-10-01: Once per process, when the full-width arm runs with
+/// `METRALE_GLM_PREFILL_SEQ_PARALLEL=1` or `METRALE_GLM_PREFILL_COMM_OVERLAP=1` also set: those
+/// two levers stay inert under it (`prefill_staged_run`).
+fn warn_fullwidth_excludes() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if prefill_seq_parallel() || prefill_comm_overlap() {
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1 takes the staged prefill:                  METRALE_GLM_PREFILL_SEQ_PARALLEL / METRALE_GLM_PREFILL_COMM_OVERLAP are                  IGNORED while it is on (mutually exclusive)"
+            );
+        });
     }
 }
 

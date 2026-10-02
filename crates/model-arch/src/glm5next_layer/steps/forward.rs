@@ -244,6 +244,45 @@ impl Glm5NextLayer {
         stream: u64,
         take_snapshots: bool,
         slot_base: usize,
+        is_prefill: bool,
+        // 2026-10-01: The DSA selection and attend width (`attn_half_inner`).
+        core_rows: usize,
+    ) -> Result<()> {
+        self.attn_half_inner(
+            hidden,
+            k,
+            state,
+            kv_cache,
+            seq_len,
+            block_table,
+            ctx,
+            stream,
+            take_snapshots,
+            slot_base,
+            is_prefill,
+            core_rows,
+            None,
+        )
+    }
+
+    /// 2026-10-01: `attn_half`, or with `defer = Some(slot)` and a mixer all-reduce, its front
+    /// only: everything up to the mixer, then the mixer output copied into rows `0..k` of
+    /// `hidden` (dead after the input norm read them) and its all-reduce issued there as a
+    /// deferred all-reduce under `slot` (`reduce_deferred`); `attn_finish` later joins it and runs
+    /// `hc_post`. Without a mixer all-reduce, `defer` is ignored and `attn_finish` does nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::glm5next_layer) fn attn_half_inner(
+        &self,
+        hidden: DevicePtr,
+        k: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+        take_snapshots: bool,
+        slot_base: usize,
         // 2026-09-25: True only for a prefill sub-chunk (`Glm5NextLayer::prefill`). It selects
         // the DSA batched selector (`batch_select_enabled`) and, with
         // `METRALE_GLM_KDA_CHUNK_PREFILL=1`, the KDA chunked scan, both prefill-only.
@@ -253,6 +292,7 @@ impl Glm5NextLayer {
         // runs `decode_k_wide`: the projections over all `k` rows, the selection and attend per
         // `core_rows` rows (`METRALE_GLM_PREFILL_FULLWIDTH_GEMM`). KDA ignores it.
         core_rows: usize,
+        defer: Option<usize>,
     ) -> Result<()> {
         let gpu = ctx.gpu;
         let h = self.hidden;
@@ -267,36 +307,6 @@ impl Glm5NextLayer {
         let comb = ctx.buffers.hc_comb().offset(slot_base * hc * hc * 4);
         let normed = ctx.buffers.norm_output();
         let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
-
-        let kda_ctx = match &self.mixer {
-            Glm5NextMixer::Kda { ws, .. } => {
-                if k > ws.max_tokens() {
-                    bail!(
-                        "GLM layer {}: a {k}-token verify exceeds the KDA workspace built for {}",
-                        self.layer_idx,
-                        ws.max_tokens()
-                    );
-                }
-                let st = self.kda_state(state)?;
-                // 2026-09-25: Intermediates only when `take_snapshots` (a verify); prefill passes
-                // none. `decode_k` looks each row up with `get`, so an empty list takes none.
-                let snaps: Vec<(DevicePtr, DevicePtr)> = if take_snapshots {
-                    (0..k.saturating_sub(1))
-                        .map(|t| (st.h_state_intermediates[t], st.conv_state_intermediates[t]))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                Some((
-                    KdaSeqState {
-                        conv: st.conv_state,
-                        recurrent: st.h_state,
-                    },
-                    snaps,
-                ))
-            }
-            Glm5NextMixer::Dsa(_) => None,
-        };
 
         let t_mhc = profile::start();
         if self.is_first {
@@ -332,66 +342,26 @@ impl Glm5NextLayer {
         let t_norm = profile::start();
         self.norm(gpu, hidden, self.input_norm, normed, k, stream)?;
         profile::end(profile::NORM, t_norm, gpu, stream);
-        let t = profile::start();
-        let attn_out = match (&self.mixer, &kda_ctx) {
-            (Glm5NextMixer::Kda { layer, ws, .. }, Some((kda, snaps))) => {
-                // 2026-09-25: The chunked scan runs only for a prefill sub-chunk of more than
-                // one row that asked for no intermediates: it never materialises the state
-                // after an interior row, and its order differs from `decode_k`'s, which a
-                // verify must match.
-                // 2026-10-01: `METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1` takes the same sub-chunks
-                // through the tensor-core chunked prefill, ahead of the FP32 chunked scan when
-                // both levers are set; it falls back to `decode_k` itself when it cannot run.
-                let chunkable = is_prefill && k > 1 && snaps.is_empty();
-                if chunkable && crate::glm5next_kda::kda_prefill_chunked_tc() {
-                    layer.prefill_chunked_tc(gpu, normed, k, kda, ws, stream)?;
-                } else if chunkable && kda_chunk_prefill() {
-                    layer.prefill(gpu, normed, k, kda, ws, stream)?;
-                } else {
-                    layer.decode_k(gpu, normed, k, kda, ws, snaps, stream)?;
-                }
-                ws.final_out
-            }
-            (Glm5NextMixer::Dsa(layer), _) => {
-                // 2026-09-25: DSA's `decode_k` writes its output projection over its input
-                // buffer.
-                // 2026-10-01: So does `decode_k_wide`, over all `k` rows.
-                if is_prefill && core_rows < k {
-                    layer.decode_k_wide(
-                        normed,
-                        k,
-                        core_rows,
-                        state,
-                        kv_cache,
-                        seq_len,
-                        block_table,
-                        ctx,
-                        stream,
-                    )?;
-                } else {
-                    layer.decode_k(
-                        normed,
-                        k,
-                        state,
-                        kv_cache,
-                        seq_len,
-                        block_table,
-                        ctx,
-                        stream,
-                        is_prefill,
-                    )?;
-                }
-                normed
-            }
-            (Glm5NextMixer::Kda { .. }, None) => {
-                bail!("GLM layer {}: KDA mixer without KDA state", self.layer_idx)
-            }
-        };
-        profile::end(profile::KDA, t, gpu, stream);
+        let attn_out = self.attn_mixer(
+            normed,
+            k,
+            state,
+            kv_cache,
+            seq_len,
+            block_table,
+            ctx,
+            stream,
+            take_snapshots,
+            is_prefill,
+            core_rows,
+        )?;
         // 2026-10-01: The verify path's FFN-head prefetch (as in `forward_one`); never in
         // prefill, whose sub-chunks are compute-bound.
         if !is_prefill {
             self.l2_prefetch(&self.prefetch.ffn_head, k, ctx, stream)?;
+        }
+        if let (Some(slot), true) = (defer, self.mixer_all_reduce) {
+            return self.reduce_deferred(attn_out, hidden, k, slot, ctx, stream);
         }
         if self.mixer_all_reduce {
             self.reduce_probe(profile::REDUCE_ATTN_BAR, "attn", ctx, stream);
@@ -419,21 +389,22 @@ impl Glm5NextLayer {
         Ok(())
     }
 
-    /// 2026-09-29: The FFN half of `forward_k` over rows `slot_base..slot_base + k`: the FFN
-    /// site's `hc_pre`, the post-attention norm, the MLP and its all-reduce, `hc_post`, and on
-    /// the last layer `hc_head_mean`. Row `t` reads only highway slot `slot_base + t` (and the
-    /// layer's weights); every launch here is row-local except the MLP's dense GEMMs, which run
-    /// in consecutive slices of `dense_slice` rows (`mlp_forward`). Errors on a layer without a
-    /// hyper-connection.
-    pub(in crate::glm5next_layer) fn ffn_half(
+    /// 2026-10-01: The back of an `attn_half_inner(.., Some(slot))` over rows
+    /// `slot_base..slot_base + k`: join `slot`, then `hc_post` of the reduced mixer output, which
+    /// sits in rows `0..k` of `hidden`. Exactly the launches `attn_half` runs after its
+    /// all-reduce, minus the profiling probes. Nothing when the layer has no mixer all-reduce.
+    pub(in crate::glm5next_layer) fn attn_finish(
         &self,
         hidden: DevicePtr,
         k: usize,
+        slot_base: usize,
+        slot: usize,
         ctx: &ForwardContext,
         stream: u64,
-        slot_base: usize,
-        dense_slice: usize,
     ) -> Result<()> {
+        if !self.mixer_all_reduce {
+            return Ok(());
+        }
         let gpu = ctx.gpu;
         let h = self.hidden;
         let Some(mhc) = self.mhc.as_ref() else {
@@ -443,37 +414,13 @@ impl Glm5NextLayer {
         let streams = ctx.buffers.hc_streams().offset(slot_base * hc * h * 4);
         let post = ctx.buffers.hc_post().offset(slot_base * hc * 4);
         let comb = ctx.buffers.hc_comb().offset(slot_base * hc * hc * 4);
-        let normed = ctx.buffers.norm_output();
-        let ffn_out = ctx.buffers.moe_output();
         let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
-
-        let t_mhc = profile::start();
-        glm_hc_pre(
-            gpu,
-            &mhc.kernels,
-            streams,
-            &mhc.ffn,
-            hidden,
-            post,
-            comb,
-            kt,
-            ht,
-            hct,
-            mhc.sinkhorn_iters as u32,
-            self.rms_eps,
-            mhc.hc_eps,
-            stream,
-        )?;
-        profile::end(profile::MHC, t_mhc, gpu, stream);
-        let t_norm = profile::start();
-        self.norm(gpu, hidden, self.post_attn_norm, normed, k, stream)?;
-        profile::end(profile::NORM, t_norm, gpu, stream);
-        self.mlp_forward(normed, ffn_out, k, dense_slice, ctx, stream)?;
+        self.reduce_join(slot, ctx, stream)?;
         let t_mhc_post = profile::start();
         glm_hc_post(
             gpu,
             mhc.kernels.hc_post,
-            ffn_out,
+            hidden,
             streams,
             post,
             comb,
@@ -483,22 +430,7 @@ impl Glm5NextLayer {
             hct,
             stream,
         )?;
-        if self.is_last {
-            hc_head_mean(
-                gpu,
-                mhc.kernels.hc_head,
-                streams,
-                hidden,
-                kt,
-                ht,
-                hct,
-                stream,
-            )?;
-        }
         profile::end(profile::MHC_POST, t_mhc_post, gpu, stream);
-        if self.is_last {
-            profile::step();
-        }
         Ok(())
     }
 }

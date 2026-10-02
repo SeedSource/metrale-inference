@@ -57,6 +57,7 @@ use crate::glm5next_mhc::{
 
 pub mod state;
 
+pub mod comm_overlap;
 pub mod profile;
 pub use state::alloc_kda_ssm_state;
 
@@ -65,14 +66,16 @@ pub use state::alloc_kda_ssm_state;
 pub(crate) mod levers;
 // 2026-10-01: Decode L2 weight prefetch plan and launcher (`METRALE_GLM_DECODE_L2_PREFETCH`).
 pub mod prefetch;
+pub mod seq_parallel;
 mod steps;
 mod types;
 pub(crate) use levers::{
     PREFILL_ROWS, cublas_wide_proj, dsa_batch_qidx, dsa_row_batch, kda_chunk_prefill,
 };
 pub use levers::{
-    PREFILL_ROWS_FFN_MAX, decode_multi_seq, fullwidth_rows, prefill_fullwidth_gemm, prefill_rows,
-    prefill_rows_ffn, prefill_staged, prefill_tail_merge, staged_merge_signature,
+    PREFILL_ROWS_FFN_MAX, decode_multi_seq, dsa_index_split, fullwidth_rows,
+    prefill_comm_overlap, prefill_fullwidth_gemm, prefill_rows, prefill_rows_ffn,
+    prefill_seq_parallel, prefill_staged, prefill_tail_merge, staged_merge_signature,
 };
 pub use steps::staged::{ffn_windows, sub_chunks};
 pub use types::{Glm5NextLayer, Glm5NextMhc, Glm5NextMixer, Glm5NextMlpSite};

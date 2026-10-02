@@ -433,6 +433,7 @@ impl DsaSelectScratch {
 
 mod launch;
 pub use launch::select_tokens;
+pub mod split;
 
 #[cfg(test)]
 mod tests;

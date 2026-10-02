@@ -93,6 +93,63 @@ impl CommBackend for NcclBackend {
         Ok(())
     }
 
+    /// 2026-10-01: The 2-rank path of `all_reduce_async` without its final
+    /// `stream_wait_event(compute_stream, ..)`: the same `all_reduce_2rank` on
+    /// `comm_stream`, after the work queued on `compute_stream`, then
+    /// `deferred_done_events[slot]` recorded on `comm_stream` for
+    /// `all_reduce_join`. Every deferred and async all-reduce runs on
+    /// `comm_stream` in submission order, so the single `recv_buffer` is never
+    /// shared by two in flight. Off the 2-rank path it is `all_reduce_async`,
+    /// joined at once.
+    fn all_reduce_deferred(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        compute_stream: u64,
+        slot: usize,
+    ) -> Result<()> {
+        ensure!(
+            slot < crate::ALL_REDUCE_DEFERRED_SLOTS,
+            "deferred all-reduce slot {slot} out of range (< {})",
+            crate::ALL_REDUCE_DEFERRED_SLOTS
+        );
+        if !self.send_recv_path() {
+            return self.all_reduce_async(ptr, bytes, compute_stream);
+        }
+        self.begin_submission(
+            "all_reduce_deferred",
+            Dtype::Bf16,
+            bytes,
+            self.comm_stream,
+            None,
+        )?;
+        nccl::record_event(self.compute_done_event, compute_stream)?;
+        nccl::stream_wait_event(self.comm_stream, self.compute_done_event)?;
+
+        self.all_reduce_2rank(ptr, bytes, self.comm_stream)?;
+
+        nccl::record_event(self.deferred_done_events[slot], self.comm_stream)
+    }
+
+    /// 2026-10-01: True on the two-rank send/recv + `bf16_add_inplace` path.
+    fn all_reduce_is_send_recv_add(&self) -> bool {
+        self.send_recv_path()
+    }
+
+    /// 2026-10-01: `compute_stream` waits for `deferred_done_events[slot]`. Off
+    /// the 2-rank path `all_reduce_deferred` already joined, so nothing to do.
+    fn all_reduce_join(&self, compute_stream: u64, slot: usize) -> Result<()> {
+        ensure!(
+            slot < crate::ALL_REDUCE_DEFERRED_SLOTS,
+            "deferred all-reduce slot {slot} out of range (< {})",
+            crate::ALL_REDUCE_DEFERRED_SLOTS
+        );
+        if !self.send_recv_path() {
+            return Ok(());
+        }
+        nccl::stream_wait_event(compute_stream, self.deferred_done_events[slot])
+    }
+
     fn register_buffer(&self, ptr: u64, bytes: usize) -> Result<u64> {
         let mut handle: *mut c_void = ptr::null_mut();
         let comm = *self.comm.lock();
@@ -262,6 +319,13 @@ impl CommBackend for NcclBackend {
 }
 
 impl NcclBackend {
+    /// 2026-10-01: Whether all-reduce takes the 2-rank send/recv path
+    /// (`world_size == 2` and the add kernel set), the test `all_reduce` and
+    /// `all_reduce_async` make inline.
+    fn send_recv_path(&self) -> bool {
+        self.world_size == 2 && self.add_kernel.load(Ordering::Relaxed) != 0
+    }
+
     fn broadcast_with_wait(
         &self,
         ptr: u64,

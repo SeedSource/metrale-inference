@@ -9,7 +9,9 @@
 use super::*;
 
 mod drafter;
+mod ffn_half;
 mod forward;
+mod mixer;
 mod multi_seq;
 pub(super) mod staged;
 
@@ -156,13 +158,81 @@ impl Glm5NextLayer {
         )
     }
 
+    /// 2026-10-01: Copy `rows` BF16 `[hidden]` rows from `src` into `dst` (skipped when they are
+    /// the same buffer) on `stream`, then issue their all-reduce in place at `dst` as a deferred
+    /// all-reduce under `slot` (`CommBackend::all_reduce_deferred`): `stream` does not wait for
+    /// it until `reduce_join`. Errors without a communicator; the caller
+    /// (`prefill_staged_run`) only takes the overlapped path with one.
+    pub(super) fn reduce_deferred(
+        &self,
+        src: DevicePtr,
+        dst: DevicePtr,
+        rows: usize,
+        slot: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(comm) = ctx.comm else {
+            bail!(
+                "GLM layer {}: deferred all-reduce without a communicator",
+                self.layer_idx
+            );
+        };
+        let bytes = rows * self.hidden * 2;
+        if src.0 != dst.0 {
+            ctx.gpu.copy_d2d_async(src, dst, bytes, stream)?;
+        }
+        comm.all_reduce_deferred(dst.0, bytes, stream, slot)
+    }
+
+    /// 2026-10-01: `stream` waits for the deferred all-reduce issued under `slot`
+    /// (`CommBackend::all_reduce_join`). No-op without a communicator.
+    pub(super) fn reduce_join(&self, slot: usize, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        match ctx.comm {
+            Some(comm) => comm.all_reduce_join(stream, slot),
+            None => Ok(()),
+        }
+    }
+
     /// 2026-09-25: The MLP over `rows` rows of `normed` into `out`, then one all-reduce of all
     /// rows when `Glm5NextMlpConfig::needs_all_reduce`.
     ///
     /// 2026-09-29: The dense GEMMs (router, shared expert, dense MLP) run in consecutive slices of
     /// `dense_slice` rows (`forward_moe_sliced`, `forward_dense_sliced`); `dense_slice >= rows` is
     /// one slice, the unsliced launch.
+    ///
+    /// 2026-10-01: The compute is `mlp_compute`; the launch sequence is unchanged.
     fn mlp_forward(
+        &self,
+        normed: DevicePtr,
+        out: DevicePtr,
+        rows: usize,
+        dense_slice: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.mlp_compute(normed, out, rows, dense_slice, ctx, stream)?;
+        // 2026-10-01: Decode L2 prefetch of the NEXT layer's attention head, ahead of the FFN
+        // all-reduce (no-op unless `METRALE_GLM_DECODE_L2_PREFETCH=1` and `rows` is small).
+        self.l2_prefetch(&self.prefetch.next_attn_head, rows, ctx, stream)?;
+        // 2026-09-25: One all-reduce covers both partial sums, the EP-split routed experts and
+        // the TP-split shared expert: `forward_moe` adds them together before returning.
+        if self.mlp_cfg.needs_all_reduce() {
+            self.reduce_probe(profile::REDUCE_MLP_BAR, "mlp", ctx, stream);
+            let t = profile::start_hot();
+            self.reduce_partial(out, rows, ctx, stream)?;
+            profile::end_nosync(profile::REDUCE_MLP_ENQ, t);
+            // 2026-09-25: This span times only the `synchronize` in `profile::end`.
+            let t = profile::start_hot();
+            profile::end(profile::REDUCE_MLP, t, ctx.gpu, stream);
+        }
+        Ok(())
+    }
+
+    /// 2026-10-01: The MLP over `rows` rows of `normed` into `out` (this rank's partial sum),
+    /// without the all-reduce: the first half of `mlp_forward`, which the overlapped staged FFN
+    /// pass (`ffn_half_inner`) follows with `reduce_deferred` instead.
+    pub(super) fn mlp_compute(
         &self,
         normed: DevicePtr,
         out: DevicePtr,
@@ -202,20 +272,6 @@ impl Glm5NextLayer {
             )?,
         }
         profile::end(profile::MLP_DENSE, t_dense, ctx.gpu, stream);
-        // 2026-10-01: Decode L2 prefetch of the NEXT layer's attention head, ahead of the FFN
-        // all-reduce (no-op unless `METRALE_GLM_DECODE_L2_PREFETCH=1` and `rows` is small).
-        self.l2_prefetch(&self.prefetch.next_attn_head, rows, ctx, stream)?;
-        // 2026-09-25: One all-reduce covers both partial sums, the EP-split routed experts and
-        // the TP-split shared expert: `forward_moe` adds them together before returning.
-        if self.mlp_cfg.needs_all_reduce() {
-            self.reduce_probe(profile::REDUCE_MLP_BAR, "mlp", ctx, stream);
-            let t = profile::start_hot();
-            self.reduce_partial(out, rows, ctx, stream)?;
-            profile::end_nosync(profile::REDUCE_MLP_ENQ, t);
-            // 2026-09-25: This span times only the `synchronize` in `profile::end`.
-            let t = profile::start_hot();
-            profile::end(profile::REDUCE_MLP, t, ctx.gpu, stream);
-        }
         Ok(())
     }
 

@@ -249,6 +249,28 @@ pub fn prefill_tail_merge() -> bool {
     })
 }
 
+/// 2026-09-25: `METRALE_GLM_KDA_CHUNK_PREFILL=1` sends a prefill sub-chunk's KDA mixer through
+/// the chunked scan (`Glm5NextKdaLayer::prefill`) instead of `decode_k`'s per-token recurrence.
+/// Off unless set to `1`; read once. The chunked scan computes the recurrence chunk by chunk, in
+/// a different order, so its output is not bit-identical to the per-token walk.
+///
+/// 2026-10-01: Moved here from `steps/forward.rs`; the loader also reads it, to size the KDA
+/// workspace's chunked-scan buffers under `METRALE_GLM_PREFILL_FULLWIDTH_GEMM`.
+pub(crate) fn kda_chunk_prefill() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_KDA_CHUNK_PREFILL").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_KDA_CHUNK_PREFILL=1 - GLM prefill KDA uses the CHUNKED scan \
+                 (kda_chunk_prepare + kda_chunk_scan). Not bit-identical to the per-token \
+                 recurrent walk."
+            );
+        }
+        on
+    })
+}
+
 /// 2026-10-01: Whether a `METRALE_GLM_PREFILL_FULLWIDTH_GEMM` value turns the lever on: `1`
 /// (surrounding blanks ignored) only.
 pub(crate) fn parse_fullwidth_switch(v: Option<&str>) -> bool {

@@ -29,6 +29,7 @@ fn test_config() -> KvCacheConfig {
         layer_dtypes: vec![],
         layer_dims: vec![],
         cache_blocks_per_seq: None,
+        v_aliases_k: false,
     }
 }
 

@@ -239,6 +239,7 @@ impl MtpHead {
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
+            v_aliases_k: false,
         };
         // 2026-09-26: `max_seq_len / block + 1` blocks for each of
         // `mtp_max_seqs()` sequences, capped at the main pool's block count

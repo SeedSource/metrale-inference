@@ -294,6 +294,7 @@ pub fn build_model(
         layer_dtypes: layer_dtypes.clone(),
         layer_dims: config.kv_layer_dims.clone(),
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
+        v_aliases_k: metrale_cache::kv_cache::glm_kv_v_alias(&config.model_type),
     };
 
     if hss_cache_blocks_per_seq.is_some() {

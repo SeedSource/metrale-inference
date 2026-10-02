@@ -87,6 +87,7 @@ pub(super) fn setup_model(
         layer_dtypes: vec![],
         layer_dims: vec![],
         cache_blocks_per_seq: None,
+        v_aliases_k: false,
     };
     let num_blocks =
         metrale_cache::kv_cache::PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;

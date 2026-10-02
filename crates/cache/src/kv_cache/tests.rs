@@ -19,6 +19,7 @@ fn test_config() -> KvCacheConfig {
         layer_dtypes: vec![],
         layer_dims: vec![],
         cache_blocks_per_seq: None,
+        v_aliases_k: false,
     }
 }
 
@@ -355,6 +356,7 @@ fn test_mixed_dtype_pool_allocation() {
         layer_dtypes,
         layer_dims: vec![],
         cache_blocks_per_seq: None,
+        v_aliases_k: false,
     };
     let cache = PagedKvCache::new(cfg, 4, &gpu).unwrap();
 
@@ -376,6 +378,7 @@ fn sliding_window_recycles_blocks() {
     let gpu = MockGpuBackend::new();
     let cfg = KvCacheConfig {
         cache_blocks_per_seq: Some(4),
+        v_aliases_k: false,
         ..test_config()
     };
     let mut cache = PagedKvCache::new(cfg, 8, &gpu).unwrap();

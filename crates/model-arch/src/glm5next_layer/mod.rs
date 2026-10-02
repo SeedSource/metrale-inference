@@ -61,6 +61,8 @@ pub use state::alloc_kda_ssm_state;
 // 2026-10-01: `pub(crate)` so the DSA launchers reach their levers (`levers::dsa_scores_tiled`,
 // `levers::dsa_gemv_split`) by path.
 pub(crate) mod levers;
+// 2026-10-01: Decode L2 weight prefetch plan and launcher (`METRALE_GLM_DECODE_L2_PREFETCH`).
+pub mod prefetch;
 mod steps;
 mod types;
 pub(crate) use levers::{
@@ -72,6 +74,7 @@ pub use levers::{
 };
 pub use steps::staged::{ffn_windows, sub_chunks};
 pub use types::{Glm5NextLayer, Glm5NextMhc, Glm5NextMixer, Glm5NextMlpSite};
+pub use prefetch::{Glm5NextPrefetch, L2Span};
 
 impl TransformerLayer for Glm5NextLayer {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {

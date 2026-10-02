@@ -185,6 +185,16 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         };
         let last = skeleton.layers.len() - 1;
         let mut out: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(skeleton.layers.len());
+        // 2026-10-01: Decode L2 prefetch (`METRALE_GLM_DECODE_L2_PREFETCH`): the kernel, optional
+        // (0 on a target without it), and each built layer with its attention-head spans, so a
+        // layer can be handed the NEXT layer's head once every layer exists.
+        let l2pf_kernel = metrale_model_layers::layers::try_kernel(
+            gpu,
+            crate::glm5next_layer::prefetch::L2_PREFETCH_MODULE,
+            crate::glm5next_layer::prefetch::L2_PREFETCH_KERNEL,
+        );
+        let mut built: Vec<(Glm5NextLayer, Vec<crate::glm5next_layer::L2Span>)> =
+            Vec::with_capacity(skeleton.layers.len());
 
         // 2026-09-25: The KV pool has `num_attention_layers()` slots, which counts
         // the sparse-attention layers only, so a DSA layer addresses it by its
@@ -198,20 +208,35 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                 .with_context(|| format!("glm5_next: collecting layer {idx}"))?;
             let t_collect = t_layer.elapsed();
 
-            let mixer = match sl.mixer {
+            // 2026-10-01: `mixer_head`: the mixer's FIRST decode projection as the `[n, k]` BF16
+            // extent its GEMV reads (KDA `front_end` `q_proj`, DSA `decode_k` `q_a_proj`). Only
+            // the first: the projection after it streams more than the 24 MB L2 and would evict
+            // anything prefetched further ahead.
+            let (mixer, mixer_head) = match sl.mixer {
                 Mixer::Kda => {
                     let sharded = KdaShardedSource::new(&src, &kda_plan)?;
                     let (w, _report) = bind_kda_weights(gpu, &kda_cfg, idx, &sharded)?;
-                    Glm5NextMixer::Kda {
+                    let head = crate::glm5next_layer::prefetch::bf16_matrix_span(
+                        w.q_proj.weight,
+                        kda_cfg.qkv_dim(),
+                        kda_cfg.hidden,
+                    );
+                    let mixer = Glm5NextMixer::Kda {
                         layer: Box::new(Glm5NextKdaLayer::new(idx, kda_cfg, w, kda_kernels)?),
                         ws: kda_ws.clone(),
                         cfg: kda_cfg,
-                    }
+                    };
+                    (mixer, head)
                 }
                 Mixer::Dsa => {
                     let load = |n: &str| src.f32(n);
                     let w = build_dsa_weights(gpu, &dsa_cfg, &dsa_plan, &load)?;
-                    Glm5NextMixer::Dsa(Box::new(Glm5NextDsaLayer {
+                    let head = crate::glm5next_layer::prefetch::bf16_matrix_span(
+                        w.q_a_proj,
+                        dsa_cfg.q_lora_rank,
+                        dsa_cfg.hidden,
+                    );
+                    let mixer = Glm5NextMixer::Dsa(Box::new(Glm5NextDsaLayer {
                         persist_bt: std::env::var("METRALE_GLM_DSA_ALLOC_PER_STEP").as_deref()
                             != Ok("1"),
                         cfg: dsa_cfg,
@@ -237,7 +262,8 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                         },
                         rms_eps: config.rms_norm_eps as f32,
                         kv_scale: 1.0,
-                    }))
+                    }));
+                    (mixer, head)
                 }
             };
 
@@ -290,7 +316,32 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                 None
             };
 
-            out.push(Box::new(Glm5NextLayer {
+            // 2026-10-01: Prefetch heads. Attention: the attention-site `hc_fn`, then the mixer
+            // head. FFN: the FFN-site `hc_fn`, then the router `[num_experts, hidden]` (MoE) or
+            // the dense `gate_proj` `[local_dense_intermediate, hidden]`, all BF16.
+            let (attn_head, ffn_head) = {
+                use crate::glm5next_layer::prefetch::{bf16_matrix_span, mhc_site_span};
+                let mut attn = Vec::new();
+                let mut ffn = Vec::new();
+                if let Some(m) = mhc.as_ref() {
+                    attn.push(mhc_site_span(&m.attn, m.hc_mult, config.hidden_size));
+                    ffn.push(mhc_site_span(&m.ffn, m.hc_mult, config.hidden_size));
+                }
+                attn.push(mixer_head);
+                ffn.push(match &mlp {
+                    Glm5NextMlpSite::Moe(w) => {
+                        bf16_matrix_span(w.router, mlp_cfg.num_experts, mlp_cfg.hidden)
+                    }
+                    Glm5NextMlpSite::Dense(w) => bf16_matrix_span(
+                        w.gate_proj,
+                        mlp_cfg.local_dense_intermediate,
+                        mlp_cfg.hidden,
+                    ),
+                });
+                (attn, ffn)
+            };
+
+            let layer = Glm5NextLayer {
                 layer_idx: idx,
                 mixer,
                 mlp,
@@ -320,7 +371,22 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                 },
                 is_first: idx == 0,
                 is_last: idx == last,
-            }));
+                prefetch: crate::glm5next_layer::Glm5NextPrefetch {
+                    kernel: l2pf_kernel,
+                    ffn_head,
+                    next_attn_head: Vec::new(),
+                },
+            };
+            built.push((layer, attn_head));
+        }
+        // 2026-10-01: Layer i prefetches layer i + 1's attention head; the last layer none.
+        let heads: Vec<Vec<crate::glm5next_layer::L2Span>> =
+            built.iter().map(|(_, h)| h.clone()).collect();
+        for (i, (mut layer, _)) in built.into_iter().enumerate() {
+            if let Some(next) = heads.get(i + 1) {
+                layer.prefetch.next_attn_head = next.clone();
+            }
+            out.push(Box::new(layer));
         }
         Ok(out)
     }

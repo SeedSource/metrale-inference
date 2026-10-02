@@ -207,6 +207,10 @@ name = "glm5next_hc_slice_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_l2_prefetch_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_moe_microtest"
 required-features = ["cuda", "gpu-examples"]
 

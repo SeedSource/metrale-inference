@@ -126,6 +126,35 @@ impl Glm5NextLayer {
         Ok(())
     }
 
+    /// 2026-10-01: Under `METRALE_GLM_DECODE_L2_PREFETCH=1`, one `glm5next_l2_prefetch` launch
+    /// over `spans` (clipped to `decode_l2_prefetch_bytes()`) for a step of 1..=
+    /// `L2_PREFETCH_MAX_ROWS` rows. Callers enqueue it just before an all-reduce, so the bytes
+    /// stream into L2 while the collective and the mHC/norm chain after it leave the DRAM idle.
+    /// The kernel writes nothing (byte-identical by construction); every other case is a no-op.
+    fn l2_prefetch(
+        &self,
+        spans: &[crate::glm5next_layer::prefetch::L2Span],
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if rows == 0
+            || rows > crate::glm5next_layer::prefetch::L2_PREFETCH_MAX_ROWS
+            || spans.is_empty()
+            || self.prefetch.kernel.0 == 0
+            || !crate::glm5next_layer::levers::decode_l2_prefetch()
+        {
+            return Ok(());
+        }
+        crate::glm5next_layer::prefetch::launch_l2_prefetch(
+            ctx.gpu,
+            self.prefetch.kernel,
+            spans,
+            crate::glm5next_layer::levers::decode_l2_prefetch_bytes(),
+            stream,
+        )
+    }
+
     /// 2026-09-25: The MLP over `rows` rows of `normed` into `out`, then one all-reduce of all
     /// rows when `Glm5NextMlpConfig::needs_all_reduce`.
     ///
@@ -172,6 +201,9 @@ impl Glm5NextLayer {
             )?,
         }
         profile::end(profile::MLP_DENSE, t_dense, ctx.gpu, stream);
+        // 2026-10-01: Decode L2 prefetch of the NEXT layer's attention head, ahead of the FFN
+        // all-reduce (no-op unless `METRALE_GLM_DECODE_L2_PREFETCH=1` and `rows` is small).
+        self.l2_prefetch(&self.prefetch.next_attn_head, rows, ctx, stream)?;
         // 2026-09-25: One all-reduce covers both partial sums, the EP-split routed experts and
         // the TP-split shared expert: `forward_moe` adds them together before returning.
         if self.mlp_cfg.needs_all_reduce() {

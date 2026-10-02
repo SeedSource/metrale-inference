@@ -146,6 +146,60 @@ pub(crate) fn dsa_gemv_split() -> bool {
     })
 }
 
+/// 2026-10-01: `METRALE_GLM_DECODE_L2_PREFETCH=1`: a decode or verify step of at most
+/// `prefetch::L2_PREFETCH_MAX_ROWS` rows enqueues one `glm5next_l2_prefetch` launch before each
+/// all-reduce, pulling the weights read right after the latency-bound chain into L2
+/// (`glm5next_layer/prefetch.rs`). Byte-identical by construction: the kernel writes nothing.
+/// Off unless set to `1`; read once.
+pub(crate) fn decode_l2_prefetch() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DECODE_L2_PREFETCH").ok();
+        let on = parse_dsa_switch(raw.as_deref());
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_DECODE_L2_PREFETCH=1 - decode/verify steps prefetch the next \
+                 weights into L2 before each all-reduce, up to {} MiB per launch \
+                 (byte-identical by construction)",
+                decode_l2_prefetch_bytes() >> 20
+            );
+        }
+        warn_unparsed_dsa_switch("METRALE_GLM_DECODE_L2_PREFETCH", raw.as_deref());
+        on
+    })
+}
+
+/// 2026-10-01: Default MiB per `glm5next_l2_prefetch` launch: 12, half the 24 MB GB10 L2.
+/// PROVISIONAL: sized from a ~50 us window at ~240 GB/s, not measured yet
+/// (`examples/glm5next_l2_prefetch_microtest.rs` sweeps it).
+pub(crate) const DECODE_L2_PREFETCH_MIB: usize = 12;
+
+/// 2026-10-01: The MiB value of `METRALE_GLM_DECODE_L2_PREFETCH_MIB`: an integer in 1..=64
+/// (surrounding blanks ignored); `None` for unset or anything else.
+pub(crate) fn parse_l2_prefetch_mib(v: Option<&str>) -> Option<usize> {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|m| (1..=64).contains(m))
+}
+
+/// 2026-10-01: Bytes per prefetch launch: `METRALE_GLM_DECODE_L2_PREFETCH_MIB` (1..=64) MiB,
+/// else [`DECODE_L2_PREFETCH_MIB`]. Read once, only when the prefetch lever is on.
+pub(crate) fn decode_l2_prefetch_bytes() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DECODE_L2_PREFETCH_MIB").ok();
+        let parsed = parse_l2_prefetch_mib(raw.as_deref());
+        if let (Some(r), None) = (raw.as_deref(), parsed)
+            && !r.trim().is_empty()
+        {
+            tracing::warn!(
+                "METRALE_GLM_DECODE_L2_PREFETCH_MIB={r} is not an integer in 1..=64 - using \
+                 {DECODE_L2_PREFETCH_MIB}"
+            );
+        }
+        parsed.unwrap_or(DECODE_L2_PREFETCH_MIB) << 20
+    })
+}
+
 /// 2026-09-25: `PREFILL_ROWS`, overridable at launch with `METRALE_GLM_PREFILL_ROWS` (values
 /// below 1 or unparsable are ignored). `1` selects the per-token walk: `Glm5NextLayer::prefill`
 /// takes the batched sub-chunk path only when `rows > 1`. A width above

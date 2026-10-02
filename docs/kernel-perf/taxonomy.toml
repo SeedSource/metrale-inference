@@ -392,7 +392,7 @@ names = ["nllb_*"]
 [[rule]]
 component = "diag"
 kind = "microtest / smoke"
-names = ["fp4_microtest_*", "noop_smoke", "moe_w4a16_grouped_stream_probe", "lora_bgmv_*_stub"]
+names = ["fp4_microtest_*", "noop_smoke", "moe_w4a16_grouped_stream_probe", "lora_bgmv_*_stub", "glm5next_l2pf_spin_ns"]
 
 [[rule]]
 component = "vision"
@@ -582,6 +582,11 @@ names = ["embed_*", "batched_embed*", "lmhead_*", "logit_softcap*", "bf16_scale_
 component = "sampling"
 kind = "argmax / top-p"
 names = ["argmax_*", "softmax_topp", "feed_resolve"]
+
+[[rule]]
+component = "elementwise"
+kind = "decode L2 weight prefetch (writes nothing)"
+names = ["glm5next_l2_prefetch"]
 
 [[rule]]
 component = "elementwise"

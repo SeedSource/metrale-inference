@@ -104,3 +104,24 @@ fn dsa_tiled_gemv_split_lever_shares_the_switch_parser() {
     assert!(body.contains("std::env::var(\"METRALE_GLM_DSA_GEMV_SPLIT\")"));
     assert!(body.contains("parse_dsa_switch(raw.as_deref())"));
 }
+
+/// 2026-10-01: `METRALE_GLM_DECODE_L2_PREFETCH` shares the switch parser (on only for `1`), and
+/// `METRALE_GLM_DECODE_L2_PREFETCH_MIB` accepts integers 1..=64 only.
+#[test]
+fn decode_l2_prefetch_levers_parse() {
+    use super::levers::parse_l2_prefetch_mib;
+    let src = include_str!("levers.rs");
+    let start = src
+        .find("pub(crate) fn decode_l2_prefetch()")
+        .expect("decode_l2_prefetch defined");
+    let body = &src[start..];
+    let body = &body[..body.find("\n}\n").expect("fn closes")];
+    assert!(body.contains("std::env::var(\"METRALE_GLM_DECODE_L2_PREFETCH\")"));
+    assert!(body.contains("parse_dsa_switch(raw.as_deref())"));
+    assert_eq!(parse_l2_prefetch_mib(Some("12")), Some(12));
+    assert_eq!(parse_l2_prefetch_mib(Some(" 1 ")), Some(1));
+    assert_eq!(parse_l2_prefetch_mib(Some("64")), Some(64));
+    for v in [None, Some(""), Some("0"), Some("65"), Some("-1"), Some("8M"), Some("1.5")] {
+        assert_eq!(parse_l2_prefetch_mib(v), None, "{v:?}");
+    }
+}

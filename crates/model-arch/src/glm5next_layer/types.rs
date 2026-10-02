@@ -72,4 +72,7 @@ pub struct Glm5NextLayer {
     pub is_first: bool,
     /// 2026-09-25: Collapse the highway in this layer; true for the last text layer only.
     pub is_last: bool,
+    /// 2026-10-01: Decode L2 weight prefetch plan (`prefetch.rs`), used only under
+    /// `METRALE_GLM_DECODE_L2_PREFETCH=1`. `Default` (empty) for the MTP block.
+    pub prefetch: super::prefetch::Glm5NextPrefetch,
 }

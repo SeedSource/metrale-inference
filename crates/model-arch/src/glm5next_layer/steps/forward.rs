@@ -114,6 +114,10 @@ impl Glm5NextLayer {
             ctx,
             stream,
         )?;
+        // 2026-10-01: Decode L2 prefetch of this layer's FFN head (FFN-site `hc_fn`, router or
+        // dense `gate_proj`) ahead of the attention all-reduce; no-op unless
+        // `METRALE_GLM_DECODE_L2_PREFETCH=1`.
+        self.l2_prefetch(&self.prefetch.ffn_head, 1, ctx, stream)?;
         if self.mixer_all_reduce {
             self.reduce_probe(profile::REDUCE_ATTN_BAR, "attn", ctx, stream);
             let t = profile::start_hot();
@@ -375,6 +379,11 @@ impl Glm5NextLayer {
             }
         };
         profile::end(profile::KDA, t, gpu, stream);
+        // 2026-10-01: The verify path's FFN-head prefetch (as in `forward_one`); never in
+        // prefill, whose sub-chunks are compute-bound.
+        if !is_prefill {
+            self.l2_prefetch(&self.prefetch.ffn_head, k, ctx, stream)?;
+        }
         if self.mixer_all_reduce {
             self.reduce_probe(profile::REDUCE_ATTN_BAR, "attn", ctx, stream);
             let t = profile::start_hot();

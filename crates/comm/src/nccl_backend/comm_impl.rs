@@ -131,6 +131,11 @@ impl CommBackend for NcclBackend {
         nccl::record_event(self.deferred_done_events[slot], self.comm_stream)
     }
 
+    /// 2026-10-01: True on the two-rank send/recv + `bf16_add_inplace` path.
+    fn all_reduce_is_send_recv_add(&self) -> bool {
+        self.send_recv_path()
+    }
+
     /// 2026-10-01: `compute_stream` waits for `deferred_done_events[slot]`. Off
     /// the 2-rank path `all_reduce_deferred` already joined, so nothing to do.
     fn all_reduce_join(&self, compute_stream: u64, slot: usize) -> Result<()> {

@@ -337,27 +337,37 @@ fn only_a_multi_row_eager_prefill_takes_the_batched_selector() {
 fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
     let src = include_str!("../../glm5next_layer/mod.rs");
     let module = concat!(
+        include_str!("../../glm5next_layer/comm_overlap.rs"),
         include_str!("../../glm5next_layer/mod.rs"),
         include_str!("../../glm5next_layer/levers.rs"),
         include_str!("../../glm5next_layer/profile.rs"),
+        include_str!("../../glm5next_layer/seq_parallel.rs"),
         include_str!("../../glm5next_layer/state.rs"),
         include_str!("../../glm5next_layer/steps.rs"),
         include_str!("../../glm5next_layer/steps/drafter.rs"),
+        include_str!("../../glm5next_layer/steps/ffn_half.rs"),
         include_str!("../../glm5next_layer/steps/forward.rs"),
+        include_str!("../../glm5next_layer/steps/mixer.rs"),
         include_str!("../../glm5next_layer/steps/staged.rs"),
+        include_str!("../../glm5next_layer/steps/staged/sp.rs"),
         include_str!("../../glm5next_layer/types.rs"),
     );
     assert_eq!(
         glm5next_layer_files(),
         [
+            "comm_overlap.rs",
             "levers.rs",
             "mod.rs",
             "profile.rs",
+            "seq_parallel.rs",
             "state.rs",
             "steps.rs",
             "steps/drafter.rs",
+            "steps/ffn_half.rs",
             "steps/forward.rs",
+            "steps/mixer.rs",
             "steps/staged.rs",
+            "steps/staged/sp.rs",
             "tests.rs",
             "types.rs",
         ],
@@ -393,6 +403,13 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
                 true,"
         ),
         "the staged attention pass must pass is_prefill = true"
+    );
+    // 2026-10-01: `attn_mixer` takes the same `is_prefill`: `attn_half_inner` forwards its
+    // own; the sequence-parallel staged prefill (`steps/staged/sp.rs`) passes `true`.
+    assert_eq!(
+        module.matches("self.attn_mixer(").count(),
+        2,
+        "a new attn_mixer caller must decide its own `is_prefill`, not inherit one"
     );
 }
 

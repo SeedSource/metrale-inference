@@ -11,6 +11,7 @@ use super::*;
 mod drafter;
 mod ffn_half;
 mod forward;
+mod mixer;
 pub(super) mod staged;
 
 impl Glm5NextLayer {

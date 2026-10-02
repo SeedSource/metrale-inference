@@ -99,6 +99,14 @@ pub trait CommBackend: Send + Sync {
         self.all_reduce_async(ptr, bytes, compute_stream)
     }
 
+    /// 2026-10-01: Whether `all_reduce_async` on this backend is the two-rank exchange plus
+    /// `bf16_add_inplace` (each rank's buffer becomes `__hadd(own, peer)`), so a caller that
+    /// moves the partials with `send_to` / `recv_from` and adds them with the same kernel gets
+    /// the same bits. The default (no such path) is `false`.
+    fn all_reduce_is_send_recv_add(&self) -> bool {
+        false
+    }
+
     /// 2026-10-01: Make `compute_stream` wait for the deferred all-reduce issued under `slot`.
     /// Joining a slot with nothing outstanding is a no-op. The default does nothing beyond the
     /// range check, matching the default `all_reduce_deferred`.
@@ -266,6 +274,7 @@ mod tests {
         let comm = SingleGpuBackend;
         assert!(comm.all_reduce_deferred(0x1000, 2, 0, ALL_REDUCE_DEFERRED_SLOTS).is_err());
         assert!(comm.all_reduce_join(0, ALL_REDUCE_DEFERRED_SLOTS).is_err());
+        assert!(!comm.all_reduce_is_send_recv_add());
     }
 
     #[test]

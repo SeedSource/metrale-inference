@@ -13,7 +13,7 @@ use super::*;
 /// the chunked scan (`Glm5NextKdaLayer::prefill`) instead of `decode_k`'s per-token recurrence.
 /// Off unless set to `1`; read once. The chunked scan computes the recurrence chunk by chunk, in
 /// a different order, so its output is not bit-identical to the per-token walk.
-fn kda_chunk_prefill() -> bool {
+pub(super) fn kda_chunk_prefill() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {
         let on = std::env::var("METRALE_GLM_KDA_CHUNK_PREFILL").as_deref() == Ok("1");
@@ -313,36 +313,6 @@ impl Glm5NextLayer {
         let normed = ctx.buffers.norm_output();
         let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
 
-        let kda_ctx = match &self.mixer {
-            Glm5NextMixer::Kda { ws, .. } => {
-                if k > ws.max_tokens() {
-                    bail!(
-                        "GLM layer {}: a {k}-token verify exceeds the KDA workspace built for {}",
-                        self.layer_idx,
-                        ws.max_tokens()
-                    );
-                }
-                let st = self.kda_state(state)?;
-                // 2026-09-25: Intermediates only when `take_snapshots` (a verify); prefill passes
-                // none. `decode_k` looks each row up with `get`, so an empty list takes none.
-                let snaps: Vec<(DevicePtr, DevicePtr)> = if take_snapshots {
-                    (0..k.saturating_sub(1))
-                        .map(|t| (st.h_state_intermediates[t], st.conv_state_intermediates[t]))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                Some((
-                    KdaSeqState {
-                        conv: st.conv_state,
-                        recurrent: st.h_state,
-                    },
-                    snaps,
-                ))
-            }
-            Glm5NextMixer::Dsa(_) => None,
-        };
-
         let t_mhc = profile::start();
         if self.is_first {
             glm_hc_expand(
@@ -377,41 +347,18 @@ impl Glm5NextLayer {
         let t_norm = profile::start();
         self.norm(gpu, hidden, self.input_norm, normed, k, stream)?;
         profile::end(profile::NORM, t_norm, gpu, stream);
-        let t = profile::start();
-        let attn_out = match (&self.mixer, &kda_ctx) {
-            (Glm5NextMixer::Kda { layer, ws, .. }, Some((kda, snaps))) => {
-                // 2026-09-25: The chunked scan runs only for a prefill sub-chunk of more than
-                // one row that asked for no intermediates: it never materialises the state
-                // after an interior row, and its order differs from `decode_k`'s, which a
-                // verify must match.
-                if is_prefill && k > 1 && snaps.is_empty() && kda_chunk_prefill() {
-                    layer.prefill(gpu, normed, k, kda, ws, stream)?;
-                } else {
-                    layer.decode_k(gpu, normed, k, kda, ws, snaps, stream)?;
-                }
-                ws.final_out
-            }
-            (Glm5NextMixer::Dsa(layer), _) => {
-                // 2026-09-25: DSA's `decode_k` writes its output projection over its input
-                // buffer.
-                layer.decode_k(
-                    normed,
-                    k,
-                    state,
-                    kv_cache,
-                    seq_len,
-                    block_table,
-                    ctx,
-                    stream,
-                    is_prefill,
-                )?;
-                normed
-            }
-            (Glm5NextMixer::Kda { .. }, None) => {
-                bail!("GLM layer {}: KDA mixer without KDA state", self.layer_idx)
-            }
-        };
-        profile::end(profile::KDA, t, gpu, stream);
+        let attn_out = self.attn_mixer(
+            normed,
+            k,
+            state,
+            kv_cache,
+            seq_len,
+            block_table,
+            ctx,
+            stream,
+            take_snapshots,
+            is_prefill,
+        )?;
         if let (Some(slot), true) = (defer, self.mixer_all_reduce) {
             return self.reduce_deferred(attn_out, hidden, k, slot, ctx, stream);
         }

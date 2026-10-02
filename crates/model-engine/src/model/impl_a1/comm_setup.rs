@@ -51,6 +51,12 @@ pub(super) fn assert_rank_levers_agree(
                  ROUTE_TRACE)",
                 metrale_model_arch::glm5next_layer::staged_merge_signature(),
             ),
+            // 2026-10-01: The sequence-parallel staged prefill replaces each all-reduce with
+            // normed-row exchanges and reduce-scatters, a different collective sequence.
+            (
+                "METRALE_GLM_PREFILL_SEQ_PARALLEL",
+                u64::from(metrale_model_arch::glm5next_layer::prefill_seq_parallel()),
+            ),
             // 2026-10-01: Each DSA prefill sub-chunk swaps its index-selection halves with
             // one grouped send/recv; a rank without it would leave the peer waiting.
             (

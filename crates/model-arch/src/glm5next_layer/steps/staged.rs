@@ -34,6 +34,8 @@ use super::*;
 use crate::glm5next_layer::comm_overlap::{OverlapStep, overlap_schedule};
 use crate::glm5next_mlp::forward_prefill_gemm::grouped_prefill_selected;
 
+mod sp;
+
 /// 2026-09-29: The unstaged loop's sub-chunks of a `num_tokens`-token chunk at width `rows`,
 /// as `(first token, rows)`.
 pub fn sub_chunks(num_tokens: usize, rows: usize) -> Vec<(usize, usize)> {
@@ -108,6 +110,23 @@ impl Glm5NextLayer {
         stream: u64,
     ) -> Result<()> {
         let subs = sub_chunks(num_tokens, rows);
+        // 2026-10-01: `METRALE_GLM_PREFILL_SEQ_PARALLEL=1`: the same two passes with the
+        // row-local work split by rows across the two ranks (`sp.rs`).
+        if let Some(plan) = self.sp_plan(num_tokens, &subs, ctx) {
+            return self.prefill_staged_sp(
+                hidden,
+                &subs,
+                plan,
+                rows,
+                rows_ffn,
+                state,
+                kv_cache,
+                seq_len_start,
+                block_table,
+                ctx,
+                stream,
+            );
+        }
         // 2026-10-01: `METRALE_GLM_PREFILL_COMM_OVERLAP=1`: the same two passes with each
         // all-reduce overlapped with the next item's compute (`prefill_staged_overlapped`).
         if prefill_comm_overlap() && ctx.comm.is_some() && !ctx.graph_capture && !profile::on() {

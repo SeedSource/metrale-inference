@@ -170,7 +170,8 @@ pub(crate) fn load_model(
     )?;
 
     load_phases::validate_kv_kernels(gpu.as_ref(), kv_dtype, &layer_dtypes, &config)?;
-    let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
+    let dflash_drafter_state =
+        serve_phases::load_dflash_drafter(&args, &config, &ptx_set, gpu.as_ref())?;
     // 2026-09-26: LoRA adapters load before `gpu` moves into `build_model`.
     // `lora_states` outlives it: `lora_args` borrows each `store`, and
     // `AppState` takes the adapter names. NLLB loads its adapter through its

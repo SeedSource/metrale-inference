@@ -47,6 +47,23 @@ fn layer_index(name: &str) -> Option<usize> {
     tail[..end].parse().ok()
 }
 
+/// 2026-10-02: Whether `name` is a tensor of the TEXT stack's layer `first` or
+/// above: `model.language_model.layers.N.*` or `model.layers.N.*` only. A
+/// vision tower's `*.layers.N.*` and a bare `layers.N.*` never match, so a
+/// ViT deeper than the text stack is not mistaken for MTP layers.
+pub fn is_text_layer_at_or_above(name: &str, first: usize) -> bool {
+    let Some(tail) = name
+        .strip_prefix("model.language_model.layers.")
+        .or_else(|| name.strip_prefix("model.layers."))
+    else {
+        return false;
+    };
+    let Some(end) = tail.find('.') else {
+        return false;
+    };
+    tail[..end].parse::<usize>().is_ok_and(|i| i >= first)
+}
+
 /// Detect the MTP layout from raw tensor names.
 ///
 /// `mtp.*` wins when both are present — that is the layout the generic
@@ -91,7 +108,22 @@ pub fn detect_in_store(store: &WeightStore, config: &ModelConfig) -> Option<MtpL
 
 #[cfg(test)]
 mod tests {
-    use super::{MtpLayout, detect, layer_index};
+    use super::{MtpLayout, detect, is_text_layer_at_or_above, layer_index};
+
+    #[test]
+    fn text_layer_predicate_matches_only_the_text_stack_from_first() {
+        let p = is_text_layer_at_or_above;
+        assert!(p("model.language_model.layers.45.eh_proj.weight", 45));
+        assert!(p("model.language_model.layers.45.mlp.experts.7.down_proj.weight", 45));
+        assert!(p("model.language_model.layers.46.x.weight", 45));
+        assert!(!p("model.language_model.layers.44.x.weight", 45));
+        assert!(!p("model.language_model.layers.4.x.weight", 45));
+        // vision tower deeper than the text stack, and non-layer tensors
+        assert!(!p("model.visual.blocks.50.attn.proj.weight", 45));
+        assert!(!p("model.visual.encoder.layers.50.attn.weight", 45));
+        assert!(!p("lm_head.weight", 45));
+        assert!(!p("model.language_model.embed_tokens.weight", 45));
+    }
 
     #[test]
     fn glm5_next_layer_45_block_is_detected() {

@@ -60,6 +60,9 @@ pub struct FastSafetensorsLoader {
     /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
     /// set only where `load_mtp_weights` is known to return `None`.
     pub skip_mtp: bool,
+    /// 2026-10-02: Skip the text stack's layers numbered `first` and above
+    /// (GLM-5.3's MTP block at `layers.{num_hidden_layers}`); `None` keeps all.
+    pub skip_layers_from: Option<usize>,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
     pub try_direct_io: bool,
@@ -130,6 +133,7 @@ impl FastSafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layers_from: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -146,6 +150,7 @@ impl FastSafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layers_from: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,

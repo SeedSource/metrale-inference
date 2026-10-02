@@ -50,3 +50,27 @@ fn the_glm_cutlass_w4a4_lever_keeps_only_glm_activation_scales() {
         }
     }
 }
+
+/// 2026-10-02: The drafter's own tables are left unloaded only when every one
+/// is `[vocab, hidden]`; the estimate then drops exactly their bytes.
+#[test]
+fn drafter_tables_are_shared_only_when_every_table_has_the_expected_shape() {
+    use super::shareable_bytes_from_headers as shareable;
+    let (v, h) = (154_880u64, 2_048u64);
+    let tbl = v * h * 2;
+    let hdrs = |lm_shape: Vec<u64>| {
+        vec![
+            ("embed_tokens.weight".to_string(), vec![v, h], tbl),
+            ("lm_head.weight".to_string(), lm_shape, tbl),
+            ("layers.0.q_proj.weight".to_string(), vec![4096, h], 4096 * h * 2),
+        ]
+    };
+    // both tables match: both counted, the layer tensor is not
+    assert_eq!(shareable(&hdrs(vec![v, h]), v as usize, h as usize), 2 * tbl);
+    // one table differs: nothing is shared
+    assert_eq!(shareable(&hdrs(vec![v, h + 1]), v as usize, h as usize), 0);
+    // wrong target hidden size: nothing is shared
+    assert_eq!(shareable(&hdrs(vec![v, h]), v as usize, h as usize + 8), 0);
+    // no tables in the checkpoint: nothing to subtract
+    assert_eq!(shareable(&[], v as usize, h as usize), 0);
+}

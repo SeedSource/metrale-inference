@@ -245,6 +245,16 @@ pub struct SafetensorsLoader {
     /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
     /// set only where `load_mtp_weights` is known to return `None`.
     pub skip_mtp: bool,
+    /// 2026-10-02: Skip the text stack's layers numbered `first` and above
+    /// (`model.language_model.layers.N.*`, `model.layers.N.*`): GLM-5.3's MTP
+    /// block sits at `layers.{num_hidden_layers}`. Set only when no MTP head is
+    /// requested (`--dflash` without `--speculative`). `None` (default) keeps
+    /// every layer.
+    pub skip_layers_from: Option<usize>,
+    /// 2026-10-02: Skip tensors whose name ends with any of these (the DFlash
+    /// drafter's `embed_tokens.weight` / `lm_head.weight`, which the head
+    /// replaces with the target's). Empty (default) skips nothing.
+    pub skip_suffixes: &'static [&'static str],
     /// Tensors the MODEL's weight loader will read from disk itself, so this
     /// loader must record their location instead of uploading them. See
     /// [`DeferHook`] for the contract and why a loader asks for it.
@@ -267,6 +277,8 @@ impl SafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layers_from: None,
+            skip_suffixes: &[],
             defer: None,
         }
     }
@@ -280,6 +292,8 @@ impl SafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layers_from: None,
+            skip_suffixes: &[],
             defer: None,
         }
     }
@@ -308,6 +322,14 @@ impl SafetensorsLoader {
     pub fn should_skip_tensor(&self, name: &str) -> bool {
         // MTP head weights for a model whose loader does not build one.
         if self.skip_mtp && name.starts_with("mtp.") {
+            return true;
+        }
+        if let Some(first) = self.skip_layers_from
+            && crate::mtp_layout::is_text_layer_at_or_above(name, first)
+        {
+            return true;
+        }
+        if self.skip_suffixes.iter().any(|s| name.ends_with(s)) {
             return true;
         }
         // W4A4 activation scales: never read on the w4a16 path (the NVFP4

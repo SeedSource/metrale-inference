@@ -48,6 +48,11 @@ impl FastSafetensorsLoader {
         if self.skip_mtp && name.starts_with("mtp.") {
             return true;
         }
+        if let Some(first) = self.skip_layers_from
+            && crate::mtp_layout::is_text_layer_at_or_above(name, first)
+        {
+            return true;
+        }
         // W4A4 activation scales: never read on the w4a16 path (the NVFP4
         // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
         // almost pure granule padding at expert scale.

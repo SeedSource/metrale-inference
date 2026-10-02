@@ -108,6 +108,7 @@ pub(crate) fn load_weight_store(
             loader.peak_memory_multiplier = mult;
             loader.skip_activation_scales = skip_activation_scales(config);
             loader.skip_mtp = skip_mtp(config);
+            loader.skip_layers_from = skip_mtp_layers_from(args, config);
             // 2026-09-26: A loader that binds no vision encoder skips the
             // tower here. `factory::build` frees an unbound tower too, but
             // only after the reserve preflight has measured free memory.
@@ -148,6 +149,7 @@ pub(crate) fn load_weight_store(
         loader.peak_memory_multiplier = mult;
         loader.skip_activation_scales = skip_activation_scales(config);
         loader.skip_mtp = skip_mtp(config);
+        loader.skip_layers_from = skip_mtp_layers_from(args, config);
         loader.defer = defer_hook(config);
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
@@ -159,6 +161,7 @@ pub(crate) fn load_weight_store(
 
 pub(crate) fn load_dflash_drafter(
     args: &cli::ServeArgs,
+    target: &ModelConfig,
     ptx_set: &metrale_kernels::TargetPtxSet,
     gpu: &dyn metrale_gpu_runtime::gpu::GpuBackend,
 ) -> Result<
@@ -213,7 +216,7 @@ pub(crate) fn load_dflash_drafter(
     // DFlash2 selector's host copies, the FP8 mirrors (half the store plus
     // twice `vocab x hidden`) unless `METRALE_DFLASH_DRAFTER_FP8=0`, and
     // 300 MiB of scratch.
-    let store_bytes: u64 = std::fs::read_dir(&drafter_dir)
+    let store_bytes_on_disk: u64 = std::fs::read_dir(&drafter_dir)
         .ok()
         .into_iter()
         .flatten()
@@ -224,6 +227,17 @@ pub(crate) fn load_dflash_drafter(
         // holds symlinks into `blobs/`.
         .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len()))
         .sum();
+    // 2026-10-02: The head drafts through the TARGET's embed/lm_head
+    // (`install_dflash_drafter`), so when the drafter's own copies have the
+    // target's hidden size (and the drafter's own vocab) they are neither
+    // loaded nor counted; GLM-5.3 targets only. Any shape or
+    // header-read mismatch loads them as before.
+    let shared_tables = if target.model_type == "glm5_next" {
+        shareable_table_bytes(&drafter_dir, drafter_config.vocab_size, target.hidden_size)
+    } else {
+        0
+    };
+    let store_bytes = store_bytes_on_disk.saturating_sub(shared_tables);
     let c = &drafter_config;
     let kv_dim = c.num_key_value_heads * c.head_dim;
     let drafter_kv =
@@ -282,6 +296,14 @@ pub(crate) fn load_dflash_drafter(
 
     let mut loader = metrale_model_weights::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
+    if shared_tables > 0 {
+        loader.skip_suffixes = &["embed_tokens.weight", "lm_head.weight"];
+        tracing::info!(
+            "DFlash drafter: not loading embed_tokens/lm_head ({:.2} GB): same shape as the \
+             target's, which the head uses",
+            shared_tables as f64 / 1e9
+        );
+    }
     let mut drafter_store = loader
         .load(&drafter_dir, gpu, 0)
         .context("Failed to load DFlash drafter weights")?;
@@ -470,6 +492,88 @@ fn skip_activation_scales_for(model_type: &str, glm_cutlass_w4a4: bool) -> bool 
 /// `Qwen4ExpWeightLoader::load_mtp_weights` returns `None`.
 fn skip_mtp(config: &ModelConfig) -> bool {
     matches!(config.model_type.as_str(), "qwen4_exp")
+}
+
+/// 2026-10-02: With `--dflash` (which excludes `--speculative`) GLM-5.3's MTP
+/// block, `layers.{num_hidden_layers}`, is never bound as the proposer, so its
+/// weights (~3 GB per rank under EP) are not loaded. `None` for every other
+/// case, so serves without `--dflash` are unchanged.
+fn skip_mtp_layers_from(args: &cli::ServeArgs, config: &ModelConfig) -> Option<usize> {
+    (args.dflash
+        && !args.speculative
+        && config.model_type == "glm5_next"
+        && !config.mtp_layer_types.is_empty())
+    .then_some(config.num_hidden_layers)
+}
+
+/// 2026-10-02: One safetensors tensor header: name, shape, byte length.
+type TensorHeader = (String, Vec<u64>, u64);
+
+/// 2026-10-02: Bytes of the drafter's `embed_tokens.weight` / `lm_head.weight`
+/// that can be left unloaded because they are `[vocab, hidden]` with the
+/// target's hidden size; 0 when any such tensor differs, or a header cannot be
+/// read. Reads only safetensors headers.
+fn shareable_table_bytes(dir: &Path, vocab: usize, hidden: usize) -> u64 {
+    let mut headers: Vec<TensorHeader> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for e in rd.flatten() {
+        if !e.path().extension().is_some_and(|x| x == "safetensors") {
+            continue;
+        }
+        match read_safetensors_headers(&e.path()) {
+            Some(h) => headers.extend(h),
+            None => return 0,
+        }
+    }
+    shareable_bytes_from_headers(&headers, vocab, hidden)
+}
+
+fn read_safetensors_headers(path: &Path) -> Option<Vec<TensorHeader>> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut len8 = [0u8; 8];
+    f.read_exact(&mut len8).ok()?;
+    let hlen = u64::from_le_bytes(len8);
+    if hlen > 64 << 20 {
+        return None;
+    }
+    let mut buf = vec![0u8; hlen as usize];
+    f.read_exact(&mut buf).ok()?;
+    let hdr: serde_json::Value = serde_json::from_slice(&buf).ok()?;
+    let mut out = Vec::new();
+    for (name, t) in hdr.as_object()? {
+        if name == "__metadata__" {
+            continue;
+        }
+        let shape: Vec<u64> = t
+            .get("shape")?
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .collect();
+        let off = t.get("data_offsets")?.as_array()?;
+        let bytes = off.get(1)?.as_u64()?.checked_sub(off.first()?.as_u64()?)?;
+        out.push((name.clone(), shape, bytes));
+    }
+    Some(out)
+}
+
+/// 2026-10-02: The sum of the table tensors' bytes if every table is
+/// `[vocab, hidden]`, else 0 (nothing is shared, everything loads).
+fn shareable_bytes_from_headers(headers: &[TensorHeader], vocab: usize, hidden: usize) -> u64 {
+    let mut total = 0u64;
+    for (name, shape, bytes) in headers {
+        if !(name.ends_with("embed_tokens.weight") || name.ends_with("lm_head.weight")) {
+            continue;
+        }
+        if shape.as_slice() != [vocab as u64, hidden as u64] {
+            return 0;
+        }
+        total += bytes;
+    }
+    total
 }
 
 /// 2026-09-26: Whether the model's weight loader binds a vision encoder;

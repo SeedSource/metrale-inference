@@ -111,6 +111,53 @@ pub(crate) fn scores_tiled_for(
     requested && resolved && exact_host_geom && shape && heads_ok && wide
 }
 
+/// 2026-10-01: Query rows per `dsa_index_scores_tc` block (`DSA_TC_ROWS`, the MMA's M).
+pub const SCORES_TC_ROWS: usize = 16;
+/// 2026-10-01: Pools per `dsa_index_scores_tc` block (`DSA_TC_POOLS`: 4 warps x two 8-pool
+/// n-tiles).
+pub const SCORES_TC_POOLS: usize = 64;
+/// 2026-10-01: Threads per `dsa_index_scores_tc` block (`DSA_TC_THREADS`).
+pub const SCORES_TC_BLOCK: u32 = 128;
+/// 2026-10-01: Widest `index_head_dim` the tensor-core scores kernel takes (its B fragments
+/// are register arrays of `DSA_TC_MAX_KSTEP` = 8 K steps of 16); it also needs a multiple of
+/// 16.
+pub const SCORES_TC_MAX_D: usize = 128;
+/// 2026-10-01: Fewest pools at which an exact launch takes the tensor-core kernel.
+/// PROVISIONAL (estimate, not measured): the same floor as [`SCORES_TILED_MIN_POOLS`]; below
+/// it the scores pass is a small share of prefill. Tune from the timing sweep in
+/// `examples/dsa_indexer_tc_microtest.rs`.
+pub const SCORES_TC_MIN_POOLS: usize = 256;
+
+/// 2026-10-01: `dsa_index_scores_tc` grid for `q_rows` rows and `n_pools` pools: 64-pool tiles
+/// on x, 16-row tiles on y.
+pub fn scores_tc_grid(q_rows: usize, n_pools: usize) -> [u32; 3] {
+    [
+        n_pools.div_ceil(SCORES_TC_POOLS) as u32,
+        q_rows.div_ceil(SCORES_TC_ROWS) as u32,
+        1,
+    ]
+}
+
+/// 2026-10-01: Whether a scores launch takes `dsa_index_scores_tc`: only when a precision mode
+/// is requested (`METRALE_GLM_DSA_SCORES_TC`, `mode` 1..=3; 0 is off), with the entry point
+/// resolved, on an exact launch with host geometry (the kernel has no `geom_dev` path), for
+/// `index_head_dim` a nonzero multiple of 16 up to [`SCORES_TC_MAX_D`], at least one head, and
+/// at `n_pools >= SCORES_TC_MIN_POOLS` (PROVISIONAL). It takes precedence over the tiled
+/// kernel when both are requested (`select_tokens`).
+pub(crate) fn scores_tc_for(
+    mode: u32,
+    resolved: bool,
+    exact_host_geom: bool,
+    d: usize,
+    heads: usize,
+    n_pools: usize,
+) -> bool {
+    let shape = d > 0 && d.is_multiple_of(16) && d <= SCORES_TC_MAX_D;
+    let mode_ok = (1..=3).contains(&mode);
+    let wide = n_pools >= SCORES_TC_MIN_POOLS;
+    mode_ok && resolved && exact_host_geom && shape && heads > 0 && wide
+}
+
 /// 2026-09-25: Tile width `dsa_topk_pools` walks the pool axis in.
 ///
 /// The block holds two tiles, the running best list and the candidate tile, of `[f32, i32]`

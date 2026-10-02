@@ -123,6 +123,47 @@ pub(crate) fn dsa_scores_tiled() -> bool {
     })
 }
 
+/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TC` as a precision mode for `dsa_index_scores_tc`
+/// (surrounding blanks and case ignored): `split3` or `1` is 3 (q and keys split into BF16
+/// hi + lo, FP32-class dots), `split2` is 2 (q split only), `bf16` is 1 (one BF16 MMA);
+/// unset, empty, `0`, `off` and anything else are 0 (off).
+pub(crate) fn parse_dsa_scores_tc(v: Option<&str>) -> u32 {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("1") | Some("split3") => 3,
+        Some("split2") => 2,
+        Some("bf16") => 1,
+        _ => 0,
+    }
+}
+
+/// 2026-10-01: `METRALE_GLM_DSA_SCORES_TC=<mode>` scores an exact (host-geometry) DSA
+/// selection of at least `SCORES_TC_MIN_POOLS` pools (PROVISIONAL) with `dsa_index_scores_tc`
+/// on tensor cores (mma.sync m16n8k16 BF16, FP32 accumulate) instead of the FP32 scorers, for
+/// long prompts where the O(rows x pools) indexer dominates prefill. NOT byte-identical: the
+/// scores carry about 2^-16 (`split3`) or 2^-9 (`split2`, `bf16`) relative error, so near-tie
+/// pools at the top-k boundary can swap. GPU gate: `examples/dsa_indexer_tc_microtest.rs`.
+/// Takes precedence over `METRALE_GLM_DSA_SCORES_TILED`. Off (0) unless set; read once.
+pub(crate) fn dsa_scores_tc() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DSA_SCORES_TC").ok();
+        let mode = parse_dsa_scores_tc(raw.as_deref());
+        let t = raw.as_deref().map(str::trim).unwrap_or_default();
+        if mode != 0 {
+            tracing::warn!(
+                "METRALE_GLM_DSA_SCORES_TC={t} - exact DSA selections score pools on tensor \
+                 cores, mode {mode} (3 split3, 2 split2, 1 bf16; NOT byte-identical)"
+            );
+        } else if !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("off") {
+            tracing::warn!(
+                "METRALE_GLM_DSA_SCORES_TC={t} is not split3, split2, bf16, 1, 0 or off - \
+                 treated as off"
+            );
+        }
+        mode
+    })
+}
+
 /// 2026-10-01: `METRALE_GLM_DSA_GEMV_SPLIT=1` runs each batched indexer GEMV of the DSA row
 /// batch (`glm5next_dsa/layer/row_batch.rs`: `wk`, `compress_gate`, `weights_proj`, `wq_b`)
 /// as ONE launch over all `k` rows, `ceil(k / 16)` block rows of at most 16 rows each

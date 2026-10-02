@@ -59,6 +59,10 @@ name = "dsa_indexer_tiled_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dsa_indexer_tc_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_mla_headgroup_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 

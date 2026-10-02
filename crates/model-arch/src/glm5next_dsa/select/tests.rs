@@ -462,3 +462,78 @@ fn dsa_tiled_entry_point_and_tile_match_the_kernel_file() {
         );
     }
 }
+
+/// 2026-10-01: The tensor-core scorer is selected only with a mode, a resolved entry point,
+/// host geometry, a head dim that is a nonzero multiple of 16 up to 128, at least one head and
+/// at least `SCORES_TC_MIN_POOLS` pools.
+#[test]
+fn dsa_scores_tc_selection_envelope() {
+    let ok = scores_tc_for;
+    for mode in 1..=3 {
+        assert!(ok(mode, true, true, 128, 32, SCORES_TC_MIN_POOLS), "mode {mode}");
+    }
+    assert!(!ok(0, true, true, 128, 32, 4096), "off");
+    assert!(!ok(4, true, true, 128, 32, 4096), "unknown mode");
+    assert!(!ok(3, false, true, 128, 32, 4096), "entry point absent");
+    assert!(!ok(3, true, false, 128, 32, 4096), "ceiling / device geometry");
+    assert!(ok(3, true, true, 16, 32, 4096), "D 16");
+    assert!(ok(3, true, true, 96, 32, 4096), "D 96");
+    for d in [0, 8, 24, 136, 256] {
+        assert!(!ok(3, true, true, d, 32, 4096), "D {d}");
+    }
+    assert!(!ok(3, true, true, 128, 0, 4096), "no heads");
+    assert!(!ok(3, true, true, 128, 32, SCORES_TC_MIN_POOLS - 1), "short selection");
+}
+
+/// 2026-10-01: `scores_tc_grid` puts 64-pool tiles on x and 16-row tiles on y.
+#[test]
+fn dsa_scores_tc_grid_covers_every_row_and_pool() {
+    assert_eq!(scores_tc_grid(1, 1), [1, 1, 1]);
+    assert_eq!(scores_tc_grid(16, 64), [1, 1, 1]);
+    assert_eq!(scores_tc_grid(17, 65), [2, 2, 1]);
+    assert_eq!(scores_tc_grid(256, 16_384), [256, 16, 1]);
+    assert_eq!(SCORES_TC_BLOCK as usize, 4 * 32, "four warps");
+    assert_eq!(SCORES_TC_POOLS, 4 * 16, "16 pools (two n-tiles) per warp");
+}
+
+/// 2026-10-01: `dsa_indexer.cu` defines `dsa_index_scores_tc` with `dsa_index_scores`'
+/// parameter list plus a trailing `mode`, and its defines mirror the Rust constants; a rename
+/// or a resize in the `.cu` alone fails here instead of mis-launching at serve.
+#[test]
+fn dsa_tc_entry_point_and_tile_match_the_kernel_file() {
+    let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../kernels/gb10/common")
+        .join(format!("{}.cu", super::super::DSA_MODULE));
+    let src = std::fs::read_to_string(&cu).expect("dsa_indexer.cu readable");
+    let params = |head: &str| -> String {
+        let Some(at) = src.find(head) else {
+            panic!("{cu:?} lacks `{head}`");
+        };
+        let start = at + head.len();
+        let len = src[start..].find(')').expect("parameter list closes");
+        src[start..start + len]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let tc = "extern \"C\" __global__ void __launch_bounds__(DSA_TC_THREADS) \
+              dsa_index_scores_tc(";
+    let base = params("extern \"C\" __global__ void dsa_index_scores(");
+    assert_eq!(
+        params(tc),
+        format!("{base}, unsigned int mode"),
+        "the launcher passes dsa_index_scores' arguments, then the mode"
+    );
+    for (define, v) in [
+        ("DSA_TC_ROWS", SCORES_TC_ROWS),
+        ("DSA_TC_POOLS", SCORES_TC_POOLS),
+        ("DSA_TC_THREADS", SCORES_TC_BLOCK as usize),
+        ("DSA_TC_MAX_KSTEP", SCORES_TC_MAX_D / 16),
+    ] {
+        let line = format!("#define {define} {v}u");
+        assert!(
+            src.lines().any(|l| l.trim() == line),
+            "{cu:?}: `{line}` does not match the Rust constant"
+        );
+    }
+}

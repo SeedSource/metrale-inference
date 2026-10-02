@@ -94,17 +94,40 @@ pub fn select_tokens(
     if has_pools {
         // 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED=1` swaps in `dsa_index_scores_tiled`
         // (same arguments, same bytes) on an exact launch; see `scores_tiled_for`.
-        let requested = crate::glm5next_layer::levers::dsa_scores_tiled();
-        let tiled = scores_tiled_for(
-            requested,
-            kernels.index_scores_tiled.0 != 0,
+        // 2026-10-01: `METRALE_GLM_DSA_SCORES_TC=<mode>` swaps in `dsa_index_scores_tc`
+        // (tensor cores, NOT byte-identical; the same arguments plus `mode`) on an exact
+        // launch, ahead of the tiled kernel; see `scores_tc_for`.
+        let tc_mode = crate::glm5next_layer::levers::dsa_scores_tc();
+        let tc = scores_tc_for(
+            tc_mode,
+            kernels.index_scores_tc.0 != 0,
             ceiling.is_none() && gd.0 == 0,
             d,
             geom.index_heads,
             geom.n_pools,
         );
-        log_scores_tiled(requested, tiled, kernels, ceiling.is_some(), geom);
-        let (handle, grid, block, smem) = if tiled {
+        log_scores_tc(tc_mode, tc, kernels, ceiling.is_some(), geom);
+        let requested = crate::glm5next_layer::levers::dsa_scores_tiled();
+        let tiled = !tc
+            && scores_tiled_for(
+                requested,
+                kernels.index_scores_tiled.0 != 0,
+                ceiling.is_none() && gd.0 == 0,
+                d,
+                geom.index_heads,
+                geom.n_pools,
+            );
+        if !tc {
+            log_scores_tiled(requested, tiled, kernels, ceiling.is_some(), geom);
+        }
+        let (handle, grid, block, smem) = if tc {
+            (
+                kernels.index_scores_tc,
+                scores_tc_grid(geom.q_rows, geom.n_pools),
+                SCORES_TC_BLOCK,
+                0u32,
+            )
+        } else if tiled {
             (
                 kernels.index_scores_tiled,
                 scores_tiled_grid(geom.q_rows, geom.n_pools),
@@ -125,7 +148,7 @@ pub fn select_tokens(
                 SCORES_BLOCK.max((geom.index_heads * 4) as u32),
             )
         };
-        KernelLaunch::new(gpu, handle)
+        let scores = KernelLaunch::new(gpu, handle)
             .grid(grid)
             .block([block, 1, 1])
             .shared_mem(smem)
@@ -145,8 +168,10 @@ pub fn select_tokens(
             .arg_u32(kp as u32)
             .arg_u32(seq_a as u32)
             .arg_f32((d as f32).powf(-0.5))
-            .arg_ptr(gd)
-            .launch(stream)?;
+            .arg_ptr(gd);
+        // 2026-10-01: `dsa_index_scores_tc` takes one argument more, the precision mode.
+        let scores = if tc { scores.arg_u32(tc_mode) } else { scores };
+        scores.launch(stream)?;
 
         // 2026-09-25: `np2_a` is at most `topk_tile()`, so the request is at most
         // `topk_smem_for_tile(topk_tile())`, within `TOPK_SMEM_CEILING`.
@@ -218,6 +243,39 @@ fn log_scores_tiled(
                  kernel needs a multiple of 32 up to {SCORES_TILED_MAX_D} and up to \
                  {SCORES_TILED_MAX_H} heads, host geometry)",
                 kernels.index_scores_tiled.0 != 0
+            );
+        });
+    }
+}
+
+/// 2026-10-01: Log once whether `METRALE_GLM_DSA_SCORES_TC` engaged, and once why a requested
+/// exact launch of at least `SCORES_TC_MIN_POOLS` pools kept the FP32 scorer. A ceiling
+/// (graph-replay decode) launch and a short selection are expected fallbacks and log nothing.
+fn log_scores_tc(
+    mode: u32,
+    tc: bool,
+    kernels: &Glm5NextDsaKernels,
+    ceiling: bool,
+    geom: &DsaSelectGeometry,
+) {
+    let (d, heads) = (geom.index_head_dim, geom.index_heads);
+    if tc {
+        static ENGAGED: std::sync::Once = std::sync::Once::new();
+        ENGAGED.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_DSA_SCORES_TC: ENGAGED (mode {mode}) - dsa_index_scores_tc scores \
+                 exact DSA selections of at least {SCORES_TC_MIN_POOLS} pools on tensor cores \
+                 (index_head_dim {d}, {heads} heads; NOT byte-identical)"
+            );
+        });
+    } else if mode != 0 && !ceiling && geom.n_pools >= SCORES_TC_MIN_POOLS {
+        static FELL_BACK: std::sync::Once = std::sync::Once::new();
+        FELL_BACK.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_DSA_SCORES_TC: NOT engaged, the FP32 scorer runs (entry point \
+                 resolved {}, index_head_dim {d}, {heads} heads; the tensor-core kernel needs a \
+                 multiple of 16 up to {SCORES_TC_MAX_D} and host geometry)",
+                kernels.index_scores_tc.0 != 0
             );
         });
     }

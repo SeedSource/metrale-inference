@@ -25,7 +25,9 @@
 //! Invariants:
 //! - Rank 0 sends only after its own validation of the batch passes, so every word the worker
 //!   reads was sent; once sent, rank 0 always sends the verdict words (the scheduler on `Ok`,
-//!   `decode_verify_batched` on `Err`).
+//!   `decode_verify_batched` on `Err`). The abort is clean only for a failure both ranks hit at
+//!   the same collective (the shape-determined refusals `verify_n_seqs` raises before any launch
+//!   do); a rank-0-only failure mid-forward desyncs the ranks, as on the per-sequence path.
 //! - The worker orders its sequences as `slots[]`, so batch row `i` is the same sequence on
 //!   both ranks.
 

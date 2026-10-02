@@ -44,15 +44,6 @@ pub fn alloc_kda_ssm_state(gpu: &dyn GpuBackend, cfg: &Glm5NextKdaConfig) -> Res
     })
 }
 
-impl LayerAuxState for Glm5NextLayer`, moved here unchanged from `mod.rs` to keep
-//! that file under the 500-line cap when the batched verify (`steps/verify_multi.rs`) joined it.
-//!
-//! Owner: model-arch (GLM-5.3).
-//! Invariants: a DSA layer's indexer cache is the only aux state; KDA state travels with the SSM
-//! snapshot.
-
-use super::*;
-
 impl LayerAuxState for Glm5NextLayer {
     /// 2026-09-25: True for a DSA layer: its indexer cache is the state `snapshot_aux` and
     /// `restore_aux` carry. A KDA layer's state is in the SSM pool (`uses_ssm_pool`) and is not

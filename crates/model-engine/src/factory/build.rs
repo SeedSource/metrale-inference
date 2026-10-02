@@ -156,7 +156,7 @@ pub fn build_model(
     // construction.
     let mut mem = MemTrace::new(gpu.as_ref());
     let free_before_layers = gpu.free_memory().unwrap_or(0);
-    let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
+    let mut layers = loader.load_layers_releasing(&mut store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
     let free_after_layers = gpu.free_memory().unwrap_or(0);
     tracing::info!(
         "Layer construction: {:.2} GB consumed ({:.2} GB free -> {:.2} GB free) \

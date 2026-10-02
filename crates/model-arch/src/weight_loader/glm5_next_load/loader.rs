@@ -52,6 +52,173 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         store: &WeightStore,
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
+        layer_kv_dtypes: &[KvCacheDtype],
+    ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+        self.build_layers(StoreAccess::Shared(store), config, gpu, layer_kv_dtypes)
+    }
+
+    /// 2026-10-02: `load_layers` with a mutable store, so each text layer's raw store
+    /// tensors are freed right after the layer is built (`METRALE_LOAD_EARLY_FREE`,
+    /// default on). See [`StoreAccess::release_layer`] for the invariant.
+    fn load_layers_releasing(
+        &self,
+        store: &mut WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+        layer_kv_dtypes: &[KvCacheDtype],
+    ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+        let access = if early_free_enabled() {
+            StoreAccess::Exclusive(store)
+        } else {
+            StoreAccess::Shared(&*store)
+        };
+        self.build_layers(access, config, gpu, layer_kv_dtypes)
+    }
+
+    fn load_embedding(
+        &self,
+        store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight> {
+        dense(store, "model.language_model.embed_tokens.weight")
+    }
+
+    fn load_final_norm(
+        &self,
+        store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight> {
+        dense(store, "model.language_model.norm.weight")
+    }
+
+    fn load_lm_head(
+        &self,
+        store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight> {
+        dense(store, "lm_head.weight")
+    }
+
+    /// 2026-09-25: `None`: the GLM-5.3 MTP layer is loaded by
+    /// `glm5_next_mtp::load_glm5next_mtp_module`, not as `MtpWeights`.
+    fn load_mtp_weights(
+        &self,
+        _store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::weight_loader::MtpWeights>> {
+        Ok(None)
+    }
+
+    /// 2026-09-25: Free the store tensors `is_reuploaded` matches, then those
+    /// `is_quantized_expert_weight` matches.
+    fn prune_after_load(
+        &self,
+        store: &mut WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        let n = config.num_hidden_layers;
+        let (count, bytes) = store.free_matching(gpu, |name| is_reuploaded(name, n))?;
+        tracing::info!(
+            "glm5_next: released {count} store tensors ({:.2} GB) already re-uploaded by the \
+             binders; routed experts and the MTP block kept",
+            bytes as f64 / 1e9,
+        );
+        let quantized: std::collections::BTreeSet<String> = store
+            .names()
+            .filter(|n| {
+                store
+                    .get(n)
+                    .is_ok_and(|t| is_quantized_expert_weight(n, t.dtype))
+            })
+            .map(str::to_string)
+            .collect();
+        if !quantized.is_empty() {
+            let (qcount, qbytes) = store.free_matching(gpu, |name| quantized.contains(name))?;
+            tracing::info!(
+                "glm5_next: released {qcount} full-width BF16 routed-expert tensors \
+                 ({:.2} GB) quantised to NVFP4 at bind time",
+                qbytes as f64 / 1e9,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// 2026-10-02: `METRALE_LOAD_EARLY_FREE`: default on; `0` restores freeing everything in
+/// `prune_after_load`.
+fn early_free_enabled() -> bool {
+    std::env::var("METRALE_LOAD_EARLY_FREE").as_deref() != Ok("0")
+}
+
+/// 2026-10-02: How `build_layers` sees the store: shared (`load_layers`) or exclusive
+/// (`load_layers_releasing`), so one body serves both without changing the trait's
+/// `load_layers(&WeightStore)` signature.
+enum StoreAccess<'a> {
+    Shared(&'a WeightStore),
+    Exclusive(&'a mut WeightStore),
+}
+
+impl StoreAccess<'_> {
+    fn shared(&self) -> &WeightStore {
+        match self {
+            StoreAccess::Shared(s) => *s,
+            StoreAccess::Exclusive(s) => &**s,
+        }
+    }
+
+    fn can_release(&self) -> bool {
+        matches!(self, StoreAccess::Exclusive(_))
+    }
+
+    /// Free layer `idx`'s store tensors that `prune_after_load` would free anyway: the
+    /// `is_reuploaded` set (non-expert tensors of a text layer) and its BF16 routed-expert
+    /// projections that `bind_expert` quantised into separate buffers. Returns (count, bytes).
+    ///
+    /// Invariant (checked by reading the code, 2026-10-02): once layer `idx` is built, nothing
+    /// reads these tensors. `LayerSource::collect` copied them to the host; the binders upload
+    /// their own buffers; layer `idx`'s U8 experts (`mlp.experts.*`, zero-copy) and the MTP layer
+    /// (`idx >= num_layers`) are never matched, and the MTP loader, embedding, final norm,
+    /// lm_head and vision tower read other names only. The only cross-layer read, layer 0's
+    /// `f_a_proj` shape, happens before the loop. Callers must not hold a shared borrow from
+    /// [`Self::shared`] across this call. A no-op on a shared store.
+    fn release_layer(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        idx: usize,
+        num_layers: usize,
+    ) -> Result<(usize, usize)> {
+        let StoreAccess::Exclusive(store) = self else {
+            return Ok((0, 0));
+        };
+        let prefix = format!("model.language_model.layers.{idx}.");
+        let quantized: std::collections::BTreeSet<String> = store
+            .names()
+            .filter(|n| n.starts_with(&prefix))
+            .filter(|n| {
+                store
+                    .get(n)
+                    .is_ok_and(|t| is_quantized_expert_weight(n, t.dtype))
+            })
+            .map(str::to_string)
+            .collect();
+        store.free_matching(gpu, |name| {
+            name.starts_with(&prefix)
+                && (is_reuploaded(name, num_layers) || quantized.contains(name))
+        })
+    }
+}
+
+impl Glm5NextWeightLoader {
+    fn build_layers(
+        &self,
+        mut access: StoreAccess<'_>,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
         _layer_kv_dtypes: &[KvCacheDtype],
     ) -> Result<Vec<Box<dyn TransformerLayer>>> {
         let skeleton = Glm5NextTextSkeleton::from_config(config)?;
@@ -72,7 +239,7 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         // config has no such key.
         let gate_rank = {
             let n = qualify(0, "self_attn.f_a_proj.weight");
-            let t = store.get(&n).with_context(|| {
+            let t = access.shared().get(&n).with_context(|| {
                 format!("glm5_next: {n} is needed to size the KDA gate bottleneck")
             })?;
             *t.shape.first().context("f_a_proj has no rows")?
@@ -220,7 +387,12 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         // ordinal among DSA layers, not by its model index.
         let mut attn_layer_idx = 0usize;
 
+        let early_free = access.can_release();
+        let (mut freed_count, mut freed_bytes) = (0usize, 0usize);
         for sl in &skeleton.layers {
+            // 2026-10-02: Shared borrow of the store for this iteration only (shadows the
+            // name the binders use); it must be dead before `release_layer` below.
+            let store = access.shared();
             let idx = sl.index;
             let t_layer = std::time::Instant::now();
             let src = LayerSource::collect(gpu, store, idx)
@@ -397,7 +569,34 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
                     next_attn_head: Vec::new(),
                 },
             };
+            // 2026-10-02: Layer `idx` is built: every binder above read its own layer's store
+            // tensors (host copy in `src`, or the routed experts via `bind_expert`), and
+            // nothing later reads them (see `StoreAccess::release_layer`).
+            if early_free {
+                let (c, b) = access
+                    .release_layer(gpu, idx, config.num_hidden_layers)
+                    .with_context(|| format!("glm5_next: early-free of layer {idx}"))?;
+                freed_count += c;
+                freed_bytes += b;
+                tracing::info!(
+                    "glm5_next early-free layer {idx}: released {c} raw store tensors \
+                     ({:.1} MB)",
+                    b as f64 / 1e6,
+                );
+            }
             built.push((layer, attn_head));
+        }
+        if early_free {
+            tracing::info!(
+                "glm5_next early-free total: released {freed_count} raw store tensors \
+                 ({:.2} GB) during load_layers; prune_after_load sweeps the rest",
+                freed_bytes as f64 / 1e9,
+            );
+        } else {
+            tracing::info!(
+                "glm5_next early-free: OFF (METRALE_LOAD_EARLY_FREE=0 or immutable store); raw \
+                 store copies stay until prune_after_load"
+            );
         }
         // 2026-10-01: Layer i prefetches layer i + 1's attention head; the last layer none.
         let heads: Vec<Vec<crate::glm5next_layer::L2Span>> =
@@ -409,78 +608,5 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
             out.push(Box::new(layer));
         }
         Ok(out)
-    }
-
-    fn load_embedding(
-        &self,
-        store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
-    ) -> Result<DenseWeight> {
-        dense(store, "model.language_model.embed_tokens.weight")
-    }
-
-    fn load_final_norm(
-        &self,
-        store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
-    ) -> Result<DenseWeight> {
-        dense(store, "model.language_model.norm.weight")
-    }
-
-    fn load_lm_head(
-        &self,
-        store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
-    ) -> Result<DenseWeight> {
-        dense(store, "lm_head.weight")
-    }
-
-    /// 2026-09-25: `None`: the GLM-5.3 MTP layer is loaded by
-    /// `glm5_next_mtp::load_glm5next_mtp_module`, not as `MtpWeights`.
-    fn load_mtp_weights(
-        &self,
-        _store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
-    ) -> Result<Option<crate::weight_loader::MtpWeights>> {
-        Ok(None)
-    }
-
-    /// 2026-09-25: Free the store tensors `is_reuploaded` matches, then those
-    /// `is_quantized_expert_weight` matches.
-    fn prune_after_load(
-        &self,
-        store: &mut WeightStore,
-        config: &ModelConfig,
-        gpu: &dyn GpuBackend,
-    ) -> Result<()> {
-        let n = config.num_hidden_layers;
-        let (count, bytes) = store.free_matching(gpu, |name| is_reuploaded(name, n))?;
-        tracing::info!(
-            "glm5_next: released {count} store tensors ({:.2} GB) already re-uploaded by the \
-             binders; routed experts and the MTP block kept",
-            bytes as f64 / 1e9,
-        );
-        let quantized: std::collections::BTreeSet<String> = store
-            .names()
-            .filter(|n| {
-                store
-                    .get(n)
-                    .is_ok_and(|t| is_quantized_expert_weight(n, t.dtype))
-            })
-            .map(str::to_string)
-            .collect();
-        if !quantized.is_empty() {
-            let (qcount, qbytes) = store.free_matching(gpu, |name| quantized.contains(name))?;
-            tracing::info!(
-                "glm5_next: released {qcount} full-width BF16 routed-expert tensors \
-                 ({:.2} GB) quantised to NVFP4 at bind time",
-                qbytes as f64 / 1e9,
-            );
-        }
-        Ok(())
     }
 }

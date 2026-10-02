@@ -176,6 +176,19 @@ pub trait ModelWeightLoader {
         layer_kv_dtypes: &[KvCacheDtype],
     ) -> Result<Vec<Box<dyn TransformerLayer>>>;
 
+    /// 2026-10-02: `load_layers` for a loader that can free each layer's raw store tensors as
+    /// soon as the layer is built, which caps the duplicate-weight peak at about one layer.
+    /// `factory::build` calls this one. The default is `load_layers` and frees nothing.
+    fn load_layers_releasing(
+        &self,
+        store: &mut WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+        layer_kv_dtypes: &[KvCacheDtype],
+    ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+        self.load_layers(&*store, config, gpu, layer_kv_dtypes)
+    }
+
     /// 2026-09-25: Drop store tensors this loader has finished with. `factory::build`
     /// calls it after every `load_*` reader and before the KV budget is
     /// computed, so the freed memory counts.

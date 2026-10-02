@@ -13,6 +13,8 @@ cuda = ["metrale-model-layers/cuda"]
 metal = ["metrale-model-layers/metal"]
 metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 gpu-examples = []
+# 2026-10-01: Two-rank GPU examples that link NCCL through metrale-comm.
+nccl-examples = ["gpu-examples", "metrale-comm/nccl"]
 
 [dependencies]
 metrale-cache = { path = "../cache", default-features = false }
@@ -173,6 +175,10 @@ required-features = ["cuda", "gpu-examples"]
 [[example]]
 name = "gemv_fp4_vs_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm5next_comm_overlap_2rank"
+required-features = ["cuda", "nccl-examples"]
 
 [[example]]
 name = "glm5next_ffn_microtest"

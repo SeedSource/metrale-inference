@@ -249,6 +249,33 @@ pub fn prefill_tail_merge() -> bool {
     })
 }
 
+/// 2026-10-01: `METRALE_GLM_PREFILL_COMM_OVERLAP=1` (with `METRALE_GLM_PREFILL_STAGED=1`): the
+/// staged prefill overlaps each sub-chunk's mixer all-reduce with the next sub-chunk's attention
+/// compute, and each FFN window's MLP all-reduce with the next window's FFN compute
+/// (`steps/staged.rs`, schedule `comm_overlap::overlap_schedule`). The partial is copied into
+/// the sub-chunk's own (dead after the norm) `hidden` rows and reduced there on the comm stream
+/// (`CommBackend::all_reduce_deferred`); the compute stream waits for it only right before the
+/// `hc_post` that folds it in. Byte-identical by construction: the same operands go through the
+/// same `bf16_add_inplace`, every launch keeps its inputs, and the collective sequence (count,
+/// sizes, order) is unchanged, so the ranks need not agree on it. Inert under graph capture,
+/// with `METRALE_GLM_PROFILE` set, without a communicator or with staging off. Off unless set to
+/// `1`; read once.
+pub fn prefill_comm_overlap() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_PREFILL_COMM_OVERLAP").as_deref() == Ok("1")
+            && std::env::var("METRALE_GLM_PREFILL_STAGED").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_COMM_OVERLAP=1 - staged GLM prefill all-reduces overlap \
+                 the next sub-chunk / FFN window (byte-identical by construction; see \
+                 steps/staged.rs)"
+            );
+        }
+        on
+    })
+}
+
 /// 2026-09-29: The env-read inputs that decide which sub-chunks the staged FFN pass merges
 /// (`grouped_prefill_selected`): the grouped-GEMM minimum rows and its switch, forced host
 /// dispatch and route tracing, packed into one value for the rank-agreement check. A skew

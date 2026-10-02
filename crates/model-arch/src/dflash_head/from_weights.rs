@@ -230,7 +230,11 @@ impl BlockDiffusionDraftHead {
         // `rope_scaling`: absent gives plain RoPE (`1 / theta^(2j / dim)`),
         // `rope_type = "yarn"` the YaRN-blended table, and any other value plain RoPE
         // with a warning. RoPE rotates the whole head (`rotary_dim = head_dim`).
-        let rope_theta = weights.config.rope_theta;
+        // 2026-10-01: θ is the top-level `rope_theta`, or under
+        // METRALE_DFLASH_CKPT_ARCH=1 the one nested in `rope_parameters` when the
+        // config nests it (`DflashConfig::resolved_rope_theta`).
+        let ckpt_arch = crate::weight_loader::dflash_loader::ckpt_arch::ckpt_arch_enabled();
+        let rope_theta = weights.config.resolved_rope_theta(ckpt_arch);
         let rotary_dim = head_dim;
         let inv_freq_table = rope_table::rope_inv_freq_table(&weights, rope_theta, rotary_dim);
 
@@ -268,6 +272,35 @@ impl BlockDiffusionDraftHead {
             num_layers,
         );
 
+        // 2026-10-01: METRALE_DFLASH_CKPT_ARCH=1 with a learned mask embedding (the
+        // server attached `mask_embedding.pt` to the config): `gamma - 1` contiguous
+        // copies of it on the device, which `block_embed` writes over the mask rows.
+        // The target's embedding table is never modified.
+        let (mask_rows, mask_rows_count) = match weights.config.mask_embedding_bf16.as_deref() {
+            Some(emb) if ckpt_arch => {
+                anyhow::ensure!(
+                    emb.len() == hidden_size * bf16,
+                    "DFlash mask embedding is {} bytes, want hidden_size {} x 2",
+                    emb.len(),
+                    hidden_size
+                );
+                let n = gamma_val.saturating_sub(1).max(1);
+                let host: Vec<u8> = emb.repeat(n);
+                let dev = gpu.alloc(host.len())?;
+                gpu.copy_h2d(&host, dev)?;
+                tracing::info!(
+                    "DFlash ckpt-arch: learned mask embedding armed ({} rows x {} BF16, \
+                     L2 norm {:.4}) for mask_token_id {}",
+                    n,
+                    hidden_size,
+                    crate::weight_loader::dflash_loader::ckpt_arch::bf16_l2_norm(emb),
+                    mask_token_id
+                );
+                (Some(dev), n)
+            }
+            _ => (None, 0),
+        };
+
         let mut head = Self {
             // 2026-09-25: The drafter's `DFlashLevers`, resolved from the environment once,
             // here.
@@ -284,6 +317,8 @@ impl BlockDiffusionDraftHead {
             block_gamma: std::sync::atomic::AtomicUsize::new(gamma_val),
             max_batch: nb,
             mask_token_id,
+            mask_rows,
+            mask_rows_count,
             window_size,
             target_layer_ids,
             target_hidden_size,
@@ -333,7 +368,9 @@ impl BlockDiffusionDraftHead {
             yarn_inv_freq,
             rope_theta,
             rotary_dim,
-            rms_norm_eps: 1e-6,
+            // 2026-10-01: 1e-6, or the config's `rms_norm_eps` under
+            // METRALE_DFLASH_CKPT_ARCH=1.
+            rms_norm_eps: weights.config.resolved_rms_norm_eps(ckpt_arch),
             ctx_window,
             propose_graphs: parking_lot::Mutex::new(super::ProposeGraphs::default()),
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),

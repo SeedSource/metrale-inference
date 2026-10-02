@@ -83,6 +83,7 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         let BlockDims {
             gpu,
+            n_seq,
             width,
             h,
             bf16,
@@ -114,6 +115,30 @@ impl BlockDiffusionDraftHead {
                 0,
                 eff_ctx * self.hidden_size * bf16,
             )?;
+        }
+        // 2026-10-01: METRALE_DFLASH_CKPT_ARCH=1 with a learned mask embedding
+        // (`mask_embedding.pt`): overwrite each sequence's `width - 1` mask rows,
+        // which batched_embed filled with the target's `embed_tokens[mask_token_id]`,
+        // with the drafter's trained mask vector. `mask_rows` holds
+        // `mask_rows_count` (= `gamma - 1`) replicated copies, so one contiguous
+        // copy per sequence covers its rows (`width <= gamma`). The anchor row and
+        // the ctx rows are untouched.
+        if let Some(mask_rows) = self.mask_rows
+            && width > 1
+        {
+            let row_bytes = self.hidden_size * bf16;
+            debug_assert!(width - 1 <= self.mask_rows_count);
+            let n_rows = (width - 1).min(self.mask_rows_count);
+            for b in 0..n_seq {
+                gpu.copy_d2d_async(
+                    mask_rows,
+                    self.scratch
+                        .stream_buf
+                        .offset((eff_ctx + b * width + 1) * row_bytes),
+                    n_rows * row_bytes,
+                    stream,
+                )?;
+            }
         }
         // 2026-09-25: METRALE_DFLASH_DEBUG_FORCE_NOISE_PATTERN=1 overwrites sequence 0's
         // `width` block rows with `0.001 * (t + 1) * (j + 1) / hidden_size`.

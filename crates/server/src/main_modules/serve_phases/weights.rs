@@ -190,9 +190,23 @@ pub(crate) fn load_dflash_drafter(
                 drafter_dir.display()
             )
         })?;
-    let drafter_config = metrale_model_arch::weight_loader::dflash_loader::parse_dflash_config(
-        &drafter_config_json,
-    )?;
+    let mut drafter_config =
+        metrale_model_arch::weight_loader::dflash_loader::parse_dflash_config(
+            &drafter_config_json,
+        )?;
+    // 2026-10-01: `METRALE_DFLASH_CKPT_ARCH=1` loads the drafter's learned
+    // mask embedding (`mask_embedding.pt`) from the drafter directory into
+    // the config the head is built from; the summary line names what the
+    // engine does with each architecture field, lever on or off.
+    {
+        use metrale_model_arch::weight_loader::dflash_loader::ckpt_arch;
+        let ckpt_arch_on = ckpt_arch::ckpt_arch_enabled();
+        if ckpt_arch_on {
+            ckpt_arch::attach_mask_embedding(&drafter_dir, &mut drafter_config)
+                .context("METRALE_DFLASH_CKPT_ARCH=1: load the drafter's mask embedding")?;
+        }
+        ckpt_arch::log_arch_summary(&drafter_config, ckpt_arch_on);
+    }
     // 2026-09-26: The drafter allocates outside the KV budget, so its whole
     // footprint is estimated from the checkpoint before anything is allocated:
     // safetensors bytes on disk, the drafter KV cache, `fused_kv`, the

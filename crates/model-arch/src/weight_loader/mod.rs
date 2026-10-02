@@ -27,8 +27,8 @@ mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;
 pub use dflash_loader::{
-    DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
-    store_has_dflash_weights,
+    DflashConfig, DflashExport, DflashLayerWeights, DflashSubConfig, DflashWeights,
+    load_dflash_weights, store_has_dflash_weights,
 };
 pub mod glm5_next_load;
 pub mod glm5_next_mtp;

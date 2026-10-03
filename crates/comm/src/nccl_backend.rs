@@ -56,7 +56,10 @@ unsafe extern "C" {
 
 mod recv_buffer;
 use recv_buffer::ensure_payload_fits;
-pub use recv_buffer::{ALL_REDUCE_DTYPE_BYTES, required_model_recv_bytes, required_recv_bytes};
+pub use recv_buffer::{
+    ALL_REDUCE_DTYPE_BYTES, TIGHT_LOGIT_ROWS, required_model_recv_bytes, required_model_recv_bytes_tight,
+    required_recv_bytes,
+};
 
 /// 2026-09-26: Deadline, in seconds, for a broadcast to complete. It bounds
 /// only the completion polling, not an NCCL or driver call that hangs.

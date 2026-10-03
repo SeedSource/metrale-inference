@@ -47,6 +47,30 @@ pub fn required_model_recv_bytes(tokens: usize, hidden: usize, vocab: usize) -> 
     required_recv_bytes(tokens, hidden.max(vocab), ALL_REDUCE_DTYPE_BYTES)
 }
 
+/// 2026-10-03: Rows of full-vocab logits the tight sizing covers. The only logits
+/// all-reduces are the vocab-parallel BF16 LM head's, at 1 row and at
+/// 2..=`DENSE_GEMV_BATCHM_DECODE_MAX_M` (8) rows (model-engine `impl_a3_lm_head.rs`);
+/// 16 leaves a 2x margin.
+pub const TIGHT_LOGIT_ROWS: usize = 16;
+
+/// 2026-10-03: `METRALE_RECV_BUFFER_TIGHT=1` sizing (race #79):
+/// `max(tokens × hidden, TIGHT_LOGIT_ROWS × vocab) × 2`. Activations are all-reduced for
+/// up to `tokens` rows, logits only for a few rows, so `tokens × vocab` (2.4 GiB at
+/// 8193 × 154880) over-reserves by ~2.3 GiB that the KV pool could hold. A payload
+/// that still exceeds it is refused before any send (`ensure_payload_fits`).
+///
+/// # Errors
+/// When a product overflows `usize`.
+pub fn required_model_recv_bytes_tight(
+    tokens: usize,
+    hidden: usize,
+    vocab: usize,
+) -> Result<usize> {
+    let act = required_recv_bytes(tokens, hidden, ALL_REDUCE_DTYPE_BYTES)?;
+    let logits = required_recv_bytes(TIGHT_LOGIT_ROWS, vocab, ALL_REDUCE_DTYPE_BYTES)?;
+    Ok(act.max(logits))
+}
+
 /// 2026-09-26: Refuse a payload of more than `capacity` bytes. A free
 /// function, so the tests below run it without a communicator or a GPU.
 pub(crate) fn ensure_payload_fits(
@@ -193,5 +217,27 @@ mod tests {
             "must report capacity: {err}"
         );
         assert!(err.contains("world_size 2"), "must report the path: {err}");
+    }
+    /// 2026-10-03: Tight sizing (race #79) at GLM-5.3 shapes: 8193 rows of hidden 4096
+    /// govern (64 MiB, vs 2420 MiB for 8193 vocab rows); the 8-row vocab-parallel logits
+    /// all-reduce fits; full-vocab logits for all 8193 rows (the old sizing) are refused.
+    #[test]
+    fn tight_sizing_covers_activations_and_few_logit_rows() {
+        let (hidden, vocab) = (4096, 154_880);
+        let cap = required_model_recv_bytes_tight(8193, hidden, vocab).unwrap();
+        assert_eq!(cap, 67_117_056);
+        assert_eq!(
+            required_model_recv_bytes(8193, hidden, vocab).unwrap() / (1024 * 1024),
+            2420
+        );
+        assert!(ensure_payload_fits(8193 * hidden * BF16, cap, 0, 2).is_ok());
+        assert!(ensure_payload_fits(8 * vocab * BF16, cap, 0, 2).is_ok());
+        // 2026-10-03: Full-vocab logits for every row (the old sizing) are refused.
+        assert!(ensure_payload_fits(8193 * vocab * BF16, cap, 0, 2).is_err());
+        // 2026-10-03: A short arena still covers 16 logits rows.
+        let small = required_model_recv_bytes_tight(33, 1024, 163_840).unwrap();
+        assert_eq!(small, TIGHT_LOGIT_ROWS * 163_840 * BF16);
+        assert!(ensure_payload_fits(8 * 163_840 * BF16, small, 0, 2).is_ok());
+        assert!(required_model_recv_bytes_tight(usize::MAX, 1024, 163_840).is_err());
     }
 }

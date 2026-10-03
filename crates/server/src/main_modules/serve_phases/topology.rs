@@ -168,12 +168,31 @@ pub(crate) fn init_nccl_comm(
     if world_size <= 1 {
         return Ok(None);
     }
-    let recv_capacity = metrale_comm::nccl_backend::required_model_recv_bytes(
-        max_batch_tokens,
-        hidden_size,
-        vocab_size,
-    )
+    // 2026-10-03: `METRALE_RECV_BUFFER_TIGHT=1` (race #79, default off) sizes for
+    // activations plus a few logits rows instead of `max_batch_tokens` logits rows.
+    let tight = std::env::var("METRALE_RECV_BUFFER_TIGHT").as_deref() == Ok("1");
+    let recv_capacity = if tight {
+        metrale_comm::nccl_backend::required_model_recv_bytes_tight(
+            max_batch_tokens,
+            hidden_size,
+            vocab_size,
+        )
+    } else {
+        metrale_comm::nccl_backend::required_model_recv_bytes(
+            max_batch_tokens,
+            hidden_size,
+            vocab_size,
+        )
+    }
     .context("Failed to size the NCCL receive buffer")?;
+    if tight {
+        tracing::info!(
+            "METRALE_RECV_BUFFER_TIGHT=1: recv_buffer = max(max_batch_tokens × hidden_size, \
+             {} × vocab_size) × {} B",
+            metrale_comm::nccl_backend::TIGHT_LOGIT_ROWS,
+            metrale_comm::nccl_backend::ALL_REDUCE_DTYPE_BYTES,
+        );
+    }
     tracing::info!(
         "Initializing NCCL: rank {}/{}, master {}:{}, recv_buffer {} MiB \
          (max_batch_tokens={} × max(hidden_size,vocab_size)={} × {} B)",

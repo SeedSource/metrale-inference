@@ -274,7 +274,11 @@ impl Glm5NextWeightLoader {
         // more with them), so ~0.54 GB more than at 256 rows at a 4096-row window. Lever off,
         // `kda_rows == kda_chunk_rows == verify_k`: the allocation `new` made before.
         let wide_rows = crate::glm5next_layer::fullwidth_rows();
-        let kda_rows = verify_k.max(wide_rows.unwrap_or(0));
+        // 2026-10-02: `METRALE_GLM_BATCHED_VERIFY=1` also widens the KDA and MLP scratch to
+        // `batched_verify_rows()` (64 rows; KDA 139,712 B per row at TP2, plus the MLP rows);
+        // off it adds 0.
+        let bv_rows = crate::glm5next_layer::levers::batched_verify_rows();
+        let kda_rows = verify_k.max(wide_rows.unwrap_or(0)).max(bv_rows);
         let kda_chunk_rows = if crate::glm5next_layer::kda_chunk_prefill() {
             kda_rows
         } else {
@@ -302,7 +306,7 @@ impl Glm5NextWeightLoader {
         // windows of `prefill_rows_ffn()` rows, so the MLP scratch holds that many; `u_slot`
         // stays at `verify_k` rows (`mlp_ws_bytes_sized`). Staged off, `mlp_rows == verify_k`
         // and the allocation is the unstaged one.
-        let mlp_rows = verify_k.max(crate::glm5next_layer::prefill_rows_ffn());
+        let mlp_rows = verify_k.max(crate::glm5next_layer::prefill_rows_ffn()).max(bv_rows);
         let mlp_ws_bytes =
             crate::glm5next_mlp::forward::mlp_ws_total_bytes_sized(&mlp_cfg, mlp_rows, verify_k);
         let shared_mlp_ws = if crate::glm5next_mlp::forward::mlp_ws_shared() {

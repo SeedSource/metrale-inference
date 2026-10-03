@@ -221,9 +221,9 @@ pub(crate) fn decode_l2_prefetch() -> bool {
 /// projections over all N rows; the KDA recurrence and the DSA attention per sequence) instead
 /// of one full forward per sequence. It flips `decode_multi_seq_unsupported` to false, which is
 /// the only routing input; the batched override itself runs whenever the dispatcher selects it.
-/// Eager and unpadded (`decode_multi_seq_eager_only`); the batched MTP verify is not covered.
-/// Off unless set to `1`; read once. Port of rsafier's Atlas research/glm-exl3 multi-sequence
-/// decode (e69446eee, acf792e28, 04beaac1f).
+/// Eager and unpadded (`decode_multi_seq_eager_only`); the batched MTP verify has its own lever,
+/// [`batched_verify`]. Off unless set to `1`; read once. Port of rsafier's Atlas
+/// research/glm-exl3 multi-sequence decode (e69446eee, acf792e28, 04beaac1f).
 pub fn decode_multi_seq() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {
@@ -237,6 +237,34 @@ pub fn decode_multi_seq() -> bool {
         }
         on
     })
+}
+
+/// 2026-10-02: `METRALE_GLM_BATCHED_VERIFY=1` lets the MTP verify of several sequences run as
+/// ONE forward over all `R = Σ ks` rows (`Glm5NextLayer::verify_n_seqs`: mHC, norms, MLP/MoE
+/// and the KDA projections over all rows; the KDA recurrence with its snapshots and the DSA
+/// attention per sequence) instead of one verify forward per sequence. It flips
+/// `decode_verify_multi_unsupported` to false, which admits the batch on one GPU and, with
+/// `METRALE_EP_PROTOCOL=v2`, on two ranks (model-engine `verify_ep.rs`). Eager. Off unless set
+/// to `1`; read once; off, every verify takes the per-sequence path it took before.
+pub fn batched_verify() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_BATCHED_VERIFY").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_BATCHED_VERIFY=1 - GLM MTP verify of several sequences runs one \
+                 batched forward per step (eager); KDA recurrence and DSA attention stay per \
+                 sequence"
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-02: Rows the KDA and MLP workspaces hold under `batched_verify`: the widest batch the
+/// default draft ladder builds (8 x 4, 16 x 3 or 32 x 2 rows). 0, no change, when it is off.
+pub fn batched_verify_rows() -> usize {
+    if batched_verify() { 64 } else { 0 }
 }
 
 /// 2026-10-01: Default MiB per `glm5next_l2_prefetch` launch: 12, half the 24 MB GB10 L2.

@@ -231,3 +231,34 @@ fn multi_seq_decode_indexes_each_row_and_stays_behind_its_lever() {
     let l = include_str!("levers.rs");
     assert!(l.contains("std::env::var(\"METRALE_GLM_DECODE_MULTI_SEQ\").as_deref() == Ok(\"1\")"));
 }
+
+/// 2026-10-02: The batched MTP verify stays default-off behind `METRALE_GLM_BATCHED_VERIFY`:
+/// with the lever off, `decode_verify_multi_unsupported` answers true and the engine never
+/// batches a GLM verify. On, each sequence keeps its own metadata rows and its own KDA walk.
+#[test]
+fn batched_verify_stays_behind_its_lever_and_indexes_each_sequence() {
+    let m = include_str!("mod.rs");
+    let start = m
+        .find("fn decode_verify_multi_unsupported(&self) -> bool {")
+        .expect("override present");
+    let body = &m[start..start + 110];
+    assert!(body.contains("!levers::batched_verify()"), "{body}");
+    let l = include_str!("levers.rs");
+    assert!(l.contains("std::env::var(\"METRALE_GLM_BATCHED_VERIFY\").as_deref() == Ok(\"1\")"));
+    let v = include_str!("steps/verify_multi.rs");
+    assert!(v.contains("verify_rows_view(m, off[i], ks[i])"), "per-sequence metadata rows");
+    assert!(v.contains("layer.decode_verify_n_seqs(gpu, normed, ks,"), "per-sequence KDA walk");
+    // 2026-10-02: The engine's row gate reads the same workspace rows the layer checks, and the
+    // loader widens those workspaces only through `batched_verify_rows` (0 with the lever off).
+    let cap = m
+        .find("fn decode_verify_multi_max_rows(&self) -> usize {")
+        .expect("row cap override present");
+    assert!(m[cap..cap + 90].contains("self.verify_rows_cap()"));
+    assert!(l.contains("if batched_verify() { 64 } else { 0 }"));
+    let ld = include_str!("../weight_loader/glm5_next_load/loader.rs");
+    assert!(ld.contains(".max(wide_rows.unwrap_or(0)).max(bv_rows);"), "KDA rows");
+    assert!(
+        ld.contains(".max(crate::glm5next_layer::prefill_rows_ffn()).max(bv_rows);"),
+        "MLP rows"
+    );
+}

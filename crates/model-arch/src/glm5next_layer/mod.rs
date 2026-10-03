@@ -11,6 +11,8 @@
 //!   `t`, and `decode_batched` gives verify row `t` slot `t`.
 //! - 2026-10-01: `decode_multi_seq` gives sequence row `i` slot `ctx.hc_row_offset + i` and
 //!   metadata row `i` (`steps/multi_seq.rs`).
+//! - 2026-10-02: `decode_verify_multi_seqs` gives verify row `r` slot `ctx.hc_row_offset + r` and
+//!   each sequence its own metadata rows (`steps/verify_multi.rs`).
 //! - The last text layer collapses the highway with `hc_head_mean`, which takes no weights.
 //! - 2026-10-01: A DFlash tap layer (`dflash_tap`) also collapses its highway into `hidden`
 //!   after its FFN-site `hc_post`; the highway itself is unchanged, so the next layer is too.
@@ -57,6 +59,7 @@ use crate::glm5next_mhc::{
     hc_head_mean,
 };
 
+// 2026-10-02: `state` also holds `impl LayerAuxState` (500-line cap).
 pub mod state;
 
 pub mod comm_overlap;
@@ -75,7 +78,7 @@ pub(crate) use levers::{
     PREFILL_ROWS, cublas_wide_proj, dsa_batch_qidx, dsa_row_batch, kda_chunk_prefill,
 };
 pub use levers::{
-    PREFILL_ROWS_FFN_MAX, decode_multi_seq, dsa_index_split, fullwidth_rows,
+    PREFILL_ROWS_FFN_MAX, batched_verify, decode_multi_seq, dsa_index_split, fullwidth_rows,
     prefill_comm_overlap, prefill_fullwidth_gemm, prefill_rows, prefill_rows_ffn,
     prefill_seq_parallel, prefill_staged, prefill_tail_merge, staged_merge_signature,
 };
@@ -318,6 +321,23 @@ impl TransformerLayer for Glm5NextLayer {
             stream,
         )
     }
+
+    /// 2026-10-02: The batched MTP verify (`METRALE_GLM_BATCHED_VERIFY`): `steps/verify_multi.rs`.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_verify_multi_seqs<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        _residual: DevicePtr,
+        ks: &[usize],
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.verify_n_seqs(hidden, ks, states, kv_cache, seq_lens, block_tables, ctx, stream)
+    }
 }
 
 impl LayerCapabilities for Glm5NextLayer {
@@ -351,11 +371,22 @@ impl LayerCapabilities for Glm5NextLayer {
         true
     }
 
-    /// 2026-09-25: True. This layer has no `decode_verify_multi`, and the trait's default
-    /// returns an error; answering true makes `can_batch_verify_dispatch` refuse the batched
-    /// verify.
+    /// 2026-09-25: True: `can_batch_verify_dispatch` then refuses the batched verify.
+    /// 2026-10-02: False under `METRALE_GLM_BATCHED_VERIFY=1`; the batch then reaches
+    /// `decode_verify_multi_seqs` (`decode_verify_multi_own_states`), never `decode_verify_multi`.
     fn decode_verify_multi_unsupported(&self) -> bool {
+        !levers::batched_verify()
+    }
+
+    /// 2026-10-02: True: the DSA state is per sequence and host-tracked, the KDA layer reads no
+    /// WY tables, and the batched verify runs eager (`steps/verify_multi.rs`).
+    fn decode_verify_multi_own_states(&self) -> bool {
         true
+    }
+
+    /// 2026-10-02: The KDA and MLP workspace rows (`verify_rows_cap`).
+    fn decode_verify_multi_max_rows(&self) -> usize {
+        self.verify_rows_cap()
     }
 
     /// 2026-09-25: True. A DSA layer's per-sequence state comes from `gpu.alloc` in
@@ -423,56 +454,6 @@ impl LayerGraphHooks for Glm5NextLayer {
                 }),
             Glm5NextMixer::Kda { .. } => Ok(()),
         }
-    }
-}
-
-impl LayerAuxState for Glm5NextLayer {
-    /// 2026-09-25: True for a DSA layer: its indexer cache is the state `snapshot_aux` and
-    /// `restore_aux` carry. A KDA layer's state is in the SSM pool (`uses_ssm_pool`) and is not
-    /// carried here.
-    fn has_aux_state(&self) -> bool {
-        matches!(self.mixer, Glm5NextMixer::Dsa(_))
-    }
-
-    fn snapshot_aux(
-        &self,
-        state: &dyn LayerState,
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<Option<Vec<u8>>> {
-        if !matches!(self.mixer, Glm5NextMixer::Dsa(_)) {
-            return Ok(None);
-        }
-        let st = state
-            .as_any()
-            .downcast_ref::<Glm5NextDsaState>()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "GLM layer {}: a DSA mixer was handed state that is not a Glm5NextDsaState",
-                    self.layer_idx
-                )
-            })?;
-        Ok(Some(st.snapshot_blob(gpu, stream)?))
-    }
-
-    /// 2026-09-25: Errors on a KDA layer, whose state travels with the SSM snapshot. On a DSA
-    /// layer it restores the blob through `Glm5NextDsaState::restore_blob`; `apply_aux_states`
-    /// propagates any error.
-    fn restore_aux(
-        &self,
-        state: &mut dyn LayerState,
-        blob: &[u8],
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<()> {
-        if !matches!(self.mixer, Glm5NextMixer::Dsa(_)) {
-            bail!(
-                "GLM layer {}: restore_aux on a KDA layer — KDA state is pool-backed and \
-                 travels with the SSM snapshot, so a blob addressed here is a routing bug",
-                self.layer_idx
-            );
-        }
-        self.dsa_state(state)?.restore_blob(blob, gpu, stream)
     }
 }
 

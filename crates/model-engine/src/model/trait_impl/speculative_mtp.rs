@@ -104,6 +104,12 @@ impl TransformerModel {
             Some(p) => p.as_ref(),
             None => return Ok(None),
         };
+        // 2026-10-02: Its forward runs without the communicator, so an EP-sharded drafter
+        // (`needs_comm`) on a multi-rank serve proposes per sequence, through the worker
+        // handshake of `run_mtp_propose_multi_dispatch`.
+        if self.multi_rank_protocol_active() && proposer.needs_comm() {
+            return Ok(None);
+        }
         if self.levers.draft_conf_tau > 0.0 {
             return Ok(None);
         }
@@ -210,6 +216,11 @@ impl TransformerModel {
         let Some(proposer) = self.proposer.as_ref().map(|p| p.as_ref()) else {
             return Ok(0);
         };
+        // 2026-10-02: No communicator in this forward either, and no worker mirror: an
+        // EP-sharded drafter on a multi-rank serve skips the batched catch-up.
+        if self.multi_rank_protocol_active() && proposer.needs_comm() {
+            return Ok(0);
+        }
         let h = self.config.hidden_size;
         let hiddens: Vec<Vec<metrale_gpu_runtime::gpu::DevicePtr>> = tokens
             .iter()

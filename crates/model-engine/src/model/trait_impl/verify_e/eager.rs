@@ -20,6 +20,7 @@ use metrale_model_layers::layers::ops;
 impl TransformerModel {
     /// 2026-09-26: Run every layer over the R rows: attention through `decode_multi_seq`
     /// with `attn_dummy_states`, every other layer through `decode_verify_multi`.
+    /// 2026-10-02: A layer that owns its verify state runs `decode_verify_multi_seqs`.
     pub(super) fn run_verify_layers(
         &self,
         attn_dummy_states: &mut [Vec<Box<dyn LayerState>>],
@@ -40,10 +41,36 @@ impl TransformerModel {
     ) -> Result<()> {
         let mut attn_idx = 0usize;
         let mut ssm_idx = 0usize;
+        // 2026-10-02: Each sequence's pre-verify length and page table, for the layers that
+        // drive their own verify state (`decode_verify_multi_own_states`).
+        let (own_lens, own_bts): (Vec<usize>, Vec<Vec<u32>>) = if self.any_verify_own_states() {
+            seqs.iter().map(|s| (s.seq_len, s.block_table.clone())).unzip()
+        } else {
+            (Vec::new(), Vec::new())
+        };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let layer_type = self.config.layer_type(layer_idx);
 
-            if layer_type == LayerType::FullAttention {
+            if layer.decode_verify_multi_own_states() {
+                // 2026-10-02: Whatever its `LayerType`; the counters stay aligned for the rest.
+                attn_idx += usize::from(layer_type == LayerType::FullAttention);
+                ssm_idx += usize::from(layer_type == LayerType::LinearAttention);
+                let mut state_refs: Vec<&mut (dyn LayerState + 'static)> = seqs
+                    .iter_mut()
+                    .map(|s| s.layer_states[layer_idx].as_mut())
+                    .collect();
+                layer.decode_verify_multi_seqs(
+                    hidden,
+                    residual,
+                    ks,
+                    &mut state_refs,
+                    kv_cache,
+                    &own_lens,
+                    &own_bts,
+                    ctx,
+                    stream,
+                )?;
+            } else if layer_type == LayerType::FullAttention {
                 let mut refs: Vec<&mut (dyn LayerState + 'static)> = attn_dummy_states[attn_idx]
                     .iter_mut()
                     .map(|s| s.as_mut())

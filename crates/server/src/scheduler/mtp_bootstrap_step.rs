@@ -54,6 +54,9 @@ pub(super) fn can_batch_bootstrap(
         // compares the pointer with the FP32 scratch buffer's start, so a
         // per-row offset pointer would be read as BF16.
         && !model.decode_logits_fp32()
+        // 2026-10-02: Multi-rank: the batched bootstrap's stash and per-sequence proposes have no
+        // worker mirror (only the batched verify does, `verify_ep.rs`), so it stays per sequence.
+        && !model.is_ep()
         // 2026-09-25: k=2 is the narrowest verify width. This asks whether the
         // model's batched-MTP envelope holds (its checks include an allocated
         // hidden stash, no EP and no HSS), not for a verify.

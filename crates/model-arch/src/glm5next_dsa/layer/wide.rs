@@ -42,7 +42,7 @@ use metrale_model_layers::layer::{ForwardContext, LayerState};
 use metrale_model_layers::layers::ops;
 
 use super::super::Glm5NextDsaConfig;
-use super::super::attend::{DsaDecodeInputs, DsaDecodePaging, decode_attention};
+use super::super::attend::{DsaDecodeInputs, DsaDecodePaging, attention};
 use super::super::select::{DsaSelectInputs, DsaSelectLaunch, select_tokens};
 use super::super::state::Glm5NextDsaState;
 use super::decode_k::bt_entries_needed;
@@ -445,7 +445,9 @@ impl Glm5NextDsaLayer {
                 cache_stride_bytes: (block_size * kvl) as u64,
             };
             let t = profile::start();
-            decode_attention(
+            // 2026-10-03: Through `attention` (prefill rows) so METRALE_GLM_MLA_PREFILL_TC=1 also
+            // engages here; before, this arm always took the decode kernel (race #68).
+            attention(
                 gpu,
                 self.decode_kernel,
                 c,
@@ -463,6 +465,7 @@ impl Glm5NextDsaLayer {
                     k_scale: self.kv_scale,
                     v_scale: self.kv_scale,
                 },
+                true,
                 stream,
             )?;
             profile::end(profile::DSA_ATTEND, t, gpu, stream);

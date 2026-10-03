@@ -289,7 +289,8 @@ impl RadixTreeInner {
 
     /// 2026-09-25: Insert the full chunks of `tokens` with their blocks from
     /// `block_table`; a chunk that already has a node keeps that node's
-    /// block. A final incomplete chunk becomes the last node's
+    /// block, except past `matched_tokens`, where the node adopts the
+    /// sequence's block (2026-10-03, race #79). A final incomplete chunk becomes the last node's
     /// `partial_suffix` when `block_table` has its block and at least one full
     /// chunk precedes it. Returns what the caller must now reference and
     /// release (`InsertAcquired`).
@@ -355,6 +356,23 @@ impl RadixTreeInner {
                 }
                 if is_seq_owned {
                     self.nodes[child].ref_count += 1;
+                    // 2026-10-03: The sequence computed this chunk into its own block, and its
+                    // ref (just taken) pins the node until it is released, so a node keeping
+                    // its older block would hold a second, unusable copy of the same K/V for
+                    // the sequence's whole life. Race #79: a 196K prompt recomputed from 0
+                    // over a 131K cached prompt left 1,898 such blocks pinned and decode ran
+                    // out of KV. The node adopts the sequence's block, and the old one is
+                    // reported for release (a sequence that matched it holds its own ref).
+                    // Not with high-speed-swap, whose disk id pairs with the node's block.
+                    let seq_block = block_table[i];
+                    if !hss_active
+                        && seq_block != u32::MAX
+                        && self.nodes[child].block_idx != seq_block
+                    {
+                        released_blocks.push(self.nodes[child].block_idx);
+                        newly_owned_blocks.push(seq_block);
+                        self.nodes[child].block_idx = seq_block;
+                    }
                 }
                 // 2026-09-25: A node without a disk id takes this insert's.
                 if hss_active && self.nodes[child].disk_block_id == u32::MAX && disk_id != u32::MAX

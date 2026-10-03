@@ -218,14 +218,14 @@ fn test_insert_idempotent() {
     assert_eq!(tree.stats(), (1, 1));
 
     // 2026-09-25: A node count cannot say which block the node holds. A
-    // re-insert of the same chunk with a different block (43) must keep the
-    // block the cache holds a ref on (42): `insert` leaves an existing node's
-    // `block_idx` unchanged and reports no newly owned block.
-    let second = tree.insert(&tokens, &[43], &[], 16, 0, 0);
+    // re-insert of the same chunk with a different block (43) inside the
+    // matched prefix must keep the block the cache holds a ref on (42):
+    // `insert` leaves the node's `block_idx` unchanged and reports nothing.
+    let second = tree.insert(&tokens, &[43], &[], 16, 16, 0);
     assert_eq!(tree.stats(), (1, 1), "still one node");
     assert!(
-        second.blocks.is_empty(),
-        "no node was created, so no KV ref is owed; got {second:?}"
+        second.blocks.is_empty() && second.released_blocks.is_empty(),
+        "no block changed hands, so no KV ref is owed or released; got {second:?}"
     );
     let m = tree.lookup(&tokens, 16, 0, 0);
     assert_eq!(
@@ -234,6 +234,54 @@ fn test_insert_idempotent() {
         "the node keeps the block the cache references"
     );
     tree.release(&tokens, 16, 0);
+
+    // 2026-10-03: Past the matched prefix the sequence owns its block (43), so
+    // the node adopts it and reports the swap: a ref owed on 43 and one
+    // released on 42 (race #79).
+    let third = tree.insert(&tokens, &[43], &[], 16, 0, 0);
+    assert_eq!(tree.stats(), (1, 1), "still one node");
+    assert_eq!(third.blocks, vec![43]);
+    assert_eq!(third.released_blocks, vec![42]);
+    let m = tree.lookup(&tokens, 16, 0, 0);
+    assert_eq!(m.matched_blocks, vec![43], "the node holds the sequence's block");
+    tree.release(&tokens, 16, 0);
+}
+
+/// 2026-10-03: Race #79 (196K needle after a 131K needle, prefix cache on,
+/// grid restore at point 0): a sequence that recomputes a cached prefix into
+/// its own blocks and then inserts must not leave the old blocks pinned. Before
+/// the fix every existing node kept the old block and took the sequence's ref,
+/// so nothing could be evicted while the sequence lived; each old block was a
+/// second copy the sequence never read.
+#[test]
+fn test_recomputed_prefix_insert_frees_old_blocks() {
+    let tree = RadixTree::new();
+    let shared: Vec<u32> = (0..64).collect();
+
+    // 2026-10-03: Request 1 cached 4 blocks, then finished (refs released).
+    let first = tree.insert(&shared, &[10, 11, 12, 13], &[], 16, 0, 0);
+    assert_eq!(first.blocks, vec![10, 11, 12, 13]);
+    tree.release(&shared, 16, 0);
+
+    // 2026-10-03: Request 2 shares the first 3 chunks, restored nothing
+    // (matched_tokens 0) and computed every chunk into its own blocks.
+    let mut second_toks: Vec<u32> = (0..48).collect();
+    second_toks.extend(500..532);
+    let second = tree.insert(&second_toks, &[20, 21, 22, 23, 24], &[], 16, 0, 0);
+    assert_eq!(
+        second.released_blocks,
+        vec![10, 11, 12],
+        "the shared nodes hand back request 1's blocks"
+    );
+    assert_eq!(second.blocks, vec![20, 21, 22, 23, 24]);
+
+    // 2026-10-03: While request 2 lives, only request 1's private tail (13) is
+    // evictable; the shared path now holds request 2's live blocks.
+    let evicted = tree.evict(16);
+    assert_eq!(evicted.physical, vec![13]);
+    let m = tree.lookup(&second_toks, 16, 0, 0);
+    assert_eq!(m.matched_blocks, vec![20, 21, 22, 23, 24]);
+    tree.release(&second_toks, 16, 0);
 }
 
 #[test]

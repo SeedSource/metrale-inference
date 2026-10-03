@@ -35,13 +35,31 @@ impl TransformerModel {
         // one block below it) or an interval end saves (`prefill_plan`). The planner ends
         // a chunk at `prefill_plan::tail_split_point`. `--ssm-checkpoint-interval` filters
         // chunk ends; it does not create them.
-        let is_prompt_tail = crate::prefill_plan::is_prompt_tail_end(end_token, tokens.len(), bs);
-        if !crate::prefill_plan::is_checkpoint_chunk_end(
-            end_token,
-            tokens.len(),
-            bs,
-            self.ssm_checkpoint_interval,
-        ) {
+        // 2026-10-03: Under the absolute grid (`grid_restore.rs`) exactly the chunk ends on the
+        // grid save (`prefill_plan::is_grid_checkpoint_end`: an exact multiple of `G` and of the
+        // block size, no flooring), every one of them, on every prefill, cold or warm; none is a
+        // prompt-tail checkpoint. Off: the previous rule.
+        let grid = if seq.prefix_grid_refs {
+            self.prefix_grid_for_bs(tokens, bs)
+        } else {
+            None
+        };
+        let (is_prompt_tail, saves) = match grid {
+            Some(g) => (
+                false,
+                crate::prefill_plan::is_grid_checkpoint_end(end_token, tokens.len(), g, bs),
+            ),
+            None => (
+                crate::prefill_plan::is_prompt_tail_end(end_token, tokens.len(), bs),
+                crate::prefill_plan::is_checkpoint_chunk_end(
+                    end_token,
+                    tokens.len(),
+                    bs,
+                    self.ssm_checkpoint_interval,
+                ),
+            ),
+        };
+        if !saves {
             return Ok(());
         }
         // 2026-09-25: Skip the checkpoint when a block below `end_block` lies past
@@ -113,7 +131,15 @@ impl TransformerModel {
         // 2026-09-25: Per-sequence aux layer state (`collect_aux_states`) rides the
         // checkpoint, taken at the end of a completed pass. A model that carries aux
         // state refuses a snapshot without it on restore (`snap_agree::local_proposal`).
-        let aux = self.collect_aux_states(seq, stream)?;
+        // 2026-10-03: A failed aux capture frees the slot before returning the error; it was
+        // leaked before, and repeated failures exhausted the pool.
+        let aux = match self.collect_aux_states(seq, stream) {
+            Ok(aux) => aux,
+            Err(e) => {
+                self.ssm_snapshots.free(snap_id);
+                return Err(e);
+            }
+        };
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }

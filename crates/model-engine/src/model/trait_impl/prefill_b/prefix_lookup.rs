@@ -95,6 +95,23 @@ impl TransformerModel {
                     );
                 }
             }
+            // 2026-10-03: `METRALE_PREFIX_GRID_RESTORE=1` (`grid_restore.rs`): truncate the match
+            // to the deepest grid point below the prompt end that holds a snapshot, so a restore
+            // resumes exactly where a cold prefill's chunk starts. The flag also switches this
+            // sequence's radix-ref accounting to `prefix_ref_tokens` (`free_sequence`). Off: no
+            // call, flag false.
+            let grid = self.prefix_grid_for_bs(tokens, bs);
+            seq.prefix_grid_refs = grid.is_some();
+            if let Some(g) = grid {
+                prefix_match = self.grid_floor_match(
+                    tokens,
+                    bs,
+                    g,
+                    seq,
+                    prefix_match,
+                    ep_active && !reserved,
+                )?;
+            }
             let matched = prefix_match.matched_tokens;
             tracing::debug!(
                 "prefix lookup: matched={matched} of {total} (reserved={reserved}) \

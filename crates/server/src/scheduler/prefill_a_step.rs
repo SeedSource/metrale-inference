@@ -137,12 +137,13 @@ pub fn start_chunked_prefill(
     let chunk_len = if model.is_mla() {
         total.min(max_prefill_tokens)
     } else {
-        metrale_model_engine::prefill_plan::plan_chunk_len(
+        metrale_model_engine::prefill_plan::plan_chunk_len_grid(
             0,
             total,
             total.min(max_prefill_tokens),
             model.kv_block_size(),
             model.prefill_tail_split(&prompt_tokens),
+            model.prefill_grid(&prompt_tokens),
         )
     };
     let is_last = chunk_len >= total;

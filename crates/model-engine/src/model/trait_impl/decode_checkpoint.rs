@@ -50,11 +50,14 @@ impl TransformerModel {
     pub(super) fn decode_marconi_checkpoint_dispatch(&self, seq: &mut SequenceState) {
         // 2026-10-01: `METRALE_MARCONI_PREFILL_ONLY=1` turns decode checkpoints off; rank 0
         // then sends no `EP_CMD_DECODE_CKPT` either (`policy`).
+        // 2026-10-03: Under the absolute grid (`prefill_b/grid_restore.rs`) snapshots are taken
+        // only at prefill grid points; a decode checkpoint would never be restored and would
+        // take a pool slot from a grid snapshot. Rank 0 decides, so the worker gets no command.
         let enabled = decode_ckpt_enabled(
             self.ssm_snapshots.is_enabled(),
             self.prefix_cache.is_active(),
             snapshot_policy(),
-        );
+        ) && !seq.prefix_grid_refs;
         // 2026-09-25: The cheap preconditions run before the env read and the KV lock.
         if !ckpt_preconditions(
             enabled,

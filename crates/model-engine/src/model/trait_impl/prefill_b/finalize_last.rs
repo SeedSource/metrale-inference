@@ -278,11 +278,46 @@ impl TransformerModel {
             );
         }
 
+        // 2026-10-03: Under the absolute grid (`grid_restore.rs`) only the blocks below the last
+        // chunk's start are inserted (`prefill_plan::grid_insert_len`), all written by full
+        // `G`-row grid chunks, and no prompt-end leaf snapshot is saved (the restore never uses a
+        // point at the prompt end). `prefix_ref_tokens` then names exactly the radix path this
+        // sequence holds refs on: the lookup's `[0, cached_prefix_tokens)` plus the nodes this
+        // insert gives it (`matched_tokens = cached_prefix_tokens`). Off: `None`.
+        let grid = if seq.prefix_grid_refs {
+            self.prefix_grid_for_bs(tokens, bs)
+        } else {
+            None
+        };
         if seq.marconi_exact_snap.is_some() {
             // 2026-09-25: Exact restore: the prompt's snapshot came from the cache; nothing
             // new is saved.
         } else if cache_blocks == 0 {
             // 2026-09-25: No complete block with written K/V, or a prompt under one block.
+        } else if let Some(g) = grid {
+            let ins = crate::prefill_plan::grid_insert_len(tokens.len(), g).min(cache_blocks * bs);
+            let ins_blocks = (ins / bs).min(seq.block_table.len());
+            let ins = ins_blocks * bs;
+            let insertable = ins > 0
+                && !self.tokens_have_vision_pad(&tokens[..ins])
+                && !self.hss_window_slid(seq);
+            if insertable {
+                let ins_disk = if seq.disk_block_ids.is_empty() {
+                    &seq.disk_block_ids[..]
+                } else {
+                    &seq.disk_block_ids[..ins_blocks.min(seq.disk_block_ids.len())]
+                };
+                let acquired = self.prefix_cache.insert(
+                    &tokens[..ins],
+                    &seq.block_table[..ins_blocks],
+                    ins_disk,
+                    bs,
+                    seq.cached_prefix_tokens.min(ins),
+                    seq.adapter_id,
+                );
+                super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
+                seq.prefix_ref_tokens = tokens[..ins.max(seq.cached_prefix_tokens)].to_vec();
+            }
         } else if cap_applied {
             if !self.tokens_have_vision_pad(cache_tokens) && !self.hss_window_slid(seq) {
                 let acquired = self.prefix_cache.insert(
@@ -386,14 +421,27 @@ impl TransformerModel {
                     // 2026-09-25: Per-sequence aux layer state (`collect_aux_states`) rides the
                     // snapshot; on restore, a model that carries aux state refuses a snapshot
                     // without it (`snap_agree::local_proposal`).
-                    let aux = self.collect_aux_states(seq, stream)?;
+                    // 2026-10-03: An aux capture or hidden stash that fails frees the slot
+                    // before returning the error (it was leaked before).
+                    let aux = match self.collect_aux_states(seq, stream) {
+                        Ok(aux) => aux,
+                        Err(e) => {
+                            self.ssm_snapshots.free(snap_id);
+                            return Err(e);
+                        }
+                    };
                     if !aux.is_empty() {
                         self.ssm_snapshots.set_aux(snap_id, aux);
                     }
                     // 2026-09-25: Stash the last token's final-norm output (`normed`, an
                     // `lm_head` input) for the exact-restore fixup above.
-                    self.ssm_snapshots
-                        .save_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
+                    let stashed = self
+                        .ssm_snapshots
+                        .save_hidden(snap_id, normed, self.gpu.as_ref(), stream);
+                    if let Err(e) = stashed {
+                        self.ssm_snapshots.free(snap_id);
+                        return Err(e);
+                    }
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
                         tokens,
                         &seq.block_table,

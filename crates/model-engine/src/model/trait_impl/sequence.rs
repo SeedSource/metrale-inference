@@ -38,6 +38,14 @@ mod state_io;
 
 impl TransformerModel {
     pub(super) fn cache_sequence_dispatch(&self, seq: &SequenceState) {
+        // 2026-10-03: Under the absolute grid (`prefill_b/grid_restore.rs`) the prefill-end insert
+        // is the whole contribution: generated tokens' blocks come from decode and verify passes,
+        // which no cold prefill runs, so they are not cached, and no finish-leaf snapshot is
+        // saved (the restore uses grid points only). The sequence's refs stay as the prefill
+        // left them (`prefix_ref_tokens`).
+        if seq.prefix_grid_refs {
+            return;
+        }
         let bs = self.kv_cache.lock().block_size();
         if seq.tokens.len() >= bs && !seq.block_table.is_empty() {
             // 2026-09-25: Prefill already inserted the prompt, so `prompt_len` is passed as
@@ -128,7 +136,13 @@ impl TransformerModel {
         // that matched a prefix and then failed never filled `seq.tokens`, so when
         // `tokens` is shorter than the matched prefix the release runs over the prefix
         // tokens stashed at lookup (`prefix_ref_tokens`). Only one of the two is used.
-        let release_tokens = if seq.tokens.len() >= seq.cached_prefix_tokens {
+        // 2026-10-03: Under the absolute grid the sequence holds refs on exactly
+        // `prefix_ref_tokens` (`SequenceState::prefix_grid_refs`), whatever stage it failed or
+        // finished at; releasing `seq.tokens` would also decrement nodes other sequences inserted
+        // past it.
+        let release_tokens = if seq.prefix_grid_refs {
+            &seq.prefix_ref_tokens
+        } else if seq.tokens.len() >= seq.cached_prefix_tokens {
             &seq.tokens
         } else {
             &seq.prefix_ref_tokens

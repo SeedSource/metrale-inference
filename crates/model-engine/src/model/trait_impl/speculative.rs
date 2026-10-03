@@ -118,6 +118,11 @@ impl TransformerModel {
         let capture_gen = seq.mtp_capture_gen;
         let session_hash = seq.session_hash;
         let store_gen = seq.mtp_store_gen;
+        // 2026-10-03: Under the absolute prefill grid (`prefill_b/grid_restore.rs`) a restored
+        // turn keeps carried drafter rows only below its restore point; the rows from there on are
+        // rebuilt from this turn's hidden rows, which match a cold prefill's.
+        let carry_max_key = (seq.prefix_grid_refs && seq.marconi_skip_to > 0)
+            .then(|| seq.marconi_skip_to - 1);
         let SequenceState {
             tokens: seq_tokens,
             prompt_len,
@@ -184,6 +189,7 @@ impl TransformerModel {
                     p,
                     session_hash,
                     store_gen,
+                    carry_max_key,
                     prop_state.as_mut(),
                     ctx,
                     stream,
@@ -216,6 +222,8 @@ impl TransformerModel {
         prompt_len: usize,
         session_hash: u64,
         store_gen: u64,
+        // 2026-10-03: `Some(k)`: keep carried pair keys up to `k` only (grid restore point - 1).
+        max_key: Option<usize>,
         prop_state: &mut dyn metrale_model_layers::speculative::ProposerState,
         ctx: &ForwardContext,
         stream: u64,
@@ -241,6 +249,14 @@ impl TransformerModel {
             };
             proposer.free_drafter_kv(&entry.block_table);
             return outcome;
+        };
+        let adopted = match max_key {
+            Some(k) => metrale_model_layers::mtp_carry::cap_adopted(rows, last_key, k),
+            None => Some((rows, last_key)),
+        };
+        let Some((rows, last_key)) = adopted else {
+            proposer.free_drafter_kv(&entry.block_table);
+            return CarryOutcome::NoCarry;
         };
         // 2026-09-25: `install_drafter_kv` takes ownership on success only; keep a copy of
         // the ids so a refused install frees them instead of leaking.

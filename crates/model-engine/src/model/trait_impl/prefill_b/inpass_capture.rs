@@ -104,6 +104,11 @@ impl TransformerModel {
             return None;
         }
         let bs = kv_cache.block_size();
+        // 2026-10-03: Under the absolute grid (`grid_restore.rs`) snapshots come only from grid
+        // chunk ends; no tail snapshot.
+        if self.prefix_grid_for_bs(tokens, bs).is_some() {
+            return None;
+        }
         let cut = crate::prefill_plan::tail_split_point(tokens.len(), bs)?;
         if !crate::prefill_plan::inpass_capture_spans(cut, proc_start, proc_count) {
             return None;

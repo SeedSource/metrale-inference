@@ -149,6 +149,19 @@ impl CarriedDrafter {
     }
 }
 
+/// 2026-10-03: Keep only carried pair keys up to `max_key` of an adopted `(rows, key)`, with the
+/// same tail arithmetic as [`CarriedDrafter::usable_by`] (one row per dropped key). The absolute
+/// prefill grid (`METRALE_PREFIX_GRID_RESTORE`) caps at the restore point minus one, so every key
+/// from the restore point on is rebuilt from this turn's hidden rows, as a cold turn builds it.
+/// `None` when no row survives.
+pub fn cap_adopted(rows: usize, key: usize, max_key: usize) -> Option<(usize, usize)> {
+    if key <= max_key {
+        return Some((rows, key));
+    }
+    let rows = rows.checked_sub(key - max_key)?;
+    if rows == 0 { None } else { Some((rows, max_key)) }
+}
+
 /// 2026-09-25: The warm-turn append after `last_pair_key` for a prompt of
 /// `prompt_len` tokens, reading hidden rows `[hidden_lo, hidden_hi)`.
 ///

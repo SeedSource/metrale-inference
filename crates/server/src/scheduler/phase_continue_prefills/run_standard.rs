@@ -77,12 +77,13 @@ pub(super) fn run_standard_chunk_loop(
     // 2026-09-27: A non-last chunk ends on a KV block boundary, or at the model's
     // tail split point when it would span it, so its SSM snapshot is restorable
     // (`prefill_plan::plan_chunk_len`).
-    let chunk_len = metrale_model_engine::prefill_plan::plan_chunk_len(
+    let chunk_len = metrale_model_engine::prefill_plan::plan_chunk_len_grid(
         p.chunk_offset,
         p.prompt_tokens.len(),
         chunk_len,
         model.kv_block_size(),
         model.prefill_tail_split(&p.prompt_tokens),
+        model.prefill_grid(&p.prompt_tokens),
     );
     let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
 

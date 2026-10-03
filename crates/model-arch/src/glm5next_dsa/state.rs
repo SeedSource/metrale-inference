@@ -20,6 +20,7 @@
 
 use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
+use metrale_gpu_runtime::lazy_buffer::LazyBuffer;
 
 use super::Glm5NextDsaConfig;
 use super::select::DsaSelectGeometry;
@@ -57,6 +58,11 @@ pub fn indexer_state_bytes(capacity: usize, index_head_dim: usize) -> usize {
 
 /// 2026-09-25: One sequence's indexer cache for one DSA layer, allocated once at
 /// [`max_dsa_context`] rows and never grown.
+///
+/// 2026-10-03: With `METRALE_DSA_INDEXER_LAZY=1` (`lazy::dsa_indexer_lazy`), `k_normed` and
+/// `gate` are lazily mapped buffers of the same full-length address range: the pointers stay
+/// fixed for the sequence's life, and the rows `[0, n)` are backed before anything writes them
+/// (`ensure_room_through`, `map_rows_through`). `valid` stays eager.
 pub struct Glm5NextDsaState {
     /// 2026-09-25: `[capacity, index_head_dim]` BF16 indexer keys, after the `k_norm`
     /// LayerNorm.
@@ -71,12 +77,30 @@ pub struct Glm5NextDsaState {
     index_head_dim: usize,
     /// 2026-09-25: Set by [`Self::free`], which then does nothing on a second call.
     released: bool,
+    /// 2026-10-03: `[k_normed, gate]` as lazily mapped buffers (lever on); `None` = eager.
+    lazy: Option<[LazyBuffer; 2]>,
+    /// 2026-10-03: Rows `map_rows_through` maps past the end it is given (the MTP proposer's
+    /// draft look-ahead, `lazy::PROPOSER_LOOKAHEAD_ROWS`; 0 for a target layer).
+    lookahead: usize,
 }
 
 impl Glm5NextDsaState {
     /// 2026-09-25: Reserve for the whole addressable context. `alloc_state` has no length
     /// argument, so the cap, not the prompt, sizes this.
     pub fn alloc(gpu: &dyn GpuBackend, cfg: &Glm5NextDsaConfig) -> Result<Self> {
+        Self::alloc_with_lookahead(gpu, cfg, 0)
+    }
+
+    /// 2026-10-03: [`Self::alloc`] for a state that maps `lookahead` rows past the end
+    /// `map_rows_through` is given (the MTP proposer). Lever off, identical to `alloc`.
+    pub fn alloc_with_lookahead(
+        gpu: &dyn GpuBackend,
+        cfg: &Glm5NextDsaConfig,
+        lookahead: usize,
+    ) -> Result<Self> {
+        if super::lazy::dsa_indexer_lazy() {
+            return Self::alloc_lazy(gpu, cfg, lookahead, super::lazy::indexer_pool());
+        }
         cfg.validate()?;
         let capacity = max_dsa_context(cfg);
         let d = cfg.index_head_dim;
@@ -88,7 +112,71 @@ impl Glm5NextDsaState {
             capacity,
             index_head_dim: d,
             released: false,
+            lazy: None,
+            lookahead,
         })
+    }
+
+    /// 2026-10-03: The lazily mapped layout: `k_normed` and `gate` reserved at full length and
+    /// charged to `pool` as rows are mapped, `valid` allocated eagerly. Nothing is mapped yet.
+    pub fn alloc_lazy(
+        gpu: &dyn GpuBackend,
+        cfg: &Glm5NextDsaConfig,
+        lookahead: usize,
+        pool: std::sync::Arc<metrale_gpu_runtime::lazy_buffer::MapBudget>,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        let capacity = max_dsa_context(cfg);
+        let d = cfg.index_head_dim;
+        let k = gpu.alloc_lazy(capacity * d * 2, Some(pool.clone()))?;
+        let g = match gpu.alloc_lazy(capacity * d * 2, Some(pool)) {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = k.release(gpu);
+                return Err(e);
+            }
+        };
+        let valid = match gpu.alloc(capacity) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = k.release(gpu);
+                let _ = g.release(gpu);
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            k_normed: k.ptr(),
+            gate: g.ptr(),
+            valid,
+            len: 0,
+            capacity,
+            index_head_dim: d,
+            released: false,
+            lazy: Some([k, g]),
+            lookahead,
+        })
+    }
+
+    /// 2026-10-03: Rows backed in `k_normed` and `gate` (the smaller of the two); `None` when
+    /// the buffers are eager.
+    pub fn mapped_rows(&self) -> Option<usize> {
+        let row = self.index_head_dim * 2;
+        self.lazy
+            .as_ref()
+            .map(|[k, g]| k.mapped_bytes().min(g.mapped_bytes()) / row.max(1))
+    }
+
+    /// 2026-10-03: Back rows `[0, min(end, capacity))` of `k_normed` and `gate`. A no-op for
+    /// eager buffers and for rows already backed. Fails (with nothing new charged) when the
+    /// indexer pool is full or a stream capture is active.
+    fn map_rows(&self, end: usize) -> Result<()> {
+        if let Some(bufs) = &self.lazy {
+            let bytes = end.min(self.capacity) * self.index_head_dim * 2;
+            for b in bufs {
+                b.ensure_mapped(bytes)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -134,7 +222,10 @@ impl Glm5NextDsaState {
                 self.capacity
             );
         }
-        Ok(())
+        // 2026-10-03: Lever on, back the rows before the caller writes them. Every write
+        // path (`indexer_forward`, the wide and row-batch prefills, aux restore) and the graph
+        // replay pre-check (`check_replay_room`) come through here first.
+        self.map_rows(end)
     }
 
     /// 2026-09-25: Advance after writing `n` rows at `[len, len + n)`. Fails, without
@@ -198,8 +289,17 @@ impl Glm5NextDsaState {
             return Ok(());
         }
         self.released = true;
-        for p in [self.k_normed, self.gate, self.valid] {
-            gpu.free(p)?;
+        match self.lazy.take() {
+            Some([k, g]) => {
+                k.release(gpu)?;
+                g.release(gpu)?;
+                gpu.free(self.valid)?;
+            }
+            None => {
+                for p in [self.k_normed, self.gate, self.valid] {
+                    gpu.free(p)?;
+                }
+            }
         }
         self.k_normed = DevicePtr(0);
         self.gate = DevicePtr(0);
@@ -215,6 +315,15 @@ impl LayerState for Glm5NextDsaState {
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    /// 2026-10-03: Back rows through `end + lookahead` (capped at capacity) ahead of the step,
+    /// so the write paths and any capture or replay find them mapped. Eager: nothing to do.
+    fn map_rows_through(&self, end: usize) -> Result<()> {
+        if self.lazy.is_none() || self.released {
+            return Ok(());
+        }
+        self.map_rows(end.saturating_add(self.lookahead))
     }
 }
 

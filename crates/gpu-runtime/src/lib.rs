@@ -37,6 +37,7 @@ pub mod gpu;
 mod gpu_args;
 pub mod host_heap;
 pub mod kernel_args;
+pub mod lazy_buffer;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod op_cache;

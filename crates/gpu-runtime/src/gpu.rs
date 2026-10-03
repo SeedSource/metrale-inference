@@ -393,6 +393,25 @@ pub trait GpuBackend: Send + Sync {
         crate::host_heap::free(ptr, bytes)
     }
 
+    /// 2026-10-03: A [`crate::lazy_buffer::LazyBuffer`] of `bytes`, physical memory mapped on
+    /// demand by `ensure_mapped` and charged to `budget`. The CUDA backend reserves virtual
+    /// address space and maps granules (VMM); the default allocates the whole buffer eagerly
+    /// through `alloc` and only does the budget accounting, so CPU tests exercise the same
+    /// charge and refusal logic. Release it with `LazyBuffer::release`.
+    #[track_caller]
+    fn alloc_lazy(
+        &self,
+        bytes: usize,
+        budget: Option<std::sync::Arc<crate::lazy_buffer::MapBudget>>,
+    ) -> Result<crate::lazy_buffer::LazyBuffer> {
+        let g = crate::lazy_buffer::DEFAULT_GRANULE;
+        let reserved = crate::lazy_buffer::round_up_to_granule(bytes.max(1), g);
+        let base = self.alloc(reserved)?;
+        Ok(crate::lazy_buffer::LazyBuffer::eager(
+            base, reserved, g, budget,
+        ))
+    }
+
     /// 2026-09-25: Device memory for a weight arena, freed with `free_arena`. The
     /// CUDA backend allocates it off the allocation ledger, whose `live_bytes`
     /// `factory::build` counts as this process's own memory when it sizes the KV

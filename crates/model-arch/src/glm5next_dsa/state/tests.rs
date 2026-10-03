@@ -74,6 +74,8 @@ fn advancing_past_the_cap_is_refused_not_clamped() {
         capacity: cap,
         index_head_dim: c.index_head_dim,
         released: false,
+        lazy: None,
+        lookahead: 0,
     };
     assert!(s.is_empty());
     s.advance(cap - 1).unwrap();
@@ -100,6 +102,8 @@ fn row_offsets_are_flat_bf16_rows() {
         capacity: max_dsa_context(&c),
         index_head_dim: c.index_head_dim,
         released: false,
+        lazy: None,
+        lookahead: 0,
     };
     assert_eq!(s.row_offset(0), 0);
     assert_eq!(s.row_offset(1), 128 * 2);
@@ -134,6 +138,8 @@ fn ensure_room_refuses_before_the_write_and_moves_nothing() {
         capacity: cap,
         index_head_dim: c.index_head_dim,
         released: false,
+        lazy: None,
+        lookahead: 0,
     };
     s.advance(cap).unwrap();
     assert!(

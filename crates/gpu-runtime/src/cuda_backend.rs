@@ -28,6 +28,10 @@ pub(crate) use redzone::{
     ALLOC_SEQ, RedZone, redzone_bytes, redzone_fill, redzone_min_idx, redzone_trace_idx,
 };
 mod memory;
+// 2026-10-03: Not under `metrale_scale`: the HIP libcuda shim has no VMM entry points, so
+// AMD builds keep the default eager `alloc_lazy`.
+#[cfg(not(metrale_scale))]
+pub(crate) mod vmm;
 pub use memory::{cuda_free_memory_bytes, spawn_oom_watchdog};
 pub(crate) use memory::{device_is_integrated, effective_free_bytes};
 

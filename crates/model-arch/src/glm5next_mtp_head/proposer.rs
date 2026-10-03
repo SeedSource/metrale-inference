@@ -18,7 +18,13 @@ impl DraftProposer for Glm5NextMtpHead {
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         let dsa = match &self.module.layer.mixer {
-            crate::glm5next_layer::Glm5NextMixer::Dsa(l) => Glm5NextDsaState::alloc(gpu, &l.cfg)?,
+            // 2026-10-03: The drafter writes rows past the target's KV grid, so its cache maps
+            // `PROPOSER_LOOKAHEAD_ROWS` ahead when lazily mapped (`METRALE_DSA_INDEXER_LAZY`).
+            crate::glm5next_layer::Glm5NextMixer::Dsa(l) => Glm5NextDsaState::alloc_with_lookahead(
+                gpu,
+                &l.cfg,
+                crate::glm5next_dsa::lazy::PROPOSER_LOOKAHEAD_ROWS,
+            )?,
             _ => bail!("GLM MTP block is not a DSA layer"),
         };
         let h = self.hidden;

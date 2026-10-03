@@ -65,6 +65,11 @@ impl ProposerState for Glm5NextMtpProposerState {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+
+    /// 2026-10-03: The drafter's DSA indexer cache, mapped with its look-ahead.
+    fn map_rows_through(&self, end: usize) -> Result<()> {
+        metrale_model_layers::layer::LayerState::map_rows_through(&self.dsa, end)
+    }
 }
 
 pub struct Glm5NextMtpHead {

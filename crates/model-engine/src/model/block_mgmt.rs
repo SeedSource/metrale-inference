@@ -275,6 +275,53 @@ pub(crate) fn ensure_blocks_through_decode(
     stream: u64,
     kv_poison: bool,
 ) -> Result<()> {
+    let bs = kv_cache.config().block_size;
+    grow_blocks_decode(
+        seq,
+        abs_block_idx,
+        kv_cache,
+        prefix_cache,
+        gpu,
+        stream,
+        kv_poison,
+    )?;
+    map_lazy_rows_through(seq, abs_block_idx, bs)
+}
+
+/// 2026-10-03: With `METRALE_DSA_INDEXER_LAZY=1`, back every lazily mapped per-position state
+/// of `seq` (the DSA indexer caches and the proposer's) for positions `[0, (abs_block_idx + 1)
+/// * block_size)`: every position the step can write, because the KV write for a position
+/// needs its block first. It runs here, at step entry, before any capture or replay, and its
+/// extents depend only on token positions, so EP ranks map identically. A full indexer pool
+/// fails with "KV cache exhausted", which the scheduler's decode path answers by preempting a
+/// sequence. Lever off: returns at once.
+fn map_lazy_rows_through(
+    seq: &SequenceState,
+    abs_block_idx: usize,
+    block_size: usize,
+) -> Result<()> {
+    if !metrale_model_arch::glm5next_dsa::lazy::dsa_indexer_lazy() {
+        return Ok(());
+    }
+    let end = abs_block_idx.saturating_add(1).saturating_mul(block_size);
+    for st in &seq.layer_states {
+        st.map_rows_through(end)?;
+    }
+    if let Some(p) = &seq.proposer_state {
+        p.map_rows_through(end)?;
+    }
+    Ok(())
+}
+
+fn grow_blocks_decode(
+    seq: &mut SequenceState,
+    abs_block_idx: usize,
+    kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn metrale_telemetry::prefix_cache::PrefixCache,
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    kv_poison: bool,
+) -> Result<()> {
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
     // 2026-09-25: Each iteration returns, slides (the window end stays put) or
     // allocates one block (the window end rises by one), so the loop ends.
@@ -376,12 +423,13 @@ pub(crate) fn ensure_blocks_through_prefill(
     kv_poison: bool,
 ) -> Result<()> {
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
+    let bs = kv_cache.config().block_size;
     loop {
         let ws = seq.hss_window_start();
         let bt_len = seq.block_table.len();
         let in_window = bt_len > 0 && abs_block_idx < ws + bt_len;
         if in_window {
-            return Ok(());
+            return map_lazy_rows_through(seq, abs_block_idx, bs);
         }
         let blk = alloc_block_evicting(kv_cache, prefix_cache)
             .ok_or_else(|| anyhow::anyhow!("KV cache exhausted: no free blocks"))?;

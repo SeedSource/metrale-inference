@@ -10,7 +10,9 @@
 //! of the draft proposer, which is not in the layer list.
 
 use metrale_config::ModelConfig;
-use metrale_model_arch::seq_state_reserve::per_sequence_state_bytes;
+use metrale_model_arch::seq_state_reserve::{
+    LazyIndexerReserve, lazy_indexer_reserve, per_sequence_state_bytes,
+};
 
 use crate::cli;
 
@@ -23,6 +25,19 @@ use crate::cli;
 /// `for_batch`.
 pub(super) fn per_sequence_reserve(args: &cli::ServeArgs, config: &ModelConfig) -> usize {
     let spec_on = args.speculative || args.self_speculative || args.dflash;
+    // 2026-10-03: `METRALE_DSA_INDEXER_LAZY=1`: one shared, lazily mapped indexer pool instead
+    // of `max_batch` full-length caches; the pool is published for the runtime to enforce.
+    if metrale_model_arch::glm5next_dsa::lazy::dsa_indexer_lazy()
+        && let Ok(Some(lazy)) = lazy_indexer_reserve(
+            config,
+            args.max_seq_len,
+            spec_on,
+            args.max_batch_size,
+            metrale_model_arch::glm5next_dsa::lazy::pool_gb_from_env(),
+        )
+    {
+        return lazy_reserve(lazy, args.max_batch_size);
+    }
     let per_seq = per_sequence_state_bytes(config, args.max_seq_len, spec_on).unwrap_or_default();
     let charge = per_seq.for_batch(args.max_batch_size);
     if charge > 0 {
@@ -36,6 +51,28 @@ pub(super) fn per_sequence_reserve(args: &cli::ServeArgs, config: &ModelConfig) 
             per_seq.proposer / (1024 * 1024),
         );
     }
+    charge
+}
+
+/// 2026-10-03: Publish the lazy pool and return its charge (`LazyIndexerReserve::for_batch`).
+fn lazy_reserve(lazy: LazyIndexerReserve, max_batch_size: usize) -> usize {
+    use metrale_model_arch::glm5next_dsa::lazy;
+    lazy::publish_pool(lazy.pool);
+    let charge = lazy.for_batch(max_batch_size);
+    let g = metrale_gpu_runtime::lazy_buffer::DEFAULT_GRANULE;
+    tracing::info!(
+        "Per-sequence state reserve (METRALE_DSA_INDEXER_LAZY=1): {} MB = {} MB shared DSA \
+         indexer pool ({} buffers/seq, {} pool tokens in whole granules; \
+         METRALE_DSA_INDEXER_POOL_GB={}) + {} seq x {} MB eager (valid flags, proposer \
+         scratch). Replicated per rank.",
+        charge >> 20,
+        lazy.pool.limit_bytes >> 20,
+        lazy.pool.shape.bufs_per_seq(),
+        lazy.pool.shape.free_tokens(lazy.pool.limit_bytes, g),
+        lazy::pool_gb_from_env().map_or_else(|| "default".to_string(), |v| v.to_string()),
+        max_batch_size.max(1),
+        lazy.eager_per_seq >> 20,
+    );
     charge
 }
 

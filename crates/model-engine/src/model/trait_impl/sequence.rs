@@ -305,12 +305,28 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// 2026-10-03: Free KV blocks, capped (lever `METRALE_DSA_INDEXER_LAZY` on) by the blocks'
+    /// worth of tokens the DSA indexer pool can still give a new sequence, so prefill
+    /// admission, swap-in and preemption-resume wait for indexer room as they do for KV room.
     pub(super) fn num_free_blocks_dispatch(&self) -> usize {
-        self.kv_cache.lock().num_free_blocks()
+        let kv = self.kv_cache.lock();
+        let free = kv.num_free_blocks();
+        match metrale_model_arch::glm5next_dsa::lazy::pool_free_tokens() {
+            Some(tokens) => free.min(tokens / kv.config().block_size.max(1)),
+            None => free,
+        }
     }
 
+    /// 2026-10-03: Total KV blocks, capped (lever `METRALE_DSA_INDEXER_LAZY` on) by the blocks'
+    /// worth of tokens the whole DSA indexer pool holds, so admission's reservation and the
+    /// preemption-resume "can never fit" check see the indexer limit too.
     pub(super) fn num_total_blocks_dispatch(&self) -> usize {
-        self.kv_cache.lock().num_blocks()
+        let kv = self.kv_cache.lock();
+        let total = kv.num_blocks();
+        match metrale_model_arch::glm5next_dsa::lazy::pool_total_tokens() {
+            Some(tokens) => total.min(tokens / kv.config().block_size.max(1)),
+            None => total,
+        }
     }
 
     pub(super) fn reclaim_prefix_blocks_dispatch(&self, num_blocks: usize) -> usize {

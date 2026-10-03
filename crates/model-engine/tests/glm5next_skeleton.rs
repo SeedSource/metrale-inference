@@ -378,3 +378,43 @@ fn per_sequence_state_budget_separates_fixed_from_growing() {
     assert_eq!(r.kda_recurrent, b.kda_recurrent / 2);
     assert_eq!(r.mhc_highway_per_token, b.mhc_highway_per_token);
 }
+
+/// 2026-10-03: The preflight charge at msl 131,072, max batch 4, MTP on, from the real config:
+/// eager (lever off) 4 x 807,213,588 B, the figure the 2026-10-03 longctx boot logged as
+/// "3079 MB"; lazy (`METRALE_DSA_INDEXER_LAZY=1`, default pool) a 784 MiB shared pool plus the
+/// eager `valid` flags and proposer scratch per sequence, 791 MiB, 2.40 GB more for the KV pool.
+#[test]
+fn lazy_indexer_reserve_at_131k_mb4_frees_2_4_gb_for_kv() {
+    use metrale_model_arch::seq_state_reserve::{lazy_indexer_reserve, per_sequence_state_bytes};
+    let cfg = parse_config(CONFIG).expect("parses");
+    let eager = per_sequence_state_bytes(&cfg, 131_072, true)
+        .unwrap()
+        .for_batch(4);
+    assert_eq!(eager, 3_228_854_352);
+    assert_eq!(eager >> 20, 3079);
+
+    let lazy = lazy_indexer_reserve(&cfg, 131_072, true, 4, None)
+        .unwrap()
+        .expect("glm5_next");
+    assert_eq!(lazy.pool.shape.bufs_per_seq(), 24);
+    assert_eq!(lazy.pool.limit_bytes, 784 << 20);
+    assert_eq!(lazy.eager_per_seq, 12 * 131_072 + 334_356);
+    assert_eq!(lazy.for_batch(4), 829_712_464);
+    assert_eq!(eager - lazy.for_batch(4), 2_399_141_888);
+
+    // 2026-10-03: An explicit pool is honoured up to what 4 full-length sequences can map.
+    let big = lazy_indexer_reserve(&cfg, 131_072, true, 4, Some(1.6))
+        .unwrap()
+        .unwrap();
+    assert_eq!(big.pool.limit_bytes, (1.6 * (1u64 << 30) as f64) as usize);
+    let huge = lazy_indexer_reserve(&cfg, 131_072, true, 4, Some(64.0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(huge.pool.limit_bytes, 4 * 24 * (32 << 20));
+    // 2026-10-03: MTP off: no proposer buffers, no look-ahead granule.
+    let nospec = lazy_indexer_reserve(&cfg, 131_072, false, 4, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(nospec.pool.shape.bufs_per_seq(), 22);
+    assert_eq!(nospec.pool.limit_bytes, 4 * 22 * 4 * (2 << 20));
+}

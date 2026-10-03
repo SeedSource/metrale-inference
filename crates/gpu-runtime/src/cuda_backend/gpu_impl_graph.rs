@@ -35,6 +35,7 @@ impl MetraleCudaBackend {
             bail!("cuStreamBeginCapture failed: status {status}");
         }
         metrale_telemetry::global().graph_capture();
+        crate::lazy_buffer::note_capture_begin(stream);
         Ok(())
     }
 
@@ -44,6 +45,7 @@ impl MetraleCudaBackend {
     pub(super) fn abort_capture_if_active_cu(&self, stream: u64) {
         let mut graph: u64 = 0;
         let status = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        crate::lazy_buffer::note_capture_end(stream);
         if status == 0 && graph != 0 {
             unsafe { cuGraphDestroy(graph) };
         }
@@ -52,6 +54,7 @@ impl MetraleCudaBackend {
     pub(super) fn end_capture_cu(&self, stream: u64) -> Result<GraphHandle> {
         let mut graph: u64 = 0;
         let status = unsafe { cuStreamEndCapture(stream, &mut graph) };
+        crate::lazy_buffer::note_capture_end(stream);
         if status != 0 {
             bail!("cuStreamEndCapture failed: status {status}");
         }

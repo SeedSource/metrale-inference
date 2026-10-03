@@ -113,6 +113,25 @@ int cuMemsetD32Async(unsigned long long a, unsigned int b, unsigned long c, void
  * with "undefined symbol: cuMemsetD8_v2 / cuMemcpyDtoH_v2". */
 int cuMemsetD8_v2(unsigned long long d, unsigned char v, unsigned long n) { (void)d; (void)v; (void)n; return 100; }
 int cuMemcpyDtoH_v2(void *d, unsigned long long s, unsigned long n) { (void)d; (void)s; (void)n; return 100; }
+/* Virtual memory management (metrale-gpu-runtime cuda_backend/vmm.rs: lazy
+ * buffers for the GLM DSA indexer, METRALE_DSA_INDEXER_LAZY). */
+int cuMemGetAllocationGranularity(unsigned long *a, const void *b, int c) { (void)a; (void)b; (void)c; return 100; }
+int cuMemAddressReserve(unsigned long long *a, unsigned long b, unsigned long c, unsigned long long d, unsigned long long e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; return 100;
+}
+int cuMemAddressFree(unsigned long long a, unsigned long b) { (void)a; (void)b; return 100; }
+int cuMemCreate(unsigned long long *a, unsigned long b, const void *c, unsigned long long d) {
+    (void)a; (void)b; (void)c; (void)d; return 100;
+}
+int cuMemRelease(unsigned long long a) { (void)a; return 100; }
+int cuMemMap(unsigned long long a, unsigned long b, unsigned long c, unsigned long long d, unsigned long long e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; return 100;
+}
+int cuMemUnmap(unsigned long long a, unsigned long b) { (void)a; (void)b; return 100; }
+int cuMemSetAccess(unsigned long long a, unsigned long b, const void *c, unsigned long d) {
+    (void)a; (void)b; (void)c; (void)d; return 100;
+}
+int cuCtxSynchronize(void) { return 100; }
 /* Graphs */
 int cuGraphInstantiateWithFlags(void **a, void *b, unsigned long long c) {
     (void)a; (void)b; (void)c; return 100;

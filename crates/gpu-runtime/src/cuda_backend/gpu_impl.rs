@@ -161,6 +161,18 @@ impl GpuBackend for MetraleCudaBackend {
         Some(MetraleCudaBackend::live_bytes(self))
     }
 
+    /// 2026-10-03: VMM: reserve address space now, map granules on `ensure_mapped`. Mapped
+    /// bytes are counted by `live_bytes` (`lazy_buffer::vmm_mapped_bytes`), not per site.
+    #[cfg(not(metrale_scale))]
+    #[track_caller]
+    fn alloc_lazy(
+        &self,
+        bytes: usize,
+        budget: Option<std::sync::Arc<crate::lazy_buffer::MapBudget>>,
+    ) -> Result<crate::lazy_buffer::LazyBuffer> {
+        super::vmm::reserve(bytes, budget)
+    }
+
     fn alloc_report(&self, top_n: usize, min_mb: usize) -> Option<String> {
         Some(MetraleCudaBackend::alloc_report(self, top_n, min_mb))
     }

@@ -98,6 +98,26 @@ pub(super) fn assert_rank_levers_agree(
                     Ok("v2")
                 )),
             ),
+            // 2026-10-03: Lazily mapped DSA indexer caches: the pool decides when a step fails
+            // with "KV cache exhausted" (and a sequence is preempted), so a rank with another
+            // lever value or pool size would fail a step the other one runs.
+            (
+                "METRALE_DSA_INDEXER_LAZY",
+                u64::from(metrale_model_arch::glm5next_dsa::lazy::dsa_indexer_lazy()),
+            ),
+            (
+                "DSA indexer pool MiB (METRALE_DSA_INDEXER_POOL_GB)",
+                if metrale_model_arch::glm5next_dsa::lazy::dsa_indexer_lazy() {
+                    let l = metrale_model_arch::glm5next_dsa::lazy::indexer_pool().limit();
+                    if l == usize::MAX {
+                        u64::MAX
+                    } else {
+                        (l >> 20) as u64
+                    }
+                } else {
+                    0
+                },
+            ),
         ],
     )?;
     // 2026-09-29 (A153): Log the resolved NoPE MLA softmax-scale choice once, on rank 0 only

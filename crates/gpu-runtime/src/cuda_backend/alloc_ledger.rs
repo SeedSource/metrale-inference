@@ -35,9 +35,15 @@ impl MetraleCudaBackend {
         self.live_allocs.lock().remove(&ptr.0);
     }
 
-    /// 2026-09-25: Total bytes on the ledger.
+    /// 2026-09-25: Total bytes on the ledger, plus (2026-10-03) the bytes VMM lazy buffers
+    /// have mapped (`lazy_buffer::vmm_mapped_bytes`), which have no per-site entry.
     pub fn live_bytes(&self) -> usize {
-        self.live_allocs.lock().values().map(|r| r.bytes).sum()
+        self.live_allocs
+            .lock()
+            .values()
+            .map(|r| r.bytes)
+            .sum::<usize>()
+            + crate::lazy_buffer::vmm_mapped_bytes()
     }
 
     /// 2026-09-25: A text report of the ledger: the total, then up to `top_n`
@@ -64,6 +70,13 @@ impl MetraleCudaBackend {
             total as f64 / 1e9,
             rows.len()
         );
+        let vmm = crate::lazy_buffer::vmm_mapped_bytes();
+        if vmm > 0 {
+            out.push_str(&format!(
+                "  {:>9.1} MB  VMM lazy buffers (mapped granules, not in the total above)\n",
+                vmm as f64 / (1024.0 * 1024.0)
+            ));
+        }
         let mut shown = 0usize;
         let mut folded_bytes = 0usize;
         let mut folded_sites = 0usize;

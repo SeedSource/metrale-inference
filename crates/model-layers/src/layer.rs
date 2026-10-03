@@ -25,6 +25,16 @@ pub use transformer_layer::{
 pub trait LayerState: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// 2026-10-03: Back this state's per-position storage for positions `[0, end)` before a
+    /// step writes them (lazily mapped state, `METRALE_DSA_INDEXER_LAZY`). The model calls it
+    /// where it grows the KV block table (`block_mgmt::ensure_blocks_through_*`), outside any
+    /// graph capture and before any replay. Positions past the state's own capacity are left
+    /// to its write-path checks. Default: nothing to map.
+    fn map_rows_through(&self, end: usize) -> anyhow::Result<()> {
+        let _ = end;
+        Ok(())
+    }
 }
 
 /// 2026-09-25: State of a layer that keeps nothing per sequence.
@@ -153,11 +163,7 @@ impl AttnMetadataDev {
     #[must_use]
     pub fn row_view(&self, base: usize) -> Self {
         let off = |p: DevicePtr, stride: usize| {
-            if p.0 == 0 {
-                p
-            } else {
-                p.offset(base * stride)
-            }
+            if p.0 == 0 { p } else { p.offset(base * stride) }
         };
         Self {
             positions: off(self.positions, 4),

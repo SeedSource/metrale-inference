@@ -34,6 +34,14 @@ use crate::layer::ForwardContext;
 pub trait ProposerState: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// 2026-10-03: [`crate::layer::LayerState::map_rows_through`] for a proposer: back the
+    /// rows the drafter will write for target positions up to `end` (an implementation adds
+    /// its own look-ahead for the rows it drafts past the target). Default: nothing to map.
+    fn map_rows_through(&self, end: usize) -> Result<()> {
+        let _ = end;
+        Ok(())
+    }
 }
 
 /// 2026-09-25: A draft-token proposer. The model calls `propose` for draft

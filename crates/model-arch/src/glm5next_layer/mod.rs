@@ -69,7 +69,8 @@ pub use state::alloc_kda_ssm_state;
 // 2026-10-01: `pub(crate)` so the DSA launchers reach their levers (`levers::dsa_scores_tiled`,
 // `levers::dsa_gemv_split`) by path.
 pub(crate) mod levers;
-// 2026-10-03: `METRALE_GLM_DENSE_FP8` FP8 weight shadows and their GEMV dispatch.
+// 2026-10-03: `METRALE_GLM_DENSE_FP8` FP8 weight copies (BF16 originals freed), their GEMV
+// dispatch and the prefill dequant arena.
 pub mod dense_fp8;
 // 2026-10-01: Decode L2 weight prefetch plan and launcher (`METRALE_GLM_DECODE_L2_PREFETCH`).
 pub mod prefetch;

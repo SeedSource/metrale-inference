@@ -32,10 +32,12 @@ pub(super) fn gemm(
     stream: u64,
 ) -> Result<()> {
     // 2026-10-03: `METRALE_GLM_DENSE_FP8=1`: a registered weight at <= 16 rows runs on its FP8
-    // copy (`glm5next_layer::dense_fp8`); off, this returns false without launching.
-    if crate::glm5next_layer::dense_fp8::try_gemv(gpu, gemv, a, b, c, m, n, kk, stream)? {
-        return Ok(());
-    }
+    // copy, and a wider call reads its BF16 dequant (`glm5next_layer::dense_fp8`); off, this
+    // returns the caller's `b` without launching.
+    let b = match crate::glm5next_layer::dense_fp8::route(gpu, gemv, a, b, c, m, n, kk, stream)? {
+        crate::glm5next_layer::dense_fp8::Route::Done => return Ok(()),
+        crate::glm5next_layer::dense_fp8::Route::Weight(w) => w,
+    };
     if m > metrale_model_layers::layers::ops::DENSE_GEMV_BATCHM_MAX_M as usize
         && crate::glm5next_layer::cublas_wide_proj()
     {

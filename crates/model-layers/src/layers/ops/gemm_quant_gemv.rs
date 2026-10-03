@@ -275,3 +275,41 @@ pub fn dense_gemv_fp8w_batchm(
         .arg_u32(out_stride)
         .launch(stream)
 }
+
+/// 2026-10-03: Blocks per `dequant_fp8_rowscale_bf16` launch (grid-stride; 48 GB10 SMs x
+/// 16 blocks of 256 threads), capped below by the vector count.
+const DEQUANT_FP8_ROWSCALE_MAX_BLOCKS: u64 = 768;
+
+/// 2026-10-03: BF16 copy of an FP8 per-row-scaled weight,
+/// `out[n, k] = bf16_rn(float(fp8(W[n, k])) * row_scale[n])`, into `output`
+/// (`n * k` BF16, 16-byte aligned). Same decode as [`dense_gemv_fp8w`] and
+/// [`dense_gemv_fp8w_batchm`], one FP32 multiply, round-to-nearest-even to
+/// BF16 (kernel header). Refuses `k` not a multiple of 16 and an empty shape.
+///
+/// Kernel: `dequant_fp8_rowscale_bf16(in, row_scale, out, N, K)`, module
+/// `dequant_fp8_rowscale_bf16`.
+pub fn dequant_fp8_rowscale_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    weight: &Fp8DenseWeight,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        n > 0 && k > 0 && k.is_multiple_of(16),
+        "dequant_fp8_rowscale_bf16: [{n}, {k}] must be non-empty with K a multiple of 16"
+    );
+    let vecs = n as u64 * (k / 16) as u64;
+    let blocks = vecs.div_ceil(256).clamp(1, DEQUANT_FP8_ROWSCALE_MAX_BLOCKS) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([blocks, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.row_scale)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}

@@ -18,7 +18,25 @@
 //!   at 1 row, `dense_gemv_fp8w_batchm` above), and the in-tree
 //!   `fp8_gemv_rowscale_batch16_rt2` for reference. Activations stay hot, as in decode.
 //!
-//! Prints `PASS` iff (a) and (b) pass; timing is reported, never gated here.
+//! - (d) 2026-10-03 phase 2: `dequant_fp8_rowscale_bf16` (the BF16 copy wide GEMMs read once
+//!   the BF16 originals are freed) bitwise against a CPU reference (exact E4M3 decode, one f32
+//!   multiply by the row scale, round-to-nearest-even to BF16; raw u16 bits) on every shape
+//!   above, a zero row, all 254 non-NaN codes x 64 random scales, N = 1 / K = 16, plus an
+//!   untouched guard band after the output.
+//! - (e) The prefill GEMM (cuBLASLt `cublas_bf16_proj_dense`, the wide-M path) over the
+//!   dequantized weight against the same GEMM over the BF16 original, per output row
+//!   (cosine, max_rel, nonfinite; tolerance, not exactness), and against the FP8 batchm GEMV
+//!   on the first 16 rows (decode/prefill consistency).
+//! - (f) `glm5next_layer::dense_fp8` end to end with the lever on: `convert_weight` frees the
+//!   BF16 original (alloc-ledger delta), `finish_load` sizes the arena, `route` runs the FP8
+//!   GEMV at <= 16 rows (bits == direct launch) and hands wide GEMMs the dequant (bits ==
+//!   CPU reference), the eager cache skips repeats and re-dequantizes after an overlapping
+//!   layer or a stream change, a captured wide call replays correctly and turns the cache
+//!   off, and misuse (interior pointer, wrong shape) is an error.
+//! - (g) Timing: the dequant over a cold pool per shape, and the M = 256 cuBLASLt GEMM it
+//!   feeds, summed over the converted weights of one rank (one full layer pass).
+//!
+//! Prints `PASS` iff (a), (b), (d), (e) and (f) pass; timing is reported, never gated here.
 //!
 //! Run (GPU):
 //!   METRALE_TARGET_HW=gb10 METRALE_TARGET_MODEL=glm-5.3-flash METRALE_TARGET_QUANT=nvfp4 \
@@ -48,7 +66,10 @@ const SHAPES: &[(usize, usize, &str, usize)] = &[
     (4096, 6144, "dense_down", 3),
     (1024, 4096, "shexp_gate_up", 84),
     (4096, 1024, "shexp_down", 42),
-    (4100, 1024, "N%4!=0", 0),
+    // 2026-10-03: 4100 was meant as the N % 4 != 0 case but 4100 % 4 == 0, so the partial
+    // last block (n >= N outputs masked) was never run; 4097 and 37 are N % 4 == 1.
+    (4097, 1024, "N%4=1", 0),
+    (37, 48, "N37_K48", 0),
 ];
 const BIT_MS: &[usize] = &[1, 2, 3, 4, 5, 8, 12, 15, 16];
 const TIME_MS: &[usize] = &[1, 3, 4, 8, 12, 16];
@@ -64,6 +85,12 @@ const TOL_MAXREL_FP8: f64 = 0.08;
 const TOL_COS_SELF: f64 = 0.99999;
 const TOL_MAXREL_SELF: f64 = 0.01;
 const POOL_BYTES_BF16: usize = 1 << 30;
+/// 2026-10-03: (e) rows; 64 and 256 (the race prefill sub-chunk) take the cuBLASLt arm.
+const GEMM_MS: &[usize] = &[64, 256];
+/// 2026-10-03: (e) dequant-GEMM against the FP8 GEMV on the same rows: the BF16 rounding of
+/// each scaled weight (relative <= 2^-9) and the accumulation order only.
+const TOL_COS_DQ_GEMV: f64 = 0.9999;
+const TOL_MAXREL_DQ_GEMV: f64 = 0.02;
 
 struct Lcg(u64);
 impl Lcg {
@@ -155,6 +182,7 @@ struct Kern {
     b1: KernelHandle,
     bbm: KernelHandle,
     rt2: Option<KernelHandle>,
+    dq: KernelHandle,
 }
 
 fn quantize(
@@ -560,7 +588,441 @@ fn timing(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------------------
+// 2026-10-03 phase 2: dequant, prefill GEMM over the dequant, dense_fp8 end to end, timing.
+// ---------------------------------------------------------------------------------------
+
+/// 2026-10-03: CPU reference of `dequant_fp8_rowscale_bf16`: exact E4M3 decode (as f32), one
+/// f32 multiply by the row scale (IEEE round to nearest even), RNE to BF16. Raw u16 bits.
+fn cpu_dequant(q: &[u8], sc: &[f32], kd: usize) -> Vec<u16> {
+    q.iter()
+        .enumerate()
+        .map(|(i, &b)| bf16::from_f32(e4m3(b) as f32 * sc[i / kd]).to_bits())
+        .collect()
+}
+
+fn up_bytes(g: &dyn GpuBackend, b: &[u8]) -> Result<DevicePtr> {
+    let p = g.alloc(b.len().max(1))?;
+    g.copy_h2d(b, p)?;
+    Ok(p)
+}
+
+const GUARD: usize = 256;
+
+/// 2026-10-03: Run the dequant of `q` (`[n, kd]`) into a guarded buffer; returns
+/// (bit mismatches vs the CPU reference, guard bytes changed).
+fn dequant_check(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    q: &Fp8DenseWeight,
+    n: usize,
+    kd: usize,
+) -> Result<(usize, usize)> {
+    let s = g.default_stream();
+    let out = g.alloc(n * kd * 2 + GUARD)?;
+    g.memset(out, 0xEE, n * kd * 2 + GUARD)?;
+    ops::dequant_fp8_rowscale_bf16(g, k.dq, q, out, n as u32, kd as u32, s)?;
+    g.synchronize(s)?;
+    let got = dn_bytes(g, out, n * kd * 2 + GUARD)?;
+    let qb = dn_bytes(g, q.weight, n * kd)?;
+    let sc: Vec<f32> = dn_u32(g, q.row_scale, n)?
+        .iter()
+        .map(|&b| f32::from_bits(b))
+        .collect();
+    let want = cpu_dequant(&qb, &sc, kd);
+    let diff = want
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| u16::from_le_bytes([got[2 * i], got[2 * i + 1]]) != **w)
+        .count();
+    let guard = got[n * kd * 2..].iter().filter(|&&b| b != 0xEE).count();
+    g.free(out)?;
+    Ok((diff, guard))
+}
+
+/// (d) Dequant bitwise for one shape (weights through the GPU quantizer, row 0 all zero).
+fn dequant_bitwise(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    rng: &mut Lcg,
+    n: usize,
+    kd: usize,
+    label: &str,
+) -> Result<usize> {
+    let mut w = gen_weight(rng, n, kd, true);
+    if n > 1 {
+        for x in &mut w[..kd] {
+            *x = bf16::ZERO;
+        }
+    }
+    let wd = up_bf16(g, &w)?;
+    let q = quantize(g, k, wd, n, kd)?;
+    let (diff, guard) = dequant_check(g, k, &q, n, kd)?;
+    let ok = diff == 0 && guard == 0;
+    println!(
+        "DEQUANT {label:<12} [{n}x{kd}] bits-vs-cpu diff={diff} guard-bytes-touched={guard}  {}",
+        if ok { "ok" } else { "MISMATCH" }
+    );
+    for p in [wd, q.weight, q.row_scale] {
+        g.free(p)?;
+    }
+    Ok(usize::from(!ok))
+}
+
+/// (d) Every non-NaN E4M3 code under 64 random row scales (log-uniform 1e-7..10), and the
+/// one-vector case N = 1, K = 16.
+fn dequant_allcodes(g: &dyn GpuBackend, k: &Kern, rng: &mut Lcg) -> Result<usize> {
+    let mut fails = 0;
+    for &(n, kd) in &[(64usize, 256usize), (1, 16)] {
+        let q: Vec<u8> = (0..n * kd)
+            .map(|i| {
+                let b = ((i % kd) + (i / kd) * 37) as u8;
+                if b & 0x7F == 0x7F { b - 1 } else { b }
+            })
+            .collect();
+        let sc: Vec<f32> = (0..n)
+            .map(|_| 10f64.powf(-7.0 + 8.0 * rng.u()) as f32)
+            .collect();
+        let sb: Vec<u8> = sc.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let w = Fp8DenseWeight {
+            weight: up_bytes(g, &q)?,
+            row_scale: up_bytes(g, &sb)?,
+        };
+        let (diff, guard) = dequant_check(g, k, &w, n, kd)?;
+        let ok = diff == 0 && guard == 0;
+        if !ok {
+            fails += 1;
+        }
+        println!(
+            "DEQUANT allcodes     [{n}x{kd}] 254 codes x random scales bits-vs-cpu diff={diff} \
+             guard-bytes-touched={guard}  {}",
+            if ok { "ok" } else { "MISMATCH" }
+        );
+        g.free(w.weight)?;
+        g.free(w.row_scale)?;
+    }
+    Ok(fails)
+}
+
+/// (e) Prefill GEMM over the dequant vs over the BF16 original, and vs the FP8 GEMV.
+fn prefill_gemm(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    rng: &mut Lcg,
+    n: usize,
+    kd: usize,
+    label: &str,
+) -> Result<usize> {
+    let s = g.default_stream();
+    let w = gen_weight(rng, n, kd, true);
+    let wd = up_bf16(g, &w)?;
+    let q = quantize(g, k, wd, n, kd)?;
+    let deq = g.alloc(n * kd * 2)?;
+    ops::dequant_fp8_rowscale_bf16(g, k.dq, &q, deq, n as u32, kd as u32, s)?;
+    let mut fails = 0;
+    for &m in GEMM_MS {
+        let a = gen_act(rng, m * kd);
+        let ad = up_bf16(g, &a)?;
+        let c_o = g.alloc(m * n * 2)?;
+        let c_d = g.alloc(m * n * 2)?;
+        let c_v = g.alloc(16 * n * 2)?;
+        ops::cublas_bf16_proj_dense(ad, wd, c_o, m as u32, n as u32, kd as u32, s)?;
+        ops::cublas_bf16_proj_dense(ad, deq, c_d, m as u32, n as u32, kd as u32, s)?;
+        ops::dense_gemv_fp8w_batchm(
+            g, k.fbm, ad, &q, c_v, 16, 1, n as u32, kd as u32, n as u32, s,
+        )?;
+        g.synchronize(s)?;
+        let f = |p: DevicePtr, len: usize| -> Result<Vec<f64>> {
+            Ok(dn_u16(g, p, len)?
+                .iter()
+                .map(|&b| bf16::from_bits(b).to_f64())
+                .collect())
+        };
+        let yo = f(c_o, m * n)?;
+        let yd = f(c_d, m * n)?;
+        let yv = f(c_v, 16 * n)?;
+        let (mut cmin, mut rmax, mut nf) = (1.0f64, 0.0f64, 0usize);
+        for t in 0..m {
+            let (c, r, x) = row_stats(&yd[t * n..(t + 1) * n], &yo[t * n..(t + 1) * n]);
+            cmin = cmin.min(c);
+            rmax = rmax.max(r);
+            nf += x;
+        }
+        let (mut vmin, mut vmax) = (1.0f64, 0.0f64);
+        for t in 0..16 {
+            let (c, r, x) = row_stats(&yd[t * n..(t + 1) * n], &yv[t * n..(t + 1) * n]);
+            vmin = vmin.min(c);
+            vmax = vmax.max(r);
+            nf += x;
+        }
+        let nf_o = yo.iter().filter(|x| !x.is_finite()).count();
+        let ok = cmin >= TOL_COS_FP8
+            && rmax <= TOL_MAXREL_FP8
+            && vmin >= TOL_COS_DQ_GEMV
+            && vmax <= TOL_MAXREL_DQ_GEMV
+            && nf == 0
+            && nf_o == 0;
+        if !ok {
+            fails += 1;
+        }
+        println!(
+            "PREFILL {label:<12} M={m:<3} cublas(dequant W) vs cublas(bf16 W): min_cos={cmin:.6} \
+             max_rel={rmax:.4} | vs fp8 batchm GEMV (rows 0..16): min_cos={vmin:.7} \
+             max_rel={vmax:.5} | nonfinite={nf}+{nf_o}  {}",
+            if ok { "ok" } else { "OUT-OF-TOL" }
+        );
+        for p in [ad, c_o, c_d, c_v] {
+            g.free(p)?;
+        }
+    }
+    for p in [wd, deq, q.weight, q.row_scale] {
+        g.free(p)?;
+    }
+    Ok(fails)
+}
+
+/// (f) `glm5next_layer::dense_fp8` end to end (lever on). Returns the number of failures.
+fn route_e2e(g: &dyn GpuBackend, k: &Kern, rng: &mut Lcg) -> Result<usize> {
+    use metrale_model_arch::glm5next_layer::dense_fp8::{self as df, LayerFp8, Route};
+    let s = g.default_stream();
+    let mut fails = 0usize;
+    let mut check = |ok: bool, what: &str| {
+        if !ok {
+            fails += 1;
+        }
+        println!("ROUTE {what}  {}", if ok { "ok" } else { "FAIL-CHECK" });
+    };
+    // Layer A: two weights; layer B: one weight overlapping both of A's arena ranges.
+    let shapes = [(512usize, 1024usize), (1024, 512), (2048, 1024)];
+    let mut ptrs = Vec::new();
+    for &(n, kd) in &shapes {
+        ptrs.push(up_bf16(g, &gen_weight(rng, n, kd, true))?);
+    }
+    let live0 = g.live_bytes().unwrap_or(0) as i64;
+    let mut la = LayerFp8::default();
+    let mut lb = LayerFp8::default();
+    let mut conv = true;
+    conv &= df::convert_weight(g, &mut ptrs[0], shapes[0].0, shapes[0].1, &mut la)?;
+    conv &= df::convert_weight(g, &mut ptrs[1], shapes[1].0, shapes[1].1, &mut la)?;
+    conv &= df::convert_weight(g, &mut ptrs[2], shapes[2].0, shapes[2].1, &mut lb)?;
+    let live1 = g.live_bytes().unwrap_or(0) as i64;
+    let want_delta: i64 = shapes
+        .iter()
+        .map(|&(n, kd)| (n * kd + 4 * n) as i64 - (2 * n * kd) as i64)
+        .sum();
+    check(
+        conv && live1 - live0 == want_delta,
+        &format!(
+            "convert_weight: 3 weights converted, alloc-ledger delta {} B (want {want_delta} B = \
+             +fp8+scales -bf16)",
+            live1 - live0
+        ),
+    );
+    let arena = df::finish_load(g)?;
+    let want_arena = la.arena_bytes.max(lb.arena_bytes);
+    let live2 = g.live_bytes().unwrap_or(0) as i64;
+    check(
+        arena == want_arena && live2 - live1 == arena as i64,
+        &format!(
+            "finish_load: arena {arena} B (want {want_arena} B), ledger +{} B",
+            live2 - live1
+        ),
+    );
+    // Host-side reference of each weight's dequant, from the registered FP8 copies.
+    let mut refs = Vec::new();
+    for (i, &(n, kd)) in shapes.iter().enumerate() {
+        let w = df::lookup(ptrs[i], n, kd).expect("registered");
+        let qb = dn_bytes(g, w.weight, n * kd)?;
+        let sc: Vec<f32> = dn_u32(g, w.row_scale, n)?
+            .iter()
+            .map(|&b| f32::from_bits(b))
+            .collect();
+        refs.push((w, cpu_dequant(&qb, &sc, kd)));
+    }
+    let maxk = 1024;
+    let a = gen_act(rng, 64 * maxk);
+    let ad = up_bf16(g, &a)?;
+    let c1 = g.alloc(64 * 2048 * 2)?;
+    let c2 = g.alloc(64 * 2048 * 2)?;
+    // <= 16 rows: the FP8 GEMV, bits equal to a direct launch.
+    let (n0, k0) = shapes[0];
+    let r = df::route(g, k.b1, ad, ptrs[0], c1, 4, n0, k0, s)?;
+    ops::dense_gemv_fp8w_batchm(
+        g, k.fbm, ad, &refs[0].0, c2, 4, 1, n0 as u32, k0 as u32, n0 as u32, s,
+    )?;
+    g.synchronize(s)?;
+    check(
+        r == Route::Done && dn_u16(g, c1, 4 * n0)? == dn_u16(g, c2, 4 * n0)?,
+        "route M=4: FP8 batchm GEMV, bits == direct launch",
+    );
+    let r1 = df::route(g, k.b1, ad, ptrs[0], c1, 1, n0, k0, s)?;
+    check(r1 == Route::Done, "route M=1: FP8 GEMV");
+    check(
+        df::route(g, k.b1, ad, ptrs[0], c1, 0, n0, k0, s)? == Route::Done,
+        "route M=0: nothing launched",
+    );
+    // Wide: the dequant, its bits, and the cache.
+    let bits_at = |p: DevicePtr, i: usize| -> Result<bool> {
+        g.synchronize(s)?;
+        let (n, kd) = shapes[i];
+        Ok(dn_u16(g, p, n * kd)? == refs[i].1)
+    };
+    let wide = |i: usize, st: u64| -> Result<(DevicePtr, u64)> {
+        let d0 = df::dequants();
+        let (n, kd) = shapes[i];
+        match df::route(g, k.b1, ad, ptrs[i], c1, 64, n, kd, st)? {
+            Route::Weight(p) => Ok((p, df::dequants() - d0)),
+            Route::Done => anyhow::bail!("wide route returned Done"),
+        }
+    };
+    let (pa, d) = wide(0, s)?;
+    check(
+        d == 1 && bits_at(pa, 0)?,
+        "route M=64 A0: dequant into the arena, bits == CPU ref",
+    );
+    let (pa2, d) = wide(0, s)?;
+    check(
+        d == 0 && pa2 == pa,
+        "route M=64 A0 again: cache hit, no launch",
+    );
+    let (pb, d) = wide(1, s)?;
+    check(
+        d == 1 && bits_at(pb, 1)? && pb != pa,
+        "route M=64 A1: own arena range, bits ok",
+    );
+    let (_, d) = wide(0, s)?;
+    check(d == 0, "route M=64 A0 after A1: still cached (no overlap)");
+    // Exercise the cuBLASLt arm on the routed weight, as the wrappers do.
+    ops::cublas_bf16_proj_dense(ad, pa, c2, 64, n0 as u32, k0 as u32, s)?;
+    let (pc, d) = wide(2, s)?;
+    check(
+        d == 1 && bits_at(pc, 2)? && pc == pa,
+        "route M=64 B0: offset 0 of the arena, bits ok",
+    );
+    let (pa3, d) = wide(0, s)?;
+    check(
+        d == 1 && pa3 == pa && bits_at(pa, 0)?,
+        "route M=64 A0 after B0: evicted, dequantized again, bits ok",
+    );
+    let s2 = g.create_stream()?;
+    let (pa4, d) = wide(0, s2)?;
+    check(
+        d == 1 && pa4 == pa && bits_at(pa, 0)?,
+        "route M=64 A0 on a second stream: redone",
+    );
+    // Misuse is an error, an unregistered pointer passes through.
+    let inner = df::route(g, k.b1, ad, ptrs[0].offset(16), c1, 64, n0, k0, s).is_err();
+    let shape = df::route(g, k.b1, ad, ptrs[0], c1, 64, n0 + 1, k0, s).is_err();
+    let other = g.alloc(64)?;
+    let pass = df::route(g, k.b1, ad, other, c1, 64, n0, k0, s)? == Route::Weight(other);
+    check(
+        inner && shape && pass,
+        "route: interior pointer err, wrong shape err, unregistered passes",
+    );
+    g.free(other)?;
+    // Captured wide call: replays the dequant; afterwards the eager cache is off.
+    g.synchronize(s)?;
+    g.memset(pb, 0, shapes[1].0 * shapes[1].1 * 2)?;
+    g.begin_capture(s2)?;
+    let cap = df::route(g, k.b1, ad, ptrs[1], c1, 64, shapes[1].0, shapes[1].1, s2);
+    let graph = g.end_capture(s2)?;
+    let cap_ok = matches!(cap, Ok(Route::Weight(p)) if p == pb);
+    let zero_before = dn_u16(g, pb, 8)?.iter().all(|&x| x == 0);
+    g.launch_graph(graph, s2)?;
+    g.synchronize(s2)?;
+    let replay_ok = dn_u16(g, pb, shapes[1].0 * shapes[1].1)? == refs[1].1;
+    g.destroy_graph(graph)?;
+    check(
+        cap_ok && zero_before && replay_ok,
+        "route M=64 under capture: captured (not run at capture), replay writes the dequant",
+    );
+    let (_, d1) = wide(0, s2)?;
+    let (_, d2) = wide(0, s2)?;
+    check(
+        d1 == 1 && d2 == 1 && bits_at(pa, 0)?,
+        "after a capture: eager cache off (every call dequantizes)",
+    );
+    println!(
+        "ROUTE stats: fp8 GEMV launches {} dequant launches {}",
+        df::hits(),
+        df::dequants()
+    );
+    for p in [ad, c1, c2] {
+        g.free(p)?;
+    }
+    Ok(fails)
+}
+
+/// (g) Dequant timing over a cold pool, and the M = 256 cuBLASLt GEMM on the BF16 weight.
+/// Returns (dequant ms, gemm ms) per weight.
+fn dequant_timing(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    rng: &mut Lcg,
+    n: usize,
+    kd: usize,
+    label: &str,
+) -> Result<(f64, f64)> {
+    let s = g.create_stream()?;
+    let bytes = n * kd * 2;
+    let pool = POOL_BYTES_BF16.div_ceil(bytes).clamp(4, 256);
+    let w = gen_weight(rng, n, kd, false);
+    let host: Vec<u8> = w.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+    let mut wb = Vec::with_capacity(pool);
+    let mut wq = Vec::with_capacity(pool);
+    for _ in 0..pool {
+        let p = g.alloc(bytes)?;
+        g.copy_h2d(&host, p)?;
+        wq.push(quantize(g, k, p, n, kd)?);
+        wb.push(p);
+    }
+    let out = g.alloc(bytes)?;
+    let t_dq = time_graph(g, s, &mut |s| {
+        for q in &wq {
+            ops::dequant_fp8_rowscale_bf16(g, k.dq, q, out, n as u32, kd as u32, s)?;
+        }
+        Ok(())
+    })? / pool as f64;
+    let m = 256;
+    let a = gen_act(rng, m * kd);
+    let ad = up_bf16(g, &a)?;
+    let c = g.alloc(m * n * 2)?;
+    // cuBLASLt picks its algorithm on the first call; warm it outside the capture.
+    ops::cublas_bf16_proj_dense(ad, wb[0], c, m as u32, n as u32, kd as u32, s)?;
+    g.synchronize(s)?;
+    let t_mm = time_graph(g, s, &mut |s| {
+        for p in &wb {
+            ops::cublas_bf16_proj_dense(ad, *p, c, m as u32, n as u32, kd as u32, s)?;
+        }
+        Ok(())
+    })? / pool as f64;
+    let gbs = |b: usize, ms: f64| b as f64 / (ms * 1e-3) / 1e9;
+    println!(
+        "TIMING-DQ {label:<12} dequant {:>8.1} us {:>6.1} GB/s (fp8 read + bf16 write) | cublas \
+         M=256 bf16 {:>8.1} us | dequant/gemm {:.2}  (pool {pool} x {:.1} MB)",
+        t_dq * 1e3,
+        gbs(bytes / 2 * 3, t_dq),
+        t_mm * 1e3,
+        t_dq / t_mm,
+        bytes as f64 / 1e6
+    );
+    for p in wb {
+        g.free(p)?;
+    }
+    for q in wq {
+        g.free(q.weight)?;
+        g.free(q.row_scale)?;
+    }
+    for p in [out, ad, c] {
+        g.free(p)?;
+    }
+    Ok((t_dq, t_mm))
+}
+
 fn main() -> Result<()> {
+    // SAFETY: single-threaded here, before anything reads the environment. Section (f) needs
+    // the lever on; (a)-(e) and (g) call the kernels directly and do not read it.
+    unsafe { std::env::set_var("METRALE_GLM_DENSE_FP8", "1") };
     let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
     let k = Kern {
@@ -573,6 +1035,7 @@ fn main() -> Result<()> {
         rt2: g
             .kernel("fp8_gemv_rt", "fp8_gemv_rowscale_batch16_rt2")
             .ok(),
+        dq: g.kernel("dequant_fp8_rowscale_bf16", "dequant_fp8_rowscale_bf16")?,
     };
     let mut rng = Lcg(0x6c6d_3533_f8f8);
 
@@ -586,6 +1049,47 @@ fn main() -> Result<()> {
             num_fail += numerics(g, &k, &mut rng, n, kd, label, heavy)?;
         }
     }
+    let mut dq_fail = 0;
+    for &(n, kd, label, _) in SHAPES {
+        dq_fail += dequant_bitwise(g, &k, &mut rng, n, kd, label)?;
+    }
+    dq_fail += dequant_allcodes(g, &k, &mut rng)?;
+    let mut pf_fail = 0;
+    for &(n, kd, label, per_step) in SHAPES {
+        if per_step > 0 {
+            pf_fail += prefill_gemm(g, &k, &mut rng, n, kd, label)?;
+        }
+    }
+    let (mut dq_pass, mut mm_pass, mut fp8_b, mut bf16_b) = (0.0f64, 0.0f64, 0usize, 0usize);
+    for &(n, kd, label, per_step) in SHAPES {
+        if per_step == 0 {
+            continue;
+        }
+        let (tdq, tmm) = dequant_timing(g, &k, &mut rng, n, kd, label)?;
+        dq_pass += tdq * per_step as f64;
+        mm_pass += tmm * per_step as f64;
+        fp8_b += (n * kd + 4 * n) * per_step;
+        bf16_b += 2 * n * kd * per_step;
+    }
+    println!(
+        "TIMING-DQ SUMMARY one pass over every converted weight of a rank (launch counts above = \
+         weights per rank): dequant {dq_pass:.2} ms; cuBLASLt M=256 GEMMs over the same weights \
+         {mm_pass:.2} ms. Per 8192-token prefill chunk at 256-row sub-chunks (32 sub-chunks, 1 \
+         pass per chunk with the eager cache): +{dq_pass:.2} ms dequant vs {:.1} ms of these \
+         GEMMs ({:.2}%); without the cache it would be +{:.1} ms ({:.1}%)",
+        mm_pass * 32.0,
+        100.0 * dq_pass / (mm_pass * 32.0),
+        dq_pass * 32.0,
+        100.0 * dq_pass / mm_pass
+    );
+    println!(
+        "MEMORY per rank (shapes x weights per rank above): BF16 originals freed {:.3} GB, FP8 \
+         copies + row scales {:.3} GB, net {:.3} GB before the dequant arena",
+        bf16_b as f64 / 1e9,
+        fp8_b as f64 / 1e9,
+        (fp8_b as f64 - bf16_b as f64) / 1e9
+    );
+    let rt_fail = route_e2e(g, &k, &mut rng)?;
     let mut summary = Vec::new();
     for &(n, kd, label, per_step) in SHAPES {
         if n % 4 != 0 {
@@ -597,9 +1101,9 @@ fn main() -> Result<()> {
     }
     for &m in TIME_MS {
         let rows: Vec<_> = summary.iter().filter(|x| x.1 == m).collect();
-        let (lo, hi) = rows
-            .iter()
-            .fold((f64::MAX, 0.0f64), |a, x| (a.0.min(x.2 / x.3), a.1.max(x.2 / x.3)));
+        let (lo, hi) = rows.iter().fold((f64::MAX, 0.0f64), |a, x| {
+            (a.0.min(x.2 / x.3), a.1.max(x.2 / x.3))
+        });
         let bf: f64 = rows.iter().map(|x| x.2 * x.4 as f64).sum();
         let f8: f64 = rows.iter().map(|x| x.3 * x.4 as f64).sum();
         println!(
@@ -622,8 +1126,20 @@ fn main() -> Result<()> {
         num_fail == 0,
         "numerics: {num_fail} shape cases out of tolerance (see OUT-OF-TOL lines)"
     );
+    ensure!(
+        dq_fail == 0,
+        "dequant: {dq_fail} cases differ from the CPU reference (see MISMATCH lines)"
+    );
+    ensure!(
+        pf_fail == 0,
+        "prefill GEMM over the dequant: {pf_fail} cases out of tolerance (see OUT-OF-TOL lines)"
+    );
+    ensure!(
+        rt_fail == 0,
+        "dense_fp8 route/arena: {rt_fail} checks failed (see FAIL-CHECK lines)"
+    );
     println!(
-        "PASS: dense_gemv_fp8w_batchm bitwise == dense_gemv_fp8w per row (M 1..16, y-split, fp32out); numerics within tolerance"
+        "PASS: dense_gemv_fp8w_batchm bitwise == dense_gemv_fp8w per row (M 1..16, y-split, fp32out, partial last block); numerics within tolerance; dequant_fp8_rowscale_bf16 bitwise == CPU reference; prefill GEMM over the dequant within tolerance; dense_fp8 route/arena/cache checks pass"
     );
     Ok(())
 }

@@ -425,7 +425,7 @@ impl Glm5NextWeightLoader {
         let mut attn_layer_idx = 0usize;
 
         let early_free = access.can_release();
-        let (mut fp8_added, mut fp8_covered) = (0usize, 0usize);
+        let mut fp8_total = crate::glm5next_layer::dense_fp8::LayerFp8::default();
         let (mut freed_count, mut freed_bytes) = (0usize, 0usize);
         for sl in &skeleton.layers {
             // 2026-10-02: Shared borrow of the store for this iteration only (shadows the
@@ -437,35 +437,20 @@ impl Glm5NextWeightLoader {
                 .with_context(|| format!("glm5_next: collecting layer {idx}"))?;
             let t_collect = t_layer.elapsed();
 
-            // 2026-10-01: `mixer_head`: the mixer's FIRST decode projection as the `[n, k]` BF16
-            // extent its GEMV reads (KDA `front_end` `q_proj`, DSA `decode_k` `q_a_proj`). Only
-            // the first: the projection after it streams more than the 24 MB L2 and would evict
-            // anything prefetched further ahead.
-            let (mixer, mixer_head) = match sl.mixer {
+            let mut mixer = match sl.mixer {
                 Mixer::Kda => {
                     let sharded = KdaShardedSource::new(&src, &kda_plan)?;
                     let (w, _report) = bind_kda_weights(gpu, &kda_cfg, idx, &sharded)?;
-                    let head = crate::glm5next_layer::prefetch::bf16_matrix_span(
-                        w.q_proj.weight,
-                        kda_cfg.qkv_dim(),
-                        kda_cfg.hidden,
-                    );
-                    let mixer = Glm5NextMixer::Kda {
+                    Glm5NextMixer::Kda {
                         layer: Box::new(Glm5NextKdaLayer::new(idx, kda_cfg, w, kda_kernels)?),
                         ws: kda_ws.clone(),
                         cfg: kda_cfg,
-                    };
-                    (mixer, head)
+                    }
                 }
                 Mixer::Dsa => {
                     let load = |n: &str| src.f32(n);
                     let w = build_dsa_weights(gpu, &dsa_cfg, &dsa_plan, &load)?;
-                    let head = crate::glm5next_layer::prefetch::bf16_matrix_span(
-                        w.q_a_proj,
-                        dsa_cfg.q_lora_rank,
-                        dsa_cfg.hidden,
-                    );
-                    let mixer = Glm5NextMixer::Dsa(Box::new(Glm5NextDsaLayer {
+                    Glm5NextMixer::Dsa(Box::new(Glm5NextDsaLayer {
                         persist_bt: std::env::var("METRALE_GLM_DSA_ALLOC_PER_STEP").as_deref()
                             != Ok("1"),
                         cfg: dsa_cfg,
@@ -491,15 +476,14 @@ impl Glm5NextWeightLoader {
                         },
                         rms_eps: config.rms_norm_eps as f32,
                         kv_scale: 1.0,
-                    }));
-                    (mixer, head)
+                    }))
                 }
             };
 
             let t_mixer = t_layer.elapsed();
 
             let load = |n: &str| src.f32(n);
-            let mlp = match sl.mlp {
+            let mut mlp = match sl.mlp {
                 Mlp::Dense => Glm5NextMlpSite::Dense(mlp_build::build_dense_mlp(
                     gpu,
                     &mlp_cfg,
@@ -522,22 +506,29 @@ impl Glm5NextWeightLoader {
             };
 
             let t_mlp = t_layer.elapsed();
-            // 2026-10-03: `METRALE_GLM_DENSE_FP8=1`: FP8 copies of this text layer's decode
-            // projections (`glm5next_layer::dense_fp8`); a no-op when the lever is off.
-            let (fp8_b, fp8_cov) =
-                crate::glm5next_layer::dense_fp8::register_layer(gpu, &mixer, &mlp, &mlp_cfg)
-                    .with_context(|| format!("glm5_next: FP8 dense copies of layer {idx}"))?;
-            fp8_added += fp8_b;
-            fp8_covered += fp8_cov;
-            // The mixer head span then names the copy the decode GEMV streams.
-            let mixer_head = match sl.mixer {
-                Mixer::Kda => crate::glm5next_layer::dense_fp8::decode_span(
-                    mixer_head.ptr,
+            // 2026-10-03: `METRALE_GLM_DENSE_FP8=1`: FP8 copies of this text layer's dense
+            // projections replace the BF16 originals, which are freed and whose fields now name
+            // the copies (`glm5next_layer::dense_fp8`); a no-op when the lever is off.
+            let fp8 = crate::glm5next_layer::dense_fp8::register_layer(
+                gpu, &mut mixer, &mut mlp, &mlp_cfg,
+            )
+            .with_context(|| format!("glm5_next: FP8 dense copies of layer {idx}"))?;
+            fp8_total.fp8_bytes += fp8.fp8_bytes;
+            fp8_total.bf16_freed += fp8.bf16_freed;
+            // 2026-10-01: `mixer_head`: the mixer's FIRST decode projection as the `[n, k]`
+            // extent its GEMV reads (KDA `front_end` `q_proj`, DSA `decode_k` `q_a_proj`). Only
+            // the first: the projection after it streams more than the 24 MB L2 and would evict
+            // anything prefetched further ahead. 2026-10-03: read from the field after
+            // `register_layer`, so under the FP8 lever it names the FP8 copy (the BF16 original
+            // is freed).
+            let mixer_head = match &mixer {
+                Glm5NextMixer::Kda { layer, .. } => crate::glm5next_layer::dense_fp8::decode_span(
+                    layer.weights.q_proj.weight,
                     kda_cfg.qkv_dim(),
                     kda_cfg.hidden,
                 ),
-                Mixer::Dsa => crate::glm5next_layer::dense_fp8::decode_span(
-                    mixer_head.ptr,
+                Glm5NextMixer::Dsa(l) => crate::glm5next_layer::dense_fp8::decode_span(
+                    l.weights.q_a_proj,
                     dsa_cfg.q_lora_rank,
                     dsa_cfg.hidden,
                 ),
@@ -644,12 +635,17 @@ impl Glm5NextWeightLoader {
             }
             built.push((layer, attn_head));
         }
+        // 2026-10-03: The prefill dequant arena, allocated here so the KV budget counts it.
+        let arena = crate::glm5next_layer::dense_fp8::finish_load(gpu)
+            .context("glm5_next: METRALE_GLM_DENSE_FP8 dequant arena")?;
         if crate::glm5next_layer::dense_fp8::dense_fp8() {
             tracing::info!(
-                "METRALE_GLM_DENSE_FP8: {:.2} GB of BF16 decode weights per rank now read as FP8; \
-                 +{:.2} GB/rank for the FP8 copies (BF16 kept for prefill)",
-                fp8_covered as f64 / 1e9,
-                fp8_added as f64 / 1e9,
+                "METRALE_GLM_DENSE_FP8: {:.2} GB of BF16 dense weights per rank freed, replaced by \
+                 {:.2} GB of FP8 copies; prefill dequant arena {:.1} MB; net {:+.2} GB/rank vs BF16",
+                fp8_total.bf16_freed as f64 / 1e9,
+                fp8_total.fp8_bytes as f64 / 1e9,
+                arena as f64 / 1e6,
+                (fp8_total.fp8_bytes + arena) as f64 / 1e9 - fp8_total.bf16_freed as f64 / 1e9,
             );
         }
         if early_free {

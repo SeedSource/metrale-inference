@@ -217,3 +217,61 @@ pub fn dense_gemv_fp8w(
         .arg_u32(k)
         .launch(stream)
 }
+
+/// 2026-10-03: Rows `dense_gemv_fp8w_batchm` (and its FP32-output twin)
+/// computes per block row: `FP8BM_MAX_M` in
+/// `kernels/gb10/common/dense_gemv_fp8w_batchm.cu`.
+pub const DENSE_GEMV_FP8W_BATCHM_MAX_M: u32 = 16;
+
+/// 2026-10-03: FP8-weight GEMV for M rows in one pass over the weight,
+/// `C[t] = A[t] @ (fp8(B) * row_scale)^T` for `t` in `[0, M)`, split over
+/// `y_blocks` block rows of `ceil(m / y_blocks)` rows each. Each row's BF16
+/// result is bit-identical to [`dense_gemv_fp8w`] on that row, at every M and
+/// split (kernel header). `fp32_out` selects the twin that stores the FP32 sum
+/// unrounded; `out_stride` counts output elements of that type. Refuses a
+/// split giving more than `DENSE_GEMV_FP8W_BATCHM_MAX_M` rows per block row
+/// and a `k` that is not a multiple of 16 (the kernel has no K tail).
+///
+/// Kernels: `dense_gemv_fp8w_batchm` / `dense_gemv_fp8w_fp32out_batchm`
+/// `(A, B, row_scale, C, M, N, K, out_stride)`, module
+/// `dense_gemv_fp8w_batchm`; dynamic shared memory `rows_per_block * 2048` B.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_fp8w_batchm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &Fp8DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    y_blocks: u32,
+    n: u32,
+    k: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        m >= 1
+            && (1..=m).contains(&y_blocks)
+            && m.div_ceil(y_blocks) <= DENSE_GEMV_FP8W_BATCHM_MAX_M,
+        "dense_gemv_fp8w_batchm: m={m} over y_blocks={y_blocks} must give \
+         1..={DENSE_GEMV_FP8W_BATCHM_MAX_M} rows per block row"
+    );
+    ensure!(
+        k.is_multiple_of(16),
+        "dense_gemv_fp8w_batchm: K={k} not a multiple of 16"
+    );
+    let rows = m.div_ceil(y_blocks);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), y_blocks, 1])
+        .block([256, 1, 1])
+        .shared_mem(rows * 2048)
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.row_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(out_stride)
+        .launch(stream)
+}

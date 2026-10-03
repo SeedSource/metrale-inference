@@ -449,6 +449,21 @@ impl Glm5NextKdaLayer {
         k: usize,
         stream: u64,
     ) -> Result<()> {
+        // 2026-10-03: `METRALE_GLM_DENSE_FP8=1`: a registered weight at <= 16 rows runs on its
+        // FP8 copy (`glm5next_layer::dense_fp8`); off, this returns false without launching.
+        if crate::glm5next_layer::dense_fp8::try_gemv(
+            gpu,
+            self.kernels.gemv,
+            input,
+            weight.weight,
+            out,
+            m,
+            n,
+            k,
+            stream,
+        )? {
+            return Ok(());
+        }
         // 2026-09-25: Only M above `DENSE_GEMV_BATCHM_MAX_M` goes to cuBLASLt. Below it
         // `dense_mm_bf16` runs the M = 1 GEMV or the batched GEMV, whose rows carry the same
         // bits, so the cuBLASLt switch never changes those widths.

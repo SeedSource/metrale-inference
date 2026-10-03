@@ -34,8 +34,9 @@ pub use w8a16::{
 #[path = "gemm_quant_gemv.rs"]
 mod gemv;
 pub use gemv::{
-    DENSE_GEMV_BATCHM_DECODE_MAX_M, DENSE_GEMV_BATCHM_MAX_M, dense_gemv, dense_gemv_batch2,
-    dense_gemv_batchm, dense_gemv_batchm_fp32out, dense_gemv_batchm_split, dense_gemv_fp8w,
+    DENSE_GEMV_BATCHM_DECODE_MAX_M, DENSE_GEMV_BATCHM_MAX_M, DENSE_GEMV_FP8W_BATCHM_MAX_M,
+    dense_gemv, dense_gemv_batch2, dense_gemv_batchm, dense_gemv_batchm_fp32out,
+    dense_gemv_batchm_split, dense_gemv_fp8w, dense_gemv_fp8w_batchm,
 };
 
 /// 2026-09-25: FP8 x FP8 GEMM: A `[M, K]` FP8 E4M3 and B `[N, K]` FP8 E4M3

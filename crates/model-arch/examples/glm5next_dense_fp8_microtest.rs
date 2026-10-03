@@ -1,0 +1,629 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! 2026-10-03: Gate for the GLM-5.3 FP8 dense-weight decode lever
+//! (`METRALE_GLM_DENSE_FP8=1`): `dense_gemv_fp8w_batchm` and its FP32-output twin.
+//!
+//! Owner: model-arch examples.
+//! Checks:
+//! - (a) Bitwise: every row of `dense_gemv_fp8w_batchm` (M = 1..16, one block row and a
+//!   two-way row split) equals `dense_gemv_fp8w` on that row (raw u16 bits), and the
+//!   FP32-output twin equals itself at M = 1 (raw u32 bits) and rounds to the BF16 bits.
+//! - (b) Numerics against an FP64 host reference over the BF16 weights, per output row:
+//!   cosine, max_rel = max|y - ref| / max|ref|, nonfinite count; the same for the BF16
+//!   kernel as the incumbent's floor, and the FP8 kernel against FP64 over its own
+//!   dequantized weights (kernel arithmetic alone). Tolerances in `TOL_*` below.
+//! - (c) Timing: CUDA-graph replay over a cold pool of distinct weights (> 1 GiB of BF16,
+//!   so the FP8 pool is > 512 MiB, both far past the 24 MB L2): BF16 incumbent
+//!   (`dense_gemv_bf16` at 1 row, `dense_gemv_bf16_batchm` above), FP8 (`dense_gemv_fp8w`
+//!   at 1 row, `dense_gemv_fp8w_batchm` above), and the in-tree
+//!   `fp8_gemv_rowscale_batch16_rt2` for reference. Activations stay hot, as in decode.
+//!
+//! Prints `PASS` iff (a) and (b) pass; timing is reported, never gated here.
+//!
+//! Run (GPU):
+//!   METRALE_TARGET_HW=gb10 METRALE_TARGET_MODEL=glm-5.3-flash METRALE_TARGET_QUANT=nvfp4 \
+//!     cargo run -p metrale-model-arch --release --features cuda,gpu-examples \
+//!     --example glm5next_dense_fp8_microtest
+
+use anyhow::{Result, ensure};
+use half::bf16;
+use metrale_gpu_runtime::cuda_backend::MetraleCudaBackend;
+use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use metrale_model_layers::layers::ops;
+use metrale_model_layers::weight_map::Fp8DenseWeight;
+
+/// 2026-10-03: Per-rank GLM-5.3 decode GEMV shapes at TP2 (hidden 4096, 64 KDA heads x 128,
+/// 64 MLA heads x kv_lora 512, q_lora 1536, dense inter 12288, shared expert 2048) as
+/// (N, K, label, launches per decode step per rank) for the weights the lever converts
+/// (`glm5next_layer/dense_fp8.rs`). The last row is an N % 4 != 0 edge case, not a GLM shape.
+const SHAPES: &[(usize, usize, &str, usize)] = &[
+    (4096, 4096, "kda_qkvo", 136),
+    (128, 4096, "kda_g_a", 34),
+    (4096, 128, "kda_g_b", 34),
+    (1536, 4096, "dsa_q_a", 11),
+    (16384, 1536, "dsa_q_absorb", 11),
+    (512, 4096, "dsa_kv_a", 11),
+    (4096, 16384, "dsa_o_absorb", 11),
+    (6144, 4096, "dense_gate_up", 6),
+    (4096, 6144, "dense_down", 3),
+    (1024, 4096, "shexp_gate_up", 84),
+    (4096, 1024, "shexp_down", 42),
+    (4100, 1024, "N%4!=0", 0),
+];
+const BIT_MS: &[usize] = &[1, 2, 3, 4, 5, 8, 12, 15, 16];
+const TIME_MS: &[usize] = &[1, 3, 4, 8, 12, 16];
+const NUM_M: usize = 4;
+/// 2026-10-03: FP8 E4M3 keeps 3 mantissa bits: each weight carries a relative error up to
+/// 2^-4, about 2^-4/sqrt(3) RMS, so a long random dot product keeps ~3.6 % relative RMS
+/// error and cos ~ 0.9994. 0.998 leaves room for heavy-tailed rows; anything a bug
+/// produces (wrong scale, wrong element order, dropped vector) is far below it.
+const TOL_COS_FP8: f64 = 0.998;
+const TOL_MAXREL_FP8: f64 = 0.08;
+/// 2026-10-03: The kernel against FP64 over its OWN dequantized weights: FP32
+/// accumulation and the BF16 output rounding only.
+const TOL_COS_SELF: f64 = 0.99999;
+const TOL_MAXREL_SELF: f64 = 0.01;
+const POOL_BYTES_BF16: usize = 1 << 30;
+
+struct Lcg(u64);
+impl Lcg {
+    fn u(&mut self) -> f64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+    /// Approximately N(0, 1) (Irwin-Hall of 4).
+    fn n(&mut self) -> f64 {
+        (self.u() + self.u() + self.u() + self.u() - 2.0) * 1.7320508
+    }
+}
+
+/// 2026-10-03: Weight generator. `heavy`: N(0, 0.02) with per-row gain spread
+/// (x0.25..x4) and 0.1 % outliers at x30, the shape of trained projection rows whose max
+/// sits far above the bulk (the per-row FP8 scale is set by that max).
+fn gen_weight(rng: &mut Lcg, n: usize, k: usize, heavy: bool) -> Vec<bf16> {
+    let mut w = Vec::with_capacity(n * k);
+    for _ in 0..n {
+        let gain = if heavy {
+            0.25 * 16f64.powf(rng.u())
+        } else {
+            1.0
+        };
+        for _ in 0..k {
+            let mut v = rng.n() * 0.02 * gain;
+            if heavy && rng.u() < 0.001 {
+                v *= 30.0;
+            }
+            w.push(bf16::from_f64(v));
+        }
+    }
+    w
+}
+
+fn gen_act(rng: &mut Lcg, len: usize) -> Vec<bf16> {
+    (0..len).map(|_| bf16::from_f64(rng.n())).collect()
+}
+
+fn up_bf16(g: &dyn GpuBackend, d: &[bf16]) -> Result<DevicePtr> {
+    let b: Vec<u8> = d.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+    let p = g.alloc(b.len().max(1))?;
+    g.copy_h2d(&b, p)?;
+    Ok(p)
+}
+fn dn_u16(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u16>> {
+    let mut b = vec![0u8; n * 2];
+    g.copy_d2h(p, &mut b)?;
+    Ok(b.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect())
+}
+fn dn_u32(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u32>> {
+    let mut b = vec![0u8; n * 4];
+    g.copy_d2h(p, &mut b)?;
+    Ok(b.chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+fn dn_bytes(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u8>> {
+    let mut b = vec![0u8; n];
+    g.copy_d2h(p, &mut b)?;
+    Ok(b)
+}
+
+/// 2026-10-03: OCP E4M3 decode (bias 7, subnormal m * 2^-9; 0x7F/0xFF are NaN).
+fn e4m3(b: u8) -> f64 {
+    let s = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let e = ((b >> 3) & 0xF) as i32;
+    let m = (b & 7) as f64;
+    if e == 15 && (b & 7) == 7 {
+        return f64::NAN;
+    }
+    if e == 0 {
+        s * m * 2f64.powi(-9)
+    } else {
+        s * (1.0 + m / 8.0) * 2f64.powi(e - 7)
+    }
+}
+
+struct Kern {
+    q: KernelHandle,
+    f1: KernelHandle,
+    fbm: KernelHandle,
+    fbm32: KernelHandle,
+    b1: KernelHandle,
+    bbm: KernelHandle,
+    rt2: Option<KernelHandle>,
+}
+
+fn quantize(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    w: DevicePtr,
+    n: usize,
+    kd: usize,
+) -> Result<Fp8DenseWeight> {
+    let dw = metrale_model_layers::weight_map::DenseWeight { weight: w };
+    metrale_model_layers::weight_map::quantize_to_fp8(&dw, n, kd, g, k.q, g.default_stream())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fp8_rows_m1(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    a: DevicePtr,
+    w: &Fp8DenseWeight,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    kd: usize,
+    s: u64,
+) -> Result<()> {
+    for t in 0..m {
+        ops::dense_gemv_fp8w(
+            g,
+            k.f1,
+            a.offset(t * kd * 2),
+            w,
+            c.offset(t * n * 2),
+            n as u32,
+            kd as u32,
+            s,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bf16_rows(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    a: DevicePtr,
+    w: DevicePtr,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    kd: usize,
+    s: u64,
+) -> Result<()> {
+    let dw = metrale_model_layers::weight_map::DenseWeight { weight: w };
+    if m == 1 {
+        ops::dense_gemv(g, k.b1, a, &dw, c, n as u32, kd as u32, s)
+    } else {
+        ops::dense_gemv_batchm(
+            g, k.bbm, a, &dw, c, m as u32, n as u32, kd as u32, n as u32, s,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fp8_rows(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    a: DevicePtr,
+    w: &Fp8DenseWeight,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    kd: usize,
+    s: u64,
+) -> Result<()> {
+    if m == 1 {
+        ops::dense_gemv_fp8w(g, k.f1, a, w, c, n as u32, kd as u32, s)
+    } else {
+        ops::dense_gemv_fp8w_batchm(
+            g, k.fbm, a, w, c, m as u32, 1, n as u32, kd as u32, n as u32, s,
+        )
+    }
+}
+
+fn row_stats(y: &[f64], r: &[f64]) -> (f64, f64, usize) {
+    let (mut dot, mut yy, mut rr, mut maxd, mut maxr) = (0.0, 0.0, 0.0, 0.0f64, 0.0f64);
+    let mut nonfinite = 0;
+    for (&a, &b) in y.iter().zip(r) {
+        if !a.is_finite() {
+            nonfinite += 1;
+            continue;
+        }
+        dot += a * b;
+        yy += a * a;
+        rr += b * b;
+        maxd = maxd.max((a - b).abs());
+        maxr = maxr.max(b.abs());
+    }
+    let cos = if yy > 0.0 && rr > 0.0 {
+        dot / (yy.sqrt() * rr.sqrt())
+    } else {
+        1.0
+    };
+    (cos, maxd / maxr.max(1e-30), nonfinite)
+}
+
+/// (a) Bitwise checks for one shape. Returns the number of failing cases.
+fn bitwise(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    rng: &mut Lcg,
+    n: usize,
+    kd: usize,
+    label: &str,
+) -> Result<usize> {
+    let s = g.default_stream();
+    let w = gen_weight(rng, n, kd, true);
+    let wd = up_bf16(g, &w)?;
+    let q = quantize(g, k, wd, n, kd)?;
+    let mut fails = 0;
+    let maxm = *BIT_MS.iter().max().unwrap();
+    let a = gen_act(rng, maxm * kd);
+    let ad = up_bf16(g, &a)?;
+    let c_ref = g.alloc(maxm * n * 2)?;
+    let c_bm = g.alloc(maxm * n * 2)?;
+    let c_y = g.alloc(maxm * n * 2)?;
+    let c32 = g.alloc(maxm * n * 4)?;
+    let c32_1 = g.alloc(maxm * n * 4)?;
+    for &m in BIT_MS {
+        g.memset(c_bm, 0xAB, maxm * n * 2)?;
+        g.memset(c_y, 0xCD, maxm * n * 2)?;
+        fp8_rows_m1(g, k, ad, &q, c_ref, m, n, kd, s)?;
+        ops::dense_gemv_fp8w_batchm(
+            g, k.fbm, ad, &q, c_bm, m as u32, 1, n as u32, kd as u32, n as u32, s,
+        )?;
+        let y = if m >= 2 { 2 } else { 1 };
+        ops::dense_gemv_fp8w_batchm(
+            g, k.fbm, ad, &q, c_y, m as u32, y, n as u32, kd as u32, n as u32, s,
+        )?;
+        ops::dense_gemv_fp8w_batchm(
+            g, k.fbm32, ad, &q, c32, m as u32, 1, n as u32, kd as u32, n as u32, s,
+        )?;
+        for t in 0..m {
+            ops::dense_gemv_fp8w_batchm(
+                g,
+                k.fbm32,
+                ad.offset(t * kd * 2),
+                &q,
+                c32_1.offset(t * n * 4),
+                1,
+                1,
+                n as u32,
+                kd as u32,
+                n as u32,
+                s,
+            )?;
+        }
+        g.synchronize(s)?;
+        let r = dn_u16(g, c_ref, m * n)?;
+        let b = dn_u16(g, c_bm, m * n)?;
+        let yb = dn_u16(g, c_y, m * n)?;
+        let f = dn_u32(g, c32, m * n)?;
+        let f1 = dn_u32(g, c32_1, m * n)?;
+        let d_bm = r.iter().zip(&b).filter(|(x, y)| x != y).count();
+        let d_y = r.iter().zip(&yb).filter(|(x, y)| x != y).count();
+        let d_32 = f.iter().zip(&f1).filter(|(x, y)| x != y).count();
+        let d_rnd = f
+            .iter()
+            .zip(&r)
+            .filter(|(x, y)| bf16::from_f32(f32::from_bits(**x)).to_bits() != **y)
+            .count();
+        let ok = d_bm == 0 && d_y == 0 && d_32 == 0 && d_rnd == 0;
+        if !ok {
+            fails += 1;
+        }
+        println!(
+            "BITWISE {label:<12} M={m:<2} batchm-vs-1row diff={d_bm} ysplit({y}) diff={d_y} \
+             fp32out-vs-M1 diff={d_32} fp32out->bf16 diff={d_rnd}  {}",
+            if ok { "ok" } else { "MISMATCH" }
+        );
+    }
+    for p in [ad, c_ref, c_bm, c_y, c32, c32_1, wd, q.weight, q.row_scale] {
+        g.free(p)?;
+    }
+    Ok(fails)
+}
+
+/// (b) Numerics for one shape at NUM_M rows. Returns the number of failing checks.
+fn numerics(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    rng: &mut Lcg,
+    n: usize,
+    kd: usize,
+    label: &str,
+    heavy: bool,
+) -> Result<usize> {
+    let s = g.default_stream();
+    let m = NUM_M;
+    let w = gen_weight(rng, n, kd, heavy);
+    let wd = up_bf16(g, &w)?;
+    let q = quantize(g, k, wd, n, kd)?;
+    let a = gen_act(rng, m * kd);
+    let ad = up_bf16(g, &a)?;
+    let c8 = g.alloc(m * n * 2)?;
+    let cb = g.alloc(m * n * 2)?;
+    fp8_rows(g, k, ad, &q, c8, m, n, kd, s)?;
+    bf16_rows(g, k, ad, wd, cb, m, n, kd, s)?;
+    g.synchronize(s)?;
+    let y8: Vec<f64> = dn_u16(g, c8, m * n)?
+        .iter()
+        .map(|&b| bf16::from_bits(b).to_f64())
+        .collect();
+    let yb: Vec<f64> = dn_u16(g, cb, m * n)?
+        .iter()
+        .map(|&b| bf16::from_bits(b).to_f64())
+        .collect();
+    let qb = dn_bytes(g, q.weight, n * kd)?;
+    let qs: Vec<f64> = dn_u32(g, q.row_scale, n)?
+        .iter()
+        .map(|&b| f32::from_bits(b) as f64)
+        .collect();
+    let wf: Vec<f64> = w.iter().map(|x| x.to_f64()).collect();
+    let af: Vec<f64> = a.iter().map(|x| x.to_f64()).collect();
+    let mut nan_codes = 0usize;
+    let wq: Vec<f64> = qb
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let v = e4m3(b);
+            if v.is_nan() {
+                nan_codes += 1;
+            }
+            v * qs[i / kd]
+        })
+        .collect();
+    let mut fails = 0;
+    let (mut c8min, mut r8max, mut cbmin, mut rbmax, mut csmin, mut rsmax) =
+        (1.0f64, 0.0f64, 1.0f64, 0.0f64, 1.0f64, 0.0f64);
+    let mut nf = 0;
+    for t in 0..m {
+        let mut r = vec![0.0f64; n];
+        let mut rq = vec![0.0f64; n];
+        for j in 0..n {
+            let (mut s1, mut s2) = (0.0, 0.0);
+            for i in 0..kd {
+                s1 += af[t * kd + i] * wf[j * kd + i];
+                s2 += af[t * kd + i] * wq[j * kd + i];
+            }
+            r[j] = s1;
+            rq[j] = s2;
+        }
+        let (c, mr, nf8) = row_stats(&y8[t * n..(t + 1) * n], &r);
+        let (cb, mrb, nfb) = row_stats(&yb[t * n..(t + 1) * n], &r);
+        let (cs, mrs, _) = row_stats(&y8[t * n..(t + 1) * n], &rq);
+        nf += nf8 + nfb;
+        c8min = c8min.min(c);
+        r8max = r8max.max(mr);
+        cbmin = cbmin.min(cb);
+        rbmax = rbmax.max(mrb);
+        csmin = csmin.min(cs);
+        rsmax = rsmax.max(mrs);
+    }
+    let ok = c8min >= TOL_COS_FP8
+        && r8max <= TOL_MAXREL_FP8
+        && csmin >= TOL_COS_SELF
+        && rsmax <= TOL_MAXREL_SELF
+        && nf == 0
+        && nan_codes == 0;
+    if !ok {
+        fails += 1;
+    }
+    println!(
+        "NUMERICS {label:<12} {} M={m} fp8-vs-fp64(bf16 W): min_cos={c8min:.6} max_rel={r8max:.4} | \
+         bf16-kernel-vs-fp64: min_cos={cbmin:.8} max_rel={rbmax:.5} | fp8-kernel-vs-fp64(own W): \
+         min_cos={csmin:.8} max_rel={rsmax:.5} | nonfinite={nf} nan_codes={nan_codes}  {}",
+        if heavy { "heavy" } else { "gauss" },
+        if ok { "ok" } else { "OUT-OF-TOL" }
+    );
+    for p in [ad, c8, cb, wd, q.weight, q.row_scale] {
+        g.free(p)?;
+    }
+    Ok(fails)
+}
+
+/// Replay a captured graph `reps` times; returns ms per graph.
+fn time_graph(g: &dyn GpuBackend, s: u64, f: &mut dyn FnMut(u64) -> Result<()>) -> Result<f64> {
+    g.begin_capture(s)?;
+    if let Err(e) = f(s) {
+        g.abort_capture_if_active(s);
+        return Err(e);
+    }
+    let graph = g.end_capture(s)?;
+    for _ in 0..2 {
+        g.launch_graph(graph, s)?;
+    }
+    g.synchronize(s)?;
+    let reps = 5;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        g.launch_graph(graph, s)?;
+    }
+    g.synchronize(s)?;
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+    g.destroy_graph(graph)?;
+    Ok(ms)
+}
+
+/// (c) Timing for one shape over a cold pool.
+fn timing(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    rng: &mut Lcg,
+    n: usize,
+    kd: usize,
+    label: &str,
+) -> Result<Vec<(usize, f64, f64)>> {
+    let s = g.create_stream()?;
+    let bytes = n * kd * 2;
+    let pool = POOL_BYTES_BF16.div_ceil(bytes).clamp(4, 1024);
+    // One random matrix, copied into every pool slot (contents do not affect timing).
+    let w = gen_weight(rng, n, kd, false);
+    let mut wb: Vec<DevicePtr> = Vec::with_capacity(pool);
+    let mut wq: Vec<Fp8DenseWeight> = Vec::with_capacity(pool);
+    let host: Vec<u8> = w.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+    for _ in 0..pool {
+        let p = g.alloc(bytes)?;
+        g.copy_h2d(&host, p)?;
+        wq.push(quantize(g, k, p, n, kd)?);
+        wb.push(p);
+    }
+    let maxm = 16;
+    let a = gen_act(rng, maxm * kd);
+    let ad = up_bf16(g, &a)?;
+    let c = g.alloc(maxm * n * 4)?;
+    let mut out = Vec::new();
+    for &m in TIME_MS {
+        let t_bf = time_graph(g, s, &mut |s| {
+            for p in &wb {
+                bf16_rows(g, k, ad, *p, c, m, n, kd, s)?;
+            }
+            Ok(())
+        })? / pool as f64;
+        let t_f8 = time_graph(g, s, &mut |s| {
+            for q in &wq {
+                fp8_rows(g, k, ad, q, c, m, n, kd, s)?;
+            }
+            Ok(())
+        })? / pool as f64;
+        let t_bm1 = if m == 1 {
+            Some(
+                time_graph(g, s, &mut |s| {
+                    for q in &wq {
+                        ops::dense_gemv_fp8w_batchm(
+                            g, k.fbm, ad, q, c, 1, 1, n as u32, kd as u32, n as u32, s,
+                        )?;
+                    }
+                    Ok(())
+                })? / pool as f64,
+            )
+        } else {
+            None
+        };
+        let t_rt = match k.rt2 {
+            Some(h) => Some(
+                time_graph(g, s, &mut |s| {
+                    for q in &wq {
+                        ops::fp8_gemv_rowscale_batch16_rt2(
+                            g, h, ad, q, c, m as u32, n as u32, kd as u32, s,
+                        )?;
+                    }
+                    Ok(())
+                })? / pool as f64,
+            ),
+            None => None,
+        };
+        let gbs = |bytes: usize, ms: f64| bytes as f64 / (ms * 1e-3) / 1e9;
+        println!(
+            "TIMING {label:<12} M={m:<2} bf16 {:>8.1} us {:>6.1} GB/s | fp8 {:>8.1} us {:>6.1} GB/s | \
+             speedup {:>5.2}x{}{}  (pool {pool} x {:.1} MB)",
+            t_bf * 1e3,
+            gbs(bytes, t_bf),
+            t_f8 * 1e3,
+            gbs(bytes / 2, t_f8),
+            t_bf / t_f8,
+            t_bm1
+                .map(|t| format!(" | fp8_batchm@M1 {:.1} us", t * 1e3))
+                .unwrap_or_default(),
+            t_rt.map(|t| format!(" | rt2 {:.1} us {:.2}x", t * 1e3, t_bf / t))
+                .unwrap_or_default(),
+            bytes as f64 / 1e6,
+        );
+        out.push((m, t_bf, t_f8));
+    }
+    for p in wb {
+        g.free(p)?;
+    }
+    for q in wq {
+        g.free(q.weight)?;
+        g.free(q.row_scale)?;
+    }
+    g.free(ad)?;
+    g.free(c)?;
+    Ok(out)
+}
+
+fn main() -> Result<()> {
+    let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
+    let g: &dyn GpuBackend = &backend;
+    let k = Kern {
+        q: g.kernel("gemv_fp8w", "quantize_bf16_to_fp8")?,
+        f1: g.kernel("gemv_fp8w", "dense_gemv_fp8w")?,
+        fbm: g.kernel("dense_gemv_fp8w_batchm", "dense_gemv_fp8w_batchm")?,
+        fbm32: g.kernel("dense_gemv_fp8w_batchm", "dense_gemv_fp8w_fp32out_batchm")?,
+        b1: g.kernel("gemv", "dense_gemv_bf16")?,
+        bbm: g.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
+        rt2: g
+            .kernel("fp8_gemv_rt", "fp8_gemv_rowscale_batch16_rt2")
+            .ok(),
+    };
+    let mut rng = Lcg(0x6c6d_3533_f8f8);
+
+    let mut bit_fail = 0;
+    for &(n, kd, label, _) in SHAPES {
+        bit_fail += bitwise(g, &k, &mut rng, n, kd, label)?;
+    }
+    let mut num_fail = 0;
+    for &(n, kd, label, _) in SHAPES {
+        for heavy in [false, true] {
+            num_fail += numerics(g, &k, &mut rng, n, kd, label, heavy)?;
+        }
+    }
+    let mut summary = Vec::new();
+    for &(n, kd, label, per_step) in SHAPES {
+        if n % 4 != 0 {
+            continue;
+        }
+        for (m, tb, tf) in timing(g, &k, &mut rng, n, kd, label)? {
+            summary.push((label, m, tb, tf, per_step));
+        }
+    }
+    for &m in TIME_MS {
+        let rows: Vec<_> = summary.iter().filter(|x| x.1 == m).collect();
+        let (lo, hi) = rows
+            .iter()
+            .fold((f64::MAX, 0.0f64), |a, x| (a.0.min(x.2 / x.3), a.1.max(x.2 / x.3)));
+        let bf: f64 = rows.iter().map(|x| x.2 * x.4 as f64).sum();
+        let f8: f64 = rows.iter().map(|x| x.3 * x.4 as f64).sum();
+        println!(
+            "TIMING SUMMARY M={m:<2} fp8/bf16 speedup over shapes: min {lo:.2}x max {hi:.2}x | \
+             per-step sum over converted GEMVs (launch counts per rank): bf16 {bf:.2} ms -> fp8 \
+             {f8:.2} ms, saves {:.2} ms ({:.2}x)",
+            bf - f8,
+            bf / f8
+        );
+    }
+    println!(
+        "tolerances: fp8 vs fp64(bf16 W) cos>={TOL_COS_FP8} max_rel<={TOL_MAXREL_FP8}; \
+         fp8 kernel vs fp64(own W) cos>={TOL_COS_SELF} max_rel<={TOL_MAXREL_SELF}; nonfinite=0"
+    );
+    ensure!(
+        bit_fail == 0,
+        "bitwise: {bit_fail} shape/M cases differ (see MISMATCH lines)"
+    );
+    ensure!(
+        num_fail == 0,
+        "numerics: {num_fail} shape cases out of tolerance (see OUT-OF-TOL lines)"
+    );
+    println!(
+        "PASS: dense_gemv_fp8w_batchm bitwise == dense_gemv_fp8w per row (M 1..16, y-split, fp32out); numerics within tolerance"
+    );
+    Ok(())
+}

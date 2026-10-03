@@ -425,6 +425,7 @@ impl Glm5NextWeightLoader {
         let mut attn_layer_idx = 0usize;
 
         let early_free = access.can_release();
+        let (mut fp8_added, mut fp8_covered) = (0usize, 0usize);
         let (mut freed_count, mut freed_bytes) = (0usize, 0usize);
         for sl in &skeleton.layers {
             // 2026-10-02: Shared borrow of the store for this iteration only (shadows the
@@ -521,6 +522,26 @@ impl Glm5NextWeightLoader {
             };
 
             let t_mlp = t_layer.elapsed();
+            // 2026-10-03: `METRALE_GLM_DENSE_FP8=1`: FP8 copies of this text layer's decode
+            // projections (`glm5next_layer::dense_fp8`); a no-op when the lever is off.
+            let (fp8_b, fp8_cov) =
+                crate::glm5next_layer::dense_fp8::register_layer(gpu, &mixer, &mlp, &mlp_cfg)
+                    .with_context(|| format!("glm5_next: FP8 dense copies of layer {idx}"))?;
+            fp8_added += fp8_b;
+            fp8_covered += fp8_cov;
+            // The mixer head span then names the copy the decode GEMV streams.
+            let mixer_head = match sl.mixer {
+                Mixer::Kda => crate::glm5next_layer::dense_fp8::decode_span(
+                    mixer_head.ptr,
+                    kda_cfg.qkv_dim(),
+                    kda_cfg.hidden,
+                ),
+                Mixer::Dsa => crate::glm5next_layer::dense_fp8::decode_span(
+                    mixer_head.ptr,
+                    dsa_cfg.q_lora_rank,
+                    dsa_cfg.hidden,
+                ),
+            };
             tracing::info!(
                 "glm5_next layer {idx} built: collect {:.2}s mixer {:.2}s mlp {:.2}s \
                  (mixer={:?} mlp={:?})",
@@ -560,7 +581,7 @@ impl Glm5NextWeightLoader {
                     Glm5NextMlpSite::Moe(w) => {
                         bf16_matrix_span(w.router, mlp_cfg.num_experts, mlp_cfg.hidden)
                     }
-                    Glm5NextMlpSite::Dense(w) => bf16_matrix_span(
+                    Glm5NextMlpSite::Dense(w) => crate::glm5next_layer::dense_fp8::decode_span(
                         w.gate_proj,
                         mlp_cfg.local_dense_intermediate,
                         mlp_cfg.hidden,
@@ -622,6 +643,14 @@ impl Glm5NextWeightLoader {
                 );
             }
             built.push((layer, attn_head));
+        }
+        if crate::glm5next_layer::dense_fp8::dense_fp8() {
+            tracing::info!(
+                "METRALE_GLM_DENSE_FP8: {:.2} GB of BF16 decode weights per rank now read as FP8; \
+                 +{:.2} GB/rank for the FP8 copies (BF16 kept for prefill)",
+                fp8_covered as f64 / 1e9,
+                fp8_added as f64 / 1e9,
+            );
         }
         if early_free {
             tracing::info!(

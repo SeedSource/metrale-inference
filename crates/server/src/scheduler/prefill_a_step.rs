@@ -154,6 +154,26 @@ pub fn start_chunked_prefill(
         chunk_len,
     );
 
+    // 2026-10-03: A prompt whose K/V (plus the first decode position) needs more blocks than
+    // the whole pool holds can never run: admission force-admits it (`admit_count`), and it
+    // used to fail only after its full prefill, minutes later (race #79). Refuse it here,
+    // before any allocation or EP broadcast, as `alloc_sequence_for` failures are refused.
+    let total_blocks = model.num_total_blocks();
+    if let Some(bs) = model.kv_block_size()
+        && bs > 0
+        && total_blocks > 0
+        && (total + 1).div_ceil(bs) > total_blocks
+    {
+        let msg = format!(
+            "prompt too long for the KV cache: {total} prompt tokens need {} KV blocks, \
+             the pool holds {total_blocks} ({} tokens)",
+            (total + 1).div_ceil(bs),
+            total_blocks * bs,
+        );
+        send_error_to_sink(&sched.io, &mut sink, &msg);
+        anyhow::bail!(msg);
+    }
+
     // 2026-09-25: `alloc_sequence_for` sizes context-scaled proposer state
     // to prompt + max_tokens rather than `--max-seq-len`.
     let seq_budget = total.saturating_add(max_tokens);

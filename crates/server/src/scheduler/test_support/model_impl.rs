@@ -65,6 +65,9 @@ impl ModelLifecycle for PreemptStubModel {
 }
 
 impl ModelForward for PreemptStubModel {
+    fn kv_block_size(&self) -> Option<usize> {
+        self.block_size
+    }
     fn prefill(&self, t: &[u32], s: &mut SequenceState, _st: u64) -> Result<DevicePtr> {
         self.prefilled.lock().unwrap().push(t.to_vec());
         // 2026-09-25: like the engine's prefill, record the prompt in tokens,

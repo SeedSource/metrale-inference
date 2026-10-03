@@ -242,6 +242,8 @@ pub(super) struct PreemptStubModel {
     pub(super) free_blocks: AtomicUsize,
     pub(super) total_blocks: usize,
     pub(super) reclaimable: AtomicUsize,
+    /// 2026-10-03: `kv_block_size`; `None` (default) is the trait default.
+    pub(super) block_size: Option<usize>,
 }
 
 impl PreemptStubModel {

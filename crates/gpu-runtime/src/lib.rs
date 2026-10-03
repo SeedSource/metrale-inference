@@ -2,7 +2,7 @@
 
 //! 2026-09-25: GPU runtime: the `GpuBackend` trait with its CUDA, Metal and mock
 //! implementations, device buffers, streams, the kernel registry, the cuBLASLt,
-//! CUTLASS and FlashInfer bridges, and the process-wide SSM tail-snapshot and
+//! CUTLASS, FlashInfer and FlashKDA bridges, and the process-wide SSM tail-snapshot and
 //! hermetic switches.
 //!
 //! Owner: gpu-runtime.
@@ -32,6 +32,9 @@ pub mod flashinfer;
 #[cfg(not(feature = "cuda"))]
 #[path = "flashinfer_metal_stub.rs"]
 pub mod flashinfer;
+// 2026-10-03: No stub needed: without `cfg(metrale_flashkda)` (never set without the `cuda`
+// feature) the module only reports itself unavailable.
+pub mod flashkda;
 pub mod gpu;
 #[path = "gpu_args.rs"]
 mod gpu_args;

@@ -175,9 +175,13 @@ committed here, but binaries built with them incorporate it.
 - **License**: BSD-3-Clause. Text at [`LICENSES/BSD-3-Clause.txt`](LICENSES/BSD-3-Clause.txt).
 - **Copyright**: `Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES.
   All rights reserved.` (upstream `LICENSE.txt`).
-- **Upstream**: https://github.com/NVIDIA/cutlass, pinned by `CUTLASS_SHA`.
+- **Upstream**: https://github.com/NVIDIA/cutlass, pinned by `CUTLASS_SHA`; and, for the
+  vendored FlashKDA (section 11), at FlashKDA's submodule pin
+  `5c149f52a436782210263fb2f19b354443a61c6a` (v4.3.2) by `FLASHKDA_CUTLASS_SHA` in
+  `docker/gb10/Dockerfile` and `docker/gb10/glm-5.3-flash/nvfp4/Dockerfile`.
 - **Used by**: `crates/gpu-runtime/cuda/cutlass_*.cu`, `crates/gpu-runtime/src/cutlass.rs`
-  and `crates/gpu-runtime/src/cutlass/`.
+  and `crates/gpu-runtime/src/cutlass/`; `vendor/flashkda/` and
+  `crates/gpu-runtime/cuda/flashkda_kda_fwd.cu` (headers, `FLASHKDA_CUTLASS_HOME`).
 
 ### 8b. FlashInfer and its pinned CCCL — Apache-2.0
 
@@ -236,27 +240,38 @@ TTFT gates. The file is compiled into the bench binary with `include_str!`.
 
 ---
 
-## 11. FlashKDA — MIT (design reference)
+## 11. FlashKDA — MIT (vendored; and design reference)
 
-`kernels/gb10/common/kda_chunk_tc.cu`, the opt-in tensor-core chunked KDA
+**Vendored (2026-10-03).** MoonshotAI's FlashKDA forward kernels are vendored unmodified at
+`vendor/flashkda/` (upstream commit `7afb9f454f160a6c4bbc0999beca0a8c40a38934`; the five CUDA
+sources the forward launcher needs, with per-file sha256 in
+[`vendor/flashkda/README.md`](vendor/flashkda/README.md)). `crates/gpu-runtime/build.rs`
+compiles them with our C-ABI wrapper `crates/gpu-runtime/cuda/flashkda_kda_fwd.cu` when
+`FLASHKDA_CUTLASS_HOME` is set (CUTLASS, section 8a). The only caller is the opt-in GLM-5.3 KDA
+prefill `METRALE_GLM_KDA_PREFILL_FLASHKDA=1`
+(`crates/model-arch/src/glm5next_kda/prefill_flashkda.rs`); the layout glue around it
+(`kernels/gb10/common/kda_flashkda_glue.cu`) is project code.
+
+**Design reference.** `kernels/gb10/common/kda_chunk_tc.cu`, the opt-in tensor-core chunked KDA
 prefill (`METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1`), follows two design choices
 described in FlashKDA's v1 design note: a chunk of 16 tokens (with
 `gate_lower_bound = -5` the in-chunk decay range fits FP32/BF16 without
 rescaling) and a split into a token-parallel per-chunk kernel and a
-head-parallel recurrence kernel. No upstream source file is vendored or
-ported; the kernels were written from the delta-rule math already in
-`kernels/gb10/common/kda_chunk.cu`. Upstream's notice is recorded here for
-attribution. The general chunk-parallel (WY) form of the delta rule is the one
-flash-linear-attention (MIT, `Copyright (c) 2023-2026 Songlin Yang, Yu Zhang,
+head-parallel recurrence kernel. No upstream source file is copied into it; the kernels were
+written from the delta-rule math already in
+`kernels/gb10/common/kda_chunk.cu`. The general chunk-parallel (WY) form of the delta rule is
+the one flash-linear-attention (MIT, `Copyright (c) 2023-2026 Songlin Yang, Yu Zhang,
 Zhiyuan Li`, https://github.com/fla-org/flash-linear-attention) implements;
 no code was taken from it either.
 
-- **License**: MIT. Text at [`LICENSES/MIT.txt`](LICENSES/MIT.txt).
+- **License**: MIT. Text shipped in place at
+  [`vendor/flashkda/LICENSE`](vendor/flashkda/LICENSE); canonical text at
+  [`LICENSES/MIT.txt`](LICENSES/MIT.txt).
 - **Copyright**: `Copyright (c) 2026 MoonshotAI` (upstream root `LICENSE`).
 - **Upstream**: https://github.com/MoonshotAI/FlashKDA
-  (`docs/20260420-flashkda-v1-deep-dive.md`)
-- **In-repo path**: `kernels/gb10/common/kda_chunk_tc.cu`
-
+  (`csrc/`, `docs/20260420-flashkda-v1-deep-dive.md`)
+- **In-repo paths**: `vendor/flashkda/` (vendored), `kernels/gb10/common/kda_chunk_tc.cu`
+  (design reference)
 ---
 
 ## Keeping this file current

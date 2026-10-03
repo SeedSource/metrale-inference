@@ -10,6 +10,9 @@
 //!   resolve to handle 0 when absent.
 //! - 2026-10-01: The four `kda_chunk_tc` entry points also resolve to handle 0 when absent;
 //!   [`Glm5NextKdaKernels::has_chunked_tc`] is false unless all four resolved.
+//! - 2026-10-03: The three `kda_flashkda_glue` entry points resolve to handle 0 when absent;
+//!   [`Glm5NextKdaKernels::has_flashkda_glue`] is false unless they and `kda_tc_conv_rows` /
+//!   `kda_tc_conv_state_tail` resolved.
 
 use super::*;
 
@@ -52,6 +55,13 @@ pub struct Glm5NextKdaKernels {
     pub tc_conv_tail: KernelHandle,
     pub tc_prepare: KernelHandle,
     pub tc_scan: KernelHandle,
+    /// 2026-10-03: The FlashKDA prefill's glue (`METRALE_GLM_KDA_PREFILL_FLASHKDA=1`,
+    /// prefill_flashkda.rs), kernels/gb10/common/kda_flashkda_glue.cu: the beta transpose, the
+    /// recurrent-state transpose and the BF16-input output norm. Resolved with `try_kernel`; any
+    /// `0` keeps the prefill off FlashKDA.
+    pub flk_beta_t: KernelHandle,
+    pub flk_state_t: KernelHandle,
+    pub flk_o_norm: KernelHandle,
     pub o_norm: KernelHandle,
     pub split_widen: KernelHandle,
     pub sigmoid: KernelHandle,
@@ -114,6 +124,21 @@ impl Glm5NextKdaKernels {
                 "kda_tc_prepare",
             ),
             tc_scan: metrale_model_layers::layers::try_kernel(gpu, "kda_chunk_tc", "kda_tc_scan"),
+            flk_beta_t: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_flashkda_glue",
+                "kda_flk_beta_t",
+            ),
+            flk_state_t: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_flashkda_glue",
+                "kda_flk_state_t",
+            ),
+            flk_o_norm: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_flashkda_glue",
+                "kda_o_norm_gated_bf16in",
+            ),
             o_norm: gpu.kernel("kda_layer_ops", "kda_o_norm_gated_bf16")?,
             split_widen: gpu.kernel("kda_layer_ops", "kda_split_widen")?,
             sigmoid: gpu.kernel("kda_layer_ops", "kda_sigmoid_bf16_f32")?,
@@ -129,6 +154,21 @@ impl Glm5NextKdaKernels {
             self.tc_conv_tail,
             self.tc_prepare,
             self.tc_scan,
+        ]
+        .iter()
+        .all(|h| h.0 != 0)
+    }
+
+    /// 2026-10-03: Whether every kernel the FlashKDA prefill launches around the library
+    /// resolved: the row-parallel conv and its state tail (`kda_chunk_tc`) and the three
+    /// `kda_flashkda_glue` kernels.
+    pub fn has_flashkda_glue(&self) -> bool {
+        [
+            self.tc_conv,
+            self.tc_conv_tail,
+            self.flk_beta_t,
+            self.flk_state_t,
+            self.flk_o_norm,
         ]
         .iter()
         .all(|h| h.0 != 0)

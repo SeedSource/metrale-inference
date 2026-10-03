@@ -295,9 +295,32 @@ impl Glm5NextWeightLoader {
                 (b(kda_rows, kda_chunk_rows) - b(verify_k, verify_k)) / 1e6,
             );
         }
-        let kda_ws = std::sync::Arc::new(crate::glm5next_kda::Glm5NextKdaWorkspace::new_split(
-            gpu, &kda_cfg, kda_rows, kda_chunk_rows,
-        )?);
+        let mut kda_ws_inner = crate::glm5next_kda::Glm5NextKdaWorkspace::new_split(
+            gpu,
+            &kda_cfg,
+            kda_rows,
+            kda_chunk_rows,
+        )?;
+        // 2026-10-03: `METRALE_GLM_KDA_PREFILL_FLASHKDA=1` adds the FlashKDA scratch (library
+        // workspace for min(kda_rows, 4096) rows plus one transposed recurrent state; 9.2 MB at
+        // 256 rows, 115 MB at 4096 rows for GLM-5.3 TP2), here at load before the KV pool is
+        // sized. Off, nothing is allocated.
+        if crate::glm5next_kda::kda_prefill_flashkda() {
+            let bytes = kda_ws_inner.alloc_flashkda(gpu, &kda_cfg)?;
+            if bytes > 0 {
+                tracing::warn!(
+                    "GLM KDA FlashKDA scratch: {:.1} MB for {kda_rows}-row KDA calls",
+                    bytes as f64 / 1e6
+                );
+            } else {
+                tracing::warn!(
+                    "METRALE_GLM_KDA_PREFILL_FLASHKDA=1 but no FlashKDA scratch was allocated \
+                     (library built: {}); the KDA prefill keeps its other arms",
+                    metrale_gpu_runtime::flashkda::available()
+                );
+            }
+        }
+        let kda_ws = std::sync::Arc::new(kda_ws_inner);
 
         // 2026-09-25: Unless `METRALE_GLM_MLP_WS_SHARED=0`, one MLP workspace serves
         // every layer; otherwise each layer allocates its own. Either way it is

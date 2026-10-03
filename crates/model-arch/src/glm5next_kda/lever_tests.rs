@@ -93,3 +93,83 @@ fn chunked_tc_prefill_outside_its_contract_is_refused() {
     c.gate_lower_bound = 0.5;
     assert!(chunked_tc_refusal(&c, 256, 256, true).is_some());
 }
+
+#[test]
+fn flashkda_lever_is_on_only_for_one() {
+    assert!(flashkda_requested(Some("1")));
+    for v in [None, Some(""), Some("0"), Some("true"), Some("on"), Some(" 1"), Some("2")] {
+        assert!(!flashkda_requested(v), "{v:?}");
+    }
+}
+
+/// 2026-10-03: The GLM geometry with the library, the glue kernels and the scratch takes the
+/// FlashKDA prefill; each missing piece is refused with a reason.
+#[test]
+fn flashkda_refusals() {
+    use prefill_flashkda::flashkda_refusal;
+    let cfg = glm_cfg();
+    assert_eq!(flashkda_refusal(&cfg, true, true, true), None);
+    assert!(flashkda_refusal(&cfg, false, true, true).is_some());
+    assert!(flashkda_refusal(&cfg, true, false, true).is_some());
+    assert!(flashkda_refusal(&cfg, true, true, false).is_some());
+    let mut c = cfg;
+    c.head_dim = 64;
+    assert!(flashkda_refusal(&c, true, true, true).is_some());
+    let mut c = cfg;
+    c.gate_lower_bound = -5.5;
+    assert!(flashkda_refusal(&c, true, true, true).is_some());
+    let mut c = cfg;
+    c.gate_lower_bound = 0.5;
+    assert!(flashkda_refusal(&c, true, true, true).is_some());
+    let mut c = cfg;
+    c.conv_kernel = 9;
+    assert!(flashkda_refusal(&c, true, true, true).is_some());
+}
+
+/// 2026-10-03: Pieces cover `0..k` in order without gaps, each at most the cap, all but the
+/// last a multiple of 16, and the count is the fewest the cap allows.
+#[test]
+fn flashkda_pieces_cover_the_call() {
+    use prefill_flashkda::{FLASHKDA_PIECE_ROWS, flashkda_pieces};
+    assert!(flashkda_pieces(0, 4096).is_empty());
+    assert_eq!(flashkda_pieces(256, 4096), vec![(0, 256)]);
+    assert_eq!(flashkda_pieces(4096, 4096), vec![(0, 4096)]);
+    assert_eq!(flashkda_pieces(4100, 4096), vec![(0, 2064), (2064, 2036)]);
+    assert_eq!(flashkda_pieces(8192, 4096), vec![(0, 4096), (4096, 4096)]);
+    for k in [1usize, 15, 17, 100, 255, 1000, 4097, 8191, 8193, 12_289, 16_384] {
+        for cap in [16usize, 256, FLASHKDA_PIECE_ROWS] {
+            let p = flashkda_pieces(k, cap);
+            assert_eq!(p.len(), k.div_ceil(cap), "k={k} cap={cap}");
+            let mut next = 0;
+            for (i, &(s, rows)) in p.iter().enumerate() {
+                assert_eq!(s, next, "k={k} cap={cap}");
+                assert!(rows >= 1 && rows <= cap, "k={k} cap={cap}");
+                if i + 1 < p.len() {
+                    assert!(rows.is_multiple_of(16), "k={k} cap={cap}");
+                }
+                next += rows;
+            }
+            assert_eq!(next, k, "k={k} cap={cap}");
+        }
+    }
+}
+
+/// 2026-10-03: The scratch the loader logs: 9.2 MB at the staged prefill's 256-row KDA calls,
+/// ~115 MB at 4,096 rows (the cap), for GLM-5.3 TP2 (32 heads).
+#[test]
+fn flashkda_scratch_bytes() {
+    let cfg = glm_cfg();
+    let state = 32 * 128 * 128 * 4;
+    assert_eq!(
+        Glm5NextKdaWorkspace::bytes_flashkda(&cfg, 256),
+        32 * 16 * 13_824 + 128 + state
+    );
+    assert_eq!(
+        Glm5NextKdaWorkspace::bytes_flashkda(&cfg, 4096),
+        Glm5NextKdaWorkspace::bytes_flashkda(&cfg, 8192)
+    );
+    assert_eq!(
+        Glm5NextKdaWorkspace::bytes_flashkda(&cfg, 100),
+        32 * 7 * 13_824 + 128 + state
+    );
+}

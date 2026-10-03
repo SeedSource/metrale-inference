@@ -408,7 +408,8 @@ impl LayerCapabilities for Glm5NextLayer {
     }
 
     /// 2026-10-03: True for a KDA text layer whose prefill runs `decode_k` (`attn_mixer`):
-    /// sub-chunks wider than one row and neither chunked KDA arm. `decode_k_capture` then copies
+    /// sub-chunks wider than one row and none of the three chunked KDA arms (FlashKDA included:
+    /// it never captures, and with its lever on a sub-chunk may take it). `decode_k_capture` then copies
     /// the state out at the in-pass capture point without changing a launch's arithmetic. The
     /// MTP block (`mhc: None`) and a one-row prefill walk `forward_one`, which never captures.
     fn inpass_ssm_capture_supported(&self) -> bool {
@@ -417,6 +418,7 @@ impl LayerCapabilities for Glm5NextLayer {
             && prefill_rows() > 1
             && !kda_chunk_prefill()
             && !crate::glm5next_kda::kda_prefill_chunked_tc()
+            && !crate::glm5next_kda::kda_prefill_flashkda()
     }
 }
 

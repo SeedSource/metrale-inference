@@ -35,6 +35,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_HOME=/usr/local/cuda
 
+# 2026-10-03: CUTLASS headers for the vendored FlashKDA (vendor/flashkda, MIT) at FlashKDA's own
+# submodule pin (v4.3.2). crates/gpu-runtime/build.rs compiles FlashKDA only when
+# FLASHKDA_CUTLASS_HOME is set; it is reached at run time only through the opt-in
+# METRALE_GLM_KDA_PREFILL_FLASHKDA=1. CUTLASS is BSD-3-Clause (THIRD_PARTY_NOTICES.md 8a).
+ARG FLASHKDA_CUTLASS_SHA=5c149f52a436782210263fb2f19b354443a61c6a
+ENV FLASHKDA_CUTLASS_HOME=/opt/cutlass-flashkda
+RUN git clone --filter=blob:none https://github.com/NVIDIA/cutlass.git ${FLASHKDA_CUTLASS_HOME} && \
+    git -C ${FLASHKDA_CUTLASS_HOME} checkout ${FLASHKDA_CUTLASS_SHA}
+
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./

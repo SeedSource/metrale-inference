@@ -13,6 +13,7 @@
 //! q|k|v_proj -> pack -> conv1d + SiLU -> L2(q,k only) -> kda_gate / sigmoid(b_proj)
 //!            -> kda_chunk (prefill) | kda_recurrent (decode)
 //!            |  kda_chunk_tc (prefill, opt-in `METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1`)
+//!            |  FlashKDA (prefill, opt-in `METRALE_GLM_KDA_PREFILL_FLASHKDA=1`, vendor/flashkda)
 //!            -> sigmoid-gated RMSNorm(o_norm, g_b(g_a(h))) -> o_proj
 //! ```
 //!
@@ -39,6 +40,7 @@ mod kernels;
 #[cfg(test)]
 mod lever_tests;
 mod prefill;
+mod prefill_flashkda;
 mod prefill_tc;
 pub use config::{Glm5NextKdaConfig, Glm5NextKdaWeights};
 pub use kernels::Glm5NextKdaKernels;
@@ -163,6 +165,49 @@ pub(crate) fn kda_prefill_chunked_tc() -> bool {
     })
 }
 
+/// 2026-10-03: Whether a `METRALE_GLM_KDA_PREFILL_FLASHKDA` value asks for the FlashKDA prefill:
+/// `1` only.
+fn flashkda_requested(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// 2026-10-03: `METRALE_GLM_KDA_PREFILL_FLASHKDA=1`: a prefill sub-chunk of at least
+/// `FLASHKDA_MIN_ROWS` rows runs its KDA recurrence through the vendored FlashKDA library
+/// ([`Glm5NextKdaLayer::prefill_flashkda`], prefill_flashkda.rs) instead of `decode_k`'s
+/// per-token walk (`glm5next_layer/steps/mixer.rs`), ahead of the two other chunked arms. Not
+/// bit-identical: FlashKDA sums in chunk order on BF16 tensor-core MMAs and keeps the state in
+/// BF16 between its 16-row chunks. Off unless set to `1`. Read once per process.
+pub(crate) fn kda_prefill_flashkda() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = flashkda_requested(
+            std::env::var("METRALE_GLM_KDA_PREFILL_FLASHKDA")
+                .ok()
+                .as_deref(),
+        );
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_KDA_PREFILL_FLASHKDA=1 - GLM prefill KDA uses FlashKDA \
+                 (vendor/flashkda, BF16 state between 16-row chunks). Not bit-identical to the \
+                 per-token recurrent walk."
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-03: The one warning when `METRALE_GLM_KDA_PREFILL_FLASHKDA=1` cannot be honoured and
+/// the prefill keeps the other arms.
+fn kda_flashkda_fallback(why: &str) {
+    static W: std::sync::Once = std::sync::Once::new();
+    W.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_KDA_PREFILL_FLASHKDA=1 ignored ({why}); the KDA prefill keeps its \
+             other arms"
+        )
+    });
+}
+
 /// 2026-10-01: Chunk width of the tensor-core prefill (`KDA_TC_C` in kda_chunk_tc.cu).
 const KDA_TC_C: usize = 16;
 /// 2026-10-01: head_dim the tensor-core prefill is compiled for (`KDA_TC_D`).
@@ -276,6 +321,10 @@ pub struct Glm5NextKdaWorkspace {
     /// `v_f32` and `chunk_gc`/`chunk_u`/`chunk_w` are sized for it. `max_tokens` unless the
     /// workspace was built by [`Glm5NextKdaWorkspace::new_split`].
     chunk_tokens: usize,
+    /// 2026-10-03: The FlashKDA prefill's own device scratch, allocated only by
+    /// [`Glm5NextKdaWorkspace::alloc_flashkda`] (the loader calls it under
+    /// `METRALE_GLM_KDA_PREFILL_FLASHKDA=1`); `None` otherwise.
+    flashkda: Option<prefill_flashkda::FlashKdaScratch>,
 }
 
 impl Glm5NextKdaWorkspace {
@@ -329,6 +378,7 @@ impl Glm5NextKdaWorkspace {
             max_tokens: t,
             t_pad,
             chunk_tokens,
+            flashkda: None,
         })
     }
 
@@ -440,6 +490,22 @@ impl Glm5NextKdaLayer {
         ws: &Glm5NextKdaWorkspace,
         stream: u64,
     ) -> Result<()> {
+        self.front_end_with(gpu, hidden, t, ws, stream, true)
+    }
+
+    /// 2026-10-03: [`Self::front_end`]; with `activate_gates` false it skips the two launches
+    /// that activate the forget gate (`kda_gate_bf16` into `ws.gate`) and beta (the sigmoid into
+    /// `ws.beta`), leaving the raw `ws.g_raw` and `ws.beta_bf16` the FlashKDA prefill hands to
+    /// the library, which activates them itself. Every other launch is the same.
+    fn front_end_with(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        t: usize,
+        ws: &Glm5NextKdaWorkspace,
+        stream: u64,
+        activate_gates: bool,
+    ) -> Result<()> {
         let c = &self.cfg;
         let (hid, qkv, hd) = (c.hidden, c.qkv_dim(), c.head_dim);
 
@@ -497,18 +563,20 @@ impl Glm5NextKdaLayer {
             hd,
             stream,
         )?;
-        KernelLaunch::new(gpu, self.kernels.gate)
-            .grid([(t * c.heads) as u32, 1, 1])
-            .block([BLOCK, 1, 1])
-            .arg_ptr(ws.g_raw)
-            .arg_ptr(self.weights.dt_bias)
-            .arg_ptr(self.weights.a_log)
-            .arg_ptr(ws.gate)
-            .arg_u32(t as u32)
-            .arg_u32(c.heads as u32)
-            .arg_u32(hd as u32)
-            .arg_f32(c.gate_lower_bound)
-            .launch(stream)?;
+        if activate_gates {
+            KernelLaunch::new(gpu, self.kernels.gate)
+                .grid([(t * c.heads) as u32, 1, 1])
+                .block([BLOCK, 1, 1])
+                .arg_ptr(ws.g_raw)
+                .arg_ptr(self.weights.dt_bias)
+                .arg_ptr(self.weights.a_log)
+                .arg_ptr(ws.gate)
+                .arg_u32(t as u32)
+                .arg_u32(c.heads as u32)
+                .arg_u32(hd as u32)
+                .arg_f32(c.gate_lower_bound)
+                .launch(stream)?;
+        }
 
         // 2026-09-25: beta = sigmoid(b_proj(hidden)); the KDA kernels read it after the sigmoid.
         self.gemm(
@@ -521,14 +589,16 @@ impl Glm5NextKdaLayer {
             hid,
             stream,
         )?;
-        let n = t * c.heads;
-        KernelLaunch::new(gpu, self.kernels.sigmoid)
-            .grid([div_ceil(n as u32, 256), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(ws.beta_bf16)
-            .arg_ptr(ws.beta)
-            .arg_u32(n as u32)
-            .launch(stream)?;
+        if activate_gates {
+            let n = t * c.heads;
+            KernelLaunch::new(gpu, self.kernels.sigmoid)
+                .grid([div_ceil(n as u32, 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(ws.beta_bf16)
+                .arg_ptr(ws.beta)
+                .arg_u32(n as u32)
+                .launch(stream)?;
+        }
 
         // 2026-09-25: Low-rank output gate; a KDA block has no `Z` tensor (`KDA_TENSORS`).
         self.gemm(
@@ -561,11 +631,26 @@ impl Glm5NextKdaLayer {
         ws: &Glm5NextKdaWorkspace,
         stream: u64,
     ) -> Result<()> {
+        self.back_end_with(gpu, t, ws, self.kernels.o_norm, ws.core, stream)
+    }
+
+    /// 2026-10-03: [`Self::back_end`] with the norm kernel and its input named: `back_end` passes
+    /// `kda_o_norm_gated_bf16` over the FP32 `ws.core`, the FlashKDA prefill
+    /// `kda_o_norm_gated_bf16in` over the library's BF16 output. Same launches otherwise.
+    fn back_end_with(
+        &self,
+        gpu: &dyn GpuBackend,
+        t: usize,
+        ws: &Glm5NextKdaWorkspace,
+        o_norm: KernelHandle,
+        core: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
         let c = &self.cfg;
-        KernelLaunch::new(gpu, self.kernels.o_norm)
+        KernelLaunch::new(gpu, o_norm)
             .grid([(t * c.heads) as u32, 1, 1])
             .block([c.head_dim as u32, 1, 1])
-            .arg_ptr(ws.core)
+            .arg_ptr(core)
             .arg_ptr(ws.out_gate)
             .arg_ptr(self.weights.o_norm.weight)
             .arg_ptr(ws.o_norm_out)

@@ -8,12 +8,15 @@
 //!   `metrale_flashinfer` only when `FLASHINFER_HOME` is set, both with the
 //!   `cuda` feature on and `METRALE_SKIP_BUILD` not `1`/`true`.
 //! - `metrale_scale` is set when `METRALE_TARGET_HW` starts with `strix`.
+//! - 2026-10-03: `metrale_flashkda` is set only when `FLASHKDA_CUTLASS_HOME` is set, under the
+//!   same two conditions as `metrale_cutlass`.
 
 fn main() {
     println!("cargo:rerun-if-env-changed=METRALE_SKIP_BUILD");
     println!("cargo:rerun-if-env-changed=METRALE_TARGET_HW");
     println!("cargo:rerun-if-env-changed=CUTLASS_HOME");
     println!("cargo:rerun-if-env-changed=FLASHINFER_HOME");
+    println!("cargo:rerun-if-env-changed=FLASHKDA_CUTLASS_HOME");
     println!("cargo:rerun-if-env-changed=METRALE_CUDA_ARCH");
     // 2026-09-25: Declared so `#[cfg(...)]` on these names does not trip the
     // `unexpected_cfgs` lint. `metrale_scale` covers both AMD targets, `strix`
@@ -21,6 +24,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(metrale_scale)");
     println!("cargo:rustc-check-cfg=cfg(metrale_cutlass)");
     println!("cargo:rustc-check-cfg=cfg(metrale_flashinfer)");
+    println!("cargo:rustc-check-cfg=cfg(metrale_flashkda)");
 
     // 2026-09-25: Resolved once, before every early return, so the CUTLASS and
     // FlashInfer objects compile for the same architecture.
@@ -83,6 +87,99 @@ fn main() {
     if let Some(fi_home) = std::env::var_os("FLASHINFER_HOME") {
         build_flashinfer_object(std::path::PathBuf::from(fi_home), &cuda_arch);
     }
+
+    // 2026-10-03: FlashKDA (vendor/flashkda, MIT) is optional the same way: with
+    // `FLASHKDA_CUTLASS_HOME` unset nothing is built and `metrale_gpu_runtime::flashkda`
+    // reports itself unavailable. Serving reaches it only through
+    // `METRALE_GLM_KDA_PREFILL_FLASHKDA=1`.
+    if let Some(cutlass_home) = std::env::var_os("FLASHKDA_CUTLASS_HOME") {
+        build_flashkda_object(std::path::PathBuf::from(cutlass_home), &cuda_arch);
+    }
+}
+
+/// 2026-10-03: Compile the vendored FlashKDA launcher (`vendor/flashkda/csrc/smxx/fwd_launch.cu`,
+/// unmodified) and our C-ABI wrapper (`cuda/flashkda_kda_fwd.cu`) into the static lib
+/// `metrale_flashkda` against the CUTLASS headers at `cutlass_home` (FlashKDA's submodule pin,
+/// see `vendor/flashkda/README.md`), and set the `metrale_flashkda` cfg. The nvcc flags are
+/// upstream's `setup.py` set (fast math included: upstream's exactness tests assume it) for the
+/// target's arch. Panics if nvcc or ar fails.
+fn build_flashkda_object(cutlass_home: std::path::PathBuf, arch: &str) {
+    use std::process::Command;
+
+    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR set"));
+    let lib = out_dir.join("libmetrale_flashkda.a");
+    let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    let nvcc = std::path::Path::new(&cuda_home).join("bin/nvcc");
+    let vendor = std::path::PathBuf::from("../../vendor/flashkda/csrc");
+
+    let sources = [
+        vendor.join("smxx/fwd_launch.cu"),
+        std::path::PathBuf::from("cuda/flashkda_kda_fwd.cu"),
+    ];
+    for src in &sources {
+        println!("cargo:rerun-if-changed={}", src.display());
+    }
+    for hdr in [
+        "fwd.h",
+        "smxx/fwd_kernel1.cuh",
+        "smxx/fwd_kernel2.cuh",
+        "smxx/utils.cuh",
+    ] {
+        println!("cargo:rerun-if-changed={}", vendor.join(hdr).display());
+    }
+    println!("cargo:rustc-cfg=metrale_flashkda");
+
+    let mut objects = Vec::new();
+    for src in &sources {
+        let obj = out_dir.join(format!(
+            "flashkda_{}.o",
+            src.file_stem()
+                .expect("FlashKDA source has a file stem")
+                .to_string_lossy()
+        ));
+        let status = Command::new(&nvcc)
+            .arg("-c")
+            .arg("-O3")
+            .arg("-std=c++17")
+            .arg("-Xcompiler")
+            .arg("-fPIC")
+            .args([
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "--use_fast_math",
+            ])
+            .arg(format!("-arch={arch}"))
+            .arg(format!("-I{}", cutlass_home.join("include").display()))
+            .arg(format!("-I{}", vendor.display()))
+            .arg(src)
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .expect("failed to spawn nvcc for FlashKDA");
+        assert!(
+            status.success(),
+            "nvcc failed while building FlashKDA source {}",
+            src.display()
+        );
+        objects.push(obj);
+    }
+
+    let mut ar = Command::new("ar");
+    ar.arg("crus").arg(&lib);
+    for obj in &objects {
+        ar.arg(obj);
+    }
+    let status = ar.status().expect("failed to spawn ar for FlashKDA");
+    assert!(status.success(), "ar failed while archiving FlashKDA");
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=metrale_flashkda");
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 }
 
 /// 2026-09-25: Compile `cuda/flashinfer_ragged_prefill.cu` into the static lib

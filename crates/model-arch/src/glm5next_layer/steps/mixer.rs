@@ -85,7 +85,15 @@ impl Glm5NextLayer {
                 // through the tensor-core chunked prefill, ahead of the FP32 chunked scan when
                 // both levers are set; it falls back to `decode_k` itself when it cannot run.
                 let chunkable = is_prefill && k > 1 && snaps.is_empty();
-                if chunkable && crate::glm5next_kda::kda_prefill_chunked_tc() {
+                // 2026-10-03: `METRALE_GLM_KDA_PREFILL_FLASHKDA=1` goes first. It returns false
+                // with nothing launched for a sub-chunk below `FLASHKDA_MIN_ROWS` or a build or
+                // geometry it cannot take, and the arms below run as before.
+                let flashkda = chunkable
+                    && crate::glm5next_kda::kda_prefill_flashkda()
+                    && layer.prefill_flashkda(gpu, normed, k, kda, ws, stream)?;
+                if flashkda {
+                    // 2026-10-03: FlashKDA ran the recurrence; the partial is in `final_out`.
+                } else if chunkable && crate::glm5next_kda::kda_prefill_chunked_tc() {
                     layer.prefill_chunked_tc(gpu, normed, k, kda, ws, stream)?;
                 } else if chunkable && kda_chunk_prefill() {
                     layer.prefill(gpu, normed, k, kda, ws, stream)?;

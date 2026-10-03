@@ -38,6 +38,7 @@ pub(crate) mod ssm_batched_copy;
 pub(crate) mod ssm_pool;
 mod ssm_pool_slots;
 pub(crate) mod ssm_snapshot;
+mod ssm_snapshot_auxbudget;
 mod ssm_snapshot_decode;
 pub(crate) mod ssm_snapshot_faultin;
 mod ssm_snapshot_init;

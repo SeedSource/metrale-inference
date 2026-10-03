@@ -112,6 +112,20 @@ impl TransformerModel {
         Ok(out)
     }
 
+    /// 2026-10-03: Host bytes `collect_aux_states` would copy for a snapshot of the first `rows`
+    /// positions, without allocating them (the aux byte budget sizes a grid save first).
+    pub(in crate::model) fn aux_prefix_bytes_total(
+        &self,
+        seq: &SequenceState,
+        rows: usize,
+    ) -> usize {
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| l.aux_prefix_bytes(seq.layer_states[i].as_ref(), rows))
+            .sum()
+    }
+
     /// 2026-09-25: True when some layer reports `has_aux_state`; restore sites
     /// then decline a snapshot that has no aux blobs.
     pub(in crate::model) fn requires_aux_state(&self) -> bool {

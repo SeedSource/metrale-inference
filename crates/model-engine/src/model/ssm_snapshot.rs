@@ -60,6 +60,9 @@ pub(crate) struct SsmSnapshotPool {
     /// [`Self::set_aux`]. A model that `requires_aux_state` restores a slot only
     /// when it has aux (`trait_impl/prefill_a.rs`, `prefill_c.rs`).
     pub(super) aux_blobs: Mutex<std::collections::HashMap<usize, Vec<(u32, Vec<u8>)>>>,
+    /// 2026-10-03: Host-byte accounting for `aux_blobs` (`ssm_snapshot_auxbudget.rs`): the live
+    /// total and, per slot, its bytes and (for a grid checkpoint) its owning sequence.
+    pub(super) aux_meta: Mutex<super::ssm_snapshot_auxbudget::AuxMeta>,
     /// 2026-09-25: Decode-rollback h region, one allocation per layer of
     /// `decode_max_seqs * decode_ring_slots * h_bytes`. Empty when the ring is disabled.
     pub(super) decode_h_snapshots: Vec<DevicePtr>,
@@ -250,6 +253,7 @@ impl SsmSnapshotPool {
         self.slot_has_hidden.lock().remove(&snap_slot);
         self.session_tags.lock().remove(&snap_slot);
         self.aux_blobs.lock().remove(&snap_slot);
+        self.aux_meta.lock().remove(snap_slot);
     }
 
     /// 2026-09-25: Clear the slot's side tables and push it on the free list. A tag
@@ -261,7 +265,26 @@ impl SsmSnapshotPool {
     }
 
     pub(super) fn set_aux(&self, snap_slot: usize, blobs: Vec<(u32, Vec<u8>)>) {
+        let bytes: usize = blobs.iter().map(|(_, b)| b.len()).sum();
         self.aux_blobs.lock().insert(snap_slot, blobs);
+        self.aux_meta.lock().set(snap_slot, bytes, None);
+    }
+
+    /// 2026-10-03: [`Self::set_aux`] for a grid checkpoint saved by sequence `owner`
+    /// (its SSM pool slot) at `tokens` tokens: the budget evicts the owner's earlier
+    /// checkpoints first (`make_room_for_aux`).
+    pub(super) fn set_aux_owned(
+        &self,
+        snap_slot: usize,
+        blobs: Vec<(u32, Vec<u8>)>,
+        owner: u64,
+        tokens: usize,
+    ) {
+        let bytes: usize = blobs.iter().map(|(_, b)| b.len()).sum();
+        self.aux_blobs.lock().insert(snap_slot, blobs);
+        self.aux_meta
+            .lock()
+            .set(snap_slot, bytes, Some((owner, tokens)));
     }
 
     pub(super) fn aux(&self, snap_slot: usize) -> Option<Vec<(u32, Vec<u8>)>> {

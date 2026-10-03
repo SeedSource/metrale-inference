@@ -287,7 +287,7 @@ fn inpass_runs_the_cache_off_passes_and_still_snapshots_the_cut_once() {
 /// 8192-token chunks), which `save_checkpoint` saves as well.
 #[test]
 fn warm_lookup_after_an_inpass_cold_prefill_restores_at_the_cut() {
-    for (total, first, cont) in [(32772, 8193, 8192), (32251, 8193, 8192), (1000, 67, 64)] {
+    for (total, first, cont) in [(32772usize, 8193, 8192), (32251, 8193, 8192), (1000, 67, 64)] {
         let tokens: Vec<u32> = (0..total as u32)
             .map(|i| 1000 + (i * 7919) % 150_000)
             .collect();

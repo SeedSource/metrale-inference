@@ -73,6 +73,17 @@ impl LayerAuxState for Glm5NextLayer {
         Ok(Some(st.snapshot_blob(gpu, stream)?))
     }
 
+    /// 2026-10-03: Size of the blob `snapshot_aux_prefix` returns; `0` on a KDA layer.
+    fn aux_prefix_bytes(&self, state: &dyn LayerState, rows: usize) -> usize {
+        if !matches!(self.mixer, Glm5NextMixer::Dsa(_)) {
+            return 0;
+        }
+        state
+            .as_any()
+            .downcast_ref::<Glm5NextDsaState>()
+            .map_or(0, |st| st.blob_bytes_for_rows(rows))
+    }
+
     /// 2026-10-03: The DSA indexer rows `[0, rows)` (`Glm5NextDsaState::snapshot_blob_prefix`):
     /// row `p` is written once, by the pass over position `p`, so after a pass that ran past
     /// `rows` the first `rows` rows are what a snapshot taken at `rows` holds. `None` on a KDA

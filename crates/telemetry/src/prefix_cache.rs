@@ -270,6 +270,14 @@ pub trait PrefixCache: Send + Sync {
     /// the caller to free.
     fn evict_snapshot_lru(&self) -> Option<usize>;
 
+    /// 2026-10-03: Remove the resident snapshot entry that holds `slot` from the index
+    /// (the caller then frees the slot). `false` when no resident entry holds it; the
+    /// default answers `false`. Used by the host aux byte budget to drop a chosen victim.
+    fn evict_snapshot_slot(&self, slot: usize) -> bool {
+        let _ = slot;
+        false
+    }
+
     /// 2026-09-26: Pick a resident snapshot to evict: one at least
     /// `min_tokens` deep is marked spilled and stays findable, a shallower one
     /// is removed ([`TierEvict`]). `min_tokens == 0` always spills. `None`

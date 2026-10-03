@@ -307,6 +307,22 @@ impl SsmSnapshotIndex {
         Some(entry.snapshot_id)
     }
 
+    /// 2026-10-03: Remove the resident entry holding `slot`, counted as an eviction. `false`
+    /// when none does (a tiered entry's `snapshot_id` is stale and never matches).
+    pub(super) fn evict_slot(&mut self, slot: usize) -> bool {
+        let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| !e.tiered && e.snapshot_id == slot)
+        else {
+            return false;
+        };
+        self.entries.swap_remove(i);
+        self.stats.evictions += 1;
+        self.evictions_since_lookup = self.evictions_since_lookup.saturating_add(1);
+        true
+    }
+
     /// 2026-09-25: The index of the entry to evict, without changing
     /// anything: the stalest session first, then the lowest score within it
     /// (`snap_evict_alpha`). `tail_protect` leases the last looked-up

@@ -50,6 +50,11 @@ fn blob_bytes(len: usize, index_head_dim: usize) -> usize {
 }
 
 impl Glm5NextDsaState {
+    /// 2026-10-03: Bytes `snapshot_blob_prefix(rows)` returns, without allocating.
+    pub fn blob_bytes_for_rows(&self, rows: usize) -> usize {
+        blob_bytes(rows, self.index_head_dim())
+    }
+
     /// 2026-09-25: Serialize the reachable indexer rows `[0, len)` for a
     /// prefix-cache snapshot. Rows past `len` were never written or are
     /// unreachable (`rewind_to` leaves them in place).

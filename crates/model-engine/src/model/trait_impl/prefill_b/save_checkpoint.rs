@@ -83,6 +83,33 @@ impl TransformerModel {
             );
         }
 
+        // 2026-10-03: Host aux byte budget (`ssm_snapshot_auxbudget.rs`), grid saves only. The
+        // size is computed from token counts and layer geometry and the eviction reads only the
+        // pool's own bookkeeping, so both EP ranks decide alike; a divergence would also be
+        // safe, since `snap_agree` restores only a depth every rank proposes.
+        let budget = super::super::super::ssm_snapshot_auxbudget::aux_budget_bytes();
+        let owner = super::super::super::ssm_snapshot_auxbudget::owner_key(tokens);
+        if grid.is_some() && budget > 0 {
+            let need = self.aux_prefix_bytes_total(seq, end_token);
+            if need > 0
+                && !self.ssm_snapshots.make_room_for_aux(
+                    self.prefix_cache.as_ref(),
+                    owner,
+                    need,
+                    budget,
+                )
+            {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    tracing::info!(
+                        "Skip grid checkpoint at token {end_token}: aux blob {need} B does not fit                          the host aux budget {budget} B (METRALE_PREFIX_AUX_BUDGET_MB) with {} B                          live and nothing evictable; later grid saves that do not fit skip silently",
+                        self.ssm_snapshots.aux_live_bytes(),
+                    );
+                });
+                return Ok(());
+            }
+        }
+
         let snap_result = match self.ssm_snapshots.save(
             seq.slot_idx,
             seq.session_hash,
@@ -141,7 +168,12 @@ impl TransformerModel {
             }
         };
         if !aux.is_empty() {
-            self.ssm_snapshots.set_aux(snap_id, aux);
+            if grid.is_some() {
+                self.ssm_snapshots
+                    .set_aux_owned(snap_id, aux, owner, end_token);
+            } else {
+                self.ssm_snapshots.set_aux(snap_id, aux);
+            }
         }
 
         self.prefill_b_register_checkpoint(

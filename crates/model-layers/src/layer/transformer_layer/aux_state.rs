@@ -45,6 +45,13 @@ pub trait LayerAuxState {
         }
     }
 
+    /// 2026-10-03: Host bytes `snapshot_aux_prefix(state, rows, ..)` would return, computed
+    /// without allocating (the host aux byte budget sizes a save before it copies). `0` for a
+    /// layer with no aux blob and by default.
+    fn aux_prefix_bytes(&self, _state: &dyn LayerState, _rows: usize) -> usize {
+        0
+    }
+
     /// 2026-09-25: True when this layer produces aux state. When any layer does, restore
     /// sites decline a snapshot that has no aux blobs (`requires_aux_state`).
     fn has_aux_state(&self) -> bool {

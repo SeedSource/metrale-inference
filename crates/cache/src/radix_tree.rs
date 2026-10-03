@@ -272,6 +272,10 @@ impl PrefixCache for RadixTree {
         self.snapshot_index.lock().evict_lru()
     }
 
+    fn evict_snapshot_slot(&self, slot: usize) -> bool {
+        self.snapshot_index.lock().evict_slot(slot)
+    }
+
     fn evict_snapshot_to_tier(
         &self,
         min_tokens: usize,

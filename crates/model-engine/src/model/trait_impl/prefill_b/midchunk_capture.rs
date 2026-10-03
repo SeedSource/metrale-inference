@@ -126,6 +126,14 @@ impl TransformerModel {
         if !metrale_gpu_runtime::ssm_tail_midchunk_enabled() || !self.ssm_snapshots.is_enabled() {
             return None;
         }
+        // 2026-10-03: Under the absolute grid (`grid_restore.rs`) snapshots come only from grid
+        // chunk ends; no mid-chunk tail snapshot.
+        if self
+            .prefix_grid_for_bs(tokens, kv_cache.block_size())
+            .is_some()
+        {
+            return None;
+        }
         // 2026-09-25: Only `metrale_scale` builds write `h_dsts` (the split4 arm of
         // `qwen3_ssm/trait_prefill_recur.rs`). On other targets the snapshot would be
         // registered with an h_state that was never written, so no plan is made.

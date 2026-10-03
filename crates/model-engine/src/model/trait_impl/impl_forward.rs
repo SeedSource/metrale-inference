@@ -175,4 +175,8 @@ impl ModelForward for TransformerModel {
     fn prefill_tail_split(&self, tokens: &[u32]) -> Option<usize> {
         self.prefill_tail_split_dispatch(tokens)
     }
+
+    fn prefill_grid(&self, tokens: &[u32]) -> Option<usize> {
+        self.prefix_grid_for(tokens)
+    }
 }

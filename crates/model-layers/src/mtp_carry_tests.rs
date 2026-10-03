@@ -436,3 +436,15 @@ fn setting_the_threshold_twice_reports_the_loss_rather_than_panicking() {
     }
     assert_eq!(resolved, marconi_min_tokens(), "stable once read");
 }
+
+#[test]
+fn cap_adopted_drops_keys_past_the_grid_restore_point() {
+    // 2026-10-03: Under the cap: unchanged.
+    assert_eq!(cap_adopted(100, 99, 200), Some((100, 99)));
+    assert_eq!(cap_adopted(100, 99, 99), Some((100, 99)));
+    // 2026-10-03: 32250 carried keys (rows 32251), restore at 24576: keys up to 24575 survive.
+    assert_eq!(cap_adopted(32251, 32250, 24575), Some((24576, 24575)));
+    // 2026-10-03: Nothing survives.
+    assert_eq!(cap_adopted(10, 50, 40), None);
+    assert_eq!(cap_adopted(10, 50, 39), None);
+}

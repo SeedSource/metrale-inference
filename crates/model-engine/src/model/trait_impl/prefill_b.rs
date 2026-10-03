@@ -32,6 +32,7 @@ mod embed_chunk;
 mod exact_leaf;
 mod finalize_last;
 mod forward_layers;
+mod grid_restore;
 mod h_state_ptrs;
 mod inpass_capture;
 mod midchunk_capture;
@@ -55,12 +56,18 @@ impl TransformerModel {
     /// 2026-10-03: `None` as well when the in-pass capture replaces the split
     /// (`METRALE_GLM_SSM_INPASS_CAPTURE=1`, `inpass_capture.rs`), so the scheduler and this
     /// dispatcher run the cache-off pass sequence.
+    /// 2026-10-03: `None` as well under the absolute grid (`METRALE_PREFIX_GRID_RESTORE=1`,
+    /// `grid_restore.rs`), whose chunks end on multiples of `G` and carry the snapshots.
     pub(in crate::model) fn prefill_tail_split_dispatch(&self, tokens: &[u32]) -> Option<usize> {
         if !self.tail_split_eligible(tokens) {
             return None;
         }
-        let cut =
-            crate::prefill_plan::tail_split_point(tokens.len(), self.kv_cache.lock().block_size());
+        let bs = self.kv_cache.lock().block_size();
+        // 2026-10-03: The absolute grid (`grid_restore.rs`) replaces the tail split.
+        if self.prefix_grid_for_bs(tokens, bs).is_some() {
+            return None;
+        }
+        let cut = crate::prefill_plan::tail_split_point(tokens.len(), bs);
         crate::prefill_plan::effective_split(cut, self.inpass_ssm_capture_active())
     }
 
@@ -155,6 +162,21 @@ impl TransformerModel {
             stream,
             None,
         )?;
+        // 2026-10-03: Under the grid the scheduler plans every chunk with `grid_chunk_len`
+        // (`Model::prefill_grid`); a chunk off that plan means a caller bypassed it, and a warm
+        // pass then no longer matches a cold one (the restore itself stays correct).
+        if seq.prefix_grid_refs
+            && let Some(g) = self.prefix_grid_active_bs(kv_cache.block_size())
+            && chunk_len != crate::prefill_plan::grid_chunk_len(chunk_start, total, g)
+        {
+            static W: std::sync::Once = std::sync::Once::new();
+            W.call_once(|| {
+                tracing::warn!(
+                    "grid restore: prefill chunk [{chunk_start}, +{chunk_len}) of {total} is off \
+                     the {g}-token grid; warm and cold passes may differ"
+                )
+            });
+        }
 
         if std::env::var("METRALE_SSM_SAVE_DUMP").is_ok() {
             self.ssm_pool.debug_state_checksum(

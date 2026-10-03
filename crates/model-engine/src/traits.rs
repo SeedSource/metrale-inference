@@ -133,6 +133,12 @@ pub struct SequenceState {
     /// at chunk 0; `finalize_last` reads it to decide whether the prompt-end leaf gets its own
     /// snapshot (`prefill_b::exact_leaf`).
     pub tail_checkpoint_tokens: Option<usize>,
+    /// 2026-10-03: Set by the chunk-0 prefix lookup when the absolute prefill grid applies to
+    /// this prompt (`METRALE_PREFIX_GRID_RESTORE=1`, `prefill_b/grid_restore.rs`). The sequence
+    /// then holds radix refs on exactly `prefix_ref_tokens` (the lookup's match, widened by the
+    /// prefill-end grid insert), and `free_sequence` releases those; `cache_sequence` and decode
+    /// checkpoints are skipped. `false` keeps the previous accounting.
+    pub prefix_grid_refs: bool,
     /// 2026-09-25: Length of the prefix, from position 0, whose paged KV this sequence has written
     /// or validly reused, updated per chunk by `prefill_b_proc_range`. The prefill-end cache
     /// insert and checkpoint save cover at most `kv_valid_tokens / block_size` complete blocks, so
@@ -213,6 +219,7 @@ impl SequenceState {
             prefix_ref_tokens: Vec::new(),
             prefix_lookup_applied: false,
             tail_checkpoint_tokens: None,
+            prefix_grid_refs: false,
             prefix_lookup_skip: false,
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,

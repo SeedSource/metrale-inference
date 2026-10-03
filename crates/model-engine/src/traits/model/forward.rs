@@ -202,4 +202,12 @@ pub trait ModelForward: ModelStreams {
     fn prefill_tail_split(&self, _tokens: &[u32]) -> Option<usize> {
         None
     }
+
+    /// 2026-10-03: The absolute prefill grid size `G` for `tokens`
+    /// (`METRALE_PREFIX_GRID_RESTORE=1`), or `None`. With `Some(G)` the scheduler plans every
+    /// chunk with `prefill_plan::plan_chunk_len_grid`, so non-last chunks end on multiples of
+    /// `G`. Default `None`.
+    fn prefill_grid(&self, _tokens: &[u32]) -> Option<usize> {
+        None
+    }
 }

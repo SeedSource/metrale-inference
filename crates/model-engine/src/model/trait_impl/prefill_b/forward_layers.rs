@@ -123,7 +123,10 @@ impl TransformerModel {
             decode_step: false,
             // 2026-09-25: After a snapshot restore, GDN layers do not take the FLA
             // chunked kernel (`gdn_exact_replay` in qwen3_ssm/trait_prefill_recur.rs).
-            gdn_exact_replay: marconi_skip,
+            // 2026-10-03: Under the absolute grid a restore lands on a chunk start and the pass
+            // must be the cold pass, so the kernel choice is the cold one (`grid_restore.rs`).
+            // Read only by the Qwen GDN layers; GLM-5.3 KDA ignores it.
+            gdn_exact_replay: marconi_skip && !seq.prefix_grid_refs,
             gdn_write_on_accept: false,
             // 2026-09-25: Hash-MoE reads this chunk's token ids, staged by
             // `prefill_b_embed_chunk_at`.

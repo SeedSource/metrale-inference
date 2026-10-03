@@ -255,3 +255,34 @@ fn the_cursor_cannot_be_moved_forward_by_a_restore() {
     ingest(&gpu, &mut st, 10, 1);
     assert!(st.rewind_to(11).is_err(), "forward rewind is still a bug");
 }
+
+/// 2026-10-03: `snapshot_blob_prefix(n)` on a state holding more rows is byte-identical to the
+/// `snapshot_blob` of the same state with its cursor at `n`, restores to exactly the first `n`
+/// rows, and refuses a prefix longer than the state.
+#[test]
+fn a_prefix_blob_equals_the_blob_taken_at_that_length() {
+    let gpu = MockGpuBackend::new();
+    let mut st = Glm5NextDsaState::alloc(&gpu, &cfg(4_096)).unwrap();
+    ingest(&gpu, &mut st, 2_000, 0x3C);
+    let full_len = st.len();
+    for n in [0usize, 1, 640, 1_999, 2_000] {
+        let prefix = st.snapshot_blob_prefix(n, &gpu, 0).unwrap();
+        assert_eq!(st.len(), full_len, "taking a prefix leaves the cursor alone");
+        st.rewind_to(n).unwrap();
+        let at_n = st.snapshot_blob(&gpu, 0).unwrap();
+        st.advance(full_len - n).unwrap();
+        assert_eq!(prefix, at_n, "prefix blob == blob at cursor {n}");
+
+        let mut other = Glm5NextDsaState::alloc(&gpu, &cfg(4_096)).unwrap();
+        ingest(&gpu, &mut other, 3_000, 0x77);
+        other.restore_blob(&prefix, &gpu, 0).unwrap();
+        assert_eq!(other.len(), n);
+        assert_eq!(other.snapshot_blob(&gpu, 0).unwrap(), at_n, "round trip at {n}");
+    }
+    assert_eq!(
+        st.snapshot_blob_prefix(full_len, &gpu, 0).unwrap(),
+        st.snapshot_blob(&gpu, 0).unwrap(),
+        "the full prefix is snapshot_blob"
+    );
+    assert!(st.snapshot_blob_prefix(full_len + 1, &gpu, 0).is_err());
+}

@@ -375,6 +375,18 @@ impl LayerCapabilities for Glm5NextLayer {
     fn is_ssm_layer(&self) -> bool {
         matches!(self.mixer, Glm5NextMixer::Kda { .. })
     }
+
+    /// 2026-10-03: True for a KDA text layer whose prefill runs `decode_k` (`attn_mixer`):
+    /// sub-chunks wider than one row and neither chunked KDA arm. `decode_k_capture` then copies
+    /// the state out at the in-pass capture point without changing a launch's arithmetic. The
+    /// MTP block (`mhc: None`) and a one-row prefill walk `forward_one`, which never captures.
+    fn inpass_ssm_capture_supported(&self) -> bool {
+        matches!(self.mixer, Glm5NextMixer::Kda { .. })
+            && self.mhc.is_some()
+            && prefill_rows() > 1
+            && !kda_chunk_prefill()
+            && !crate::glm5next_kda::kda_prefill_chunked_tc()
+    }
 }
 
 impl LayerWeightSetup for Glm5NextLayer {}
@@ -453,6 +465,32 @@ impl LayerAuxState for Glm5NextLayer {
                 )
             })?;
         Ok(Some(st.snapshot_blob(gpu, stream)?))
+    }
+
+    /// 2026-10-03: The DSA indexer rows `[0, rows)` (`Glm5NextDsaState::snapshot_blob_prefix`):
+    /// row `p` is written once, by the pass over position `p`, so after a pass that ran past
+    /// `rows` the first `rows` rows are what a snapshot taken at `rows` holds. `None` on a KDA
+    /// layer, as `snapshot_aux`.
+    fn snapshot_aux_prefix(
+        &self,
+        state: &dyn LayerState,
+        rows: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        if !matches!(self.mixer, Glm5NextMixer::Dsa(_)) {
+            return Ok(None);
+        }
+        let st = state
+            .as_any()
+            .downcast_ref::<Glm5NextDsaState>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GLM layer {}: a DSA mixer was handed state that is not a Glm5NextDsaState",
+                    self.layer_idx
+                )
+            })?;
+        Ok(Some(st.snapshot_blob_prefix(rows, gpu, stream)?))
     }
 
     /// 2026-09-25: Errors on a KDA layer, whose state travels with the SSM snapshot. On a DSA

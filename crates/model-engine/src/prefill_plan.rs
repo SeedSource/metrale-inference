@@ -31,6 +31,50 @@ pub fn min_tail_rows() -> usize {
         .unwrap_or(DEFAULT_MIN_TAIL_ROWS)
 }
 
+/// 2026-10-03: Whether a `METRALE_GLM_SSM_INPASS_CAPTURE` value asks for the in-pass tail
+/// snapshot: `1` only.
+pub fn inpass_capture_requested(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// 2026-10-03: `METRALE_GLM_SSM_INPASS_CAPTURE=1` (race #69): instead of splitting the prefill at
+/// `tail_split_point`, take the SSM snapshot there inside the one pass, so a prompt runs the
+/// cache-off pass sequence with the prefix cache on (`TransformerModel::inpass_ssm_capture_active`
+/// adds the per-model condition). Off unless set to `1`. Read once per process.
+pub fn inpass_capture_lever() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = inpass_capture_requested(
+            std::env::var("METRALE_GLM_SSM_INPASS_CAPTURE")
+                .ok()
+                .as_deref(),
+        );
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_SSM_INPASS_CAPTURE=1 - the prefix-cache tail snapshot is captured \
+                 inside the prefill pass; prompts are no longer split at the tail split point"
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-03: The split point the dispatcher and the scheduler use: `cut` (the model's
+/// `tail_split_point` for this prompt, `None` when it does not split), or `None` when the
+/// in-pass capture replaces the split. With the split gone, `plan_chunk_len` and
+/// `prefill_chunk_dispatch` follow the cache-off chunk grid exactly.
+pub fn effective_split(cut: Option<usize>, inpass_capture: bool) -> Option<usize> {
+    if inpass_capture { None } else { cut }
+}
+
+/// 2026-10-03: Whether a prefill pass over `[proc_start, proc_start + proc_count)` must capture
+/// the in-pass snapshot at `cut`: only when it strictly spans `cut`. A pass that ends at `cut` is
+/// a non-last chunk whose end `save_checkpoint` saves (`is_prompt_tail_end`), and one that starts
+/// at or after `cut` begins from a state at or past it.
+pub fn inpass_capture_spans(cut: usize, proc_start: usize, proc_count: usize) -> bool {
+    proc_start < cut && cut < proc_start + proc_count
+}
+
 /// 2026-10-02: The tail split point of a `total`-token prompt with the env minimum tail.
 pub fn tail_split_point(total: usize, block_size: usize) -> Option<usize> {
     tail_split_point_min(total, block_size, min_tail_rows())

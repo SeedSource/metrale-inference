@@ -33,6 +33,7 @@ mod exact_leaf;
 mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
+mod inpass_capture;
 mod midchunk_capture;
 mod prefix_lookup;
 mod prefix_reserve;
@@ -51,16 +52,28 @@ impl TransformerModel {
     /// snapshot lands at `prefill_plan::tail_split_point`: `Some` for an SSM model with
     /// snapshots and prefix caching on and no vision pads in the prompt.
     /// `METRALE_NO_TAIL_SPLIT=1` turns the split off.
+    /// 2026-10-03: `None` as well when the in-pass capture replaces the split
+    /// (`METRALE_GLM_SSM_INPASS_CAPTURE=1`, `inpass_capture.rs`), so the scheduler and this
+    /// dispatcher run the cache-off pass sequence.
     pub(in crate::model) fn prefill_tail_split_dispatch(&self, tokens: &[u32]) -> Option<usize> {
-        if self.config.num_ssm_layers() == 0
+        if !self.tail_split_eligible(tokens) {
+            return None;
+        }
+        let cut =
+            crate::prefill_plan::tail_split_point(tokens.len(), self.kv_cache.lock().block_size());
+        crate::prefill_plan::effective_split(cut, self.inpass_ssm_capture_active())
+    }
+
+    /// 2026-10-03: Whether this prompt gets a prefix-cache tail snapshot at all: an SSM model
+    /// with snapshots and prefix caching on, `METRALE_NO_TAIL_SPLIT` not `1`, and no vision
+    /// pads in the prompt (the conditions `prefill_tail_split_dispatch` has always checked, in
+    /// the same order). Takes no lock.
+    pub(in crate::model) fn tail_split_eligible(&self, tokens: &[u32]) -> bool {
+        !(self.config.num_ssm_layers() == 0
             || !self.ssm_snapshots.is_enabled()
             || !self.prefix_cache.is_active()
             || std::env::var("METRALE_NO_TAIL_SPLIT").as_deref() == Ok("1")
-            || self.tokens_have_vision_pad(tokens)
-        {
-            return None;
-        }
-        crate::prefill_plan::tail_split_point(tokens.len(), self.kv_cache.lock().block_size())
+            || self.tokens_have_vision_pad(tokens))
     }
 
     pub(super) fn prefill_chunk_dispatch(
@@ -235,17 +248,29 @@ impl TransformerModel {
         // 2026-09-25: Mid-chunk tail SSM capture is planned before the forward
         // pass, which uses the plan. `None` (flag off, or the pass does not span
         // `tb`, among other cases) means no capture.
-        let midcap_plan = self.prepare_midchunk_capture(
+        // 2026-10-03: Under `METRALE_GLM_SSM_INPASS_CAPTURE=1` the in-pass tail-split capture
+        // (`inpass_capture.rs`) takes the plan's place; with the lever off it is `None` and
+        // the mid-chunk plan is made as before.
+        let midcap_plan = match self.prepare_inpass_capture(
             tokens,
             seq,
             &mut kv_cache,
             proc_start,
             proc_count,
-            stream,
-        );
+        ) {
+            Some(plan) => Some(plan),
+            None => self.prepare_midchunk_capture(
+                tokens,
+                seq,
+                &mut kv_cache,
+                proc_start,
+                proc_count,
+                stream,
+            ),
+        };
 
         // 2026-09-25: Forward through all layers.
-        self.prefill_b_forward_layers(
+        let forward = self.prefill_b_forward_layers(
             seq,
             &mut kv_cache,
             chunk_start,
@@ -262,12 +287,23 @@ impl TransformerModel {
             needs_paged,
             midcap_plan.as_ref(),
             stream,
-        )?;
+        );
+        // 2026-10-03: A failed pass returns the in-pass slot it reserved.
+        if let Some(plan) = midcap_plan.as_ref().filter(|p| p.inpass && forward.is_err()) {
+            self.ssm_snapshots.free(plan.snap_slot);
+        }
+        forward?;
 
         // 2026-09-25: Register the captured slots once the pass has written the
         // `tb` state into them.
+        // 2026-10-03: The in-pass capture registers as an intermediate checkpoint, before
+        // `finalize_last` inserts the whole prompt, as the split's first pass did.
         if let Some(plan) = midcap_plan.as_ref() {
-            self.finalize_midchunk_capture(tokens, seq, plan);
+            if plan.inpass {
+                self.finalize_inpass_capture(tokens, seq, &mut kv_cache, plan, stream);
+            } else {
+                self.finalize_midchunk_capture(tokens, seq, plan);
+            }
         }
 
         // 2026-09-25: Append this chunk's tokens; the early-return arm above

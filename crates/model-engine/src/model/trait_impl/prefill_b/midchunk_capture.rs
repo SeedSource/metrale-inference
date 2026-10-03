@@ -68,12 +68,23 @@ pub(in crate::model) struct MidCapturePlan {
     pub h_dsts_early: Vec<DevicePtr>,
     /// 2026-09-25: Per-SSM-layer conv_state destination for the in-pass `tb - bs` capture.
     pub conv_dsts_early: Vec<DevicePtr>,
+    /// 2026-10-03: True for an in-pass tail-split capture (`inpass_capture.rs`,
+    /// `METRALE_GLM_SSM_INPASS_CAPTURE=1`): `tb` is then `prefill_plan::tail_split_point`, the
+    /// slot is registered as an intermediate checkpoint (`finalize_inpass_capture`), and the
+    /// layers find their ordinal by `live_h`. False for the tail mid-chunk plan above.
+    pub inpass: bool,
+    /// 2026-10-03: Per SSM ordinal, this sequence's live h_state pool address; empty unless
+    /// `inpass`.
+    pub live_h: Vec<DevicePtr>,
+    /// 2026-10-03: SSM layers that issued their in-pass capture copies during the pass
+    /// (`MidchunkCapture::captured`).
+    pub captured: std::sync::atomic::AtomicUsize,
 }
 
 impl TransformerModel {
     /// 2026-09-25: Reserve a tail snapshot slot, reclaiming one from the prefix cache when
     /// the pool is full. `None` when the pool is full and the reclaim fails.
-    fn reserve_snapshot_slot(
+    pub(super) fn reserve_snapshot_slot(
         &self,
         session_hash: u64,
         kv_cache: &mut PagedKvCache,
@@ -253,6 +264,9 @@ impl TransformerModel {
             tb_early,
             h_dsts_early,
             conv_dsts_early,
+            inpass: false,
+            live_h: Vec::new(),
+            captured: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 

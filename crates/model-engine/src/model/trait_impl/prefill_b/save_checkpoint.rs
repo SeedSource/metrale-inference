@@ -118,6 +118,34 @@ impl TransformerModel {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }
 
+        self.prefill_b_register_checkpoint(
+            tokens,
+            seq,
+            kv_cache,
+            end_token,
+            snap_id,
+            is_prompt_tail,
+        );
+        Ok(())
+    }
+
+    /// 2026-10-03: Register snapshot `snap_id`, which holds the state after `end_token` tokens
+    /// (and its aux blobs, already attached), as an intermediate checkpoint: the K/V insert of
+    /// `tokens[..end_token]` and `insert_intermediate_snapshot`, or free it when the insert is
+    /// skipped. Records `seq.tail_checkpoint_tokens` for a prompt-tail end. Moved out of
+    /// `prefill_b_save_checkpoint` unchanged so the in-pass capture (`inpass_capture.rs`)
+    /// registers its snapshot the same way.
+    pub(in crate::model) fn prefill_b_register_checkpoint(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        kv_cache: &mut PagedKvCache,
+        end_token: usize,
+        snap_id: usize,
+        is_prompt_tail: bool,
+    ) {
+        let bs = kv_cache.block_size();
+        let end_block = end_token / bs;
         let boundary_tokens = &tokens[..end_token];
         // 2026-09-25: No insert when the HSS window has slid (`hss_window_start() > 0`:
         // the front of the prefix has no physical blocks) or the block table is shorter
@@ -126,14 +154,14 @@ impl TransformerModel {
         let skip_boundary_insert = seq.hss_window_start() > 0 || end_block > seq.block_table.len();
         if skip_boundary_insert {
             self.ssm_snapshots.free(snap_id);
-            return Ok(());
+            return;
         }
         let boundary_blocks = &seq.block_table[..end_block];
         // 2026-09-25: No insert for a prefix with vision pads: the pad tokens are the same
         // for different images, so a later hit would restore another image's state.
         if self.tokens_have_vision_pad(boundary_tokens) {
             self.ssm_snapshots.free(snap_id);
-            return Ok(());
+            return;
         }
         let boundary_disk = if seq.disk_block_ids.len() >= end_block {
             &seq.disk_block_ids[..end_block]
@@ -173,6 +201,5 @@ impl TransformerModel {
             snap_id,
             end_block,
         );
-        Ok(())
     }
 }

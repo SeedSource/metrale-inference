@@ -25,6 +25,26 @@ pub trait LayerAuxState {
         Ok(None)
     }
 
+    /// 2026-10-03: [`Self::snapshot_aux`] as of the first `rows` positions of the sequence, for
+    /// an SSM snapshot captured inside a prefill pass that ran past `rows`
+    /// (model-engine `prefill_b/inpass_capture.rs`). The default can only answer for a layer
+    /// with no aux blob: it returns `Ok(None)` when `snapshot_aux` does, and an error when
+    /// `snapshot_aux` returns a blob it cannot cut to `rows`.
+    fn snapshot_aux_prefix(
+        &self,
+        state: &dyn LayerState,
+        rows: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.snapshot_aux(state, gpu, stream)? {
+            None => Ok(None),
+            Some(_) => anyhow::bail!(
+                "snapshot_aux_prefix({rows}): this layer's aux blob cannot be cut to a prefix"
+            ),
+        }
+    }
+
     /// 2026-09-25: True when this layer produces aux state. When any layer does, restore
     /// sites decline a snapshot that has no aux blobs (`requires_aux_state`).
     fn has_aux_state(&self) -> bool {

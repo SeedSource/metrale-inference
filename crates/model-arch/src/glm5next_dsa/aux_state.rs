@@ -54,7 +54,27 @@ impl Glm5NextDsaState {
     /// prefix-cache snapshot. Rows past `len` were never written or are
     /// unreachable (`rewind_to` leaves them in place).
     pub fn snapshot_blob(&self, gpu: &dyn GpuBackend, stream: u64) -> Result<Vec<u8>> {
-        let len = self.len();
+        self.snapshot_blob_prefix(self.len(), gpu, stream)
+    }
+
+    /// 2026-10-03: Serialize rows `[0, rows)` only, as a blob of `rows` rows: the blob
+    /// `snapshot_blob` returns for a state whose cursor is at `rows`. For an SSM snapshot
+    /// captured inside a prefill pass that continued past `rows` (model-engine
+    /// `prefill_b/inpass_capture.rs`): rows are written once each, by the pass over their
+    /// position, so the first `rows` rows are unchanged by the rest of the pass. Refuses
+    /// `rows > len`.
+    pub fn snapshot_blob_prefix(
+        &self,
+        rows: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            rows <= self.len(),
+            "DSA aux prefix of {rows} rows past the {} rows this state holds",
+            self.len()
+        );
+        let len = rows;
         let d = self.index_head_dim();
         let key_bytes = len * d * 2;
 

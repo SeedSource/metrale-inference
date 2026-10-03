@@ -100,6 +100,11 @@ impl TransformerModel {
             cap_local_early: p.cap_local_early,
             h_dsts_early: &p.h_dsts_early,
             conv_dsts_early: &p.conv_dsts_early,
+            // 2026-10-03: In-pass capture fields (`inpass_capture.rs`); `live_h` is empty for
+            // the tail mid-chunk plan, whose layers use the counter above.
+            seq_pos_start: effective_seq_len_start,
+            live_h: &p.live_h,
+            captured: &p.captured,
         });
 
         let ctx = ForwardContext {

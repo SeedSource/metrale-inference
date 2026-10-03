@@ -53,19 +53,30 @@ impl Glm5NextLayer {
                 } else {
                     Vec::new()
                 };
+                // 2026-10-03: An in-pass snapshot capture (`METRALE_GLM_SSM_INPASS_CAPTURE=1`)
+                // whose point falls in this prefill call's rows; `None` on every other call and
+                // whenever the pass plans no in-pass capture.
+                let capture = if is_prefill && !take_snapshots {
+                    ctx.midchunk_capture
+                        .as_ref()
+                        .and_then(|c| c.inpass_split(seq_len, k, st.h_state))
+                } else {
+                    None
+                };
                 Some((
                     KdaSeqState {
                         conv: st.conv_state,
                         recurrent: st.h_state,
                     },
                     snaps,
+                    capture,
                 ))
             }
             Glm5NextMixer::Dsa(_) => None,
         };
         let t = profile::start();
         let attn_out = match (&self.mixer, &kda_ctx) {
-            (Glm5NextMixer::Kda { layer, ws, .. }, Some((kda, snaps))) => {
+            (Glm5NextMixer::Kda { layer, ws, .. }, Some((kda, snaps, capture))) => {
                 // 2026-09-25: The chunked scan runs only for a prefill sub-chunk of more than
                 // one row that asked for no intermediates: it never materialises the state
                 // after an interior row, and its order differs from `decode_k`'s, which a
@@ -78,6 +89,14 @@ impl Glm5NextLayer {
                     layer.prefill_chunked_tc(gpu, normed, k, kda, ws, stream)?;
                 } else if chunkable && kda_chunk_prefill() {
                     layer.prefill(gpu, normed, k, kda, ws, stream)?;
+                } else if let (Some(cap), Some(mc)) = (capture, ctx.midchunk_capture.as_ref()) {
+                    // 2026-10-03: The same launches as `decode_k` below, with the state copied
+                    // into the reserved snapshot slot after row `cap.row - 1`. The chunked arms
+                    // above never capture; the model enables the in-pass capture only when
+                    // neither runs (`inpass_ssm_capture_supported`), and without this count the
+                    // engine registers nothing.
+                    layer.decode_k_capture(gpu, normed, k, kda, ws, cap, stream)?;
+                    mc.captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     layer.decode_k(gpu, normed, k, kda, ws, snaps, stream)?;
                 }

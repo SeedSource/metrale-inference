@@ -128,4 +128,14 @@ pub trait LayerCapabilities {
     fn uses_ssm_pool(&self) -> bool {
         true
     }
+
+    /// 2026-10-03: True when this SSM layer's prefill honours an in-pass capture
+    /// (`MidchunkCapture::inpass_split`): it writes its recurrent and conv state as of the
+    /// capture point into the reserved snapshot slot, inside the pass, bit-identical to the
+    /// state the pass itself carries there, and counts itself in `MidchunkCapture::captured`.
+    /// The model enables `METRALE_GLM_SSM_INPASS_CAPTURE` only when every SSM layer answers
+    /// true (model-engine `prefill_b/inpass_capture.rs`). Default false.
+    fn inpass_ssm_capture_supported(&self) -> bool {
+        false
+    }
 }

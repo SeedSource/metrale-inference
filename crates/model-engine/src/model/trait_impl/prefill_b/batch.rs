@@ -298,8 +298,18 @@ impl TransformerModel {
 
                 self.gpu.synchronize(stream)?;
 
+                // 2026-10-03: The in-pass tail-split capture (`inpass_capture.rs`), `None`
+                // unless `METRALE_GLM_SSM_INPASS_CAPTURE=1`.
+                let inpass_plan = self.prepare_inpass_capture(
+                    tokens,
+                    seq,
+                    &mut kv_cache,
+                    proc_start,
+                    proc_count,
+                );
+
                 // 2026-09-25: Forward through all layers.
-                self.prefill_b_forward_layers(
+                let forward = self.prefill_b_forward_layers(
                     seq,
                     &mut kv_cache,
                     chunk_start,
@@ -315,9 +325,18 @@ impl TransformerModel {
                     use_mrope,
                     needs_paged,
                     // 2026-09-25: No mid-chunk tail capture on this path.
-                    None,
+                    // 2026-10-03: Only the in-pass capture, when planned.
+                    inpass_plan.as_ref(),
                     stream,
-                )?;
+                );
+                if let Some(plan) = inpass_plan.as_ref() {
+                    if forward.is_err() {
+                        self.ssm_snapshots.free(plan.snap_slot);
+                    } else {
+                        self.finalize_inpass_capture(tokens, seq, &mut kv_cache, plan, stream);
+                    }
+                }
+                forward?;
 
                 // 2026-09-25: Update the sequence state.
                 seq.tokens

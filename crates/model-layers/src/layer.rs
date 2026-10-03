@@ -361,6 +361,69 @@ pub struct MidchunkCapture<'a> {
     pub h_dsts_early: &'a [DevicePtr],
     /// 2026-09-25: Per-SSM-layer conv_state destination in the `tb - block_size` slot.
     pub conv_dsts_early: &'a [DevicePtr],
+    /// 2026-10-03: Absolute token position of the pass's row 0 (`effective_seq_len_start`),
+    /// so a layer that runs its rows in several calls can place `cap_local` from the `seq_len`
+    /// each call is handed (`Self::inpass_split`).
+    pub seq_pos_start: usize,
+    /// 2026-10-03: In-pass capture by pool address (`METRALE_GLM_SSM_INPASS_CAPTURE=1`,
+    /// model-engine `prefill_b/inpass_capture.rs`): per SSM ordinal, the sequence's live
+    /// h_state pool address. A layer finds its ordinal as the index of its own
+    /// `SsmLayerState::h_state` here instead of taking one from `ssm_layer_counter`. Empty for
+    /// the tail mid-chunk plan, whose layers ignore the three fields below.
+    pub live_h: &'a [DevicePtr],
+    /// 2026-10-03: Incremented once by each SSM layer that issued its in-pass capture copies;
+    /// the engine registers the snapshot only when every SSM layer did.
+    pub captured: &'a std::sync::atomic::AtomicUsize,
+}
+
+/// 2026-10-03: Where one call of an SSM layer's prefill captures an in-pass snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InpassSplit {
+    /// 2026-10-03: Rows of this call to run before the capture, `1..=k`: the captured state is
+    /// the state after row `row - 1` of the call.
+    pub row: usize,
+    /// 2026-10-03: This layer's h_state destination in the reserved snapshot slot.
+    pub h_dst: DevicePtr,
+    /// 2026-10-03: This layer's conv_state destination in the reserved snapshot slot.
+    pub conv_dst: DevicePtr,
+    /// 2026-10-03: Bytes of h_state to copy (the snapshot pool's `h_bytes`).
+    pub h_bytes: usize,
+    /// 2026-10-03: Bytes of conv_state to copy (the snapshot pool's `conv_bytes`).
+    pub conv_bytes: usize,
+}
+
+impl MidchunkCapture<'_> {
+    /// 2026-10-03: For an in-pass plan (`live_h` non-empty), the split of one prefill call over
+    /// `k` rows starting at absolute position `seq_len`, for the layer whose live h_state is
+    /// `h_state`: `Some` exactly when the capture point `seq_pos_start + cap_local` lies in
+    /// `(seq_len, seq_len + k]` and `h_state` is one of `live_h`. Over calls that tile a pass,
+    /// at most one returns `Some` per layer.
+    pub fn inpass_split(
+        &self,
+        seq_len: usize,
+        k: usize,
+        h_state: DevicePtr,
+    ) -> Option<InpassSplit> {
+        if self.live_h.is_empty() {
+            return None;
+        }
+        let row = inpass_split_row(self.seq_pos_start + self.cap_local, seq_len, k)?;
+        let ord = self.live_h.iter().position(|p| *p == h_state)?;
+        Some(InpassSplit {
+            row,
+            h_dst: *self.h_dsts.get(ord)?,
+            conv_dst: *self.conv_dsts.get(ord)?,
+            h_bytes: self.h_bytes,
+            conv_bytes: self.conv_bytes,
+        })
+    }
+}
+
+/// 2026-10-03: Rows before the capture point `cut` (absolute) in a call over positions
+/// `[seq_len, seq_len + k)`: `Some(cut - seq_len)` when `seq_len < cut <= seq_len + k`, else
+/// `None`. The state after `cut` tokens is the state after row `cut - seq_len - 1` of the call.
+pub fn inpass_split_row(cut: usize, seq_len: usize, k: usize) -> Option<usize> {
+    (seq_len < cut && cut <= seq_len + k).then(|| cut - seq_len)
 }
 
 /// 2026-09-25: MoE-LoRA fold decision for one forward pass. One MoE adapter is active at

@@ -73,6 +73,32 @@ impl LayerAuxState for Glm5NextLayer {
         Ok(Some(st.snapshot_blob(gpu, stream)?))
     }
 
+    /// 2026-10-03: The DSA indexer rows `[0, rows)` (`Glm5NextDsaState::snapshot_blob_prefix`):
+    /// row `p` is written once, by the pass over position `p`, so after a pass that ran past
+    /// `rows` the first `rows` rows are what a snapshot taken at `rows` holds. `None` on a KDA
+    /// layer, as `snapshot_aux`.
+    fn snapshot_aux_prefix(
+        &self,
+        state: &dyn LayerState,
+        rows: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        if !matches!(self.mixer, Glm5NextMixer::Dsa(_)) {
+            return Ok(None);
+        }
+        let st = state
+            .as_any()
+            .downcast_ref::<Glm5NextDsaState>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GLM layer {}: a DSA mixer was handed state that is not a Glm5NextDsaState",
+                    self.layer_idx
+                )
+            })?;
+        Ok(Some(st.snapshot_blob_prefix(rows, gpu, stream)?))
+    }
+
     /// 2026-09-25: Errors on a KDA layer, whose state travels with the SSM snapshot. On a DSA
     /// layer it restores the blob through `Glm5NextDsaState::restore_blob`; `apply_aux_states`
     /// propagates any error.

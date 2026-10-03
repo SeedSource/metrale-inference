@@ -191,3 +191,146 @@ fn checkpoint_chunk_end_rule() {
     assert!(!is_checkpoint_chunk_end(8, 32772, BS, 16));
     assert!(!is_checkpoint_chunk_end(8192, 32772, 0, 16));
 }
+
+/// 2026-10-03: The passes a prompt runs in with the in-pass capture on: the scheduler and the
+/// dispatcher both see `effective_split(cut, true)`, so no last chunk is split. Returns the passes
+/// and the in-pass capture points (`inpass_capture_spans`).
+fn run_chunks_inpass(total: usize, first: usize, cont: usize) -> (Vec<(usize, usize)>, Vec<usize>) {
+    let cut = tail_split_point(total, BS);
+    let split = effective_split(cut, true);
+    let mut out = Vec::new();
+    let mut caps = Vec::new();
+    let mut off = 0;
+    while off < total {
+        let cap = if off == 0 { first } else { cont };
+        let len = plan_chunk_len(off, total, (total - off).min(cap), Some(BS), split);
+        assert!(len >= 1, "total={total} off={off}: empty chunk");
+        if let Some(c) = cut.filter(|&c| inpass_capture_spans(c, off, len)) {
+            caps.push(c);
+        }
+        out.push((off, off + len));
+        off += len;
+    }
+    (out, caps)
+}
+
+/// 2026-10-03: The cache-off pass sequence: no split anywhere.
+fn run_chunks_cache_off(total: usize, first: usize, cont: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off < total {
+        let cap = if off == 0 { first } else { cont };
+        let len = plan_chunk_len(off, total, (total - off).min(cap), Some(BS), None);
+        out.push((off, off + len));
+        off += len;
+    }
+    out
+}
+
+#[test]
+fn lever_parsing_and_effective_split() {
+    assert!(inpass_capture_requested(Some("1")));
+    for v in [None, Some("0"), Some(""), Some("true"), Some("on")] {
+        assert!(!inpass_capture_requested(v), "{v:?}");
+    }
+    assert_eq!(effective_split(Some(32512), false), Some(32512));
+    assert_eq!(effective_split(Some(32512), true), None);
+    assert_eq!(effective_split(None, false), None);
+    assert_eq!(effective_split(None, true), None);
+}
+
+#[test]
+fn inpass_capture_spans_only_a_pass_that_strictly_crosses_the_cut() {
+    assert!(inpass_capture_spans(640, 0, 1000));
+    assert!(inpass_capture_spans(640, 639, 2));
+    assert!(!inpass_capture_spans(640, 0, 640), "a pass ending at cut: save_checkpoint saves");
+    assert!(!inpass_capture_spans(640, 640, 100), "a pass starting at cut");
+    assert!(!inpass_capture_spans(640, 700, 100));
+    assert!(!inpass_capture_spans(640, 0, 0));
+}
+
+/// 2026-10-03: With the in-pass capture on, a prompt runs exactly the cache-off pass sequence,
+/// and the tail snapshot still lands at `tail_split_point`, exactly once: captured inside the
+/// one pass that crosses it, or saved at a non-last chunk end that falls on it.
+#[test]
+fn inpass_runs_the_cache_off_passes_and_still_snapshots_the_cut_once() {
+    for (first, cont) in [(8193, 8192), (67, 64), (65, 64), (72, 64), (64, 64), (130, 96)] {
+        for total in (1..=2600).chain([8192, 8193, 16385, 32251, 32768, 32772, 40000]) {
+            let (passes, caps) = run_chunks_inpass(total, first, cont);
+            assert_eq!(
+                passes,
+                run_chunks_cache_off(total, first, cont),
+                "total={total} first={first}: not the cache-off pass sequence"
+            );
+            let Some(cut) = tail_split_point(total, BS) else {
+                assert!(caps.is_empty());
+                continue;
+            };
+            let saves = passes[..passes.len() - 1]
+                .iter()
+                .filter(|&&(_, e)| e == cut && is_checkpoint_chunk_end(e, total, BS, 0))
+                .count();
+            assert_eq!(
+                caps.len() + saves,
+                1,
+                "total={total} first={first}: cut {cut} captured {} and saved {saves} times",
+                caps.len()
+            );
+        }
+    }
+}
+
+/// 2026-10-03: The warm lookup after an in-pass cold prefill restores at or past
+/// `tail_split_point` and within the match, as after the split prefill
+/// (`warm_restores_within_two_blocks_of_the_match_for_every_length`). On the cache-off grid a
+/// non-last chunk can also end on a deeper prompt-tail end (32768 for the 32772-token fixture at
+/// 8192-token chunks), which `save_checkpoint` saves as well.
+#[test]
+fn warm_lookup_after_an_inpass_cold_prefill_restores_at_the_cut() {
+    for (total, first, cont) in [(32772, 8193, 8192), (32251, 8193, 8192), (1000, 67, 64)] {
+        let tokens: Vec<u32> = (0..total as u32)
+            .map(|i| 1000 + (i * 7919) % 150_000)
+            .collect();
+        let blocks: Vec<u32> = (0..total.div_ceil(BS) as u32).collect();
+        let cache = RadixTree::new();
+        let (passes, caps) = run_chunks_inpass(total, first, cont);
+        let mut ends: Vec<usize> = passes[..passes.len() - 1]
+            .iter()
+            .map(|&(_, e)| e)
+            .filter(|&e| is_checkpoint_chunk_end(e, total, BS, 0))
+            .collect();
+        ends.extend(caps);
+        for (snap, end) in ends.into_iter().enumerate() {
+            let eb = end / BS;
+            cache.insert(&tokens[..end], &blocks[..eb], &[], BS, end, 0);
+            cache.insert_intermediate_snapshot(
+                &tokens[..end],
+                &blocks[..eb],
+                &[],
+                BS,
+                snap,
+                0,
+                end,
+                0,
+            );
+        }
+        cache.insert(&tokens, &blocks[..total / BS], &[], BS, 0, 0);
+        let m = cache.lookup(&tokens, BS, 0, 0);
+        assert!(m.ssm_snapshot.is_some(), "total={total}: no snapshot");
+        let cut = tail_split_point(total, BS).unwrap();
+        assert!(
+            m.ssm_snapshot_tokens >= cut && m.ssm_snapshot_tokens <= m.matched_tokens,
+            "total={total}: snap {}, cut {cut}, matched {}",
+            m.ssm_snapshot_tokens,
+            m.matched_tokens
+        );
+    }
+    // 2026-10-03: Where no non-last chunk ends near the tail, the restore is at the cut itself.
+    let (passes, caps) = run_chunks_inpass(32251, 8193, 8192);
+    assert_eq!(caps, vec![tail_split_point(32251, BS).unwrap()]);
+    assert!(
+        passes[..passes.len() - 1]
+            .iter()
+            .all(|&(_, e)| !is_checkpoint_chunk_end(e, 32251, BS, 0))
+    );
+}

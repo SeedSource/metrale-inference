@@ -617,6 +617,10 @@ fn main() -> Result<()> {
          {COS_MIN} vs decode_k; errors above are the quality evidence): {}",
         if all_ok { "PASS" } else { "FAIL" }
     );
+    // 2026-10-03: build-mt's contract needs a line that starts with the verdict token.
+    if all_ok {
+        eprintln!("PASS: flashkda_prefill_microtest (tolerance check, not exactness)");
+    }
     if !all_ok {
         std::process::exit(1);
     }

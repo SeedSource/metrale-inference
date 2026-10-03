@@ -90,8 +90,9 @@ __device__ __forceinline__ void fp8bm_body(
     unsigned int K,
     unsigned int out_stride
 ) {
-    // 2026-10-03: As[t * 128 + l * 2 + h]: half h (activations 8h..8h+7) of slab vector l
-    // of row t. Sized by the launch to m rows.
+    // 2026-10-03: As[t * 128 + h * 64 + l]: half h (activations 8h..8h+7) of slab vector l
+    // of row t, halves stored apart so a warp's 16-byte reads of one half are contiguous
+    // (no bank conflict). Sized by the launch to m rows.
     extern __shared__ uint4 fp8bm_As[];
 
     const unsigned int rows_per_y = (M + gridDim.y - 1) / gridDim.y;
@@ -125,7 +126,8 @@ __device__ __forceinline__ void fp8bm_body(
             const unsigned int t = idx / (2 * FP8BM_THREADS_PER_OUT);
             const unsigned int j = idx % (2 * FP8BM_THREADS_PER_OUT);
             if (base * 2 + j < K_VEC * 2) {
-                fp8bm_As[idx] = ((const uint4*)(A + (unsigned long long)t * K))[base * 2 + j];
+                fp8bm_As[t * 2 * FP8BM_THREADS_PER_OUT + (j & 1u) * FP8BM_THREADS_PER_OUT + (j >> 1)] =
+                    ((const uint4*)(A + (unsigned long long)t * K))[base * 2 + j];
             }
         }
         __syncthreads();
@@ -142,8 +144,8 @@ __device__ __forceinline__ void fp8bm_body(
             }
 
             for (unsigned int t = 0; t < m; t++) {
-                const uint4 a0 = fp8bm_As[t * 2 * FP8BM_THREADS_PER_OUT + lane * 2];
-                const uint4 a1 = fp8bm_As[t * 2 * FP8BM_THREADS_PER_OUT + lane * 2 + 1];
+                const uint4 a0 = fp8bm_As[t * 2 * FP8BM_THREADS_PER_OUT + lane];
+                const uint4 a1 = fp8bm_As[t * 2 * FP8BM_THREADS_PER_OUT + FP8BM_THREADS_PER_OUT + lane];
                 const unsigned int a_raw[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
                 float a = acc[t];
                 #pragma unroll

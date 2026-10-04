@@ -152,3 +152,31 @@ fn ordinary_content_untouched() {
         assert_eq!(d, "the tool ran");
     }
 }
+
+/// 2026-10-03: E1/L17. Replays the content-phase strip over token-sized deltas
+/// (as `handle_token_inner` feeds them: `delta` = newly decoded bytes of one token).
+fn replay(chunks: &[&str], inside: bool) -> String {
+    let mut out = String::new();
+    for &c in chunks {
+        let mut d = c.to_string();
+        strip_bare_role_literal(&mut d, inside);
+        out.push_str(&d);
+    }
+    out
+}
+
+#[test]
+fn role_word_split_outside_envelope_loses_word_before_fix() {
+    let whole = replay(&["a tool."], false);
+    let split = replay(&["a", " tool", "."], false);
+    println!("E1 L17 whole={whole:?} split={split:?}");
+    assert_eq!(whole, "a tool.");
+    assert_eq!(split, "a."); // FIXFLIP: want "a tool."
+    assert_eq!(replay(&["the", " user", " asked"], false), "the asked"); // FIXFLIP
+    assert_eq!(replay(&["I", " am", " an", " assistant"], false), "I am an"); // FIXFLIP
+}
+
+#[test]
+fn role_word_split_inside_envelope_is_preserved() {
+    assert_eq!(replay(&["a", " tool", "."], true), "a tool.");
+}

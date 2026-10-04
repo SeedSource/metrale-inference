@@ -371,4 +371,3 @@ fn zero_head_bytes_trims_m_and_ceil16_buffers() {
     // m already a multiple of 16: unchanged behaviour
     assert_eq!(zero_head_bytes(4096 * w, 4096, 1), w);
 }
-

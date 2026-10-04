@@ -17,6 +17,13 @@
 //! row therefore hands each row the inputs and output slot it had in the full pass. The
 //! exchange is a byte copy. GPU gate: `examples/glm5next_dsa_index_split_2rank.rs`.
 //!
+//! 2026-10-04: The full-width staged prefill (`decode_k_wide`) splits each `core_rows`
+//! sub-chunk's selection the same way under `METRALE_GLM_DSA_INDEX_SPLIT_WIDE=1`
+//! (`row_split_for`). Only the selection kernels are split there: the query-side projections
+//! (`wq_b`, `weights_proj`) run once over the whole window on cuBLASLt (the default,
+//! `METRALE_GLM_CUBLAS_PROJ`), whose per-row bytes depend on M (it picks its algorithm per
+//! shape, `gpu-runtime/src/cublaslt.rs`), so both ranks keep computing them for every row.
+//!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants:
 //! - Both ranks call `select_tokens_split` for the same `k` at the same point, or neither
@@ -86,6 +93,18 @@ impl RowSplit {
             ..*inputs
         }
     }
+}
+
+/// 2026-10-04: This rank's split of an exact `k`-row pass, with the communicator to swap
+/// over, when `on` and `comm` has two ranks; `None` otherwise and below two rows. Both ranks
+/// get `Some` for the same `k` or neither does (`on` is rank-agreed at startup).
+pub fn row_split_for(
+    comm: Option<&dyn CommBackend>,
+    on: bool,
+    k: usize,
+) -> Option<(RowSplit, &dyn CommBackend)> {
+    let comm = comm.filter(|c| on && c.world_size() == 2)?;
+    RowSplit::new(k, comm.rank()).map(|s| (s, comm))
 }
 
 /// 2026-10-01: Swap the two ranks' rows of a row-major buffer in place: send this rank's

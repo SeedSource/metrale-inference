@@ -7,6 +7,11 @@
 //! on a real `NcclBackend`, over the item sequence one staged layer issues: every attention
 //! sub-chunk, then every FFN window (`sub_chunks`, `ffn_windows`, 5400 tokens at 256 / 2048
 //! by default; each rank owns half of every sub-chunk, so every exchange runs both ways).
+//! 2026-10-04: With `--fw 1` (the default) the attention items are the full-width arm's
+//! `sub_chunks(tokens, ffn)` windows (`METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1`), and `--merge 1`
+//! (the default) merges the tail into the last FFN window as `METRALE_GLM_PREFILL_TAIL_MERGE=1`
+//! does; `--fw 0 --merge 0` is the 2026-10-01 sequence. The whole-layer gate (mHC, norms and
+//! the pass driver) is `glm5next_seq_parallel_layer_2rank`.
 //!
 //! Each rank holds a seeded BF16 partial for all `tokens` rows of `[tokens, 4096]`. Per item
 //! both arms first copy the item's partial rows into a work buffer (where a mixer or the MLP
@@ -64,6 +69,8 @@ struct Args {
     rows: usize,
     ffn: usize,
     reps: usize,
+    fw: bool,
+    merge: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -75,6 +82,8 @@ fn parse_args() -> Result<Args> {
         rows: 256,
         ffn: 2048,
         reps: 3,
+        fw: true,
+        merge: true,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -90,6 +99,8 @@ fn parse_args() -> Result<Args> {
             "--rows" => a.rows = v.parse()?,
             "--ffn" => a.ffn = v.parse()?,
             "--reps" => a.reps = v.parse()?,
+            "--fw" => a.fw = v.parse::<u8>()? != 0,
+            "--merge" => a.merge = v.parse::<u8>()? != 0,
             other => bail!("unknown argument {other}"),
         }
         i += 2;
@@ -97,7 +108,7 @@ fn parse_args() -> Result<Args> {
     if a.rank > 1 || a.peer.is_empty() || a.rows == 0 || a.tokens <= a.rows || a.reps == 0 {
         bail!(
             "usage: --rank 0|1 --peer <rank0 address> [--port P] [--tokens 5400 (> rows)] \
-             [--rows 256] [--ffn 2048] [--reps 3]"
+             [--rows 256] [--ffn 2048] [--reps 3] [--fw 1] [--merge 1]"
         );
     }
     Ok(a)
@@ -176,10 +187,16 @@ fn main() -> Result<()> {
     let send_recv_add = comm.all_reduce_is_send_recv_add();
 
     let subs = sub_chunks(a.tokens, a.rows);
-    let items: Vec<(usize, usize)> = subs
-        .iter()
-        .copied()
-        .chain(ffn_windows(&subs, a.ffn.max(a.rows), false, |_| true))
+    // 2026-10-04: The attention items: the sub-chunks, or the full-width windows.
+    let ffn = a.ffn.max(a.rows);
+    let attn = if a.fw && ffn > a.rows {
+        sub_chunks(a.tokens, ffn)
+    } else {
+        subs.clone()
+    };
+    let items: Vec<(usize, usize)> = attn
+        .into_iter()
+        .chain(ffn_windows(&subs, ffn, a.merge, |_| true))
         .collect();
     let plan = SpPlan::new(&subs).context("no sub-chunks")?;
     let chunk = (0, a.tokens);
@@ -274,12 +291,14 @@ fn main() -> Result<()> {
     let (ma, mb) = (median(ta), median(tb));
 
     println!(
-        "rank {} tokens {} rows {} ffn {}: {} items, {own_rows} own rows in {} spans; \
-         send/recv+add all-reduce: {send_recv_add}",
+        "rank {} tokens {} rows {} ffn {} fw {} merge {}: {} items, {own_rows} own rows in {} \
+         spans; send/recv+add all-reduce: {send_recv_add}",
         a.rank,
         a.tokens,
         a.rows,
         a.ffn,
+        a.fw,
+        a.merge,
         items.len(),
         own.len()
     );

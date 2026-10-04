@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! 2026-10-01: The GLM-5.3 two-rank communication levers (split out of `levers.rs` for the
-//! 500-line cap): the DSA index-selection row split, the staged-prefill all-reduce overlap
-//! and the staged-prefill sequence parallelism. All default-off, all byte-identical by
-//! construction.
+//! 500-line cap): the DSA index-selection row split (sliced and full-width), the
+//! staged-prefill all-reduce overlap and the staged-prefill sequence parallelism. All
+//! default-off, all byte-identical by construction.
 //!
 //! Owner: model-arch (GLM-5.3).
 //! Invariants:
@@ -35,6 +35,33 @@ pub fn dsa_index_split() -> bool {
                 } else {
                     "NOT engaged"
                 }
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-04: `METRALE_GLM_DSA_INDEX_SPLIT_WIDE=1`: the `METRALE_GLM_DSA_INDEX_SPLIT` row
+/// split on the full-width staged prefill (`METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1`,
+/// `Glm5NextDsaLayer::decode_k_wide`), which the base lever does not reach: on two
+/// tensor-parallel ranks each `core_rows` sub-chunk's selection kernels (index scores, pool
+/// top-k, expansion) run for half its rows on each rank, and the ranks swap their token rows
+/// (`select_tokens_split`). The query projections (`wq_b`, `weights_proj`) still run over the
+/// whole window on both ranks: they are one cuBLASLt GEMM at M = window, whose per-row bytes
+/// depend on M. Byte-identical by construction (the base lever's argument); adds one grouped
+/// send/recv per DSA sub-chunk of two or more rows, so the ranks must agree on it (startup
+/// check). Independent of `METRALE_GLM_DSA_ROW_BATCH` / `METRALE_GLM_DSA_BATCH_QIDX`. Off
+/// unless set to `1`; read once.
+pub fn dsa_index_split_wide() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DSA_INDEX_SPLIT_WIDE").ok();
+        let on = parse_dsa_switch(raw.as_deref());
+        warn_unparsed_dsa_switch("METRALE_GLM_DSA_INDEX_SPLIT_WIDE", raw.as_deref());
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_DSA_INDEX_SPLIT_WIDE=1 - two ranks split each full-width DSA \
+                 prefill sub-chunk's index selection by rows (byte-identical by construction)"
             );
         }
         on
@@ -80,8 +107,13 @@ pub fn prefill_comm_overlap() -> bool {
 /// `METRALE_GLM_PREFILL_COMM_OVERLAP` while engaged. Inert under graph capture, without a
 /// two-rank send/recv all-reduce, or when the chunk outgrows the norm buffer. Off unless set
 /// to `1`; read once. Off under `METRALE_GLM_DFLASH=1` (startup warning): rank 0's DFlash
-/// capture reads every row of a tap layer's `hidden`, and `sp_back` collapses only the
+/// capture reads every row of a tap layer's `hidden`, and `SpRows::back` collapses only the
 /// rank's own rows.
+/// 2026-10-04: Composes with `METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1` (before, inert under it):
+/// the attention pass then runs per `rows_ffn` window and the MLP's dense GEMMs per window,
+/// exactly the full-width arm's calls; only the row-local mHC / norm work is split (ownership
+/// stays per sub-chunk). Splits nothing else: the router, MoE sort / combine and DSA indexer
+/// projections stay on every row (see the lever doc in `table_a.rs`).
 pub fn prefill_seq_parallel() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {
@@ -98,8 +130,8 @@ pub fn prefill_seq_parallel() -> bool {
         if on {
             tracing::warn!(
                 "METRALE_GLM_PREFILL_SEQ_PARALLEL=1 - staged GLM prefill splits mHC and norms \
-                 by rows across the two ranks (byte-identical by construction; see \
-                 steps/staged/sp.rs)"
+                 by rows across the two ranks, full-width arm included (byte-identical by \
+                 construction; see steps/staged/sp.rs)"
             );
         }
         on

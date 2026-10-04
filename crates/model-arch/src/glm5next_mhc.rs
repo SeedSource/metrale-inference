@@ -341,7 +341,60 @@ pub fn glm_hc_pre_sliced(
         norm_eps,
         hc_eps,
         slice_rows,
-        mhc_tokmajor() && num_tokens >= MHC_TOKMAJOR_MIN_ROWS,
+        mix_tokmajor_for_call(num_tokens),
+        stream,
+    )
+}
+
+/// 2026-10-04: The mix kernel request `glm_hc_pre` makes for a call of `call_rows` tokens:
+/// `METRALE_GLM_MHC_TOKMAJOR=1` and at least `MHC_TOKMAJOR_MIN_ROWS` tokens (the expression
+/// `glm_hc_pre_sliced` has always used, moved here unchanged).
+pub fn mix_tokmajor_for_call(call_rows: u32) -> bool {
+    mhc_tokmajor() && call_rows >= MHC_TOKMAJOR_MIN_ROWS
+}
+
+/// 2026-10-04: `glm_hc_pre` over `num_tokens` tokens that are a part of a `call_rows`-token
+/// `glm_hc_pre` call (the sequence-parallel staged prefill runs each rank's rows of a call,
+/// `glm5next_layer::seq_parallel`): the same `MHC_SLICE_ROWS` slicing, and the mix kernel the
+/// whole call would take (`mix_tokmajor_for_call(call_rows)`), so a narrow part (a tail half
+/// below `MHC_TOKMAJOR_MIN_ROWS`) still runs the kernel the call runs. Every row then gets the
+/// bytes it gets in the call: see `glm_hc_pre_sliced` (both mix kernels and `hc_finish` use
+/// `blockIdx.x` only as the token and never read `gridDim.x`, and the pointers are advanced
+/// by the part's first row). At `call_rows == num_tokens` this is `glm_hc_pre`.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_hc_pre_part(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextMhcKernels,
+    streams: DevicePtr,
+    w: &Glm5NextMhcSiteWeights,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    call_rows: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    glm_hc_pre_sliced_mix(
+        gpu,
+        kernels,
+        streams,
+        w,
+        y_out,
+        post_out,
+        comb_out,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        sinkhorn_iters,
+        norm_eps,
+        hc_eps,
+        MHC_SLICE_ROWS,
+        mix_tokmajor_for_call(call_rows),
         stream,
     )
 }

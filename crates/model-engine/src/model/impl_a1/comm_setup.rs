@@ -59,6 +59,7 @@ pub(super) fn assert_rank_levers_agree(
             ),
             // 2026-10-01: The sequence-parallel staged prefill replaces each all-reduce with
             // normed-row exchanges and reduce-scatters, a different collective sequence.
+            // 2026-10-04: Also under the full-width arm (FULLWIDTH_GEMM, checked above).
             (
                 "METRALE_GLM_PREFILL_SEQ_PARALLEL",
                 u64::from(metrale_model_arch::glm5next_layer::prefill_seq_parallel()),
@@ -68,6 +69,11 @@ pub(super) fn assert_rank_levers_agree(
             (
                 "METRALE_GLM_DSA_INDEX_SPLIT (with DSA_ROW_BATCH, DSA_BATCH_QIDX)",
                 u64::from(metrale_model_arch::glm5next_layer::dsa_index_split()),
+            ),
+            // 2026-10-04: The same swap per full-width DSA sub-chunk (`decode_k_wide`).
+            (
+                "METRALE_GLM_DSA_INDEX_SPLIT_WIDE",
+                u64::from(metrale_model_arch::glm5next_layer::dsa_index_split_wide()),
             ),
             // 2026-09-25: Performance only (the MLP reduces once per site
             // whichever arm runs); checked because the check is free.

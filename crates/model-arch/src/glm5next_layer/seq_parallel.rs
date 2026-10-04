@@ -7,19 +7,32 @@
 //! keeps every exchange two-way: a reduce-scatter then moves half an item each way at once,
 //! so with the normed-row exchange it costs what the all-reduce did on a full-duplex link.
 //!
+//! 2026-10-04: Also the pass body both the driver and the two-rank gate run (`sp_pass`): the
+//! owned-row fronts (`SpRows::front`), the normed-row swap, the per-call body and
+//! reduce-scatter, and the owned-row backs (`SpRows::back`). With
+//! `METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1` the attention calls are the `rows_ffn` windows, not
+//! the sub-chunks; ownership stays per sub-chunk (`SpPlan::spans` clips it to any item), so a
+//! row has one owner in both passes and every layer.
+//!
 //! Owner: model-arch (GLM-5.3).
 //! Invariants:
-//! - The two ranks' rows of any item (a sub-chunk or an FFN window, a run of whole
-//!   sub-chunks) tile it; `spans` lists them in row order and without empty spans, and both
-//!   ranks compute both lists, so the k-th send of one rank meets the k-th receive of the
-//!   other with the same size.
+//! - A row's owner is a function of the row, the sub-chunk width and the chunk length alone,
+//!   whatever item asks (`SpPlan::spans`), so the rank that ran a row's `hc_post` in one pass
+//!   runs its `hc_pre` in the next.
+//! - The two ranks' rows of any item tile it; `spans` lists them in row order and without
+//!   empty spans, and both ranks compute both lists, so the k-th send of one rank meets the
+//!   k-th receive of the other with the same size.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use metrale_comm::CommBackend;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
-use super::sub_chunks;
+use super::profile;
+use crate::glm5next_mhc::{
+    Glm5NextMhcKernels, Glm5NextMhcSiteWeights, glm_hc_expand, glm_hc_post, glm_hc_pre_part,
+    hc_head_mean,
+};
 
 /// 2026-10-01: A row range, `(first row, rows)`.
 pub type Span = (usize, usize);
@@ -29,16 +42,23 @@ const MAX_PAIRS: usize = 32;
 
 /// 2026-10-01: The ownership of a staged prefill chunk whose sub-chunks are `width` rows
 /// (the last may be narrower).
+/// 2026-10-04: `total` is the chunk's row count, so a span can be clipped to an item that
+/// does not start or end on a sub-chunk boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpPlan {
     pub width: usize,
+    pub total: usize,
 }
 
 impl SpPlan {
     /// 2026-10-01: The plan over `subs` (from `sub_chunks`, starting at row 0). `None` for an
     /// empty list.
     pub fn new(subs: &[(usize, usize)]) -> Option<Self> {
-        subs.first().map(|s| Self { width: s.1 })
+        let (first, last) = (subs.first()?, subs.last()?);
+        Some(Self {
+            width: first.1.max(1),
+            total: last.0 + last.1,
+        })
     }
 
     /// 2026-10-01: `rank`'s rows of sub-chunk `[t, t + k)`: rank 0 the first `ceil(k / 2)`.
@@ -47,15 +67,233 @@ impl SpPlan {
         if rank == 0 { (t, a) } else { (t + a, k - a) }
     }
 
-    /// 2026-10-01: `rank`'s non-empty spans of item `[t, t + k)` (which starts on a sub-chunk
-    /// boundary and holds whole sub-chunks), in row order.
+    /// 2026-10-01: `rank`'s non-empty spans of item `[t, t + k)`, in row order.
+    /// 2026-10-04: Its half of every chunk sub-chunk (`sub_chunks(total, width)`) that meets
+    /// the item, clipped to the item; rows past `total` belong to no one. For an item of whole
+    /// sub-chunks (every item before the full-width lever) these are the halves of its
+    /// sub-chunks, as before.
     pub fn spans(&self, rank: usize, (t, k): Span) -> Vec<Span> {
-        sub_chunks(k, self.width)
-            .into_iter()
-            .map(|(s, n)| Self::half(rank, (t + s, n)))
-            .filter(|s| s.1 > 0)
-            .collect()
+        let end = (t + k).min(self.total);
+        let w = self.width.max(1);
+        let mut out = Vec::new();
+        let mut s = (t / w) * w;
+        while s < end {
+            let n = w.min(self.total - s);
+            let (a, m) = Self::half(rank, (s, n));
+            let (lo, hi) = (a.max(t), (a + m).min(end));
+            if hi > lo {
+                out.push((lo, hi - lo));
+            }
+            s += n;
+        }
+        out
     }
+}
+
+/// 2026-10-04: `rms_norm_vanilla` over `rows` contiguous `[hidden]` BF16 rows in one launch,
+/// one block of `min(hidden, 1024)` threads per row (`token = blockIdx.x`; the blocks share
+/// nothing and the kernel never reads `gridDim`): the launch `Glm5NextLayer::norm` issues
+/// (it calls this), so a row's bytes do not depend on which rows share the launch.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    x: DevicePtr,
+    w: DevicePtr,
+    out: DevicePtr,
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows as u32, 1, 1])
+        .block([(hidden.min(1024)) as u32, 1, 1])
+        .arg_ptr(x)
+        .arg_ptr(w)
+        .arg_ptr(out)
+        .arg_u32(hidden as u32)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
+/// 2026-10-04: What the owned-row launches need: the layer's mHC kernels and constants, its
+/// RMSNorm kernel, and the forward's highway (`streams`, `post`, `comb`) and whole-chunk
+/// normed buffer, each at the chunk's row 0 (highway slot `t` is chunk row `t`).
+#[derive(Clone, Copy)]
+pub struct SpRows<'a> {
+    pub mhc: &'a Glm5NextMhcKernels,
+    pub rms_norm: KernelHandle,
+    pub hidden: usize,
+    pub hc_mult: usize,
+    pub sinkhorn_iters: u32,
+    pub rms_eps: f32,
+    pub hc_eps: f32,
+    pub streams: DevicePtr,
+    pub post: DevicePtr,
+    pub comb: DevicePtr,
+    pub normed: DevicePtr,
+}
+
+/// 2026-10-04: One mHC site of a pass: its weights and norm, whether the pass expands the
+/// highway first (layer 0's attention pass) or collapses it last (the last layer's FFN pass),
+/// whether the body's partial is all-reduced (`reduce`), and which profile buckets it uses.
+#[derive(Clone, Copy)]
+pub struct SpSite<'a> {
+    pub weights: &'a Glm5NextMhcSiteWeights,
+    pub norm: DevicePtr,
+    pub expand: bool,
+    pub last: bool,
+    pub reduce: bool,
+    pub attn: bool,
+}
+
+impl SpRows<'_> {
+    /// 2026-10-04: The front of rows `[t, t + k)`, part of a `call_rows`-row call: `hc_expand`
+    /// when `site.expand`, `hc_pre` of the site into those `hidden` rows (the mix kernel the
+    /// whole call takes, `glm_hc_pre_part`), then the norm into the same rows of `normed`:
+    /// the launches `attn_half` / `ffn_half` issue for the call, restricted to these rows.
+    pub fn front(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        (t, k): Span,
+        call_rows: usize,
+        site: &SpSite<'_>,
+        stream: u64,
+    ) -> Result<()> {
+        let (h, hc) = (self.hidden, self.hc_mult);
+        let streams = self.streams.offset(t * hc * h * 4);
+        let post = self.post.offset(t * hc * 4);
+        let comb = self.comb.offset(t * hc * hc * 4);
+        let x = hidden.offset(t * h * 2);
+        let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
+        let t_mhc = profile::start();
+        if site.expand {
+            glm_hc_expand(gpu, self.mhc.hc_expand, x, streams, kt, ht, hct, stream)?;
+        }
+        glm_hc_pre_part(
+            gpu,
+            self.mhc,
+            streams,
+            site.weights,
+            x,
+            post,
+            comb,
+            kt,
+            call_rows as u32,
+            ht,
+            hct,
+            self.sinkhorn_iters,
+            self.rms_eps,
+            self.hc_eps,
+            stream,
+        )?;
+        profile::end(profile::MHC, t_mhc, gpu, stream);
+        let t_norm = profile::start();
+        let out = self.normed.offset(t * h * 2);
+        rms_norm_rows(gpu, self.rms_norm, x, site.norm, out, k, h, self.rms_eps, stream)?;
+        profile::end(profile::NORM, t_norm, gpu, stream);
+        Ok(())
+    }
+
+    /// 2026-10-04: The back of rows `[t, t + k)`: `hc_post` of the reduced partial in its
+    /// `hidden` rows into the highway, then (`last`) `hc_head_mean` into the same rows.
+    pub fn back(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        (t, k): Span,
+        last: bool,
+        stream: u64,
+    ) -> Result<()> {
+        let (h, hc) = (self.hidden, self.hc_mult);
+        let streams = self.streams.offset(t * hc * h * 4);
+        let post = self.post.offset(t * hc * 4);
+        let comb = self.comb.offset(t * hc * hc * 4);
+        let x = hidden.offset(t * h * 2);
+        let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
+        let t_post = profile::start();
+        let post_k = self.mhc.hc_post;
+        glm_hc_post(gpu, post_k, x, streams, post, comb, streams, kt, ht, hct, stream)?;
+        if last {
+            hc_head_mean(gpu, self.mhc.hc_head, streams, x, kt, ht, hct, stream)?;
+        }
+        profile::end(profile::MHC_POST, t_post, gpu, stream);
+        Ok(())
+    }
+}
+
+/// 2026-10-04: Whether `calls` tile `[0, total)` in order with no empty call.
+pub fn calls_tile(calls: &[Span], total: usize) -> bool {
+    let mut next = 0;
+    for &(t, k) in calls {
+        if t != next || k == 0 {
+            return false;
+        }
+        next = t + k;
+    }
+    next == total
+}
+
+/// 2026-10-04: One pass (attention or FFN) of the sequence-parallel staged prefill over
+/// `calls`, the attention calls or FFN windows `prefill_staged_run` issues for the chunk (they
+/// must tile it):
+/// 1. the front of this rank's rows of every call (`SpRows::front`, with the call's width);
+/// 2. the normed-row swap (`swap_owned`), so `rows.normed` holds every row's normed input;
+/// 3. per call `(t, k)`, `body((t, k), normed rows of the call)`: the mixer or MLP over all
+///    `k` rows, returning where its partial's rows `0..k` are; then its reduce-scatter into
+///    this rank's rows of `hidden` (`reduce_item`, a copy without `site.reduce`);
+/// 4. the back of this rank's rows (`SpRows::back`).
+///
+/// Both ranks issue the same collectives in the same order: the calls, the plan and the flags
+/// are the same on both.
+#[allow(clippy::too_many_arguments)]
+pub fn sp_pass(
+    gpu: &dyn GpuBackend,
+    comm: &dyn CommBackend,
+    add_k: KernelHandle,
+    plan: SpPlan,
+    rows: &SpRows<'_>,
+    hidden: DevicePtr,
+    calls: &[Span],
+    site: SpSite<'_>,
+    mut body: impl FnMut(Span, DevicePtr) -> Result<DevicePtr>,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        calls_tile(calls, plan.total),
+        "sequence-parallel pass: calls {calls:?} do not tile the {}-row chunk",
+        plan.total
+    );
+    let (rank, h) = (comm.rank(), rows.hidden);
+    let rb = h * 2;
+    let bucket = if site.attn {
+        profile::REDUCE_ATTN
+    } else {
+        profile::REDUCE_MLP
+    };
+    for &c in calls {
+        for s in plan.spans(rank, c) {
+            rows.front(gpu, hidden, s, c.1, &site, stream)?;
+        }
+    }
+    let t_x = profile::start();
+    swap_owned(comm, plan, rows.normed, (0, plan.total), rb, stream)?;
+    profile::end(bucket, t_x, gpu, stream);
+    for &(t, k) in calls {
+        let p = body((t, k), rows.normed.offset(t * rb))?;
+        let t_x = profile::start();
+        let reduce = site.reduce;
+        reduce_item(gpu, add_k, comm, plan, p, hidden, (t, k), h, reduce, stream)?;
+        profile::end(bucket, t_x, gpu, stream);
+    }
+    for &c in calls {
+        for s in plan.spans(rank, c) {
+            rows.back(gpu, hidden, s, site.last, stream)?;
+        }
+    }
+    Ok(())
 }
 
 /// 2026-10-01: Exchange with the peer of a two-rank `comm`: post a send of each
@@ -154,47 +392,6 @@ pub fn reduce_item(
     Ok(())
 }
 
+// 2026-10-04: In `seq_parallel/tests.rs` (500-line cap).
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::glm5next_layer::ffn_windows;
-
-    /// 2026-10-01: Rows of `spans`, expanded.
-    fn rows(spans: &[Span]) -> Vec<usize> {
-        spans.iter().flat_map(|&(t, n)| t..t + n).collect()
-    }
-
-    #[test]
-    fn halves_tile_every_item_and_match_across_ranks() {
-        let cases = [(5400, 256, 2048), (8192, 256, 4096), (8191, 256, 4096), (257, 256, 256)];
-        for (n, w, ffn) in cases {
-            let subs = sub_chunks(n, w);
-            let plan = SpPlan::new(&subs).unwrap();
-            let wins = ffn_windows(&subs, ffn, true, |_| true);
-            for &(t, k) in subs.iter().chain(&wins).chain(&[(0, n)]) {
-                let (a, b) = (plan.spans(0, (t, k)), plan.spans(1, (t, k)));
-                let mut all = [rows(&a), rows(&b)].concat();
-                all.sort_unstable();
-                assert_eq!(all, (t..t + k).collect::<Vec<_>>(), "n={n} item ({t}, {k})");
-                assert!(a.iter().chain(&b).all(|s| s.1 > 0));
-                assert!(a.windows(2).all(|p| p[0].0 < p[1].0), "row order");
-            }
-            // 2026-10-01: Each rank's spans of the chunk are its spans of the sub-chunks.
-            for r in 0..2 {
-                let per_sub: Vec<Span> = subs.iter().flat_map(|&s| plan.spans(r, s)).collect();
-                assert_eq!(plan.spans(r, (0, n)), per_sub);
-            }
-        }
-    }
-
-    #[test]
-    fn halves_of_a_sub_chunk() {
-        assert_eq!(SpPlan::half(0, (512, 256)), (512, 128));
-        assert_eq!(SpPlan::half(1, (512, 256)), (640, 128));
-        assert_eq!(SpPlan::half(0, (8192, 1)), (8192, 1));
-        assert_eq!(SpPlan::half(1, (8192, 1)), (8193, 0));
-        let plan = SpPlan::new(&sub_chunks(257, 256)).unwrap();
-        assert_eq!(plan.spans(1, (0, 257)), vec![(128, 128)]);
-        assert_eq!(SpPlan::new(&[]), None);
-    }
-}
+mod tests;

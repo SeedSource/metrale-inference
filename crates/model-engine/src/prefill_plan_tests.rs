@@ -92,8 +92,13 @@ fn warm_restores_within_two_blocks_of_the_match_for_every_length() {
     // so only the tail rule can place the snapshot.
     for (first, cont) in [(67, 64), (65, 64), (72, 64), (64, 64), (130, 96)] {
         for total in (2 * BS + 1)..=2600 {
+            // 2026-10-04: race #69 (b69f1ecb): the default tail split leaves >= 256 rows in the last
+            // pass, so a prompt of 271 tokens or fewer has no split point and no tail snapshot.
+            let Some(cut) = tail_split_point(total, BS) else {
+                assert!(total <= 271, "total={total}: no split point above 271 tokens");
+                continue;
+            };
             let (matched, snap) = cold_then_warm(total, first, cont, 0);
-            let cut = tail_split_point(total, BS).unwrap_or(0);
             assert!(
                 snap >= cut && snap <= matched,
                 "total={total} first={first}: snap {snap}, cut {cut}, matched {matched}"
@@ -149,11 +154,17 @@ fn plan_keeps_a_last_chunk_and_never_grows_a_chunk() {
 
 #[test]
 fn tail_split_point_matches_the_dispatch_formula() {
-    assert_eq!(tail_split_point(16, BS), None);
-    assert_eq!(tail_split_point(32, BS), None);
-    assert_eq!(tail_split_point(33, BS), Some(16));
-    assert_eq!(tail_split_point(48, BS), Some(16));
-    assert_eq!(tail_split_point(49, BS), Some(32));
+    // 2026-10-04: the old one-block-below-the-boundary formula is the `min_tail = 0` case; the
+    // default (race #69, b69f1ecb) also leaves >= 256 rows in the last pass.
+    assert_eq!(tail_split_point_min(16, BS, 0), None);
+    assert_eq!(tail_split_point_min(32, BS, 0), None);
+    assert_eq!(tail_split_point_min(33, BS, 0), Some(16));
+    assert_eq!(tail_split_point_min(48, BS, 0), Some(16));
+    assert_eq!(tail_split_point_min(49, BS, 0), Some(32));
+    assert_eq!(tail_split_point(33, BS), None);
+    assert_eq!(tail_split_point(271, BS), None);
+    assert_eq!(tail_split_point(272, BS), Some(16));
+    assert_eq!(tail_split_point(32772, BS), Some(32512));
     assert_eq!(tail_split_point_min(32772, BS, 0), Some(32752));
     assert_eq!(tail_split_point_min(32768, BS, 0), Some(32736));
     assert_eq!(tail_split_point_min(100, 0, 256), None);

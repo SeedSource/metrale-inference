@@ -359,7 +359,7 @@ fn promoting_the_head_preserves_the_order_of_the_remainder() {
         &model,
         &SchedIo::for_test_with(std::sync::Arc::new(PrefillStubModel)),
         &mut prefilling,
-        vec![(0, Some(FIRST))],
+        vec![(0, Ok(FIRST))],
         &mut active,
         None,
         None,
@@ -398,7 +398,7 @@ fn promoting_several_at_once_preserves_the_order_of_the_remainder() {
         &model,
         &SchedIo::for_test_with(std::sync::Arc::new(PrefillStubModel)),
         &mut prefilling,
-        vec![(0, Some(FIRST)), (2, Some(FIRST))],
+        vec![(0, Ok(FIRST)), (2, Ok(FIRST))],
         &mut active,
         None,
         None,
@@ -419,4 +419,41 @@ fn promoting_several_at_once_preserves_the_order_of_the_remainder() {
         vec![3, 1],
         "promotion still walks the indices in reverse"
     );
+}
+
+/// 2026-10-03: A prefill that fails mid-way (e.g. "KV cache exhausted" on a later chunk)
+/// answers its client with the reason. The sink used to be dropped, which a streaming
+/// client read as an empty HTTP 200 stream with no finish reason (race #79).
+#[test]
+fn a_failed_prefill_answers_its_client_with_the_reason() {
+    let model = PrefillStubModel;
+    let (p1, mut rx1) = test_prefill_ident(1, CHUNK);
+    let (p2, _rx2) = test_prefill_ident(2, CHUNK);
+    let mut prefilling = vec![p1, p2];
+    let mut active: Vec<ActiveSeq> = Vec::new();
+
+    promote_completed_prefills(
+        &model,
+        &SchedIo::for_test_with(std::sync::Arc::new(PrefillStubModel)),
+        &mut prefilling,
+        vec![(
+            0,
+            Err("prefill failed: KV cache exhausted: no free blocks".into()),
+        )],
+        &mut active,
+        None,
+        None,
+        None,
+        None,
+        4096,
+    );
+
+    let sent = rx1
+        .try_recv()
+        .expect("the sink must be answered, not dropped");
+    let err = format!("{:#}", sent.err().expect("an error, not a response"));
+    assert!(err.contains("KV cache exhausted"), "{err}");
+    assert!(active.is_empty());
+    assert_eq!(prefilling.len(), 1);
+    assert_eq!(prefilling[0].session_hash, 2);
 }

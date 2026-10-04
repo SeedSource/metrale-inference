@@ -312,11 +312,11 @@ pub(super) fn continue_in_progress_prefills(
                     ) {
                         Ok(first) => {
                             tracing::info!("Two-phase prefill first token: {first}");
-                            completed_indices.push((idx, Some(first)));
+                            completed_indices.push((idx, Ok(first)));
                         }
                         Err(e) => {
                             tracing::error!("Two-phase prefill sampling: {e:#}");
-                            completed_indices.push((idx, None));
+                            completed_indices.push((idx, Err(format!("prefill failed: {e:#}"))));
                         }
                     }
                 }

@@ -18,7 +18,7 @@ pub(super) fn promote_completed_prefills(
     model: &dyn Model,
     io: &crate::scheduler::io::SchedIo,
     prefilling: &mut Vec<PrefillInProgress>,
-    mut completed_indices: Vec<(usize, Option<u32>)>,
+    mut completed_indices: Vec<(usize, Result<u32, String>)>,
     active: &mut Vec<ActiveSeq>,
     think_end_token: Option<u32>,
     think_start_token: Option<u32>,
@@ -30,24 +30,31 @@ pub(super) fn promote_completed_prefills(
     // 2026-09-25: Reverse index order, so a removal never shifts an index
     // still to be removed.
     completed_indices.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
-    for (idx, maybe_token) in completed_indices {
+    for (idx, outcome) in completed_indices {
         // 2026-09-25: `remove`, not `swap_remove`: the single-stream path
         // advances the head (`prefilling.first_mut()`), and `swap_remove`
         // would move the newest arrival there. `enforce_request_deadlines`
         // walks only `active`, so a request passed over this way would not
         // time out either. See `prefill_fifo_tests`.
         let mut p = prefilling.remove(idx);
-        let Some(first) = maybe_token else {
-            let mut seq = p.seq;
-            if let Err(e) = model.free_sequence(&mut seq) {
-                tracing::error!("phase_promote_prefills: free_sequence (error path): {e:#}");
+        let first = match outcome {
+            Ok(first) => first,
+            Err(reason) => {
+                // 2026-10-03: Answer the client with the reason. The sink used to be dropped
+                // here, which a streaming client read as an empty HTTP 200 stream with no
+                // finish reason (race #79, "KV cache exhausted" mid-prefill).
+                super::lifecycle::send_error_to_sink(io, &mut p.sink, &reason);
+                let mut seq = p.seq;
+                if let Err(e) = model.free_sequence(&mut seq) {
+                    tracing::error!("phase_promote_prefills: free_sequence (error path): {e:#}");
+                }
+                if let Err(e) = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1) {
+                    tracing::error!(
+                        "phase_promote_prefills: ep_broadcast free+realloc (error path): {e:#}"
+                    );
+                }
+                continue;
             }
-            if let Err(e) = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1) {
-                tracing::error!(
-                    "phase_promote_prefills: ep_broadcast free+realloc (error path): {e:#}"
-                );
-            }
-            continue;
         };
         let spontaneous_think = !p.enable_thinking && think_start_token == Some(first);
         // 2026-09-25: Prompt logprobs go to a streaming client before any

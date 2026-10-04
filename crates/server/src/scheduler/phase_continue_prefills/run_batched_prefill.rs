@@ -20,7 +20,7 @@ pub(super) fn run_batched_prefill_step(
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     prefilling: &mut [PrefillInProgress],
-    completed_indices: &mut Vec<(usize, Option<u32>)>,
+    completed_indices: &mut Vec<(usize, Result<u32, String>)>,
     max_prefill_tokens: usize,
     max_batch_tokens: usize,
     prefill_stream: u64,
@@ -160,7 +160,7 @@ pub(super) fn run_batched_prefill_step(
                 // `promote_completed_prefills`). Later waves have not
                 // advanced and retry next tick.
                 for &i in &wave {
-                    completed_indices.push((i, None));
+                    completed_indices.push((i, Err(format!("prefill failed: {e:#}"))));
                 }
                 return;
             }
@@ -194,7 +194,7 @@ pub(super) fn run_batched_prefill_step(
                 tracing::error!(
                     "Batched prefill: stream {i} marked is_last but model returned NULL logits",
                 );
-                completed_indices.push((i, None));
+                completed_indices.push((i, Err("prefill returned no logits".to_string())));
                 continue;
             }
             // 2026-09-25: `sample_first_token` applies the sequence's `min_p`
@@ -223,11 +223,11 @@ pub(super) fn run_batched_prefill_step(
                         chunk_lens[i],
                         p.prompt_tokens.len(),
                     );
-                    completed_indices.push((i, Some(first)));
+                    completed_indices.push((i, Ok(first)));
                 }
                 Err(e) => {
                     tracing::error!("Batched prefill[{i}] sampling: {e:#}");
-                    completed_indices.push((i, None));
+                    completed_indices.push((i, Err(format!("prefill failed: {e:#}"))));
                 }
             }
         }

@@ -22,7 +22,7 @@ pub(super) fn run_batched_mixed_step(
     model: &dyn Model,
     active: &mut Vec<ActiveSeq>,
     prefilling: &mut [PrefillInProgress],
-    completed_indices: &mut Vec<(usize, Option<u32>)>,
+    completed_indices: &mut Vec<(usize, Result<u32, String>)>,
     max_prefill_tokens: usize,
     prefill_stream: u64,
     prefill_event: u64,
@@ -122,7 +122,7 @@ pub(super) fn run_batched_mixed_step(
                 "Mixed-batch forward error (n_decode={n_decode}, n_prefill={n_prefill}): {e:#}",
             );
             for i in 0..n_prefill {
-                completed_indices.push((i, None));
+                completed_indices.push((i, Err(format!("prefill failed: {e:#}"))));
             }
             return;
         }
@@ -144,7 +144,7 @@ pub(super) fn run_batched_mixed_step(
             tracing::error!(
                 "Mixed-batch: stream {i} marked is_last but model returned NULL logits"
             );
-            completed_indices.push((i, None));
+            completed_indices.push((i, Err("prefill returned no logits".to_string())));
             continue;
         }
         // 2026-09-25: `sample_first_token` applies the sequence's `min_p` (0.0
@@ -169,11 +169,11 @@ pub(super) fn run_batched_mixed_step(
                     chunk_lens[i],
                     p.prompt_tokens.len(),
                 );
-                completed_indices.push((i, Some(first)));
+                completed_indices.push((i, Ok(first)));
             }
             Err(e) => {
                 tracing::error!("Mixed-batch prefill[{i}] sampling: {e:#}");
-                completed_indices.push((i, None));
+                completed_indices.push((i, Err(format!("prefill failed: {e:#}"))));
             }
         }
     }

@@ -257,6 +257,10 @@ name = "glm5next_seq_parallel_2rank"
 required-features = ["cuda", "nccl-examples"]
 
 [[example]]
+name = "glm5next_seq_parallel_layer_2rank"
+required-features = ["cuda", "nccl-examples"]
+
+[[example]]
 name = "attn_prefill_fa128_microtest"
 required-features = ["cuda", "gpu-examples"]
 

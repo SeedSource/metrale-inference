@@ -107,7 +107,22 @@ impl Glm5NextMtpHead {
             }
         };
 
+        // 2026-10-03: Scratch for `METRALE_GLM_MTP_CTX_ROWBATCH=1` (about 10 MB at 256 rows).
+        let ctx_scratch = if ctx_rowbatch() && module.layer.can_drafter_write_kv_rows() {
+            let (t, h) = (CTX_TILE, config.hidden_size);
+            Some(CtxScratch {
+                gath: gpu.alloc(t * h * 2)?,
+                nrm: gpu.alloc(t * h * 2)?,
+                concat: gpu.alloc(t * 2 * h * 2)?,
+                xo: gpu.alloc(t * h * 2)?,
+                kv_a: gpu.alloc(t * dsa.cfg.kv_lora_rank * 2)?,
+                slots: gpu.alloc(t * 8)?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
+            ctx_scratch,
             module,
             embed_tokens,
             lm_head,

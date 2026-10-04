@@ -98,6 +98,31 @@ pub struct Glm5NextMtpHead {
     /// Measured 2026-08-29 (nsys): 2.66 ms -> ~1.33 ms per draft sweep.
     head_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
     gemv_fp8w_k: KernelHandle,
+    /// 2026-10-03: Scratch for the row-batched context write; `Some` only with
+    /// `METRALE_GLM_MTP_CTX_ROWBATCH=1` and a block that can run it. Allocated at load, so it
+    /// sits before KV sizing. Used under the `kv_cache` lock, so one tile buffer is enough.
+    ctx_scratch: Option<CtxScratch>,
+}
+
+/// 2026-10-03: Rows per tile of the batched context write.
+const CTX_TILE: usize = 256;
+
+/// 2026-10-03: `METRALE_GLM_MTP_CTX_ROWBATCH=1`; read once per process.
+fn ctx_rowbatch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("METRALE_GLM_MTP_CTX_ROWBATCH").ok().as_deref() == Some("1"))
+}
+
+/// 2026-10-03: Device scratch of one `CTX_TILE`: `gath` and `nrm` are `[T, hidden]`,
+/// `concat` `[T, 2 hidden]`, `xo` `[T, hidden]`, `kv_a` `[T, kv_lora_rank]` (all BF16),
+/// `slots` `[T]` i64.
+struct CtxScratch {
+    gath: DevicePtr,
+    nrm: DevicePtr,
+    concat: DevicePtr,
+    xo: DevicePtr,
+    kv_a: DevicePtr,
+    slots: DevicePtr,
 }
 
 /// 2026-09-25: Rows the GLM drafter can ever be asked for: the served context, clamped to
@@ -124,6 +149,27 @@ impl Glm5NextMtpHead {
             .arg_ptr(w)
             .arg_ptr(out)
             .arg_u32(n as u32)
+            .arg_f32(self.module.layer.rms_eps)
+            .launch(stream)
+    }
+
+    /// 2026-10-03: `norm` over `rows` rows (one block per row, same block size as `norm`).
+    fn norm_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        x: DevicePtr,
+        w: DevicePtr,
+        out: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        KernelLaunch::new(gpu, self.rms_norm_k)
+            .grid([rows as u32, 1, 1])
+            .block([(self.hidden.min(1024)) as u32, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(w)
+            .arg_ptr(out)
+            .arg_u32(self.hidden as u32)
             .arg_f32(self.module.layer.rms_eps)
             .launch(stream)
     }
@@ -332,6 +378,95 @@ impl Glm5NextMtpHead {
             x,
             ..
         } = st;
+        if let Some(sc) = self
+            .ctx_scratch
+            .as_ref()
+            .filter(|_| !prefill_full && !dbg && ctx_rowbatch())
+        {
+            let dsa_state: &mut dyn LayerState = dsa;
+            let mut r0 = 0;
+            while r0 < rows {
+                let t = CTX_TILE.min(rows - r0);
+                if r0 > 0 {
+                    // The tile's blocking slot copy overwrites `slots`; the previous tile's
+                    // latent write may still be reading it.
+                    gpu.synchronize(stream)?;
+                }
+                for i in 0..t {
+                    gpu.copy_d2d_async(
+                        self.embed_tokens
+                            .weight
+                            .offset(tokens[r0 + i + 1] as usize * h * 2),
+                        sc.gath.offset(i * h * 2),
+                        h * 2,
+                        stream,
+                    )?;
+                }
+                // 2026-10-03: Same one-block-per-row kernel and block size as the per-row
+                // `norm`, so each row's bytes are the per-row path's.
+                self.norm_rows(gpu, sc.gath, self.module.enorm, sc.nrm, t, stream)?;
+                gpu.copy_d2d_2d_async(sc.nrm, h * 2, sc.concat, 2 * h * 2, h * 2, t, stream)?;
+                self.norm_rows(
+                    gpu,
+                    hiddens.offset(r0 * h * 2),
+                    self.module.hnorm,
+                    sc.nrm,
+                    t,
+                    stream,
+                )?;
+                gpu.copy_d2d_2d_async(
+                    sc.nrm,
+                    h * 2,
+                    sc.concat.offset(h * 2),
+                    2 * h * 2,
+                    h * 2,
+                    t,
+                    stream,
+                )?;
+                // 2026-10-03: eh_proj as one GEMM over the tile (GEMV order differs from
+                // cuBLASLt's: bf16-level only). Tiles of up to 16 rows keep the GEMV.
+                if t > ops::DENSE_GEMV_BATCHM_MAX_M as usize {
+                    ops::cublas_bf16_proj_dense(
+                        sc.concat,
+                        self.module.eh_proj.weight,
+                        sc.xo,
+                        t as u32,
+                        h as u32,
+                        (2 * h) as u32,
+                        stream,
+                    )?;
+                } else {
+                    for i in 0..t {
+                        ops::dense_gemv(
+                            gpu,
+                            self.gemv_k,
+                            sc.concat.offset(i * 2 * h * 2),
+                            &self.module.eh_proj,
+                            sc.xo.offset(i * h * 2),
+                            h as u32,
+                            (2 * h) as u32,
+                            stream,
+                        )?;
+                    }
+                }
+                self.module.layer.drafter_write_kv_rows(
+                    sc.xo,
+                    t,
+                    sc.nrm,
+                    sc.kv_a,
+                    sc.slots,
+                    dsa_state,
+                    &mut kv,
+                    *seq_len,
+                    &block_table[..],
+                    ctx,
+                    stream,
+                )?;
+                *seq_len += t;
+                r0 += t;
+            }
+            return Ok(rows);
+        }
         for r in 0..rows {
             let embed_row = self
                 .embed_tokens

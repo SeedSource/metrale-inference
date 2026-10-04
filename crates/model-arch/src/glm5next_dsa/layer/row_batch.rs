@@ -116,7 +116,7 @@ pub(super) fn gemv_split_blocks(rows: usize) -> u32 {
 /// `dense_gemv_batchm_split` passes `out_stride` through, so it counts FP32 elements for the
 /// FP32-out kernel as `dense_gemv_batchm_fp32out` does).
 #[allow(clippy::too_many_arguments)]
-fn batchm_rows(
+pub(super) fn batchm_rows(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     out_elem: usize,

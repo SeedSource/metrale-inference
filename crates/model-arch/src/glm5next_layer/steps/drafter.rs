@@ -71,4 +71,41 @@ impl Glm5NextLayer {
         self.norm(ctx.gpu, x, self.input_norm, normed, 1, stream)?;
         layer.write_kv_row(normed, state, kv_cache, seq_len, block_table, ctx, stream)
     }
+
+    /// 2026-10-03: `drafter_write_kv_row` for `k` consecutive rows: `input_norm` over all
+    /// `k` rows of `x` (`[k, hidden]`) into `normed`, then `Glm5NextDsaLayer::write_kv_rows`.
+    /// `normed` and `kv_a` are caller scratch (`[k, hidden]`, `[k, kv_lora_rank]` BF16), `slots`
+    /// a device `[k]` i64 buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drafter_write_kv_rows(
+        &self,
+        x: DevicePtr,
+        k: usize,
+        normed: DevicePtr,
+        kv_a: DevicePtr,
+        slots: DevicePtr,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &[u32],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let layer = match &self.mixer {
+            Glm5NextMixer::Dsa(l) => l,
+            _ => bail!(
+                "GLM layer {}: drafter_write_kv_rows is the MTP block's path; this layer is not                  a DSA layer",
+                self.layer_idx
+            ),
+        };
+        self.norm(ctx.gpu, x, self.input_norm, normed, k, stream)?;
+        layer.write_kv_rows(
+            ctx.gpu, normed, k, kv_a, slots, state, kv_cache, seq_len, block_table, stream,
+        )
+    }
+
+    /// 2026-10-03: Whether `drafter_write_kv_rows` can run on this block.
+    pub fn can_drafter_write_kv_rows(&self) -> bool {
+        matches!(&self.mixer, Glm5NextMixer::Dsa(l) if l.can_write_kv_rows())
+    }
 }

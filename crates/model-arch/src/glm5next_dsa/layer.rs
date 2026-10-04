@@ -46,6 +46,7 @@ use super::state::Glm5NextDsaState;
 use super::{Glm5NextDsaConfig, Glm5NextDsaKernels};
 use metrale_model_layers::layer::{ForwardContext, LayerState, TransformerLayer};
 
+mod ctx_rows;
 mod decode_k;
 mod proj_gemm;
 mod row_batch;

@@ -148,7 +148,15 @@ fn kernel_leg(rig: &Rig, rng: &mut st::Lcg) -> Result<usize> {
     ];
     let proj =
         |a: DevicePtr, b: DevicePtr, out: DevicePtr, m: usize, n: usize, k: usize| match df::route(
-            g, kn.gemv, a, b, out, m, n, k, 0,
+            g,
+            kn.gemv,
+            a,
+            b,
+            out,
+            m,
+            n,
+            k,
+            g.default_stream(),
         )? {
             df::Route::Done => Ok(()),
             df::Route::Weight(b) => ops::dense_mm_bf16(
@@ -164,7 +172,7 @@ fn kernel_leg(rig: &Rig, rng: &mut st::Lcg) -> Result<usize> {
                 m,
                 n,
                 k,
-                0,
+                g.default_stream(),
             ),
         };
     let mut fails = 0;
@@ -172,7 +180,7 @@ fn kernel_leg(rig: &Rig, rng: &mut st::Lcg) -> Result<usize> {
         let a = g.alloc(16 * k * 2)?;
         let (c1, cm) = (g.alloc(16 * n * 2)?, g.alloc(16 * n * 2)?);
         for m in [2usize, 4, 6, 12, 16] {
-            g.synchronize(0)?;
+            g.synchronize(g.default_stream())?;
             g.copy_h2d(&st::bf16_bytes(&rng.vec(m * k, 1.0)), a)?;
             g.copy_h2d(&vec![POISON_OFF; m * n * 2], c1)?;
             g.copy_h2d(&vec![POISON_ON; m * n * 2], cm)?;
@@ -218,17 +226,17 @@ fn time_arm(
     let mut v = Vec::with_capacity(reps);
     let mut rng = st::Lcg(0x7135);
     for rep in 0..reps + 1 {
-        rig.g().synchronize(0)?;
+        rig.g().synchronize(rig.g().default_stream())?;
         rig.g()
             .copy_h2d(&st::bf16_bytes(&rng.vec(rows * rig.h, 1.0)), rig.hid)?;
-        rig.g().synchronize(0)?;
+        rig.g().synchronize(rig.g().default_stream())?;
         let t0 = Instant::now();
         if on {
             rig.run_on(seqs, ks, &metas, decode_step)?;
         } else {
             rig.run_off(seqs, ks, &metas, decode_step)?;
         }
-        rig.g().synchronize(0)?;
+        rig.g().synchronize(rig.g().default_stream())?;
         if rep > 0 {
             v.push(t0.elapsed().as_secs_f64());
         }

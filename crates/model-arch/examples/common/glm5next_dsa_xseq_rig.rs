@@ -145,7 +145,7 @@ impl Rig<'_> {
             }
         }
         let g = self.g();
-        g.synchronize(0)?;
+        g.synchronize(g.default_stream())?;
         g.copy_h2d(&pos, self.meta.pos)?;
         g.copy_h2d(&slot, self.meta.slot)?;
         g.copy_h2d(&sl, self.meta.sl)?;
@@ -191,7 +191,7 @@ impl Rig<'_> {
         let mut t = 0;
         while t < len {
             let k = CHUNK.min(len - t);
-            self.g().synchronize(0)?;
+            self.g().synchronize(self.g().default_stream())?;
             self.g()
                 .copy_h2d(&st::bf16_bytes(&rng.vec(k * self.h, 1.0)), self.hid)?;
             let ctx = self.env.ctx(None, false);
@@ -204,7 +204,7 @@ impl Rig<'_> {
                 t,
                 &mut bt,
                 &ctx,
-                0,
+                self.env.gpu.default_stream(),
                 true,
             )?;
             t += k;
@@ -216,7 +216,7 @@ impl Rig<'_> {
     /// 2026-10-03: Fill every byte a step over `ks` writes outside `hid` with `poison`.
     pub(crate) fn poison(&self, seqs: &mut [Seq], ks: &[usize], poison: u8) -> Result<()> {
         let g = self.env.gpu;
-        g.synchronize(0)?;
+        g.synchronize(g.default_stream())?;
         let (kv_lora, d) = (self.kv_lora, self.d);
         for (s, &k) in seqs.iter_mut().zip(ks) {
             for j in 0..k {
@@ -289,7 +289,7 @@ impl Rig<'_> {
                 s.len,
                 &mut bt,
                 &ctx,
-                0,
+                self.env.gpu.default_stream(),
                 false,
             )?;
             o += ks[i];
@@ -320,7 +320,7 @@ impl Rig<'_> {
             &bts,
             metas,
             &ctx,
-            0,
+            self.env.gpu.default_stream(),
         )?;
         self.layer.workspace.set_xseq(None);
         if !engaged {

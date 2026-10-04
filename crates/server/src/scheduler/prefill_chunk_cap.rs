@@ -17,6 +17,8 @@
 //! - Unset, empty, `0` or unparsable: off; every plan is the uncapped one.
 //! - On: the cap is a positive multiple of [`GRANULE`], and at plan time of the KV block size.
 //! - The cap only shortens a chunk, and only while a decoder is active.
+//! - On, with a decoder active, a tick runs at most one prefill chunk ([`admit_now`],
+//!   [`skip_continue`]), so a decode step runs between any two chunks, chunk 0 included.
 //! - Under `METRALE_PREFIX_GRID_RESTORE` a capped chunk never crosses a grid point: every grid
 //!   point is still a chunk end, so the grid snapshots are saved where they always were.
 
@@ -122,6 +124,37 @@ pub(crate) fn plan_capped(
         _ => uncapped,
     };
     (capped, uncapped)
+}
+
+/// 2026-10-03: One prefill chunk per tick while decoding. A tick runs StartPrefills (each new
+/// request's chunk 0 inline), then ContinuePrefills (one more chunk of the head prefill), then
+/// Decode (`core/tick.rs` lane order). Measured on ra-dec-fp8b (cap lever absent, C=4, L34,
+/// 2026-10-04): a 17,612-token prompt ran chunk 0 (8192) and chunk 16384 back to back in one
+/// tick, and the decoders' largest gap was 25.2 s. With the lever on and a decoder active, this
+/// many of the tick's `n_new` admitted requests start now (the rest go back to the front of the
+/// pending queue): at most one, and none when a prefill is in progress and the previous tick
+/// started one, so StartPrefills and ContinuePrefills alternate instead of either starving.
+pub(crate) fn admit_now(
+    lever_on: bool,
+    decoders: usize,
+    n_new: usize,
+    prefilling: bool,
+    started_last_tick: bool,
+) -> usize {
+    if !lever_on || decoders == 0 || n_new == 0 {
+        return n_new;
+    }
+    if prefilling && started_last_tick {
+        0
+    } else {
+        1
+    }
+}
+
+/// 2026-10-03: Whether ContinuePrefills skips this tick: the lever is on, a decoder is active,
+/// and StartPrefills already ran a chunk 0 this tick, so Decode runs before the next chunk.
+pub(crate) fn skip_continue(lever_on: bool, decoders: usize, started_this_tick: bool) -> bool {
+    lever_on && decoders > 0 && started_this_tick
 }
 
 /// 2026-10-03: Log, once per prefill (`logged`), that a chunk was capped.

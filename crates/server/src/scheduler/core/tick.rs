@@ -52,6 +52,24 @@ impl SchedulerCore {
             sched.limits.max_seq_len,
             block_size,
         );
+        // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING`: while a sequence decodes, start
+        // at most one request this tick, and none when a prefill is in progress and the last
+        // tick started one (`prefill_chunk_cap::admit_now`); the rest return to the front of
+        // the pending queue in arrival order.
+        let mut new_reqs = new_reqs;
+        let admit = crate::scheduler::prefill_chunk_cap::admit_now(
+            sched.levers.prefill_chunk_while_decoding.is_some(),
+            crate::scheduler::prefill_chunk_cap::decoders(active),
+            new_reqs.len(),
+            !prefilling.is_empty(),
+            self.started_prefill,
+        );
+        if admit < new_reqs.len() {
+            for (i, req) in new_reqs.drain(admit..).enumerate() {
+                pending.requests.insert(i, req);
+            }
+        }
+        self.started_prefill = !new_reqs.is_empty();
         sched.io.tel.mark(mtp_timing::Phase::LoopDrain, t_loop);
 
         // 2026-09-25: Settle a step running ahead of the host before this tick starts

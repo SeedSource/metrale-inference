@@ -192,3 +192,67 @@ fn log_capped_once() {
     log_capped(&mut logged, 2048, 1);
     assert!(logged);
 }
+
+#[test]
+fn one_prefill_chunk_per_tick_while_decoding() {
+    // 2026-10-03: lever off or no decoder: every admitted request starts, continue runs.
+    assert_eq!(admit_now(false, 3, 4, true, true), 4);
+    assert_eq!(admit_now(true, 0, 4, true, true), 4);
+    assert!(!skip_continue(false, 3, true));
+    assert!(!skip_continue(true, 0, true));
+    // 2026-10-03: on, decoders 1 and 3: one start per tick, and continue is skipped in it.
+    for d in [1, 3] {
+        assert_eq!(admit_now(true, d, 0, false, false), 0);
+        assert_eq!(admit_now(true, d, 4, false, false), 1);
+        assert_eq!(admit_now(true, d, 4, false, true), 1);
+        assert_eq!(admit_now(true, d, 4, true, false), 1);
+        assert!(skip_continue(true, d, true));
+        assert!(!skip_continue(true, d, false));
+        // 2026-10-03: a prefill in progress and a start last tick: this tick continues.
+        assert_eq!(admit_now(true, d, 4, true, true), 0);
+    }
+}
+
+/// 2026-10-03: Simulate ticks (StartPrefills, ContinuePrefills, Decode) for a long prompt
+/// arriving while decoders run, plus a second request arriving mid-prefill: with the lever on,
+/// no tick runs more than one prefill chunk, and both prefills still finish.
+#[test]
+fn ticks_alternate_and_never_run_two_chunks() {
+    let mut pending: Vec<usize> = vec![17612];
+    let mut prefilling: Vec<(usize, usize)> = Vec::new(); // (offset, total)
+    let mut started_last = false;
+    let mut done = 0;
+    for tick in 0..64 {
+        if tick == 2 {
+            pending.push(1000);
+        }
+        let n = admit_now(true, 3, pending.len(), !prefilling.is_empty(), started_last);
+        let new: Vec<usize> = pending.drain(..n).collect();
+        let started = !new.is_empty();
+        let mut chunks = 0;
+        for total in new {
+            let (len, _) = plan_capped(0, total, total.min(8192), BS, None, None, Some(2048));
+            chunks += 1;
+            if len < total {
+                prefilling.push((len, total));
+            } else {
+                done += 1;
+            }
+        }
+        if !skip_continue(true, 3, started)
+            && let Some(p) = prefilling.first_mut()
+        {
+            let (len, _) = plan_capped(p.0, p.1, (p.1 - p.0).min(8192), BS, None, None, Some(2048));
+            p.0 += len;
+            chunks += 1;
+            if p.0 == p.1 {
+                prefilling.remove(0);
+                done += 1;
+            }
+        }
+        assert!(chunks <= 1, "tick {tick} ran {chunks} prefill chunks");
+        started_last = started;
+    }
+    assert_eq!(done, 2);
+    assert!(pending.is_empty() && prefilling.is_empty());
+}

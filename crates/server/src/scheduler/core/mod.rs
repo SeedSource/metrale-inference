@@ -75,6 +75,10 @@ pub struct SchedulerCore {
     snapshot_steps: u64,
     /// 2026-09-25: Set by the prefill-continuation lane, read by the decode lane.
     did_mixed_step: bool,
+    /// 2026-10-03: This tick's StartPrefills lane starts at least one request (set in
+    /// `plan_tick`); with `METRALE_PREFILL_CHUNK_WHILE_DECODING` on it decides the next tick's
+    /// admissions and whether this tick's ContinuePrefills runs (`prefill_chunk_cap`).
+    started_prefill: bool,
     /// 2026-09-25: The pipelined decode lane's steps still in flight.
     pipeline: pipeline::Pipeline,
 }
@@ -291,6 +295,7 @@ impl SchedulerCore {
             preempted,
             snapshot_steps: 0,
             did_mixed_step: false,
+            started_prefill: false,
             pipeline: pipeline::Pipeline::new(pipeline_faults),
         }
     }

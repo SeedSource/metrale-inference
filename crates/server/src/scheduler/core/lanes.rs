@@ -82,7 +82,15 @@ impl SchedulerCore {
         let max_batch_size = self.max_batch_size;
         let block_size = self.block_size;
         let t_loop = sched.io.clock.now();
-        *did_mixed_step = continue_in_progress_prefills(
+        // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING`: no second prefill chunk in a tick
+        // whose StartPrefills ran one while a sequence decodes (`prefill_chunk_cap`).
+        let skip = crate::scheduler::prefill_chunk_cap::skip_continue(
+            sched.levers.prefill_chunk_while_decoding.is_some(),
+            crate::scheduler::prefill_chunk_cap::decoders(active),
+            self.started_prefill,
+        );
+        *did_mixed_step = !skip
+            && continue_in_progress_prefills(
             sched.io.dev.model(),
             &**policy,
             active,

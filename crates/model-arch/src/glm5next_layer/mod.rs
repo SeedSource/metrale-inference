@@ -81,8 +81,8 @@ pub(crate) use levers::{
     PREFILL_ROWS, cublas_wide_proj, dsa_batch_qidx, dsa_row_batch, kda_chunk_prefill,
 };
 pub use levers::{
-    PREFILL_ROWS_FFN_MAX, batched_verify, decode_multi_seq, dsa_index_split, fullwidth_rows,
-    prefill_comm_overlap, prefill_fullwidth_gemm, prefill_rows, prefill_rows_ffn,
+    PREFILL_ROWS_FFN_MAX, batched_verify, decode_multi_seq, dsa_index_split, dsa_index_split_wide,
+    fullwidth_rows, prefill_comm_overlap, prefill_fullwidth_gemm, prefill_rows, prefill_rows_ffn,
     prefill_seq_parallel, prefill_staged, prefill_tail_merge, staged_merge_signature,
 };
 pub use steps::staged::{ffn_windows, sub_chunks};

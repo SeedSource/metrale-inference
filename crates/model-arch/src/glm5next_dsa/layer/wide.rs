@@ -43,7 +43,8 @@ use metrale_model_layers::layers::ops;
 
 use super::super::Glm5NextDsaConfig;
 use super::super::attend::{DsaDecodeInputs, DsaDecodePaging, attention};
-use super::super::select::{DsaSelectInputs, DsaSelectLaunch, select_tokens};
+use super::super::select::split::{row_split_for, select_tokens_split};
+use super::super::select::{DsaSelectInputs, DsaSelectLaunch::Exact, select_tokens};
 use super::super::state::Glm5NextDsaState;
 use super::decode_k::bt_entries_needed;
 use super::{Glm5NextDsaLayer, gemm};
@@ -422,16 +423,17 @@ impl Glm5NextDsaLayer {
             let t = profile::start();
             // 2026-10-01: Rows `0..n` of the workspace's `[max_rows, out_width]` selection,
             // which the attend below reads before the next sub-chunk overwrites it.
-            select_tokens(
-                gpu,
-                &self.select_kernels,
-                c,
-                &geom,
-                &inputs,
-                &w.select,
-                DsaSelectLaunch::Exact,
-                stream,
-            )?;
+            // 2026-10-04: `METRALE_GLM_DSA_INDEX_SPLIT_WIDE=1` on two ranks: each rank selects
+            // half the rows and the ranks swap token rows, the same bytes in rows `0..n`
+            // (`select_tokens_split`, the `METRALE_GLM_DSA_INDEX_SPLIT` mechanism).
+            let (sk, sel) = (&self.select_kernels, &w.select);
+            let on = crate::glm5next_layer::dsa_index_split_wide();
+            match row_split_for(ctx.comm, on, n) {
+                Some((s, comm)) => {
+                    select_tokens_split(gpu, sk, c, &geom, &inputs, sel, s, comm, stream)?
+                }
+                None => select_tokens(gpu, sk, c, &geom, &inputs, sel, Exact, stream)?,
+            }
             profile::end(profile::DSA_SELECT, t, gpu, stream);
 
             // 2026-10-01: `attend_rows`' launch at offset inputs: all sub-chunk rows share the

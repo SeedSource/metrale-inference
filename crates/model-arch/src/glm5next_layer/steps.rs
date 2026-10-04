@@ -29,16 +29,10 @@ impl Glm5NextLayer {
         rows: usize,
         stream: u64,
     ) -> Result<()> {
-        KernelLaunch::new(gpu, self.rms_norm_k)
-            .grid([rows as u32, 1, 1])
-            .block([(self.hidden.min(1024)) as u32, 1, 1])
-            .arg_ptr(x)
-            .arg_ptr(w)
-            .arg_ptr(out)
-            .arg_u32(self.hidden as u32)
-            .arg_f32(self.rms_eps)
-            .launch(stream)?;
-        Ok(())
+        // 2026-10-04: The launch itself is `seq_parallel::rms_norm_rows` (unchanged: grid
+        // `rows`, `min(hidden, 1024)` threads), shared with the sequence-parallel fronts.
+        let (k, h, eps) = (self.rms_norm_k, self.hidden, self.rms_eps);
+        super::seq_parallel::rms_norm_rows(gpu, k, x, w, out, rows, h, eps, stream)
     }
 
     /// 2026-09-25: Run the mixer on `normed`; returns the pointer that holds its output.

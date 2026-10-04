@@ -120,47 +120,51 @@ impl Glm5NextLayer {
     ) -> Result<()> {
         let subs = sub_chunks(num_tokens, rows);
         let wide = full_width_attn(prefill_fullwidth_gemm(), rows, rows_ffn);
-        // 2026-10-01: The full-width arm and the byte-identical restructurings below are
-        // mutually exclusive: SEQ_PARALLEL and COMM_OVERLAP assume per-sub-chunk attention
-        // calls and `rows`-wide dense slices, which the full-width arm replaces. Full width wins;
-        // the other two stay inert (one warning per process).
+        // 2026-10-01: `METRALE_GLM_PREFILL_SEQ_PARALLEL=1`: the same two passes with the
+        // row-local work split by rows across the two ranks (`sp.rs`).
+        // 2026-10-04: Under the full-width arm too: `prefill_staged_sp` then issues the
+        // full-width calls (`wide`). Before, the full-width arm left it inert.
+        if let Some(plan) = self.sp_plan(num_tokens, &subs, ctx) {
+            return self.prefill_staged_sp(
+                hidden,
+                &subs,
+                plan,
+                rows,
+                rows_ffn,
+                wide,
+                state,
+                kv_cache,
+                seq_len_start,
+                block_table,
+                ctx,
+                stream,
+            );
+        }
+        // 2026-10-01: The full-width arm and COMM_OVERLAP are mutually exclusive: the
+        // overlapped schedule assumes per-sub-chunk attention calls and `rows`-wide dense
+        // slices, which the full-width arm replaces. Full width wins; COMM_OVERLAP stays inert
+        // (one warning per process).
         if wide {
             warn_fullwidth_excludes();
-        } else {
-            // 2026-10-01: `METRALE_GLM_PREFILL_SEQ_PARALLEL=1`: the same two passes with the
-            // row-local work split by rows across the two ranks (`sp.rs`).
-            if let Some(plan) = self.sp_plan(num_tokens, &subs, ctx) {
-                return self.prefill_staged_sp(
-                    hidden,
-                    &subs,
-                    plan,
-                    rows,
-                    rows_ffn,
-                    state,
-                    kv_cache,
-                    seq_len_start,
-                    block_table,
-                    ctx,
-                    stream,
-                );
-            }
+        } else if prefill_comm_overlap()
+            && ctx.comm.is_some()
+            && !ctx.graph_capture
+            && !profile::on()
+        {
             // 2026-10-01: `METRALE_GLM_PREFILL_COMM_OVERLAP=1`: the same two passes with each
             // all-reduce overlapped with the next item's compute (`prefill_staged_overlapped`).
-            if prefill_comm_overlap() && ctx.comm.is_some() && !ctx.graph_capture && !profile::on()
-            {
-                return self.prefill_staged_overlapped(
-                    hidden,
-                    &subs,
-                    rows,
-                    rows_ffn,
-                    state,
-                    kv_cache,
-                    seq_len_start,
-                    block_table,
-                    ctx,
-                    stream,
-                );
-            }
+            return self.prefill_staged_overlapped(
+                hidden,
+                &subs,
+                rows,
+                rows_ffn,
+                state,
+                kv_cache,
+                seq_len_start,
+                block_table,
+                ctx,
+                stream,
+            );
         }
         // 2026-10-01: The attention calls: the sub-chunks, or under the full-width lever the
         // windows of `rows_ffn` rows (whole sub-chunks, since `rows_ffn` is a multiple of
@@ -291,14 +295,17 @@ impl Glm5NextLayer {
 }
 
 /// 2026-10-01: Once per process, when the full-width arm runs with
-/// `METRALE_GLM_PREFILL_SEQ_PARALLEL=1` or `METRALE_GLM_PREFILL_COMM_OVERLAP=1` also set: those
-/// two levers stay inert under it (`prefill_staged_run`).
+/// `METRALE_GLM_PREFILL_COMM_OVERLAP=1` also set: that lever stays inert under it
+/// (`prefill_staged_run`).
+/// 2026-10-04: `METRALE_GLM_PREFILL_SEQ_PARALLEL` no longer: it composes with the full-width
+/// arm (`sp.rs`).
 fn warn_fullwidth_excludes() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    if prefill_seq_parallel() || prefill_comm_overlap() {
+    if prefill_comm_overlap() {
         ONCE.call_once(|| {
             tracing::warn!(
-                "METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1 takes the staged prefill:                  METRALE_GLM_PREFILL_SEQ_PARALLEL / METRALE_GLM_PREFILL_COMM_OVERLAP are                  IGNORED while it is on (mutually exclusive)"
+                "METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1 takes the staged prefill: \
+                 METRALE_GLM_PREFILL_COMM_OVERLAP is IGNORED while it is on (mutually exclusive)"
             );
         });
     }

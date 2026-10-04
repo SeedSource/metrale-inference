@@ -368,6 +368,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
             "prefetch.rs",
             "profile.rs",
             "seq_parallel.rs",
+            "seq_parallel/tests.rs",
             "state.rs",
             "steps.rs",
             "steps/drafter.rs",

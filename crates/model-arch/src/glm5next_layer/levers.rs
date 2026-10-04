@@ -11,7 +11,7 @@
 // 2026-10-01: The two-rank communication levers live in `levers_comm.rs` (500-line cap).
 #[path = "levers_comm.rs"]
 mod comm;
-pub use comm::{dsa_index_split, prefill_comm_overlap, prefill_seq_parallel};
+pub use comm::{dsa_index_split, dsa_index_split_wide, prefill_comm_overlap, prefill_seq_parallel};
 
 /// 2026-09-25: Default tokens per batched prefill sub-chunk, the width `Glm5NextLayer::prefill`
 /// hands `Glm5NextLayer::forward_k` (overridable through [`prefill_rows`]).

@@ -356,3 +356,18 @@ fn rowwise_bf16_slab_is_counted_in_total_bytes() {
     sizes.ssm_rowwise_w_bf16 = 4096;
     assert_eq!(sizes.total_bytes(), before + 4096);
 }
+
+#[test]
+fn zero_head_bytes_trims_m_and_ceil16_buffers() {
+    use super::accessors::zero_head_bytes;
+    // 2026-10-04: GLM-5.3 serve: max_batch_tokens 8193, m_pad = 8208 rows.
+    let (m, w) = (8193, 16_384 * 2);
+    assert_eq!(zero_head_bytes(m * w, m, 1), w);
+    assert_eq!(zero_head_bytes(8208 * w, m, 1), 16 * w);
+    assert_eq!(zero_head_bytes(8208 * w, m, 17), 32 * w);
+    // whole buffer when every row is in use or the size matches neither layout
+    assert_eq!(zero_head_bytes(8208 * w, m, m), 8208 * w);
+    assert_eq!(zero_head_bytes(1_000_003, m, 1), 1_000_003);
+    // m already a multiple of 16: unchanged behaviour
+    assert_eq!(zero_head_bytes(4096 * w, 4096, 1), w);
+}

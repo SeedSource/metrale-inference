@@ -334,7 +334,9 @@ impl BufferArena {
     /// `max_batch_tokens`, `size / max_batch_tokens * tokens` bytes; any other
     /// buffer, and every buffer when `tokens >= max_batch_tokens`, is zeroed
     /// whole. `splitk_workspace`, `logits` and `scratch` are zeroed whole. The
-    /// caller must read only rows `0..tokens`. Measured 2026-08-28 on
+    /// caller must read only rows `0..tokens`. 2026-10-04: buffers sized on
+    /// `ceil16(max_batch_tokens)` rows are trimmed too (see `zero_head_bytes`).
+    /// Measured 2026-08-28 on
     /// GLM-5.3-Flash (nsys, `max_batch_tokens = 4096`): `zero_all` took 8.01 ms
     /// of an 85 ms decode step.
     pub fn zero_all_rows(
@@ -344,13 +346,7 @@ impl BufferArena {
         tokens: usize,
     ) -> anyhow::Result<()> {
         let m = self.max_batch_tokens.max(1);
-        let head = |n: usize| {
-            if tokens >= m || m == 0 || !n.is_multiple_of(m) {
-                n
-            } else {
-                n / m * tokens
-            }
-        };
+        let head = |n: usize| zero_head_bytes(n, m, tokens);
         for (ptr, n) in [
             (self.hidden_states, self.sizes.hidden_states),
             (self.residual, self.sizes.residual),
@@ -432,4 +428,28 @@ impl BufferArena {
         memset_live(gpu, self.scratch, self.sizes.scratch, stream)?;
         Ok(())
     }
+}
+
+/// 2026-10-04: Bytes of a token-major buffer of `n` bytes that `zero_all_rows`
+/// clears for `tokens` rows, with `m = max_batch_tokens`. A buffer of `m` rows
+/// keeps the first `tokens` rows. A buffer of `ceil16(m)` rows (`m_pad` and
+/// `k_max` in `sizes.rs`, which the cuBLASLt arms address in 16-row tiles)
+/// keeps the first `ceil16(tokens)` rows. Anything else, and any buffer when
+/// `tokens >= m`, is cleared whole. Before this, `m_pad` buffers were cleared
+/// whole whenever `m` was not a multiple of 16: on GLM-5.3 with
+/// `max_batch_tokens = 8193` that was ~2.1 GB per spec-off decode step,
+/// 10.8 ms of 62.7 (race-decode 2026-10-04, nsys on `ra-r3`).
+pub(crate) fn zero_head_bytes(n: usize, m: usize, tokens: usize) -> usize {
+    let m = m.max(1);
+    if tokens >= m {
+        return n;
+    }
+    if n.is_multiple_of(m) {
+        return n / m * tokens;
+    }
+    let m16 = m.next_multiple_of(16);
+    if n.is_multiple_of(m16) {
+        return n / m16 * tokens.next_multiple_of(16).min(m16);
+    }
+    n
 }

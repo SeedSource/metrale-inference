@@ -20,13 +20,23 @@
 //!       this window's x for gate/up, of arm (a)'s activation for down), and again with the
 //!       DYNAMIC fallback (`input_scale` 0.0, amax computed on the device);
 //!   (c) FP32 reference on sampled local rows: exact dequantized NVFP4 weights, BF16 x, gate/up
-//!       and the SwiGLU output rounded to BF16 as the GPU paths store them.
+//!       and the SwiGLU output rounded to BF16 as the GPU paths store them;
+//!   (d) emulated W4A4 FP32 reference (same rows, same weights as (c)): x and the SwiGLU output
+//!       are quantized to NVFP4 on the host exactly as the CUTLASS wrapper's
+//!       `pack_act_grouped_gs` does (16-element blocks along K, UE4M3 block scale
+//!       `min(amax16 / 6 / gs, 448)` rounded by `cvt.rn.satfinite.e4m3x2`, E2M1 codes RNE with
+//!       saturation at 6), dequantized, and fed to FP32 gate/up/SwiGLU/down. gs per mode:
+//!       static = the same checkpoint-`input_scale` stand-in handed to arm (b); dynamic =
+//!       amax / (6 * 448) with the amax `act_amax_grouped` computes (x over every routed local
+//!       row for gate/up; arm (b)'s own SwiGLU output over every local row for down). (d) has
+//!       the activation-quantization loss of W4A4 built in, so cos(b, d) isolates kernel error
+//!       from intrinsic loss: cos(b, c) low but cos(b, d) ~ 1 means intrinsic, not a bug.
 //! - Per case: cosine, max_abs, max_rel (= max_abs / max |ref|), nonfinite, for act and out, each
-//!   GPU arm vs (c). Timing per call (ms, TFLOP/s over the local rows) for (a) and (b), plus the
+//!   GPU arm vs (c); arm (b) also vs (d) (`b_<mode>_vs_emu`), plus (d) vs (c) (`emu_<mode>_vs_ref`). Timing per call (ms, TFLOP/s over the local rows) for (a) and (b), plus the
 //!   once-per-layer SFB swizzle. Lines are labelled ok / below_screen.
 //! - Ends with exactly one verdict line: `PASS: ...` when arm (b) ran, every output is finite
-//!   and cos(b, c) >= 0.98 on `out` for both scale modes in every case; otherwise a single
-//!   verdict line naming the reason.
+//!   and cos(b, c) >= 0.98 and cos(b, d) >= 0.999 on `out` for both scale modes in every case
+//!   (the PASS line prints both cosines); otherwise a `FAIL:` line naming the reasons.
 //!
 //!   cargo run -p metrale-model-arch --release --example glm_moe_w4a4_cutlass_microtest \
 //!       --features cuda,gpu-examples      (build with CUTLASS_HOME set, or arm (b) cannot run)
@@ -54,6 +64,9 @@ const LOCAL: usize = 144;
 const LIMIT: f32 = 10.0;
 const TOKEN_WINDOWS: [usize; 3] = [256, 2048, 8192];
 const COS_MIN: f64 = 0.98;
+/// 2026-10-03: cos(b, emulated W4A4 reference) floor on `out`: arm (b) differs from (d) only by
+/// kernel arithmetic (BF16 stores, FP32 accumulation order), not by activation quantization.
+const EMU_COS_MIN: f64 = 0.999;
 const VA2: &str = "moe_w4a16_grouped_gemm_ptrtable_bt_m128_k64_va2";
 const TEMPLATES: usize = 4;
 /// 2026-10-03: The NVFP4 global-scale denominator (E2M1 max 6 x E4M3 max 448).
@@ -252,6 +265,119 @@ fn reference_row(
         let mut s = 0f64;
         for k in 0..MI {
             s += (act[k] * dr[k]) as f64;
+        }
+        *o = s as f32 * down.s2_host[e];
+    }
+    (act, out)
+}
+
+/// 2026-10-03: E4M3 (UE4M3 for the non-negative block scales) round-to-nearest-even with
+/// saturation at 448, returned as the decoded value: PTX `cvt.rn.satfinite.e4m3x2.f32`, which
+/// `cutlass::float_ue4m3_t(float)` uses on sm_121 (CUTLASS float8.h `convert_from_float`).
+/// Subnormals have spacing 2^-9 (below 2^-6); a normal in [2^e, 2^(e+1)) has spacing 2^(e-3).
+fn e4m3_rne_sat(x: f32) -> f32 {
+    if x.is_nan() || x <= 0.0 {
+        return 0.0;
+    }
+    let x = x.min(448.0);
+    let q = if x < 2f32.powi(-6) {
+        2f32.powi(-9)
+    } else {
+        let e = ((x.to_bits() >> 23) & 0xFF) as i32 - 127;
+        2f32.powi(e - 3)
+    };
+    ((x / q).round_ties_even() * q).min(448.0)
+}
+
+/// 2026-10-03: `float_to_e2m1_rne` of `cutlass_nvfp4_grouped_gemm.cu`: E2M1 value (not code) of
+/// `x` rounded to nearest even, saturating at 6.
+fn e2m1_rne_val(x: f32) -> f32 {
+    let ax = x.abs();
+    let mag = if ax <= 0.25 {
+        0.0
+    } else if ax < 0.75 {
+        0.5
+    } else if ax <= 1.25 {
+        1.0
+    } else if ax < 1.75 {
+        1.5
+    } else if ax <= 2.5 {
+        2.0
+    } else if ax < 3.5 {
+        3.0
+    } else if ax <= 5.0 {
+        4.0
+    } else {
+        6.0
+    };
+    if x < 0.0 { -mag } else { mag }
+}
+
+/// 2026-10-03: The device's activation global scale for one projection (`act_gs_host` check in
+/// the wrapper, then `act_amax_grouped` + `resolve_act_gs`): a static `gs` that is finite and
+/// > 0 is used as is; otherwise amax / (6 * 448), or 1.0 when that amax is zero or not finite.
+fn resolve_gs(static_gs: f32, dyn_amax: f32) -> f32 {
+    if static_gs > 0.0 && static_gs < 3.0e38 {
+        static_gs
+    } else if dyn_amax > 0.0 && dyn_amax.is_finite() {
+        dyn_amax / FP4_GS_DEN
+    } else {
+        1.0
+    }
+}
+
+/// 2026-10-03: Quantize BF16-valued `v` (len a multiple of 16) to NVFP4 the way
+/// `pack_act_grouped_gs` does and return the dequantized values `e2m1 * block_scale * gs` (the
+/// GEMM epilogue's `alpha = weight_scale_2 * gs` carries the `gs`, so the product matches).
+fn nvfp4_fake_quant(v: &[f32], gs: f32) -> Vec<f32> {
+    let inv_gs = 1.0f32 / gs;
+    let mut out = vec![0f32; v.len()];
+    for (blk, o) in v.chunks_exact(16).zip(out.chunks_exact_mut(16)) {
+        let max_abs = blk.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let dec = e4m3_rne_sat(((max_abs / 6.0f32) * inv_gs).min(448.0));
+        let out_scale = if dec > 0.0 { 1.0f32 / (dec * gs) } else { 0.0 };
+        for (x, d) in blk.iter().zip(o.iter_mut()) {
+            *d = e2m1_rne_val(*x * out_scale) * dec * gs;
+        }
+    }
+    out
+}
+
+/// 2026-10-03: Arm (d), emulated W4A4 FP32 reference for one sorted row: (act `[MI]`, out `[H]`).
+/// As [`reference_row`], but `x` and the BF16-rounded SwiGLU output are NVFP4-quantized (global
+/// scales `gu_gs` for gate/up, `dn_gs` for down) before their dot products with the dequantized
+/// NVFP4 weights.
+fn reference_row_emu(
+    x: &[f32],
+    e: usize,
+    gate: &Table,
+    upt: &Table,
+    down: &Table,
+    gu_gs: f32,
+    dn_gs: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let t = e % TEMPLATES;
+    let (gd, ud, dd) = (&gate.tpl[t].deq, &upt.tpl[t].deq, &down.tpl[t].deq);
+    let xq = nvfp4_fake_quant(x, gu_gs);
+    let mut act = vec![0f32; MI];
+    for (n, a) in act.iter_mut().enumerate() {
+        let (mut sg, mut su) = (0f64, 0f64);
+        let (gr, ur) = (&gd[n * H..(n + 1) * H], &ud[n * H..(n + 1) * H]);
+        for k in 0..H {
+            sg += (xq[k] * gr[k]) as f64;
+            su += (xq[k] * ur[k]) as f64;
+        }
+        let gv = round_bf16(sg as f32 * gate.s2_host[e]).min(LIMIT);
+        let uv = round_bf16(su as f32 * upt.s2_host[e]).clamp(-LIMIT, LIMIT);
+        *a = round_bf16(gv / (1.0 + (-gv).exp()) * uv);
+    }
+    let aq = nvfp4_fake_quant(&act, dn_gs);
+    let mut out = vec![0f32; H];
+    for (n, o) in out.iter_mut().enumerate() {
+        let dr = &dd[n * MI..(n + 1) * MI];
+        let mut s = 0f64;
+        for k in 0..MI {
+            s += (aq[k] * dr[k]) as f64;
         }
         *o = s as f32 * down.s2_host[e];
     }
@@ -543,14 +669,15 @@ fn main() -> Result<()> {
                 .flat_map(|h| h.join().expect("reference thread"))
                 .collect()
         });
-        let stats = |act: &[u8], out: &[u8]| -> (Stats, Stats) {
+        let stats_vs = |refs: &[(Vec<f32>, Vec<f32>)], act: &[u8], out: &[u8]| -> (Stats, Stats) {
             let (mut sa, mut so) = (Stats::default(), Stats::default());
-            for ((i, _), (ra, ro)) in picks.iter().zip(&refs) {
+            for ((i, _), (ra, ro)) in picks.iter().zip(refs) {
                 sa.add(ra, (0..MI).map(|c| bf(act, i * MI + c)));
                 so.add(ro, (0..H).map(|c| bf(out, i * H + c)));
             }
             (sa, so)
         };
+        let stats = |act: &[u8], out: &[u8]| stats_vs(&refs, act, out);
         let (sa_a, so_a) = stats(&got_act_a, &got_out_a);
         println!(
             "  tokens={tokens} a_vs_ref act  {} ref_rows={n_ref}",
@@ -564,6 +691,17 @@ fn main() -> Result<()> {
         let act_amax = amax_rows(&got_act_a, &local, MI);
         let gu_static = x_amax / FP4_GS_DEN;
         let dn_static = act_amax / FP4_GS_DEN;
+        // 2026-10-03: The dynamic arm's gate/up amax: x over every routed local row, as
+        // `act_amax_grouped` reads it (down's amax is read from arm (b)'s own activation below).
+        let gu_dyn_amax = local
+            .iter()
+            .flat_map(|&(lo, hi)| lo..hi)
+            .map(|i| stid[i])
+            .fold(0f32, |m, tok| {
+                x_f[tok * H..(tok + 1) * H]
+                    .iter()
+                    .fold(m, |m, v| m.max(v.abs()))
+            });
         for (mode, gu_is, dn_is) in [("static", gu_static, dn_static), ("dynamic", 0.0, 0.0)] {
             let experts = experts_for(gu_is, dn_is);
             let tables = MoeTables::build(E, 0..LOCAL, &experts, &cache.layout());
@@ -612,6 +750,45 @@ fn main() -> Result<()> {
                 }
                 (x1, x2)
             };
+            // 2026-10-03: Arm (d) for this mode: the device's resolved global scales, then the
+            // emulated W4A4 reference rows (same sampled rows as (c)).
+            let gu_gs = resolve_gs(gu_is, gu_dyn_amax);
+            let dn_gs = resolve_gs(dn_is, amax_rows(&got_act_b, &local, MI));
+            let emu: Vec<(Vec<f32>, Vec<f32>)> = std::thread::scope(|s| {
+                let chunk = picks.len().div_ceil(threads).max(1);
+                let handles: Vec<_> = picks
+                    .chunks(chunk)
+                    .map(|part| {
+                        let (x_f, stid, gate, upt, down) = (&x_f, &stid, &gate, &upt, &down);
+                        s.spawn(move || {
+                            part.iter()
+                                .map(|&(i, e)| {
+                                    let tok = stid[i];
+                                    reference_row_emu(
+                                        &x_f[tok * H..(tok + 1) * H],
+                                        e,
+                                        gate,
+                                        upt,
+                                        down,
+                                        gu_gs,
+                                        dn_gs,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("emulated reference thread"))
+                    .collect()
+            });
+            let (sa_e, so_e) = stats_vs(&emu, &got_act_b, &got_out_b);
+            let (mut ea, mut eo) = (Stats::default(), Stats::default());
+            for ((ra, ro), (ca, co)) in refs.iter().zip(&emu) {
+                ea.add(ra, ca.iter().copied());
+                eo.add(ro, co.iter().copied());
+            }
             let label = |s: &Stats| {
                 if s.nonfinite == 0 && s.cos() >= COS_MIN {
                     "ok"
@@ -632,6 +809,16 @@ fn main() -> Result<()> {
                 label(&so)
             );
             println!("  tokens={tokens} b_{mode}_vs_a   out  {}", so_ab.line());
+            println!(
+                "  tokens={tokens} b_{mode}_vs_emu act  {} gs_gate_up={gu_gs:.4e} gs_down={dn_gs:.4e}",
+                sa_e.line()
+            );
+            println!("  tokens={tokens} b_{mode}_vs_emu out  {}", so_e.line());
+            println!(
+                "  tokens={tokens} emu_{mode}_vs_ref act  {} (intrinsic W4A4 loss vs c)",
+                ea.line()
+            );
+            println!("  tokens={tokens} emu_{mode}_vs_ref out  {}", eo.line());
             if so.nonfinite > 0 || sa.nonfinite > 0 {
                 problems.push(format!("tokens={tokens} {mode}: non-finite output"));
             }
@@ -639,6 +826,17 @@ fn main() -> Result<()> {
                 problems.push(format!(
                     "tokens={tokens} {mode}: cos(b,ref) out {:.5} < {COS_MIN}",
                     so.cos()
+                ));
+            }
+            if so_e.nonfinite > 0 || sa_e.nonfinite > 0 {
+                problems.push(format!(
+                    "tokens={tokens} {mode}: non-finite output vs emulated W4A4"
+                ));
+            }
+            if so_e.cos() < EMU_COS_MIN {
+                problems.push(format!(
+                    "tokens={tokens} {mode}: cos(b,emu) out {:.5} < {EMU_COS_MIN}",
+                    so_e.cos()
                 ));
             }
             let t_b = time_ms(g, iters, || run(g, &args, 0))?;
@@ -650,8 +848,9 @@ fn main() -> Result<()> {
                 t_a - t_b
             );
             summary.push(format!(
-                "{tokens}/{mode} cos={:.4} x{:.2}",
+                "{tokens}/{mode} cos_ref={:.4} cos_emu={:.5} x{:.2}",
                 so.cos(),
+                so_e.cos(),
                 t_a / t_b
             ));
         }
@@ -676,7 +875,8 @@ fn main() -> Result<()> {
         );
     }
     println!(
-        "PASS: CUTLASS W4A4 finite, cos(b,ref) out >= {COS_MIN} in every case ({})",
+        "PASS: CUTLASS W4A4 finite, cos(b,ref) out >= {COS_MIN} and cos(b,emu) out >= \
+         {EMU_COS_MIN} in every case ({})",
         summary.join(", ")
     );
     Ok(())

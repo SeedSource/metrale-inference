@@ -68,13 +68,25 @@ pub(super) fn run_batched_mixed_step(
         }
         // 2026-09-27: Non-last chunk ends as in `run_standard_chunk_loop`
         // (`prefill_plan::plan_chunk_len`).
-        let chunk_len = metrale_model_engine::prefill_plan::plan_chunk_len_grid(
+        // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING` cap (`prefill_chunk_cap`); this
+        // path runs with decoders active. No log line here (`prefilling` is borrowed shared).
+        let cap = if model.is_mla() {
+            None
+        } else {
+            super::super::prefill_chunk_cap::active_cap(
+                sched.levers.prefill_chunk_while_decoding,
+                super::super::prefill_chunk_cap::decoders(active),
+                model.kv_block_size(),
+            )
+        };
+        let (chunk_len, _) = super::super::prefill_chunk_cap::plan_capped(
             p.chunk_offset,
             p.prompt_tokens.len(),
             chunk_len,
             model.kv_block_size(),
             model.prefill_tail_split(&p.prompt_tokens),
             model.prefill_grid(&p.prompt_tokens),
+            cap,
         );
         let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
         chunk_lens.push(chunk_len);

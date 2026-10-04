@@ -95,5 +95,6 @@ pub(super) fn build_prefill_in_progress(
         seed,
         top_logprobs,
         timeout_at,
+        chunk_cap_logged: false,
     }
 }

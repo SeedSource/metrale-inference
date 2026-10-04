@@ -154,6 +154,9 @@ pub struct SchedLevers {
     /// 2026-09-25: `METRALE_MIXED_SLICE_TOKENS`: a cap on the mixed step's
     /// prefill slice (0 = the policy's budget).
     pub mixed_slice_tokens: usize,
+    /// 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING`: the prefill chunk cap while another
+    /// sequence decodes (`prefill_chunk_cap`); `None` = off.
+    pub prefill_chunk_while_decoding: Option<usize>,
     /// 2026-09-25: `METRALE_GRAMMAR_BUDGET_CLOSE` (default on; `0`/`false`
     /// disables).
     pub grammar_budget_close: bool,
@@ -374,6 +377,9 @@ impl SchedLevers {
             bisect_q12_disable: opt_in_lowercase("METRALE_BISECT_Q12_DISABLE"),
             bisect_no_mix: opt_in_lowercase("METRALE_BISECT_NO_MIX"),
             mixed_slice_tokens: num("METRALE_MIXED_SLICE_TOKENS", 0),
+            prefill_chunk_while_decoding: super::prefill_chunk_cap::resolve(
+                metrale_config::levers::var(super::prefill_chunk_cap::LEVER).as_deref(),
+            ),
             grammar_budget_close: crate::scheduler::helpers::parse_flag_default_on(
                 metrale_config::levers::var("METRALE_GRAMMAR_BUDGET_CLOSE").as_deref(),
             ),
@@ -444,6 +450,7 @@ impl SchedLevers {
             bisect_q12_disable: false,
             bisect_no_mix: false,
             mixed_slice_tokens: 0,
+            prefill_chunk_while_decoding: None,
             grammar_budget_close: true,
             think_ended_gpu_argmax: true,
             parallel_sample: true,

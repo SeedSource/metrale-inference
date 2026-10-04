@@ -222,6 +222,22 @@ pub(super) fn start_new_requests(
             } else {
                 max_prefill_tokens
             };
+            // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING`: while a sequence decodes,
+            // chunk 0 is planned from the capped budget (`prefill_chunk_cap`). Not for MLA
+            // (one chunk) or image prompts: the embed splice (`prefill_b/embed_chunk.rs`) restarts
+            // its row index every chunk, so image pads must stay inside chunk 0 as uncapped.
+            let decoders = super::prefill_chunk_cap::decoders(active);
+            let cap = if model.is_mla() || req.has_image_pixels() {
+                None
+            } else {
+                super::prefill_chunk_cap::active_cap(
+                    sched.levers.prefill_chunk_while_decoding,
+                    decoders,
+                    model.kv_block_size(),
+                )
+            };
+            let uncapped_budget = budget;
+            let budget = cap.map_or(budget, |c| budget.min(c));
             match start_chunked_prefill(
                 sched,
                 think_end_token,
@@ -248,7 +264,27 @@ pub(super) fn start_new_requests(
                     );
                     active.push(a);
                 }
-                Ok(StartPrefillResult::InProgress(p)) => {
+                Ok(StartPrefillResult::InProgress(mut p)) => {
+                    // 2026-10-03: Chunk 0 ran shorter than its uncapped plan: the cap fired.
+                    if budget < uncapped_budget && p.chunk_offset > 0 {
+                        let total = p.prompt_tokens.len();
+                        let (_, uncapped) = super::prefill_chunk_cap::plan_capped(
+                            0,
+                            total,
+                            total.min(uncapped_budget),
+                            model.kv_block_size(),
+                            model.prefill_tail_split(&p.prompt_tokens),
+                            model.prefill_grid(&p.prompt_tokens),
+                            None,
+                        );
+                        if p.chunk_offset < uncapped {
+                            super::prefill_chunk_cap::log_capped(
+                                &mut p.chunk_cap_logged,
+                                p.chunk_offset,
+                                decoders,
+                            );
+                        }
+                    }
                     tracing::info!(
                         "Prefill chunk 0/{}: {}/{} tokens",
                         p.prompt_tokens.len(),

@@ -131,6 +131,9 @@ pub(super) struct PrefillInProgress {
     pub seed: Option<u64>,
     pub top_logprobs: Option<u8>,
     pub timeout_at: Option<Instant>,
+    /// 2026-10-03: The "prefill chunk capped" line was logged for this prefill
+    /// (`prefill_chunk_cap::log_capped`).
+    pub chunk_cap_logged: bool,
 }
 
 mod active;

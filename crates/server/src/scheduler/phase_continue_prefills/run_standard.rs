@@ -77,14 +77,31 @@ pub(super) fn run_standard_chunk_loop(
     // 2026-09-27: A non-last chunk ends on a KV block boundary, or at the model's
     // tail split point when it would span it, so its SSM snapshot is restorable
     // (`prefill_plan::plan_chunk_len`).
-    let chunk_len = metrale_model_engine::prefill_plan::plan_chunk_len_grid(
+    // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING` caps the chunk while a sequence
+    // decodes (`prefill_chunk_cap`); off, or with no decoder, this is the uncapped plan. MLA
+    // prompts are not split. Rank 0 only: the worker gets `chunk_len` in the broadcast below.
+    let decoders = super::super::prefill_chunk_cap::decoders(active);
+    let cap = if model.is_mla() {
+        None
+    } else {
+        super::super::prefill_chunk_cap::active_cap(
+            sched.levers.prefill_chunk_while_decoding,
+            decoders,
+            model.kv_block_size(),
+        )
+    };
+    let (chunk_len, uncapped_len) = super::super::prefill_chunk_cap::plan_capped(
         p.chunk_offset,
         p.prompt_tokens.len(),
         chunk_len,
         model.kv_block_size(),
         model.prefill_tail_split(&p.prompt_tokens),
         model.prefill_grid(&p.prompt_tokens),
+        cap,
     );
+    if chunk_len < uncapped_len {
+        super::super::prefill_chunk_cap::log_capped(&mut p.chunk_cap_logged, chunk_len, decoders);
+    }
     let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
 
     // 2026-09-25: `METRALE_BISECT_NO_MIX=1` turns the fused `mixed_forward`

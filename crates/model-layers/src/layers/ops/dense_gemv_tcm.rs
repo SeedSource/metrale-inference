@@ -125,7 +125,10 @@ pub fn routes(m: u32, n: u32, k: u32, fp8: bool) -> bool {
 
 /// 2026-10-04: The entry for a weight kind and shape. A function of `(n, k)` only, so a
 /// weight runs the same entry at every M (variants of a kind are bit-identical anyway).
-/// Chosen from the 2026-10-04 microtest (glm5next_gemv_tc_microtest, TIMING-VAR lines).
+/// Measured 2026-10-04 (glm5next_gemv_tc_microtest, image ra-dec-gemvm @4ad8a124, n1, cold
+/// pool, 11 GLM shapes x M 1,3,4,8,11,12,16): summed variant time BF16 KU8 11622 / KU4 11766
+/// / NT2 11702 us, FP8 KU4 5992 / KU8 5954 / NT2 6094 us; spreads within run noise, so the
+/// default per kind is kept for every shape.
 pub fn variant_for(_n: u32, _k: u32, fp8: bool) -> TcmVariant {
     if fp8 {
         TcmVariant::Fp8

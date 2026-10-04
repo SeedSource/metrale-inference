@@ -34,6 +34,12 @@
 //! - Per case: cosine, max_abs, max_rel (= max_abs / max |ref|), nonfinite, for act and out, each
 //!   GPU arm vs (c); arm (b) also vs (d) (`b_<mode>_vs_emu`), plus (d) vs (c) (`emu_<mode>_vs_ref`). Timing per call (ms, TFLOP/s over the local rows) for (a) and (b), plus the
 //!   once-per-layer SFB swizzle. Lines are labelled ok / below_screen.
+//! - 2026-10-04: Arm (b)'s `dynamic` mode is the `METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE=1` table
+//!   (`MoeTables::build(.., dynamic_scale = true)`). Arm (e), per mode, informational only (no
+//!   FAIL condition, not in the PASS line): the `METRALE_GLM_MOE_W4A4_DOWN_W4A16=1` split, W4A4
+//!   gate/up + SwiGLU (`RunArgs::skip_down`) then the arm-(a) W4A16 `va2` kernel for down over
+//!   the same `a_act`; prints `e_<mode>_w4a4gu_w4a16dn_vs_ref` (cos / max_abs vs (c)) and a
+//!   `TIMING ... arm=e_w4a4_gateup_w4a16_down_<mode>` line.
 //! - Ends with exactly one verdict line: `PASS: ...` when arm (b) ran, every output is finite
 //!   and cos(b, c) >= 0.98 and cos(b, d) >= 0.999 on `out` for both scale modes in every case
 //!   (the PASS line prints both cosines); otherwise a `FAIL:` line naming the reasons.
@@ -601,6 +607,7 @@ fn main() -> Result<()> {
         let act_b = g.alloc(te * MI * 2)?;
         let out_a = g.alloc(te * H * 2)?;
         let out_b = g.alloc(te * H * 2)?;
+        let out_c = g.alloc(te * H * 2)?;
 
         // 2026-10-03: Arm (a): the production W4A16 prefill path at the VA2 tile.
         let m_tiles = busiest.div_ceil(128).max(1) as u32;
@@ -704,7 +711,10 @@ fn main() -> Result<()> {
             });
         for (mode, gu_is, dn_is) in [("static", gu_static, dn_static), ("dynamic", 0.0, 0.0)] {
             let experts = experts_for(gu_is, dn_is);
-            let tables = MoeTables::build(E, 0..LOCAL, &experts, &cache.layout());
+            // 2026-10-04: The dynamic mode goes through the `METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE`
+            // table path (`dynamic_scale = true`), whose result `experts_for(0, 0)` already gives.
+            let tables =
+                MoeTables::build(E, 0..LOCAL, &experts, &cache.layout(), mode == "dynamic");
             let args = RunArgs {
                 swiglu: k_swiglu,
                 x: d_x,
@@ -719,6 +729,7 @@ fn main() -> Result<()> {
                 swiglu_limit: LIMIT,
                 offsets: &off_i32,
                 tables: &tables,
+                skip_down: false,
             };
             g.memset_async(act_b, 0, te * MI * 2, 0)?;
             g.memset_async(out_b, 0, te * H * 2, 0)?;
@@ -847,6 +858,53 @@ fn main() -> Result<()> {
                 t_a / t_b,
                 t_a - t_b
             );
+            // 2026-10-04: Arm (e), informational only (no FAIL condition, not in the PASS line):
+            // the `METRALE_GLM_MOE_W4A4_DOWN_W4A16=1` split: W4A4 gate/up + SwiGLU
+            // (`skip_down`), then the REAL W4A16 down (the arm-(a) `va2` kernel) over `act_b`.
+            let args_e = RunArgs {
+                skip_down: true,
+                ..args
+            };
+            let arm_e = || -> Result<()> {
+                run(g, &args_e, 0)?;
+                va2(
+                    g,
+                    k_va2,
+                    act_b,
+                    &down,
+                    out_c,
+                    d_off,
+                    DevicePtr(0),
+                    H,
+                    MI,
+                    m_tiles,
+                )
+            };
+            g.memset_async(out_c, 0, te * H * 2, 0)?;
+            match arm_e().and_then(|_| g.synchronize(0)) {
+                Err(e) => println!("  tokens={tokens} e_{mode} run error: {e:#}"),
+                Ok(()) => {
+                    let got_act_e = dn(g, act_b, te * MI * 2)?;
+                    let got_out_e = dn(g, out_c, te * H * 2)?;
+                    let (sa_e2, so_e2) = stats(&got_act_e, &got_out_e);
+                    println!(
+                        "  tokens={tokens} e_{mode}_w4a4gu_w4a16dn_vs_ref act  {}",
+                        sa_e2.line()
+                    );
+                    println!(
+                        "  tokens={tokens} e_{mode}_w4a4gu_w4a16dn_vs_ref out  {}",
+                        so_e2.line()
+                    );
+                    let t_e = time_ms(g, iters, arm_e)?;
+                    println!(
+                        "TIMING tokens={tokens} arm=e_w4a4_gateup_w4a16_down_{mode} ms={t_e:.3} \
+                         TFLOP/s={:.1} speedup_vs_a={:.3}x saved_ms_per_window={:.3}",
+                        flop / (t_e * 1e9),
+                        t_a / t_e,
+                        t_a - t_e
+                    );
+                }
+            }
             summary.push(format!(
                 "{tokens}/{mode} cos_ref={:.4} cos_emu={:.5} x{:.2}",
                 so.cos(),
@@ -860,7 +918,7 @@ fn main() -> Result<()> {
         ] {
             g.free(p)?;
         }
-        for p in [out_a, out_b] {
+        for p in [out_a, out_b, out_c] {
             g.free(p)?;
         }
     }

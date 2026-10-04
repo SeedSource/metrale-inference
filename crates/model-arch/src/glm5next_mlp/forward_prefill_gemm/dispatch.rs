@@ -51,6 +51,71 @@ fn grouped_gemm(
         .launch(stream)
 }
 
+/// 2026-09-25: The grid height of the production grouped GEMM: the real expert histogram with
+/// `prefill_gemm_exact_tiles()` (`copy_d2h_on_stream` synchronises the stream first, so the read
+/// sees the sort's output), else the worst case, `ceil(rows * top_k / m_tile)`.
+/// 2026-10-04: Lifted out of `forward_moe_grouped_prefill` unchanged so the W4A4 down arm shares
+/// it.
+fn grouped_max_m_tiles(
+    gpu: &dyn GpuBackend,
+    cfg: &Glm5NextMlpConfig,
+    ws: &Glm5NextMlpWorkspace,
+    te: usize,
+    tile: GemmTile,
+    stream: u64,
+) -> Result<u32> {
+    let worst_case = te.div_ceil(tile.m_tile).max(1) as u32;
+    if prefill_gemm_exact_tiles() {
+        let mut off_raw = vec![0u8; (cfg.num_experts + 1) * 4];
+        gpu.copy_d2h_on_stream(ws.expert_offsets(), &mut off_raw, stream)?;
+        let offsets: Vec<i32> = off_raw
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok(max_m_tiles_from_offsets(&offsets, worst_case, tile.m_tile))
+    } else {
+        Ok(worst_case)
+    }
+}
+
+/// 2026-10-04: The down projection alone, over `ws.a_act` (BF16, expert-sorted, `te` rows of
+/// `moe_intermediate`), into `ws.expert_out`, on the W4A16 kernel the non-W4A4 path selects for
+/// this call: the fused `moe_w4a16_prefill_mma_down_*` when its `usable` contract holds (the
+/// `METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1` arm of [`forward_moe_grouped_prefill`]), else the
+/// production `moe_grouped_gemm` tile with the same grid and null gather map as its down launch.
+#[allow(clippy::too_many_arguments)]
+fn down_w4a16(
+    gpu: &dyn GpuBackend,
+    k: &Glm5NextMlpKernels,
+    cfg: &Glm5NextMlpConfig,
+    w: &Glm5NextMoeWeights,
+    x: DevicePtr,
+    te: usize,
+    ws: &Glm5NextMlpWorkspace,
+    stream: u64,
+) -> Result<()> {
+    if super::w4a16_mma::usable(&k.moe_prefill_mma, cfg, w, x, te, ws) {
+        return super::w4a16_mma::forward_down(gpu, &k.moe_prefill_mma, cfg, w, te, ws, stream);
+    }
+    let tile = k.moe_grouped_tile;
+    let max_m_tiles = grouped_max_m_tiles(gpu, cfg, ws, te, tile, stream)?;
+    grouped_gemm(
+        gpu,
+        k.moe_grouped_gemm,
+        ws.a_act(),
+        &w.ptrs.down,
+        ws.expert_out(),
+        ws.expert_offsets(),
+        DevicePtr(0),
+        cfg.num_experts,
+        cfg.hidden,
+        cfg.moe_intermediate,
+        max_m_tiles,
+        tile,
+        stream,
+    )
+}
+
 /// 2026-09-25: Sort, grouped gate GEMM, grouped up GEMM, clamped SwiGLU, grouped down GEMM, over
 /// all `rows` rows in one launch each. Reads the router's `ws.ids` and leaves the routed outputs
 /// in `ws.expert_out` in expert-sorted row order, addressed by `ws.token_to_perm`; the caller
@@ -99,10 +164,16 @@ pub(crate) fn forward_moe_grouped_prefill(
     // CUTLASS NVFP4 grouped GEMM (`cutlass_w4a4.rs`), same buffers and row order. Off (default):
     // one cached env read, nothing else. A refusal (logged) returns false before any output is
     // trusted and the W4A16 paths below run unchanged.
-    if super::cutlass_w4a4::lever_on()
-        && super::cutlass_w4a4::forward(gpu, k, cfg, w, x, te, ws, stream)?
-    {
-        return Ok(());
+    // 2026-10-04: With `METRALE_GLM_MOE_W4A4_DOWN_W4A16=1` the CUTLASS arm stops after the
+    // SwiGLU (`DownPending`) and the down GEMM runs on the W4A16 path this call would have taken.
+    if super::cutlass_w4a4::lever_on() {
+        match super::cutlass_w4a4::forward(gpu, k, cfg, w, x, te, ws, stream)? {
+            super::cutlass_w4a4::Outcome::Done => return Ok(()),
+            super::cutlass_w4a4::Outcome::DownPending => {
+                return down_w4a16(gpu, k, cfg, w, x, te, ws, stream);
+            }
+            super::cutlass_w4a4::Outcome::Refused => {}
+        }
     }
 
     // 2026-10-01: `METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1`: tile list + fused gate/up/SwiGLU +
@@ -128,18 +199,7 @@ pub(crate) fn forward_moe_grouped_prefill(
     // 2026-09-29: The tile `resolve` actually bound (the base tile after a fallback), so the grid
     // matches the kernel that runs.
     let tile = k.moe_grouped_tile;
-    let worst_case = te.div_ceil(tile.m_tile).max(1) as u32;
-    let max_m_tiles = if prefill_gemm_exact_tiles() {
-        let mut off_raw = vec![0u8; (cfg.num_experts + 1) * 4];
-        gpu.copy_d2h_on_stream(ws.expert_offsets(), &mut off_raw, stream)?;
-        let offsets: Vec<i32> = off_raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        max_m_tiles_from_offsets(&offsets, worst_case, tile.m_tile)
-    } else {
-        worst_case
-    };
+    let max_m_tiles = grouped_max_m_tiles(gpu, cfg, ws, te, tile, stream)?;
 
     // 2026-09-30: `METRALE_GLM_MOE_PREFILL_PERMUTE=1`: gather `x` into `ws.moe_perm()` once, in
     // expert-sorted order (`moe_permute_tokens`, `moe_permute.cu`, the same module

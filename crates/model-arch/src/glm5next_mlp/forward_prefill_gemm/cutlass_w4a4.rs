@@ -26,6 +26,21 @@
 //! layer's experts, which Metrale quantizes at load) gets a DYNAMIC global scale: amax / (6 *
 //! 448) over every row its experts read in that call, computed on the device.
 //!
+//! 2026-10-04: two independent opt-in fix levers (each default off, each only with the lever
+//! above; lever off = the code above, unchanged), added after paired-seed quality testing
+//! showed the static-scale W4A4 degrading one safety scenario:
+//!   - `METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE=1`: ignore every static `input_scale`; all gate/up and
+//!     down projections get the dynamic global scale (`gs = 0.0` in [`MoeTables`], the C side's
+//!     existing amax / 2688 path). The startup log says which mode is on.
+//!   - `METRALE_GLM_MOE_W4A4_DOWN_W4A16=1`: gate/up and the clamped SwiGLU stay as above, but
+//!     the DOWN projection runs the W4A16 grouped GEMM on BF16 `ws.a_act` instead of quantizing
+//!     it to NVFP4 (no second activation quantization). [`forward`] returns
+//!     [`Outcome::DownPending`] after the SwiGLU and `dispatch.rs` runs the down kernel the
+//!     W4A16 path would have chosen for the call (`w4a16_mma::forward_down` when that lever's
+//!     contract holds, else the production `moe_grouped_gemm` tile). `ws.a_act` has the same
+//!     layout either way: `swiglu_rows` writes `[te, moe_intermediate]` BF16 in expert-sorted
+//!     row order, exactly what the production down launch reads (null gather map).
+//!
 //! The weight block scales are swizzled into CUTLASS's SFB layout per layer into one cache
 //! (`SfbCache`, local experts x (gate + up + down), 216 MB at GLM-5.3 EP=2) and re-swizzled
 //! only when the layer changes; the staged prefill runs all FFN windows of a layer back to
@@ -39,8 +54,9 @@
 //!   (`glm5next_moe_combine_indexed` reads them unchanged); rows of a remote expert are not
 //!   written (the caller pre-zeroes `expert_out`).
 //! - Refusals never produce output: a build without CUTLASS, a shape outside
-//!   [`shape_contract`], no cache, or a CUTLASS error makes [`forward`] return `Ok(false)` with
-//!   a logged reason and the caller runs the W4A16 path, which rewrites every local row.
+//!   [`shape_contract`], no cache, or a CUTLASS error makes [`forward`] return
+//!   [`Outcome::Refused`] with a logged reason and the caller runs the W4A16 path, which
+//!   rewrites every local row.
 //! - Numerics: W4A4, NOT bit-identical to any W4A16 path; quality is gated at model level.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,6 +72,16 @@ use super::super::{Glm5NextMlpConfig, Glm5NextMlpKernels};
 /// 2026-10-03: `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1` (read once, `metrale_config`).
 pub fn lever_on() -> bool {
     metrale_config::glm_moe_prefill_cutlass_w4a4()
+}
+
+/// 2026-10-04: `METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE=1` (read once, `metrale_config`).
+pub fn dynamic_scale_on() -> bool {
+    metrale_config::glm_moe_w4a4_dynamic_scale()
+}
+
+/// 2026-10-04: `METRALE_GLM_MOE_W4A4_DOWN_W4A16=1` (read once, `metrale_config`).
+pub fn down_w4a16_on() -> bool {
+    metrale_config::glm_moe_w4a4_down_w4a16()
 }
 
 /// 2026-10-03: The CUTLASS tile's K and the TMA row alignment: both GEMM dims a multiple of
@@ -156,12 +182,15 @@ pub struct MoeTables {
 
 impl MoeTables {
     /// 2026-10-03: Tables for `num_experts` global ids of which `local` (ascending, slot `s` =
-    /// id `local.start + s`) are `experts`, with SFBs at `sfb`.
+    /// id `local.start + s`) are `experts`, with SFBs at `sfb`. 2026-10-04: `dynamic_scale` (the
+    /// `METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE` lever) leaves every `gate_up_gs` / `down_gs` at 0.0,
+    /// the dynamic global scale, whatever the checkpoint's `input_scale`s are.
     pub fn build(
         num_experts: usize,
         local: std::ops::Range<usize>,
         experts: &[Glm5NextExpertWeights],
         sfb: &SfbLayout,
+        dynamic_scale: bool,
     ) -> Self {
         let mut t = Self {
             gate: ProjTables::zeroed(num_experts),
@@ -194,8 +223,11 @@ impl MoeTables {
                 sfb.base + sfb.down_off + s64 * sfb.down_stride,
                 e.down_proj.scale_2,
             );
-            t.gate_up_gs[id] = gate_up_global_scale(e.gate_proj.input_scale, e.up_proj.input_scale);
-            t.down_gs[id] = sanitize_input_scale(e.down_proj.input_scale);
+            if !dynamic_scale {
+                t.gate_up_gs[id] =
+                    gate_up_global_scale(e.gate_proj.input_scale, e.up_proj.input_scale);
+                t.down_gs[id] = sanitize_input_scale(e.down_proj.input_scale);
+            }
         }
         t
     }
@@ -370,9 +402,14 @@ pub struct RunArgs<'a> {
     /// 2026-10-03: Host copy of `expert_offsets`, `num_experts + 1` entries.
     pub offsets: &'a [i32],
     pub tables: &'a MoeTables,
+    /// 2026-10-04: Stop after the SwiGLU: the caller runs the down projection on W4A16
+    /// (`METRALE_GLM_MOE_W4A4_DOWN_W4A16=1`).
+    pub skip_down: bool,
 }
 
 /// 2026-10-03: CUTLASS W4A4 gate/up, the clamped SwiGLU, CUTLASS W4A4 down, all on `stream`.
+/// 2026-10-04: With `skip_down`, only gate/up and the SwiGLU (`a_act` is then ready for a W4A16
+/// down; `expert_out` is not written).
 pub fn run(gpu: &dyn GpuBackend, a: &RunArgs<'_>, stream: u64) -> Result<()> {
     let t = a.tables;
     let (h, mi) = (a.hidden as u32, a.moe_intermediate as u32);
@@ -403,6 +440,9 @@ pub fn run(gpu: &dyn GpuBackend, a: &RunArgs<'_>, stream: u64) -> Result<()> {
         a.swiglu_limit,
         stream,
     )?;
+    if a.skip_down {
+        return Ok(());
+    }
     metrale_gpu_runtime::cutlass::nvfp4_grouped_down_w4a4(
         a.a_act.0,
         &t.down.packed,
@@ -454,8 +494,10 @@ pub fn prepare_at_load(gpu: &dyn GpuBackend, cfg: &Glm5NextMlpConfig) -> Result<
     let _ = CACHE.set(cache);
     tracing::warn!(
         "GLM routed-MoE prefill: CUTLASS W4A4 ON (METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1) — NVFP4 \
-         activations against the checkpoint input_scale, NOT bit-identical to W4A16. SFB cache \
+         activations against {}, down projection {}; NOT bit-identical to W4A16. SFB cache \
          {:.1} MB ({} local experts), CUTLASS workspace {:.1} MB",
+        scale_mode_text(dynamic_scale_on()),
+        down_mode_text(down_w4a16_on()),
         sfb as f64 / 1e6,
         cfg.local_experts,
         ws as f64 / 1e6
@@ -463,8 +505,39 @@ pub fn prepare_at_load(gpu: &dyn GpuBackend, cfg: &Glm5NextMlpConfig) -> Result<
     Ok(Some(sfb + ws))
 }
 
+/// 2026-10-04: Startup-log wording of the activation-scale mode.
+fn scale_mode_text(dynamic: bool) -> &'static str {
+    if dynamic {
+        "the DYNAMIC per-call global scale (METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE=1; static \
+         input_scales ignored)"
+    } else {
+        "the checkpoint input_scale (dynamic only where one is missing)"
+    }
+}
+
+/// 2026-10-04: Startup-log wording of the down-projection mode.
+fn down_mode_text(down_w4a16: bool) -> &'static str {
+    if down_w4a16 {
+        "W4A16 on BF16 activations (METRALE_GLM_MOE_W4A4_DOWN_W4A16=1)"
+    } else {
+        "W4A4"
+    }
+}
+
+/// 2026-10-04: What [`forward`] did with a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// 2026-10-04: Refused before any output was trusted; the caller runs the W4A16 path.
+    Refused,
+    /// 2026-10-04: Gate/up, SwiGLU and down done; `expert_out` written.
+    Done,
+    /// 2026-10-04: Gate/up and SwiGLU done (`ws.a_act` ready); the caller runs the W4A16 down
+    /// (`METRALE_GLM_MOE_W4A4_DOWN_W4A16=1`).
+    DownPending,
+}
+
 /// 2026-10-03: Log the first few refusals of a call, then count silently.
-fn refuse(why: &str) -> Result<bool> {
+fn refuse(why: &str) -> Result<Outcome> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     if n < 4 {
@@ -477,12 +550,14 @@ fn refuse(why: &str) -> Result<bool> {
             }
         );
     }
-    Ok(false)
+    Ok(Outcome::Refused)
 }
 
 /// 2026-10-03: The dispatch arm: after `moe_sort_by_expert`, run the routed experts of `te`
-/// slots through CUTLASS W4A4. `Ok(true)`: done, outputs written. `Ok(false)`: refused with a
-/// logged reason before any output was trusted; the caller runs the W4A16 path.
+/// slots through CUTLASS W4A4. [`Outcome::Done`]: outputs written. [`Outcome::Refused`]: refused
+/// with a logged reason before any output was trusted; the caller runs the W4A16 path.
+/// 2026-10-04: [`Outcome::DownPending`] with `METRALE_GLM_MOE_W4A4_DOWN_W4A16=1`: only the down
+/// projection is left to the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(
     gpu: &dyn GpuBackend,
@@ -493,7 +568,7 @@ pub(crate) fn forward(
     te: usize,
     ws: &Glm5NextMlpWorkspace,
     stream: u64,
-) -> Result<bool> {
+) -> Result<Outcome> {
     let Some(cache) = CACHE.get() else {
         return refuse("not prepared at load (no CUTLASS build, or a refused shape)");
     };
@@ -531,15 +606,23 @@ pub(crate) fn forward(
         cfg.local_expert_range(),
         &w.experts,
         &cache.layout(),
+        dynamic_scale_on(),
     );
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             let (gu, dn) = tables.static_scale_counts();
             tracing::warn!(
-                "GLM routed-MoE prefill CUTLASS W4A4: first layer has a static input_scale for \
+                "GLM routed-MoE prefill CUTLASS W4A4: first layer uses a static input_scale for \
                  {gu}/{n} local gate/up and {dn}/{n} local down projections (the rest: dynamic \
-                 per-tensor amax / 2688)",
+                 per-tensor amax / 2688; METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE {}); down projection \
+                 {}",
+                if dynamic_scale_on() {
+                    "=1: all dynamic"
+                } else {
+                    "off"
+                },
+                down_mode_text(down_w4a16_on()),
                 n = cfg.local_experts
             );
         });
@@ -558,9 +641,11 @@ pub(crate) fn forward(
         swiglu_limit: cfg.swiglu_limit,
         offsets: &offsets,
         tables: &tables,
+        skip_down: down_w4a16_on(),
     };
     match run(gpu, &args, stream) {
-        Ok(()) => Ok(true),
+        Ok(()) if args.skip_down => Ok(Outcome::DownPending),
+        Ok(()) => Ok(Outcome::Done),
         Err(e) => refuse(&format!("{e:#}")),
     }
 }
@@ -625,7 +710,7 @@ mod tests {
             })
             .collect();
         let l = SfbLayout::new(0x9000_0000, 3, 256, 128);
-        let t = MoeTables::build(8, 3..6, &experts, &l);
+        let t = MoeTables::build(8, 3..6, &experts, &l, false);
         for id in [0usize, 1, 2, 6, 7] {
             assert_eq!(t.gate.packed[id], 0);
             assert_eq!(t.gate.sfb[id], 0);
@@ -652,5 +737,38 @@ mod tests {
         assert_eq!(t.down_gs[4], 0.0);
         assert_eq!(t.down_gs[5], 5e-4);
         assert_eq!(t.static_scale_counts(), (3, 2));
+    }
+
+    /// 2026-10-04: `METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE=1`: every global scale is 0.0 (dynamic),
+    /// while weights, SFBs and weight scales are exactly what the static build produces.
+    #[test]
+    fn dynamic_scale_zeroes_every_activation_scale_and_nothing_else() {
+        let experts: Vec<Glm5NextExpertWeights> = (0..3u64)
+            .map(|s| Glm5NextExpertWeights {
+                gate_proj: proj(0x10_000 + s * 0x100, 0.5, 1e-4 * (s + 1) as f32),
+                up_proj: proj(0x20_000 + s * 0x100, 0.25, 2e-4),
+                down_proj: proj(0x30_000 + s * 0x100, 0.125, 5e-4),
+            })
+            .collect();
+        let l = SfbLayout::new(0x9000_0000, 3, 256, 128);
+        let stat = MoeTables::build(8, 3..6, &experts, &l, false);
+        let dynm = MoeTables::build(8, 3..6, &experts, &l, true);
+        assert_eq!(stat.static_scale_counts(), (3, 3));
+        assert_eq!(dynm.static_scale_counts(), (0, 0));
+        assert_eq!(dynm.gate_up_gs, vec![0.0; 8]);
+        assert_eq!(dynm.down_gs, vec![0.0; 8]);
+        // Only the two activation-scale vectors differ.
+        assert_eq!(
+            MoeTables {
+                gate_up_gs: vec![],
+                down_gs: vec![],
+                ..stat
+            },
+            MoeTables {
+                gate_up_gs: vec![],
+                down_gs: vec![],
+                ..dynm
+            }
+        );
     }
 }

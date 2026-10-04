@@ -197,6 +197,75 @@ mod glm_moe_cutlass_w4a4_gate_tests {
     }
 }
 
+/// 2026-10-04: Whether the CUTLASS W4A4 routed-MoE prefill ignores the checkpoint's static
+/// `input_scale`s and quantizes every activation with the dynamic per-call global scale
+/// (`METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE`, see [`glm_moe_w4a4_dynamic_scale_from`]); off by
+/// default, and only meaningful with `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1`. Read once per
+/// process.
+pub fn glm_moe_w4a4_dynamic_scale() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        glm_moe_w4a4_dynamic_scale_from(
+            std::env::var("METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-04: The policy half of [`glm_moe_w4a4_dynamic_scale`]: only `1` (trimmed) turns it on.
+pub fn glm_moe_w4a4_dynamic_scale_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// 2026-10-04: Whether the CUTLASS W4A4 routed-MoE prefill runs its DOWN projection as the
+/// W4A16 grouped GEMM (BF16 activations) instead of W4A4 (`METRALE_GLM_MOE_W4A4_DOWN_W4A16`, see
+/// [`glm_moe_w4a4_down_w4a16_from`]); gate/up stay W4A4. Off by default, and only meaningful with
+/// `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1`. Read once per process.
+pub fn glm_moe_w4a4_down_w4a16() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        glm_moe_w4a4_down_w4a16_from(
+            std::env::var("METRALE_GLM_MOE_W4A4_DOWN_W4A16")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-04: The policy half of [`glm_moe_w4a4_down_w4a16`]: only `1` (trimmed) turns it on.
+pub fn glm_moe_w4a4_down_w4a16_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+#[cfg(test)]
+mod glm_moe_w4a4_fix_lever_tests {
+    use super::{glm_moe_w4a4_down_w4a16_from, glm_moe_w4a4_dynamic_scale_from};
+
+    #[test]
+    fn only_one_turns_either_fix_lever_on() {
+        for f in [
+            glm_moe_w4a4_dynamic_scale_from,
+            glm_moe_w4a4_down_w4a16_from,
+        ] {
+            for off in [
+                None,
+                Some(""),
+                Some("0"),
+                Some("true"),
+                Some("on"),
+                Some("11"),
+                Some("1x"),
+            ] {
+                assert!(!f(off), "{off:?} must leave the lever off");
+            }
+            for v in ["1", " 1", "1\n"] {
+                assert!(f(Some(v)), "{v:?} must turn the lever on");
+            }
+        }
+    }
+}
+
 /// 2026-09-26: Vision tower configuration: `parse_vision_config` for the Qwen family, and the
 /// GLM-5.3 parser, which also fills the fields the Qwen parser leaves at their defaults.
 #[derive(Debug, Clone)]

@@ -218,16 +218,7 @@ pub(crate) fn forward(
     let tiles = ws.prefill_tile_scratch();
     let mi = cfg.moe_intermediate;
 
-    KernelLaunch::new(gpu, k.tile_list)
-        .grid([1, 1, 1])
-        .block([256, 1, 1])
-        .arg_ptr(ws.expert_offsets())
-        .arg_ptr(w.ptrs.gate.packed_ptrs)
-        .arg_ptr(tiles)
-        .arg_u32(cfg.num_experts as u32)
-        .arg_u32(tile.m_tile as u32)
-        .arg_u32(cap)
-        .launch(stream)?;
+    launch_tile_list(gpu, k, cfg, w, te, ws, stream)?;
 
     KernelLaunch::new(gpu, k.gateup)
         .grid([(mi / PREFILL_MMA_GATEUP_COLS) as u32, cap, 1])
@@ -249,6 +240,47 @@ pub(crate) fn forward(
         .arg_f32(cfg.swiglu_limit)
         .launch(stream)?;
 
+    launch_down(gpu, k, cfg, w, te, ws, stream)
+}
+
+/// 2026-10-04: The compact (expert, M tile) list for `te` sorted rows into
+/// `ws.prefill_tile_scratch()`; shared by [`forward`] and [`forward_down`].
+fn launch_tile_list(
+    gpu: &dyn GpuBackend,
+    k: &PrefillMmaKernels,
+    cfg: &Glm5NextMlpConfig,
+    w: &Glm5NextMoeWeights,
+    te: usize,
+    ws: &Glm5NextMlpWorkspace,
+    stream: u64,
+) -> Result<()> {
+    let tile = k.tile;
+    let cap = tile_cap(te, cfg.local_experts, tile) as u32;
+    KernelLaunch::new(gpu, k.tile_list)
+        .grid([1, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(ws.expert_offsets())
+        .arg_ptr(w.ptrs.gate.packed_ptrs)
+        .arg_ptr(ws.prefill_tile_scratch())
+        .arg_u32(cfg.num_experts as u32)
+        .arg_u32(tile.m_tile as u32)
+        .arg_u32(cap)
+        .launch(stream)
+}
+
+/// 2026-10-04: The down launch of [`forward`] (reads `ws.a_act` in sorted order with a null
+/// gather map, writes `ws.expert_out`), over the tile list already in the scratch.
+fn launch_down(
+    gpu: &dyn GpuBackend,
+    k: &PrefillMmaKernels,
+    cfg: &Glm5NextMlpConfig,
+    w: &Glm5NextMoeWeights,
+    te: usize,
+    ws: &Glm5NextMlpWorkspace,
+    stream: u64,
+) -> Result<()> {
+    let tile = k.tile;
+    let cap = tile_cap(te, cfg.local_experts, tile) as u32;
     KernelLaunch::new(gpu, k.down)
         .grid([(cfg.hidden / PREFILL_MMA_DOWN_COLS) as u32, cap, 1])
         .block([tile.threads, 1, 1])
@@ -260,10 +292,27 @@ pub(crate) fn forward(
         .arg_ptr(w.ptrs.down.scale2_vals)
         .arg_ptr(ws.expert_out())
         .arg_ptr(ws.expert_offsets())
-        .arg_ptr(tiles)
+        .arg_ptr(ws.prefill_tile_scratch())
         .arg_u32(cfg.hidden as u32)
-        .arg_u32(mi as u32)
+        .arg_u32(cfg.moe_intermediate as u32)
         .launch(stream)
+}
+
+/// 2026-10-04: Tile list + the down kernel only, for a caller that has already left the
+/// clamped-SwiGLU activation in `ws.a_act` in expert-sorted order (the CUTLASS W4A4 path with
+/// `METRALE_GLM_MOE_W4A4_DOWN_W4A16=1`). Same two launches [`forward`] ends with; call only after
+/// `moe_sort_by_expert` and when `usable` holds.
+pub(crate) fn forward_down(
+    gpu: &dyn GpuBackend,
+    k: &PrefillMmaKernels,
+    cfg: &Glm5NextMlpConfig,
+    w: &Glm5NextMoeWeights,
+    te: usize,
+    ws: &Glm5NextMlpWorkspace,
+    stream: u64,
+) -> Result<()> {
+    launch_tile_list(gpu, k, cfg, w, te, ws, stream)?;
+    launch_down(gpu, k, cfg, w, te, ws, stream)
 }
 
 #[cfg(test)]

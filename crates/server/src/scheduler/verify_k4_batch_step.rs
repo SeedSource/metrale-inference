@@ -286,7 +286,7 @@ pub(super) fn step_verify_k4_batched(
         .tel
         .mark(crate::scheduler::mtp_timing::Phase::Commit, t_verdict);
     let t_propose = sched.io.clock.now();
-    let pending: Vec<usize> = (0..n)
+    let mut pending: Vec<usize> = (0..n)
         .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty())
         .collect();
     if pending.is_empty() {
@@ -319,6 +319,16 @@ pub(super) fn step_verify_k4_batched(
         }
     }
     let mut need_fallback: Vec<usize> = Vec::new();
+    // 2026-10-04: A batch that mirrors the per-sequence propose
+    // (`METRALE_GLM_MTP_BATCH_DRAFT=1`) takes no grammar, so sequences with one propose per
+    // sequence, after the batched groups, as the fallbacks do.
+    if model.mtp_propose_batch_mirrors_serial() {
+        let (grammar, free): (Vec<usize>, Vec<usize>) = pending
+            .iter()
+            .partition(|&&i| batch[i].grammar_state.is_some());
+        need_fallback = grammar;
+        pending = free;
+    }
     let mut groups_batched = 0usize;
     // 2026-09-25: draft confidences (the D-Cut ranking key) are requested
     // only when D-Cut is on.
@@ -374,7 +384,7 @@ pub(super) fn step_verify_k4_batched(
             }
         }
     } else {
-        need_fallback = pending.clone();
+        need_fallback.extend_from_slice(&pending);
     }
     for &i in &need_fallback {
         let a = &mut batch[i];

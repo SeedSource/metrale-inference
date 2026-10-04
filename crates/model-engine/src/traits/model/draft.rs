@@ -108,6 +108,14 @@ pub trait ModelDraft {
         1
     }
 
+    /// 2026-10-04: True when [`Self::run_mtp_propose_batched`] proposes exactly what the
+    /// per-sequence propose would for every sequence (`DraftProposer::propose_batch_mirrors_serial`,
+    /// `METRALE_GLM_MTP_BATCH_DRAFT=1`); the scheduler then keeps sequences the per-sequence
+    /// propose would treat differently (a grammar) out of the batch. Default false.
+    fn mtp_propose_batch_mirrors_serial(&self) -> bool {
+        false
+    }
+
     /// 2026-09-25: Copy the hidden state at `token_idx` into the MTP input buffer, which
     /// `run_mtp_propose` and `run_mtp_propose_multi` read. `TransformerModel` copies the hidden
     /// state before the final norm, because the MTP head applies its own norm.

@@ -104,10 +104,14 @@ impl TransformerModel {
             Some(p) => p.as_ref(),
             None => return Ok(None),
         };
+        // 2026-10-04: A proposer whose batch mirrors its per-sequence propose
+        // (`METRALE_GLM_MTP_BATCH_DRAFT=1`) takes the mirrored path, with the per-sequence
+        // context and, multi-rank, its own worker command (`propose_batch_ep.rs`).
+        let mirrors = proposer.propose_batch_mirrors_serial();
         // 2026-10-02: Its forward runs without the communicator, so an EP-sharded drafter
         // (`needs_comm`) on a multi-rank serve proposes per sequence, through the worker
         // handshake of `run_mtp_propose_multi_dispatch`.
-        if self.multi_rank_protocol_active() && proposer.needs_comm() {
+        if !mirrors && self.multi_rank_protocol_active() && proposer.needs_comm() {
             return Ok(None);
         }
         if self.levers.draft_conf_tau > 0.0 {
@@ -115,6 +119,11 @@ impl TransformerModel {
         }
         if self.verify_hidden_stash.is_null() {
             return Ok(None);
+        }
+        if mirrors {
+            return self.run_mtp_propose_batched_mirrored(
+                proposer, tokens, positions, stash_idx, num_drafts, seqs, out_conf,
+            );
         }
         let stream = self.gpu.default_stream();
         let ctx = self.mtp_propose_ctx();

@@ -75,6 +75,9 @@ mod verify_e;
 pub(in crate::model) mod verify_e2;
 // 2026-10-02: The multi-rank batched MTP verify (`EP_CMD_VERIFY_BATCH`).
 pub(in crate::model) mod verify_ep;
+// 2026-10-04: The batched MTP propose that mirrors the per-sequence one
+// (`EP_CMD_MTP_PROPOSE_BATCH`).
+pub(in crate::model) mod propose_batch_ep;
 mod verify_fused;
 
 impl Model for TransformerModel {}

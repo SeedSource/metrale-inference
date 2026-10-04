@@ -462,6 +462,7 @@ impl TransformerModel {
             ep_protocol_v2: matches!(std::env::var("METRALE_EP_PROTOCOL").as_deref(), Ok("v2")),
             self_speculative,
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
+            ep_stash_mirrored: std::sync::atomic::AtomicBool::new(false),
             vision_encoder,
             vision_embed_patches: Mutex::new(0),
             vision_image_grids: Mutex::new(Vec::new()),

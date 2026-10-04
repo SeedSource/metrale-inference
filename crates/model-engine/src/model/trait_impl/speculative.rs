@@ -354,6 +354,10 @@ impl TransformerModel {
             rows.len(),
             metrale_model_layers::layer::VERIFY_WY_TABLE_SEQS
         );
+        // 2026-10-04: A new stash; the batched verify's failure gather marks it mirrored
+        // (`ep_stash_mirrored`) when the workers wrote theirs in the same step.
+        self.ep_stash_mirrored
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;

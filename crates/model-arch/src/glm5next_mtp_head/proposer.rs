@@ -17,32 +17,80 @@ impl DraftProposer for Glm5NextMtpHead {
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
-        let dsa = match &self.module.layer.mixer {
-            // 2026-10-03: The drafter writes rows past the target's KV grid, so its cache maps
-            // `PROPOSER_LOOKAHEAD_ROWS` ahead when lazily mapped (`METRALE_DSA_INDEXER_LAZY`).
-            crate::glm5next_layer::Glm5NextMixer::Dsa(l) => Glm5NextDsaState::alloc_with_lookahead(
-                gpu,
-                &l.cfg,
-                crate::glm5next_dsa::lazy::PROPOSER_LOOKAHEAD_ROWS,
-            )?,
-            _ => bail!("GLM MTP block is not a DSA layer"),
-        };
-        let h = self.hidden;
-        // 2026-09-25: Claims every block of the private pool, which `new` sizes for one
-        // sequence of `max_seq_len` rows.
-        let blocks = (self.max_seq_len / 16 + 2) as u32;
-        Ok(Box::new(Glm5NextMtpProposerState {
-            dsa,
-            seq_len: 0,
-            block_table: (0..blocks).collect(),
-            last_drafted: 0,
-            concat: gpu.alloc(2 * h * 2)?,
-            x: gpu.alloc(h * 2)?,
-            logits: gpu.alloc(self.vocab * 2)?,
-            arg: gpu.alloc(4)?,
-            head_xchg: gpu.alloc(16)?,
-            released: false,
-        }))
+        self.alloc_state_rows(gpu, self.max_seq_len)
+    }
+
+    /// 2026-10-04: Under `METRALE_GLM_MTP_SEQ_KV` the sequence's own pool is sized to its reach
+    /// (`budget_tokens`, plus 16 rows for drafts written past it), capped at `max_seq_len`; a
+    /// draft past its pool fails the DSA block-table lookup and never writes outside it. Off,
+    /// this is `alloc_state`.
+    fn alloc_state_for(
+        &self,
+        gpu: &dyn GpuBackend,
+        budget_tokens: usize,
+    ) -> Result<Box<dyn ProposerState>> {
+        if !self.seq_kv {
+            return self.alloc_state(gpu);
+        }
+        let rows = budget_tokens.saturating_add(16).min(self.max_seq_len);
+        self.alloc_state_rows(gpu, rows)
+    }
+
+    /// 2026-10-04: `batch_rows_max` under `METRALE_GLM_MTP_BATCH_DRAFT`, else 1.
+    fn propose_batch_max(
+        &self,
+        buffers: &metrale_gpu_runtime::buffers::BufferArena,
+        _config: &metrale_config::ModelConfig,
+    ) -> usize {
+        self.batch_rows_max(buffers)
+    }
+
+    /// 2026-10-04: True under `METRALE_GLM_MTP_BATCH_DRAFT` (with its kernels): `propose_batch`
+    /// is `propose` for each sequence, batched, and wants the same forward context.
+    fn propose_batch_mirrors_serial(&self) -> bool {
+        self.batch.is_some()
+    }
+
+    fn propose_batch_ready(
+        &self,
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn ProposerState],
+    ) -> bool {
+        self.batch_ready(positions, num_drafts, states)
+    }
+
+    /// 2026-10-04: `Ok(None)` unless `propose_batch_ready`; otherwise `propose` for every
+    /// sequence, batched per draft step (`batch.rs`). No confidences: `out_conf` is cleared,
+    /// as the per-sequence propose leaves none.
+    #[allow(clippy::too_many_arguments)]
+    fn propose_batch(
+        &self,
+        last_tokens: &[u32],
+        target_hiddens: &[DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn ProposerState],
+        ctx: &ForwardContext,
+        stream: u64,
+        out_conf: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        if !self.batch_ready(positions, num_drafts, states) {
+            return Ok(None);
+        }
+        if let Some(c) = out_conf {
+            c.clear();
+        }
+        self.propose_batch_impl(
+            last_tokens,
+            target_hiddens,
+            positions,
+            num_drafts,
+            states,
+            ctx,
+            stream,
+        )
+        .map(Some)
     }
 
     /// 2026-09-25: Release everything `alloc_state` allocated: the DSA indexer cache and the
@@ -60,6 +108,15 @@ impl DraftProposer for Glm5NextMtpHead {
         st.dsa.free(gpu)?;
         for p in [st.concat, st.x, st.logits, st.arg, st.head_xchg] {
             gpu.free(p)?;
+        }
+        // 2026-10-04: The sequence's own latent pool (`METRALE_GLM_MTP_SEQ_KV`): one layer, its
+        // K pool, and its V pool unless V aliases K (`drafter_kv_config`).
+        if let Some(own) = st.own_kv.take() {
+            let (k, v) = (own.k_pool_ptr(0), own.v_pool_ptr(0));
+            gpu.free(k)?;
+            if v.0 != k.0 {
+                gpu.free(v)?;
+            }
         }
         // 2026-09-25: The drafter's private pool is claimed whole by `alloc_state`
         // (`(0..blocks).collect()`), not drawn from an allocator, so there is
@@ -209,5 +266,54 @@ impl DraftProposer for Glm5NextMtpHead {
             st.dsa.rewind_to(st.seq_len)?;
         }
         Ok(())
+    }
+}
+
+impl Glm5NextMtpHead {
+    /// 2026-10-04: A drafter state whose block table covers `rows` rows. Without
+    /// `METRALE_GLM_MTP_SEQ_KV`, `rows` is `max_seq_len` and the table is the whole of the
+    /// head's shared pool, as before the lever; with it, the table indexes a pool of this
+    /// state's own of the same block count.
+    fn alloc_state_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+    ) -> Result<Box<dyn ProposerState>> {
+        let dsa = match &self.module.layer.mixer {
+            // 2026-10-03: The drafter writes rows past the target's KV grid, so its cache maps
+            // `PROPOSER_LOOKAHEAD_ROWS` ahead when lazily mapped (`METRALE_DSA_INDEXER_LAZY`).
+            crate::glm5next_layer::Glm5NextMixer::Dsa(l) => Glm5NextDsaState::alloc_with_lookahead(
+                gpu,
+                &l.cfg,
+                crate::glm5next_dsa::lazy::PROPOSER_LOOKAHEAD_ROWS,
+            )?,
+            _ => bail!("GLM MTP block is not a DSA layer"),
+        };
+        let h = self.hidden;
+        // 2026-09-25: Claims every block of the private pool, which `new` sizes for one
+        // sequence of `max_seq_len` rows.
+        let blocks = (rows / 16 + 2) as u32;
+        let own_kv = if self.seq_kv {
+            Some(PagedKvCache::new(
+                init::drafter_kv_config(self.kv_lora_rank),
+                blocks as usize,
+                gpu,
+            )?)
+        } else {
+            None
+        };
+        Ok(Box::new(Glm5NextMtpProposerState {
+            dsa,
+            own_kv,
+            seq_len: 0,
+            block_table: (0..blocks).collect(),
+            last_drafted: 0,
+            concat: gpu.alloc(2 * h * 2)?,
+            x: gpu.alloc(h * 2)?,
+            logits: gpu.alloc(self.vocab * 2)?,
+            arg: gpu.alloc(4)?,
+            head_xchg: gpu.alloc(16)?,
+            released: false,
+        }))
     }
 }

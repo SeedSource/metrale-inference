@@ -374,6 +374,11 @@ pub struct TransformerModel {
     /// 2026-09-25: Last token index `save_hidden_for_mtp` copied from, broadcast
     /// to the other EP rank before an MTP propose.
     pub(super) last_mtp_hidden_idx: std::sync::atomic::AtomicUsize,
+    /// 2026-10-04: Rank 0, multi-rank: the verify stash holds rows every worker stashed too
+    /// (set by the batched verify's failure gather, cleared by each rank-0 stash). The batched
+    /// propose's worker command reads its inputs from the worker's stash only while this holds
+    /// (`trait_impl/propose_batch_ep.rs`).
+    pub(super) ep_stash_mirrored: std::sync::atomic::AtomicBool,
     pub(super) vision_encoder: Option<metrale_model_layers::layers::VisionTower>,
     /// 2026-09-25: Number of patches encoded by the last `prepare_vision_embed`
     /// call. 0 means no vision embeddings are pending.

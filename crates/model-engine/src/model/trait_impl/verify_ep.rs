@@ -200,7 +200,13 @@ impl TransformerModel {
         if !self.multi_rank_protocol_active() {
             return Ok(local);
         }
-        Ok(merge_failure_masks(&self.ep_gather_u32(local)?))
+        let merged = merge_failure_masks(&self.ep_gather_u32(local)?);
+        // 2026-10-04: Every worker made this gather after stashing the same rows (or failed
+        // the whole batch, which retires every sequence before a propose): the stash is
+        // mirrored (`ep_stash_mirrored`, `propose_batch_ep.rs`).
+        self.ep_stash_mirrored
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(merged)
     }
 
     /// 2026-10-02: Whether any layer drives its own verify state

@@ -105,9 +105,16 @@ pub fn load_glm5next_mtp_module(
             mlp_cfg,
             mlp_kernels,
             // 2026-09-25: Its own one-row workspace, not the text stack's shared one, which
-            // is sized for a prefill sub-chunk.
+            // is sized for a prefill sub-chunk. 2026-10-04: `MTP_BATCH_DRAFT_MAX` rows under
+            // `METRALE_GLM_MTP_BATCH_DRAFT=1`, which runs one row per sequence through it.
             mlp_ws: std::sync::Arc::new(crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new(
-                gpu, &mlp_cfg, 1,
+                gpu,
+                &mlp_cfg,
+                if crate::glm5next_mtp_head::mtp_batch_draft() {
+                    crate::glm5next_mtp_head::MTP_BATCH_DRAFT_MAX
+                } else {
+                    1
+                },
             )?),
             // 2026-09-25: No hyper-connection: nothing here binds `hc_*` tensors, and
             // `mhc: None` selects the plain residual path.

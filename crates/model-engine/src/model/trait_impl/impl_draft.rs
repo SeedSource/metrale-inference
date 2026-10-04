@@ -92,6 +92,12 @@ impl ModelDraft for TransformerModel {
         }
     }
 
+    fn mtp_propose_batch_mirrors_serial(&self) -> bool {
+        self.proposer
+            .as_ref()
+            .is_some_and(|p| p.propose_batch_mirrors_serial())
+    }
+
     fn save_hidden_for_catchup(&self, token_idx: usize, pos: usize) -> Result<()> {
         self.save_hidden_for_catchup_dispatch(token_idx, pos)
     }

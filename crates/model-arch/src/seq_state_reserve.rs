@@ -92,6 +92,17 @@ pub fn per_sequence_state_bytes(
             + config.vocab_size * 2
             + 4
             + 16
+            // 2026-10-04: Under `METRALE_GLM_MTP_SEQ_KV` (implied by
+            // `METRALE_GLM_MTP_BATCH_DRAFT`) the state also owns its drafter latent pool,
+            // sized by `alloc_state_for` to at most `max_seq_len + 16` rows.
+            + if crate::glm5next_mtp_head::mtp_seq_kv() {
+                crate::glm5next_mtp_head::seq_kv_pool_bytes(
+                    max_seq_len.saturating_add(16),
+                    config.kv_lora_rank,
+                )
+            } else {
+                0
+            }
     } else {
         0
     };

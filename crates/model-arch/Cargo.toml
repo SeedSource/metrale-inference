@@ -253,6 +253,10 @@ name = "glm5next_dsa_xseq_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_mtp_batch_draft_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_seq_parallel_2rank"
 required-features = ["cuda", "nccl-examples"]
 

@@ -220,6 +220,26 @@ pub trait DraftProposer: Send + Sync {
         1
     }
 
+    /// 2026-10-04: True when [`Self::propose_batch`] is [`Self::propose`] for every sequence,
+    /// batched: same drafts, same state updates, and the same forward context (including the
+    /// communicator when [`Self::needs_comm`]), so every rank that proposes per sequence can
+    /// propose the batch instead. The default is false.
+    fn propose_batch_mirrors_serial(&self) -> bool {
+        false
+    }
+
+    /// 2026-10-04: Whether [`Self::propose_batch`] would run for these sequences rather than
+    /// return `Ok(None)`, decided without a launch so ranks can agree before proposing. Index i
+    /// of every slice belongs to sequence i. The default is false.
+    fn propose_batch_ready(
+        &self,
+        _positions: &[usize],
+        _num_drafts: usize,
+        _states: &mut [&mut dyn ProposerState],
+    ) -> bool {
+        false
+    }
+
     /// 2026-09-25: Append one drafter row per accepted draft of the last
     /// verify, for several sequences; the model calls it only with
     /// `ModelLevers::mtp_kv_exact` on. `tokens[i]` are sequence i's accepted

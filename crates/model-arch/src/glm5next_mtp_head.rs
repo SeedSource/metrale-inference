@@ -16,6 +16,13 @@
 //!
 //! The block is sharded like a text layer: its routed experts are split across EP ranks and
 //! its DSA `o_proj` is row-parallel, so its forward needs the communicator (`needs_comm`).
+//!
+//! 2026-10-04: Two default-off levers (`batch.rs`). `METRALE_GLM_MTP_SEQ_KV=1` gives every
+//! sequence its own drafter latent KV pool: off, every state's block table is the whole of the
+//! head's one private pool, so concurrent sequences write and read each other's latent rows
+//! (a row's slot is its position, and positions overlap). `METRALE_GLM_MTP_BATCH_DRAFT=1`
+//! (implies the first) runs draft step `d` of every batched sequence in one pass
+//! (`propose_batch`).
 
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
@@ -33,12 +40,20 @@ use metrale_model_layers::layers::ops;
 use metrale_model_layers::speculative::{DraftProposer, ProposerState};
 use metrale_model_layers::weight_map::DenseWeight;
 
+mod batch;
 mod init;
 mod proposer;
+
+pub use batch::{
+    DebugStateView, MTP_BATCH_DRAFT_MAX, mtp_batch_draft, mtp_seq_kv, seq_kv_pool_bytes,
+};
 
 /// 2026-09-25: Per-sequence drafter state: the block's own indexer cache and KV block table.
 pub struct Glm5NextMtpProposerState {
     dsa: Glm5NextDsaState,
+    /// 2026-10-04: This sequence's own drafter latent pool (`METRALE_GLM_MTP_SEQ_KV=1`); `None`
+    /// reads and writes the head's shared pool, as before the lever.
+    own_kv: Option<PagedKvCache>,
     /// 2026-09-25: Rows the drafter has written. `propose` and `after_verify` roll it back.
     seq_len: usize,
     block_table: Vec<u32>,
@@ -98,10 +113,21 @@ pub struct Glm5NextMtpHead {
     /// Measured 2026-08-29 (nsys): 2.66 ms -> ~1.33 ms per draft sweep.
     head_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
     gemv_fp8w_k: KernelHandle,
+    /// 2026-10-04: `kv_lora_rank` of the block, the head dim of a per-sequence pool.
+    kv_lora_rank: usize,
+    /// 2026-10-04: `METRALE_GLM_MTP_SEQ_KV` (or `METRALE_GLM_MTP_BATCH_DRAFT`) at construction:
+    /// `alloc_state` gives each sequence its own latent pool.
+    seq_kv: bool,
+    /// 2026-10-04: The batched propose's kernels and scratch; `Some` only under
+    /// `METRALE_GLM_MTP_BATCH_DRAFT=1` with every kernel resolved (`batch.rs`).
+    batch: Option<Mutex<batch::BatchScratch>>,
     /// 2026-10-03: Scratch for the row-batched context write; `Some` only with
     /// `METRALE_GLM_MTP_CTX_ROWBATCH=1` and a block that can run it. Allocated at load, so it
-    /// sits before KV sizing. Used under the `kv_cache` lock, so one tile buffer is enough.
-    ctx_scratch: Option<CtxScratch>,
+    /// sits before KV sizing. One tile buffer is enough because its own mutex is held for the
+    /// whole write (2026-10-04: under `METRALE_GLM_MTP_SEQ_KV` a context write uses the
+    /// sequence's own pool and no longer holds the head's `kv_cache` lock, which used to
+    /// serialise it).
+    ctx_scratch: Option<Mutex<CtxScratch>>,
 }
 
 /// 2026-10-03: Rows per tile of the batched context write.
@@ -219,18 +245,24 @@ impl Glm5NextMtpHead {
         if skip_block() {
             st.seq_len += 1;
         } else {
-            let mut kv = self.kv_cache.lock();
+            // 2026-10-04: The sequence's own pool under `METRALE_GLM_MTP_SEQ_KV`, else the
+            // head's shared one.
+            let mut shared = None;
+            let kv: &mut PagedKvCache = match st.own_kv.as_mut() {
+                Some(own) => own,
+                None => &mut *shared.insert(self.kv_cache.lock()),
+            };
             let dsa_state: &mut dyn LayerState = &mut st.dsa;
             self.module.layer.decode_one_for_drafter(
                 st.x,
                 dsa_state,
-                &mut kv,
+                kv,
                 st.seq_len,
                 &mut st.block_table,
                 ctx,
                 stream,
             )?;
-            drop(kv);
+            drop(shared);
             st.seq_len += 1;
         }
 
@@ -369,20 +401,29 @@ impl Glm5NextMtpHead {
             .ok()
             .as_deref()
             == Some("1");
-        let mut kv = self.kv_cache.lock();
         let Glm5NextMtpProposerState {
             dsa,
+            own_kv,
             seq_len,
             block_table,
             concat,
             x,
             ..
         } = st;
-        if let Some(sc) = self
+        // 2026-10-04: The sequence's own pool under `METRALE_GLM_MTP_SEQ_KV`, else the head's.
+        // Both context paths below (the row-batched tile write and the per-row loop) write
+        // through this one `kv`.
+        let mut shared = None;
+        let kv: &mut PagedKvCache = match own_kv.as_mut() {
+            Some(own) => own,
+            None => &mut *shared.insert(self.kv_cache.lock()),
+        };
+        if let Some(sc_lock) = self
             .ctx_scratch
             .as_ref()
             .filter(|_| !prefill_full && !dbg && ctx_rowbatch())
         {
+            let sc = sc_lock.lock();
             let dsa_state: &mut dyn LayerState = dsa;
             let mut r0 = 0;
             while r0 < rows {
@@ -456,7 +497,7 @@ impl Glm5NextMtpHead {
                     sc.kv_a,
                     sc.slots,
                     dsa_state,
-                    &mut kv,
+                    kv,
                     *seq_len,
                     &block_table[..],
                     ctx,
@@ -499,7 +540,7 @@ impl Glm5NextMtpHead {
                 self.module.layer.decode_one_for_drafter(
                     *x,
                     dsa_state,
-                    &mut kv,
+                    kv,
                     *seq_len,
                     block_table,
                     ctx,
@@ -509,7 +550,7 @@ impl Glm5NextMtpHead {
                 self.module.layer.drafter_write_kv_row(
                     *x,
                     dsa_state,
-                    &mut kv,
+                    kv,
                     *seq_len,
                     block_table,
                     ctx,

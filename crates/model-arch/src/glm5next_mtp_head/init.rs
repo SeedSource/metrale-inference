@@ -30,22 +30,15 @@ impl Glm5NextMtpHead {
         // the bounds checks in `forward_one` and `rows_impl`, and, through
         // `prefill_hidden_rows`, the model's `mtp_prefill_hidden` capture.
         let max_seq_len = drafter_context_rows(max_seq_len, &dsa.cfg);
-        // 2026-09-25: One KV head of `kv_lora_rank` per token, the absorbed-MLA latent that
-        // the block's `latent_write` and paged gather address.
-        let kv_config = KvCacheConfig {
-            block_size: 16,
-            num_kv_heads: 1,
-            head_dim: dsa.cfg.kv_lora_rank,
-            num_layers: 1,
-            dtype: KvCacheDtype::Fp8,
-            layer_dtypes: vec![],
-            layer_dims: vec![],
-            cache_blocks_per_seq: None,
-            // 2026-10-01: The drafter block, like the target's DSA layers,
-            // touches only the K pool (`write_kv_row`, the paged gather).
-            v_aliases_k: metrale_cache::kv_cache::glm_kv_v_alias("glm5_next"),
+        let kv_config = drafter_kv_config(dsa.cfg.kv_lora_rank);
+        // 2026-10-04: Under `METRALE_GLM_MTP_SEQ_KV` every state allocates its own pool
+        // (`alloc_state_for`) and nothing reads this one, so it shrinks to two blocks.
+        let seq_kv = batch::mtp_seq_kv();
+        let blocks = if seq_kv {
+            2
+        } else {
+            max_seq_len / kv_config.block_size + 2
         };
-        let blocks = max_seq_len / kv_config.block_size + 2;
         let kv_cache = PagedKvCache::new(kv_config, blocks, gpu)?;
         // 2026-09-25: The draft `lm_head` sweep is most of the drafter's time. Measured
         // 2026-08-29 with `METRALE_GLM_MTP_SKIP=head`: propose 8.84 ms -> 1.52 ms. It reads
@@ -110,17 +103,25 @@ impl Glm5NextMtpHead {
         // 2026-10-03: Scratch for `METRALE_GLM_MTP_CTX_ROWBATCH=1` (about 10 MB at 256 rows).
         let ctx_scratch = if ctx_rowbatch() && module.layer.can_drafter_write_kv_rows() {
             let (t, h) = (CTX_TILE, config.hidden_size);
-            Some(CtxScratch {
+            Some(Mutex::new(CtxScratch {
                 gath: gpu.alloc(t * h * 2)?,
                 nrm: gpu.alloc(t * h * 2)?,
                 concat: gpu.alloc(t * 2 * h * 2)?,
                 xo: gpu.alloc(t * h * 2)?,
                 kv_a: gpu.alloc(t * dsa.cfg.kv_lora_rank * 2)?,
                 slots: gpu.alloc(t * 8)?,
-            })
+            }))
         } else {
             None
         };
+
+        // 2026-10-04: `METRALE_GLM_MTP_BATCH_DRAFT=1`: the batched propose's kernels and
+        // scratch, sized once here; `None` (per-sequence proposes only) when the lever is off
+        // or a kernel is missing.
+        let batch =
+            batch::BatchScratch::new(gpu, config.hidden_size, config.vocab_size)?.map(Mutex::new);
+        let kv_lora_rank = dsa.cfg.kv_lora_rank;
+
         Ok(Self {
             ctx_scratch,
             module,
@@ -138,6 +139,30 @@ impl Glm5NextMtpHead {
             head_n,
             head_fp8,
             gemv_fp8w_k,
+            kv_lora_rank,
+            seq_kv,
+            batch,
         })
+    }
+}
+
+/// 2026-10-04: The drafter's latent pool geometry: one KV head of `kv_lora_rank` FP8 per token,
+/// 16-token blocks, one layer. The head's shared pool and every per-sequence pool
+/// (`METRALE_GLM_MTP_SEQ_KV`) use it.
+pub(super) fn drafter_kv_config(kv_lora_rank: usize) -> KvCacheConfig {
+    // 2026-09-25: One KV head of `kv_lora_rank` per token, the absorbed-MLA latent that
+    // the block's `latent_write` and paged gather address.
+    KvCacheConfig {
+        block_size: 16,
+        num_kv_heads: 1,
+        head_dim: kv_lora_rank,
+        num_layers: 1,
+        dtype: KvCacheDtype::Fp8,
+        layer_dtypes: vec![],
+        layer_dims: vec![],
+        cache_blocks_per_seq: None,
+        // 2026-10-01: The drafter block, like the target's DSA layers,
+        // touches only the K pool (`write_kv_row`, the paged gather).
+        v_aliases_k: metrale_cache::kv_cache::glm_kv_v_alias("glm5_next"),
     }
 }

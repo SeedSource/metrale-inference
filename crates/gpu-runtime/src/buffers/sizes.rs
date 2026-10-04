@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 2026-09-25: Byte size of every buffer in the GPU buffer arena, from the model config, the serve limits and four environment levers.
+//! 2026-10-04: Byte size of every buffer in the GPU buffer arena, from the model config, the serve limits and five environment levers.
 //!
 //! Owner: gpu-runtime.
 //! Invariants:
 //! - [`BufferSizes::from_config`] allocates nothing; besides its arguments it
 //!   reads only `METRALE_GGUF_NATIVE_Q2`, `METRALE_GGUF_NATIVE_Q2_MMQ`,
-//!   `METRALE_FP8_ROWWISE` and, through `attn_splitk::policy_from_env`,
-//!   `METRALE_ATTN_DECODE_SPLITK`.
+//!   `METRALE_FP8_ROWWISE`, `METRALE_GLM_ARENA_TRIM` (`sizes_glm_trim.rs`) and,
+//!   through `attn_splitk::policy_from_env`, `METRALE_ATTN_DECODE_SPLITK`.
 
 use metrale_config::ModelConfig;
 use metrale_kernels::attn_splitk;
@@ -147,6 +147,8 @@ pub struct BufferSizes {
     /// for the arena's life. Sized in `sizes_rowwise.rs`; 0 unless the lever is
     /// `1`.
     pub ssm_rowwise_w_bf16: usize,
+    /// 2026-10-04: Bytes the GLM-5.3 trim zeroed above (`sizes_glm_trim.rs`); not a buffer.
+    pub glm_trimmed: usize,
 }
 
 impl BufferSizes {
@@ -291,7 +293,7 @@ impl BufferSizes {
                 (0, 0, 0, 0)
             };
 
-        Self {
+        let mut sizes = Self {
             hidden_states: m * h * residual_elem,
             residual: m * h * residual_elem,
             norm_output: m * max_dim * bf16,
@@ -440,7 +442,10 @@ impl BufferSizes {
             q2_dequant_scratch,
             q2_act_q8,
             ssm_rowwise_w_bf16,
-        }
+            glm_trimmed: 0,
+        };
+        sizes.glm_trimmed = super::sizes_glm_trim::trim_for_glm(&mut sizes, config);
+        sizes
     }
 
     /// 2026-09-25: The sum of the sizes, which preflight reserves for the arena.

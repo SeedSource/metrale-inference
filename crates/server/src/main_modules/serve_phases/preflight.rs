@@ -187,7 +187,12 @@ pub(crate) fn preflight_reserve(
         let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
         let nv = config.linear_num_value_heads;
         let conv_dim = key_dim * 2 + value_dim;
-        if conv_dim > 0 && config.num_ssm_layers() > 0 {
+        // 2026-10-04: Nothing to reserve when the GLM-5.3 arena trim skips the
+        // buffers (`build_gdn_prefill_buffers` in metrale-model-engine).
+        if conv_dim > 0
+            && config.num_ssm_layers() > 0
+            && !metrale_gpu_runtime::buffers::glm_arena_trim_active(config)
+        {
             let sl = max_batch_tokens_pre;
             sl * conv_dim * 2 + sl * nv * 2 * 4 + sl * value_dim * 2 + sl * value_dim * 2
         } else {

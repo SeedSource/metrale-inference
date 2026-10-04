@@ -9,15 +9,19 @@ use super::BufferArena;
 use crate::gpu::{DevicePtr, GpuBackend};
 
 impl BufferArena {
-    /// 2026-09-25: Synchronize `stream`, then log at warn level the sum, sum of
+    /// 2026-10-04: Synchronize `stream`, then log at warn level the sum, sum of
     /// squares and sum of absolute values of each listed buffer read as f32
     /// lanes over its whole allocation (non-finite lanes skipped), tagged with
     /// `tag`. A failed synchronize or copy is ignored; a failed copy skips that
-    /// buffer. The model engine calls it at the first decode step when
+    /// buffer, and so does a NULL or 0-byte one (an entry the GLM-5.3 trim left
+    /// unallocated). The model engine calls it at the first decode step when
     /// `ssm_save_dump` is set.
     pub fn debug_buffer_checksum(&self, gpu: &dyn GpuBackend, stream: u64, tag: &str) {
         gpu.synchronize(stream).ok();
         let probe = |name: &str, ptr: DevicePtr, bytes: usize| {
+            if ptr.is_null() || bytes == 0 {
+                return;
+            }
             let mut hb = vec![0u8; bytes];
             if gpu.copy_d2h(ptr, &mut hb).is_err() {
                 return;

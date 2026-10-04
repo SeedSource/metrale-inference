@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 2026-09-25: The per-model GPU buffer arena: every intermediate tensor of a forward pass, allocated once and reused by every step.
+//! 2026-10-04: The per-model GPU buffer arena: every intermediate tensor of a forward pass, allocated once and reused by every step.
 //!
 //! Owner: gpu-runtime.
 //! Invariants:
 //! - Every buffer is allocated at its [`BufferSizes`] size. The gated ones
 //!   (`ssd_scratch`, `gdn_fla_scratch`, `ffn_*`, `moe_fp8_scratch`, `q2_*`,
-//!   `lora_*`, `ssm_rowwise_w_bf16`) are `DevicePtr::NULL` when that size is 0.
+//!   `lora_*`, `ssm_rowwise_w_bf16`, and the entries the GLM-5.3 trim can
+//!   zero, `sizes_glm_trim.rs`) are `DevicePtr::NULL` when that size is 0.
 //! - No device memory is allocated after construction, and `release` frees
 //!   every pointer field.
 
@@ -21,12 +22,14 @@ mod moe_fp8_scratch;
 mod release;
 mod rowwise_slab;
 mod sizes;
+mod sizes_glm_trim;
 mod sizes_q12;
 mod sizes_q2;
 mod sizes_rowwise;
 pub use decode_meta::{DECODE_META_MAX_ROWS, DECODE_META_MIN_ROWS, DecodeMetaLayout};
 pub use moe_fp8_scratch::MoeFp8Scratch;
 pub use sizes::{BufferSizes, GATEUP_FUSED_MAX_M};
+pub use sizes_glm_trim::glm_arena_trim_active;
 pub use sizes_q2::q2_dequant_scratch_bytes;
 pub use sizes_q12::{
     Q12_SIZING_STREAMS, q12_batched_scratch_bytes, q12_batched_scratch_bytes_varlen,
@@ -135,22 +138,22 @@ impl BufferArena {
         let hidden_states = gpu.alloc(sizes.hidden_states)?;
         let residual = gpu.alloc(sizes.residual)?;
         let norm_output = gpu.alloc(sizes.norm_output)?;
-        let qkv_output = gpu.alloc(sizes.qkv_output)?;
-        let attn_output = gpu.alloc(sizes.attn_output)?;
-        let gate_logits = gpu.alloc(sizes.gate_logits)?;
-        let gate_logits_f32 = gpu.alloc(sizes.gate_logits_f32)?;
-        let moe_router_in_f32 = gpu.alloc(sizes.moe_router_in_f32)?;
+        let qkv_output = alloc_or_null(gpu, sizes.qkv_output)?;
+        let attn_output = alloc_or_null(gpu, sizes.attn_output)?;
+        let gate_logits = alloc_or_null(gpu, sizes.gate_logits)?;
+        let gate_logits_f32 = alloc_or_null(gpu, sizes.gate_logits_f32)?;
+        let moe_router_in_f32 = alloc_or_null(gpu, sizes.moe_router_in_f32)?;
         let moe_output = gpu.alloc(sizes.moe_output)?;
         let logits = gpu.alloc(sizes.logits)?;
-        let ssm_qkvz = gpu.alloc(sizes.ssm_qkvz)?;
-        let ssm_ba = gpu.alloc(sizes.ssm_ba)?;
-        let ssm_deinterleaved = gpu.alloc(sizes.ssm_deinterleaved)?;
-        let ssm_gates = gpu.alloc(sizes.ssm_gates)?;
-        let ssm_conv_out_f32 = gpu.alloc(sizes.ssm_conv_out_f32)?;
+        let ssm_qkvz = alloc_or_null(gpu, sizes.ssm_qkvz)?;
+        let ssm_ba = alloc_or_null(gpu, sizes.ssm_ba)?;
+        let ssm_deinterleaved = alloc_or_null(gpu, sizes.ssm_deinterleaved)?;
+        let ssm_gates = alloc_or_null(gpu, sizes.ssm_gates)?;
+        let ssm_conv_out_f32 = alloc_or_null(gpu, sizes.ssm_conv_out_f32)?;
         let scratch = gpu.alloc(sizes.scratch)?;
-        let expert_gate_out = gpu.alloc(sizes.expert_gate_out)?;
-        let expert_up_out = gpu.alloc(sizes.expert_up_out)?;
-        let expert_down_out = gpu.alloc(sizes.expert_down_out)?;
+        let expert_gate_out = alloc_or_null(gpu, sizes.expert_gate_out)?;
+        let expert_up_out = alloc_or_null(gpu, sizes.expert_up_out)?;
+        let expert_down_out = alloc_or_null(gpu, sizes.expert_down_out)?;
         let splitk_workspace = gpu.alloc(sizes.splitk_workspace)?;
         let o_latent = gpu.alloc(sizes.o_latent)?;
         // 2026-09-25: All zeros: the `rms_norm` kernel scales by 1 + weight, so a
@@ -200,14 +203,14 @@ impl BufferArena {
         } else {
             DevicePtr::NULL
         };
-        let fp8_act = gpu.alloc(sizes.fp8_act)?;
+        let fp8_act = alloc_or_null(gpu, sizes.fp8_act)?;
         let moe_fp8_scratch = if sizes.moe_fp8_scratch > 0 {
             gpu.alloc(sizes.moe_fp8_scratch)?
         } else {
             DevicePtr::NULL
         };
-        let fp8_act_scale = gpu.alloc(sizes.fp8_act_scale)?;
-        let fp8_act_scale_kmajor = gpu.alloc(sizes.fp8_act_scale_kmajor)?;
+        let fp8_act_scale = alloc_or_null(gpu, sizes.fp8_act_scale)?;
+        let fp8_act_scale_kmajor = alloc_or_null(gpu, sizes.fp8_act_scale_kmajor)?;
         let q2_dequant_scratch = if sizes.q2_dequant_scratch > 0 {
             gpu.alloc(sizes.q2_dequant_scratch)?
         } else {
@@ -252,6 +255,15 @@ impl BufferArena {
             sizes.ssm_deinterleaved as f64 / (1024.0 * 1024.0),
             config.kv_lora_rank,
         );
+        if sizes.glm_trimmed > 0 {
+            tracing::info!(
+                "GLM-5.3 arena trim ENGAGED (METRALE_GLM_ARENA_TRIM): {} bytes ({:.1} MiB) of \
+                 arena buffers this model never reads left unallocated; the GDN two-phase \
+                 prefill scratch is skipped too",
+                sizes.glm_trimmed,
+                sizes.glm_trimmed as f64 / (1024.0 * 1024.0),
+            );
+        }
 
         Ok(Self {
             hidden_states,
@@ -308,5 +320,17 @@ impl BufferArena {
     }
 }
 
+/// 2026-10-04: `gpu.alloc(bytes)`, or `DevicePtr::NULL` for 0 bytes:
+/// `cuMemAlloc_v2` refuses a zero-byte request.
+fn alloc_or_null(gpu: &dyn GpuBackend, bytes: usize) -> Result<DevicePtr> {
+    if bytes > 0 {
+        gpu.alloc(bytes)
+    } else {
+        Ok(DevicePtr::NULL)
+    }
+}
+
+#[cfg(test)]
+mod glm_trim_tests;
 #[cfg(test)]
 mod tests;

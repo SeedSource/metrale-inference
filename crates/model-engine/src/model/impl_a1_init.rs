@@ -18,11 +18,14 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_model_layers::speculative::DraftProposer;
 use metrale_model_layers::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
-/// 2026-09-25: Allocate the GDN prefill scratch buffers for
+/// 2026-10-04: Allocate the GDN prefill scratch buffers for
 /// `min(max_batch_tokens, max_seq_len)` tokens. Returns
 /// `(qkv, gate_beta, out, z, gdn_buf_len)`. The buffers are allocated only when
-/// the config has linear-attention heads (`conv_dim > 0`); otherwise all four
-/// are `DevicePtr::NULL`, which also avoids a zero-byte allocation.
+/// the config has linear-attention heads (`conv_dim > 0`) and the GLM-5.3 arena
+/// trim does not apply (`glm_arena_trim_active`: GLM-5.3 never runs the
+/// two-phase SSM prefill, which needs a single rank, and with NULL buffers
+/// `prefill_twophase_dispatch` falls back to `prefill_chunk`); otherwise all
+/// four are `DevicePtr::NULL`, which also avoids a zero-byte allocation.
 pub(super) fn build_gdn_prefill_buffers(
     config: &ModelConfig,
     max_batch_tokens: usize,
@@ -34,7 +37,8 @@ pub(super) fn build_gdn_prefill_buffers(
     let nv = config.linear_num_value_heads;
     let conv_dim = key_dim * 2 + value_dim;
     let gdn_buf_len = max_batch_tokens.min(max_seq_len);
-    let (gdn_qkv, gdn_gate_beta, gdn_out, gdn_z) = if conv_dim > 0 {
+    let glm_trim = metrale_gpu_runtime::buffers::glm_arena_trim_active(config);
+    let (gdn_qkv, gdn_gate_beta, gdn_out, gdn_z) = if conv_dim > 0 && !glm_trim {
         let qkv = gpu.alloc(gdn_buf_len * conv_dim * 2)?;
         let gb = gpu.alloc(gdn_buf_len * nv * 2 * 4)?;
         let o = gpu.alloc(gdn_buf_len * value_dim * 2)?;
@@ -46,6 +50,13 @@ pub(super) fn build_gdn_prefill_buffers(
         );
         (qkv, gb, o, z)
     } else {
+        if conv_dim > 0 {
+            tracing::info!(
+                "GDN prefill buffers: not allocated, {} MB saved (METRALE_GLM_ARENA_TRIM: \
+                 GLM-5.3 never runs the two-phase SSM prefill)",
+                (gdn_buf_len * (conv_dim * 2 + nv * 2 * 4 + value_dim * 2 * 2)) / (1024 * 1024),
+            );
+        }
         (
             DevicePtr::NULL,
             DevicePtr::NULL,

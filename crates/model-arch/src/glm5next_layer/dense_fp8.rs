@@ -17,6 +17,9 @@
 //!   field that names a registered pointer therefore holds FP8 bytes: every read of it must
 //!   go through [`route`] (the three GLM `gemm` wrappers: KDA `Glm5NextKdaLayer::gemm`, DSA
 //!   `proj_gemm::gemm`, MLP `forward::launch::gemm`; audited 2026-10-03, no other reader).
+//!   The one direct BF16 reader, the MTP drafter's `write_kv_rows` (`batchm_rows` on
+//!   `kv_a_proj`, `wk`, `compress_gate`), reads only unregistered weights and checks that with
+//!   [`ensure_bf16`] (2026-10-04).
 //!   Keys are live allocations that are never freed, so a later allocation can never alias
 //!   one; a pointer strictly inside a registered FP8 allocation, or a registered key passed
 //!   with another `[n, k]`, is an error, never a silent BF16 read of FP8 bytes.
@@ -214,6 +217,23 @@ fn find(b: DevicePtr, n: usize, k: usize) -> Result<Option<Entry>> {
         );
     }
     Ok(None)
+}
+
+/// 2026-10-04: An error when `b` is, or lies inside, a registered FP8 copy. For a call site
+/// that reads a `[n, k]` BF16 weight directly instead of through [`route`]
+/// (`Glm5NextDsaLayer::write_kv_rows`); those weights are not registered today, and this
+/// keeps a future registration from turning into a silent BF16 read of FP8 bytes.
+pub fn ensure_bf16(b: DevicePtr, n: usize, k: usize, site: &str) -> Result<()> {
+    if !dense_fp8() {
+        return Ok(());
+    }
+    if find(b, n, k)?.is_some() {
+        bail!(
+            "METRALE_GLM_DENSE_FP8: {site} reads weight {b} ([{n}, {k}]) as BF16, but it is \
+             registered as an FP8 copy; route that read through dense_fp8::route"
+        );
+    }
+    Ok(())
 }
 
 /// 2026-10-03: The FP8 copy registered under key `ptr` with shape `[n, k]`, if any.

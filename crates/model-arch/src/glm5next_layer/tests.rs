@@ -216,10 +216,11 @@ fn decode_l2_prefetch_levers_parse() {
 fn multi_seq_decode_indexes_each_row_and_stays_behind_its_lever() {
     let ms = include_str!("steps/multi_seq.rs");
     assert!(ms.contains("ctx.hc_row_offset + i,"), "per-row highway slot");
+    // 2026-10-03: Three: the two per-row arms and the `METRALE_GLM_DSA_XSEQ_BATCH` arm.
     assert_eq!(
         ms.matches("m.row_view(i)").count(),
-        2,
-        "both per-row arms read their own metadata row"
+        3,
+        "every per-row arm reads its own metadata row"
     );
     assert!(ms.contains("layer.decode_n_seqs(gpu, normed, n, &seq_states, ws, stream)"));
     let m = include_str!("mod.rs");
@@ -230,6 +231,43 @@ fn multi_seq_decode_indexes_each_row_and_stays_behind_its_lever() {
     assert!(body.contains("!levers::decode_multi_seq()"), "{body}");
     let l = include_str!("levers.rs");
     assert!(l.contains("std::env::var(\"METRALE_GLM_DECODE_MULTI_SEQ\").as_deref() == Ok(\"1\")"));
+}
+
+/// 2026-10-03: The cross-sequence DSA projections stay default-off behind
+/// `METRALE_GLM_DSA_XSEQ_BATCH`: the loader attaches the arena only under the lever, both
+/// call sites try `decode_xseq` only with the arena attached and keep their per-sequence loop
+/// as the fallback arm, and each sequence gets the loop's own metadata rows.
+#[test]
+fn dsa_xseq_batch_stays_behind_its_lever() {
+    let l = include_str!("../glm5next_dsa/layer/xseq.rs");
+    assert!(l.contains("std::env::var(\"METRALE_GLM_DSA_XSEQ_BATCH\").as_deref() == Ok(\"1\")"));
+    let ld = include_str!("../weight_loader/glm5_next_load/loader.rs");
+    assert!(ld.contains("let dsa_xseq = if crate::glm5next_dsa::layer::dsa_xseq_batch() {"));
+    assert_eq!(ld.matches("ws.with_xseq(").count(), 1);
+    for (file, src, meta) in [
+        (
+            "multi_seq.rs",
+            include_str!("steps/multi_seq.rs"),
+            "ctx.attn_metadata.as_ref().map(|m| m.row_view(i))",
+        ),
+        (
+            "verify_multi.rs",
+            include_str!("steps/verify_multi.rs"),
+            ".map(|m| verify_rows_view(m, off[i], ks[i]))",
+        ),
+    ] {
+        let arm = src
+            .split_once("if layer.xseq_attached() && {")
+            .unwrap_or_else(|| panic!("{file}: xseq arm present"))
+            .1;
+        let arm = &arm[..arm.find("=>").expect("arm ends")];
+        assert!(arm.contains(meta), "{file}: the loop's metadata rows");
+        assert!(arm.contains("layer.decode_xseq("), "{file}");
+        assert!(
+            src.matches("layer.decode_k(").count() == 1,
+            "{file}: the per-sequence loop stays as the fallback"
+        );
+    }
 }
 
 /// 2026-10-02: The batched MTP verify stays default-off behind `METRALE_GLM_BATCHED_VERIFY`:

@@ -94,6 +94,10 @@ pub struct Glm5NextDsaWorkspace {
     /// (`wide.rs`), one arena shared by every DSA layer; `None` unless the loader attached it
     /// with [`Glm5NextDsaWorkspace::with_wide`].
     pub(super) wide: Option<std::sync::Arc<super::wide::DsaWideArena>>,
+    /// 2026-10-03: `METRALE_GLM_DSA_XSEQ_BATCH` scratch for `decode_xseq` (`xseq.rs`), one
+    /// arena shared by every DSA layer; `None` unless the loader attached it with
+    /// [`Glm5NextDsaWorkspace::with_xseq`].
+    pub(super) xseq: Option<std::sync::Arc<super::xseq::DsaXseqArena>>,
 }
 
 impl Glm5NextDsaWorkspace {
@@ -179,6 +183,7 @@ impl Glm5NextDsaWorkspace {
                 None
             },
             wide: None,
+            xseq: None,
         })
     }
 
@@ -188,5 +193,20 @@ impl Glm5NextDsaWorkspace {
     pub fn with_wide(mut self, arena: std::sync::Arc<super::wide::DsaWideArena>) -> Self {
         self.wide = Some(arena);
         self
+    }
+
+    /// 2026-10-03: This workspace with the shared cross-sequence arena attached, so
+    /// `decode_xseq` runs the projections of several sequences at once
+    /// (`METRALE_GLM_DSA_XSEQ_BATCH`). The arena is shared: the layers run one after another
+    /// on one stream.
+    pub fn with_xseq(mut self, arena: std::sync::Arc<super::xseq::DsaXseqArena>) -> Self {
+        self.xseq = Some(arena);
+        self
+    }
+
+    /// 2026-10-03: Attach or detach the cross-sequence arena in place (the A/B microtest
+    /// `glm5next_dsa_xseq_microtest` runs both arms on one layer).
+    pub fn set_xseq(&mut self, arena: Option<std::sync::Arc<super::xseq::DsaXseqArena>>) {
+        self.xseq = arena;
     }
 }

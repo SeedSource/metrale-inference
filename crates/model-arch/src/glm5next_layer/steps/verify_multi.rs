@@ -210,6 +210,34 @@ impl Glm5NextLayer {
                 layer.decode_verify_n_seqs(gpu, normed, ks, &seq_states, &snaps, ws, stream)?;
                 ws.final_out
             }
+            // 2026-10-03: `METRALE_GLM_DSA_XSEQ_BATCH`: the projections once over all R rows
+            // (`glm5next_dsa/layer/xseq.rs`), each sequence's metadata the loop's
+            // `verify_rows_view`; `decode_xseq` returns false, launching nothing, when it does
+            // not engage, and the per-sequence loop below runs.
+            (Glm5NextMixer::Dsa(layer), _)
+                if layer.xseq_attached() && {
+                    let metas: Vec<_> = (0..n)
+                        .map(|i| {
+                            ctx.attn_metadata
+                                .as_ref()
+                                .map(|m| verify_rows_view(m, off[i], ks[i]))
+                        })
+                        .collect();
+                    layer.decode_xseq(
+                        normed,
+                        ks,
+                        &mut states[..n],
+                        kv_cache,
+                        &seq_lens[..n],
+                        &block_tables[..n],
+                        &metas,
+                        ctx,
+                        stream,
+                    )?
+                } =>
+            {
+                normed
+            }
             (Glm5NextMixer::Dsa(layer), _) => {
                 for (i, state) in states.iter_mut().enumerate().take(n) {
                     let row_ctx = ForwardContext {

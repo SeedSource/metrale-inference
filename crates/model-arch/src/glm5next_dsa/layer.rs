@@ -41,7 +41,6 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
 use super::attend::{DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, attention};
-use super::select::{DsaSelectInputs, select_tokens};
 use super::state::Glm5NextDsaState;
 use super::{Glm5NextDsaConfig, Glm5NextDsaKernels};
 use metrale_model_layers::layer::{ForwardContext, LayerState, TransformerLayer};
@@ -50,14 +49,17 @@ mod ctx_rows;
 mod decode_k;
 mod proj_gemm;
 mod row_batch;
+mod row_src;
 mod rows;
 mod wide;
 mod workspace;
+mod xseq;
 
 use proj_gemm::gemm;
 pub use wide::DsaWideArena;
 pub use workspace::Glm5NextDsaWorkspace;
 pub(crate) use workspace::batch_select_enabled;
+pub use xseq::{DsaXseqArena, dsa_xseq_batch};
 
 /// 2026-09-25: The projection, norm and latent-write kernels of a DSA block. The selection
 /// kernels are in `Glm5NextDsaKernels`, the decode kernel in `attend`.
@@ -248,90 +250,6 @@ impl Glm5NextDsaLayer {
         self.store_indexer_row(gpu, state, pos_dev, pos, d, stream)
     }
 
-    /// 2026-09-25: The selector query projection and the selection for one query row, written
-    /// to row `row` of the selection output.
-    ///
-    /// `decode_k` calls it right after that row's indexer write, so the geometry is planned
-    /// at the row's own cache length; `attend_rows` then attends all rows in one launch.
-    #[allow(clippy::too_many_arguments)]
-    fn select_row(
-        &self,
-        gpu: &dyn GpuBackend,
-        row: usize,
-        state: &Glm5NextDsaState,
-        q_pos_dev: DevicePtr,
-        replay_safe: bool,
-        stream: u64,
-    ) -> Result<()> {
-        let w = &self.workspace;
-        let geom = state.geometry(&self.cfg, 1)?;
-
-        // 2026-09-25: The selector query `q_idx`, FP32 out.
-        gemm(
-            gpu,
-            self.kernels.gemm_f32,
-            self.kernels.gemv_f32,
-            // 2026-09-25: No FP32-out batched GEMV kernel exists.
-            KernelHandle(0),
-            w.q_resid.offset(row * self.cfg.q_lora_rank * 2),
-            self.weights.wq_b,
-            w.q_idx,
-            1,
-            self.cfg.index_heads * self.cfg.index_head_dim,
-            self.cfg.q_lora_rank,
-            stream,
-        )?;
-        // 2026-09-25: `head_weights` comes from `indexer_forward`, which has the layer input.
-
-        let inputs = DsaSelectInputs {
-            k_normed: state.k_normed,
-            gate: state.gate,
-            valid: state.valid,
-            ape: self.weights.ape,
-            q: w.q_idx,
-            weights: w.head_weights,
-            q_pos: q_pos_dev,
-            // 2026-09-25: All 1s, set once in `Glm5NextDsaWorkspace::new`.
-            q_mask: w.q_mask,
-            first_key: 0,
-            geom_dev: if replay_safe {
-                w.geom_dev
-            } else {
-                DevicePtr::NULL
-            },
-        };
-        // 2026-09-25: On the replay-safe path the grid and the shared-memory request are set
-        // at the context ceiling and the live extents come from `geom_dev`, so one graph
-        // serves every context length.
-        let launch = if replay_safe {
-            super::select::DsaSelectLaunch::Ceiling {
-                max_pools: super::select::contiguous_pool_count(
-                    self.cfg.index_kpool,
-                    super::state::max_dsa_context(&self.cfg),
-                ),
-            }
-        } else {
-            super::select::DsaSelectLaunch::Exact
-        };
-        let t = crate::glm5next_layer::profile::start();
-        // 2026-09-25: Row `row` of the `[max_rows, out_width]` selection output. The kernels
-        // run one query row (`q_rows == 1`) into this row's slot, so `attend_rows` reads all
-        // rows in one launch.
-        select_tokens(
-            gpu,
-            &self.select_kernels,
-            &self.cfg,
-            &geom,
-            &inputs,
-            &w.select.row(row, &self.cfg),
-            launch,
-            stream,
-        )?;
-        use crate::glm5next_layer::profile;
-        profile::end(profile::DSA_SELECT, t, gpu, stream);
-        Ok(())
-    }
-
     /// 2026-09-25: The gather-attend for all `rows` query rows in one launch.
     ///
     /// Grid y is the row. Each row reads the paged latent cache through its own `q_abs` row,
@@ -351,6 +269,39 @@ impl Glm5NextDsaLayer {
         is_prefill: bool,
         stream: u64,
     ) -> Result<()> {
+        let w = &self.workspace;
+        self.attend_rows_at(
+            gpu,
+            rows,
+            state,
+            kv_cache,
+            block_table_dev,
+            seq_lens_dev,
+            paging,
+            is_prefill,
+            w.q_abs,
+            w.attn_out,
+            stream,
+        )
+    }
+
+    /// 2026-10-03: `attend_rows` reading the absorbed queries from `q` and writing `out`
+    /// (`[rows, local_heads * kv_lora_rank]` BF16 each), the selection from the workspace.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_rows_at(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: usize,
+        state: &Glm5NextDsaState,
+        kv_cache: &PagedKvCache,
+        block_table_dev: DevicePtr,
+        seq_lens_dev: DevicePtr,
+        paging: &DsaDecodePaging,
+        is_prefill: bool,
+        q: DevicePtr,
+        out: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
         use crate::glm5next_layer::profile;
         let w = &self.workspace;
         // 2026-09-25: `decode_attention` reads only `out_width` and `q_rows` from it.
@@ -368,10 +319,10 @@ impl Glm5NextDsaLayer {
             &geom,
             &paging,
             &DsaDecodeInputs {
-                q: w.q_abs,
+                q,
                 k_cache: pool,
                 v_cache: pool, // 2026-09-25: absorbed NoPE MLA: K and V are the same latent
-                out: w.attn_out,
+                out,
                 block_tables: block_table_dev,
                 seq_lens: seq_lens_dev,
                 sel_indices: w.select.tokens(),

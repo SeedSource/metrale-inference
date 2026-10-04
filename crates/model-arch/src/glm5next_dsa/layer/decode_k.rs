@@ -17,6 +17,7 @@ use metrale_model_layers::layer::{ForwardContext, LayerState};
 
 use super::super::attend::DsaDecodePaging;
 use super::super::state::Glm5NextDsaState;
+use super::row_src::RowSrc;
 use super::{Glm5NextDsaLayer, batch_select_enabled, gemm};
 
 impl Glm5NextDsaLayer {
@@ -48,7 +49,6 @@ impl Glm5NextDsaLayer {
         is_prefill: bool,
     ) -> Result<()> {
         use crate::glm5next_layer::profile;
-        let bt_block_size = kv_cache.block_size().max(1);
         let st = state
             .as_any_mut()
             .downcast_mut::<Glm5NextDsaState>()
@@ -159,6 +159,67 @@ impl Glm5NextDsaLayer {
                 stream,
             );
         }
+        let src = RowSrc::workspace(w);
+        self.decode_k_rows(
+            &src,
+            hidden,
+            k,
+            st,
+            kv_cache,
+            seq_len,
+            block_table,
+            ctx,
+            rowwise_meta.copied(),
+            t_proj,
+            stream,
+            is_prefill,
+        )?;
+
+        let t_proj = profile::start();
+        gemm(
+            gpu,
+            self.kernels.gemm,
+            self.kernels.gemv,
+            self.kernels.gemv_batchm,
+            w.attn_out,
+            self.weights.o_absorb,
+            hidden,
+            k,
+            self.cfg.hidden,
+            self.cfg.local_heads * self.cfg.kv_lora_rank,
+            stream,
+        )?;
+        profile::end(profile::DSA_PROJ, t_proj, gpu, stream);
+        Ok(())
+    }
+
+    /// 2026-10-03: `decode_k` from the latent write through the gather-attend, for the `k`
+    /// rows of one sequence whose projections `src` holds (row `r` of each `src` buffer is
+    /// the sequence's row `r`); the attend output goes to `src.attn_out`. The caller has run
+    /// the lockstep and `k` checks and the projections, and runs the output projection.
+    /// `decode_k` passes the workspace buffers ([`RowSrc::workspace`]); the cross-sequence
+    /// batch (`xseq.rs`, `METRALE_GLM_DSA_XSEQ_BATCH`) passes its arena rows and the
+    /// indexer projections it ran for all sequences at once (`src.pre`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_k_rows(
+        &self,
+        src: &RowSrc,
+        hidden: DevicePtr,
+        k: usize,
+        st: &mut Glm5NextDsaState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        rowwise_meta: Option<metrale_model_layers::layer::AttnMetadataDev>,
+        t_proj: Option<std::time::Instant>,
+        stream: u64,
+        is_prefill: bool,
+    ) -> Result<()> {
+        let rowwise_meta = rowwise_meta.as_ref();
+        let gpu = ctx.gpu;
+        let w = &self.workspace;
+        let bt_block_size = kv_cache.block_size().max(1);
         let mut attend_bt = DevicePtr::NULL;
         let mut attend_sl = DevicePtr::NULL;
         // 2026-09-25: On the host path without `persist_bt`, row 0 allocates the shared bt/sl
@@ -169,6 +230,14 @@ impl Glm5NextDsaLayer {
         // allocated (they are NULL under `METRALE_DSA_SELECT_ROWS=0`).
         let batch_select =
             batch_select_enabled(w.q_idx_rows.0 != 0, is_prefill, ctx.graph_capture, k);
+        // 2026-10-03: The batched selector reads the head weights `indexer_forward` leaves in
+        // the workspace, which a precomputed indexer (`src.pre`) does not write.
+        if batch_select && src.pre.is_some() {
+            bail!(
+                "DSA layer {}: a precomputed indexer cannot feed the batched selector",
+                self.layer_idx
+            );
+        }
         let mut batch_q_pos: Vec<i32> = Vec::with_capacity(if batch_select { k } else { 0 });
         for row in 0..k {
             let pos = seq_len + row;
@@ -202,7 +271,7 @@ impl Glm5NextDsaLayer {
             KernelLaunch::new(gpu, self.kernels.latent_write)
                 .grid([1, 1, 1])
                 .block([self.cfg.kv_lora_rank as u32, 1, 1])
-                .arg_ptr(w.kv_a.offset(row * self.cfg.kv_lora_rank * 2))
+                .arg_ptr(src.kv_a.offset(row * self.cfg.kv_lora_rank * 2))
                 .arg_ptr(self.weights.kv_a_layernorm)
                 .arg_ptr(kv_cache.k_pool_ptr(self.attn_layer_idx))
                 .arg_ptr(slot_dev)
@@ -226,13 +295,16 @@ impl Glm5NextDsaLayer {
             } else {
                 None
             };
-            self.indexer_forward(
-                gpu,
-                hidden.offset(row * self.cfg.hidden * 2),
-                st,
-                pos_dev,
-                stream,
-            )?;
+            match &src.pre {
+                None => self.indexer_forward(
+                    gpu,
+                    hidden.offset(row * self.cfg.hidden * 2),
+                    st,
+                    pos_dev,
+                    stream,
+                )?,
+                Some(pre) => self.store_pre_indexer_row(gpu, pre, row, st, pos_dev, stream)?,
+            }
             profile::end(profile::DSA_INDEXER, t, gpu, stream);
 
             let (q_pos_dev, bt_dev_meta, sl_dev_meta) = match meta {
@@ -330,7 +402,18 @@ impl Glm5NextDsaLayer {
                 )?;
                 batch_q_pos.push(pos as i32);
             } else {
-                self.select_row(gpu, row, st, q_pos_dev, replay_safe, stream)?;
+                let q_resid_row = src.q_resid.offset(row * self.cfg.q_lora_rank * 2);
+                let pre = src.pre.as_ref().map(|p| p.row(row, &self.cfg));
+                self.select_row_at(
+                    gpu,
+                    row,
+                    st,
+                    q_pos_dev,
+                    replay_safe,
+                    q_resid_row,
+                    pre,
+                    stream,
+                )?;
             }
             // 2026-09-25: The attend takes row 0's pointers, the base of the per-row arrays,
             // and indexes rows itself on grid y.
@@ -350,7 +433,7 @@ impl Glm5NextDsaLayer {
         }
 
         if let Some(paging) = attend_paging {
-            self.attend_rows(
+            self.attend_rows_at(
                 gpu,
                 k,
                 st,
@@ -359,6 +442,8 @@ impl Glm5NextDsaLayer {
                 attend_sl,
                 &paging,
                 is_prefill,
+                src.q_abs,
+                src.attn_out,
                 stream,
             )?;
         }
@@ -367,22 +452,6 @@ impl Glm5NextDsaLayer {
             gpu.free(attend_bt)?;
             gpu.free(attend_sl)?;
         }
-
-        let t_proj = profile::start();
-        gemm(
-            gpu,
-            self.kernels.gemm,
-            self.kernels.gemv,
-            self.kernels.gemv_batchm,
-            w.attn_out,
-            self.weights.o_absorb,
-            hidden,
-            k,
-            self.cfg.hidden,
-            self.cfg.local_heads * self.cfg.kv_lora_rank,
-            stream,
-        )?;
-        profile::end(profile::DSA_PROJ, t_proj, gpu, stream);
         Ok(())
     }
 }

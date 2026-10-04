@@ -17,7 +17,8 @@ use metrale_config::ModelConfig;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_model_arch::glm5next_dsa::attend::Glm5NextDsaDecodeKernel;
 use metrale_model_arch::glm5next_dsa::layer::{
-    Glm5NextDsaLayer, Glm5NextDsaLayerKernels, Glm5NextDsaWeights, Glm5NextDsaWorkspace,
+    DsaXseqArena, Glm5NextDsaLayer, Glm5NextDsaLayerKernels, Glm5NextDsaWeights,
+    Glm5NextDsaWorkspace,
 };
 use metrale_model_arch::glm5next_dsa::{Glm5NextDsaConfig, Glm5NextDsaKernels};
 use metrale_model_arch::glm5next_kda::{
@@ -197,7 +198,7 @@ fn kda_weights(
 /// 2026-10-01: Post-transform DSA weights at this rank's shapes (`build_dsa_weights` output):
 /// `q_absorb` `[local_heads * kv_lora_rank, q_lora_rank]`, `o_absorb`
 /// `[hidden, local_heads * kv_lora_rank]`, the indexer replicated.
-fn dsa_weights(
+pub(crate) fn dsa_weights(
     g: &dyn GpuBackend,
     c: &Glm5NextDsaConfig,
     s: &mut Lcg,
@@ -300,7 +301,17 @@ pub(crate) fn build_stack(
                 kernels: dsa_lk,
                 select_kernels: dsa_k,
                 decode_kernel: Glm5NextDsaDecodeKernel::resolve(g)?,
-                workspace: Glm5NextDsaWorkspace::new(g, &geo.dsa, rows)?,
+                workspace: {
+                    let ws = Glm5NextDsaWorkspace::new(g, &geo.dsa, rows)?;
+                    // 2026-10-03: As the loader attaches it, so `decode_multi_seq` takes the
+                    // cross-sequence DSA projections under the lever.
+                    if metrale_model_arch::glm5next_dsa::layer::dsa_xseq_batch() {
+                        println!("DSA xseq arena attached (METRALE_GLM_DSA_XSEQ_BATCH=1)");
+                        ws.with_xseq(Arc::new(DsaXseqArena::new(g, &geo.dsa, 16)?))
+                    } else {
+                        ws
+                    }
+                },
                 layer_idx: idx,
                 attn_layer_idx: 0,
                 rms_eps: cfg.rms_norm_eps as f32,

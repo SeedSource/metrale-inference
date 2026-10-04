@@ -3,6 +3,8 @@
 //! 2026-09-26: Three `Glm5NextDsaLayer` methods: `store_indexer_row`, the last step of
 //! `indexer_forward`; `select_rows_batched`, the one-pass selection for all rows of a
 //! prefill sub-chunk; and `write_kv_row`, one MTP drafter context row.
+//! 2026-10-03: Plus `select_row_at`, the per-row selection (moved from `layer.rs`, 500-line
+//! cap).
 //!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants:
@@ -18,9 +20,108 @@ use super::super::select::split::{RowSplit, select_tokens_split};
 use super::super::select::{DsaSelectInputs, select_tokens};
 use super::super::state::Glm5NextDsaState;
 use super::row_batch::DsaRowBatch;
+use super::row_src::PreRow;
 use super::{Glm5NextDsaLayer, gemm};
 
 impl Glm5NextDsaLayer {
+    /// 2026-09-25: The selector query projection and the selection for one query row, written
+    /// to row `row` of the selection output.
+    ///
+    /// `decode_k` calls it right after that row's indexer write, so the geometry is planned
+    /// at the row's own cache length; `attend_rows` then attends all rows in one launch.
+    ///
+    /// 2026-10-03: The row's `q_resid` is at `q_resid_row`. With `pre` (`xseq.rs`), the
+    /// selector query and head weights were already computed for this row and are read from
+    /// there; without, `wq_b` runs here into the workspace `q_idx` and the head weights are
+    /// the ones `indexer_forward` left in the workspace.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn select_row_at(
+        &self,
+        gpu: &dyn GpuBackend,
+        row: usize,
+        state: &Glm5NextDsaState,
+        q_pos_dev: DevicePtr,
+        replay_safe: bool,
+        q_resid_row: DevicePtr,
+        pre: Option<PreRow>,
+        stream: u64,
+    ) -> Result<()> {
+        let w = &self.workspace;
+        let geom = state.geometry(&self.cfg, 1)?;
+
+        let (q_idx, head_weights) = match pre {
+            Some(p) => (p.q_idx, p.head_weights),
+            None => {
+                // 2026-09-25: The selector query `q_idx`, FP32 out.
+                gemm(
+                    gpu,
+                    self.kernels.gemm_f32,
+                    self.kernels.gemv_f32,
+                    // 2026-09-25: No FP32-out batched GEMV kernel exists.
+                    KernelHandle(0),
+                    q_resid_row,
+                    self.weights.wq_b,
+                    w.q_idx,
+                    1,
+                    self.cfg.index_heads * self.cfg.index_head_dim,
+                    self.cfg.q_lora_rank,
+                    stream,
+                )?;
+                // 2026-09-25: `head_weights` comes from `indexer_forward`, which has the layer
+                // input.
+                (w.q_idx, w.head_weights)
+            }
+        };
+
+        let inputs = DsaSelectInputs {
+            k_normed: state.k_normed,
+            gate: state.gate,
+            valid: state.valid,
+            ape: self.weights.ape,
+            q: q_idx,
+            weights: head_weights,
+            q_pos: q_pos_dev,
+            // 2026-09-25: All 1s, set once in `Glm5NextDsaWorkspace::new`.
+            q_mask: w.q_mask,
+            first_key: 0,
+            geom_dev: if replay_safe {
+                w.geom_dev
+            } else {
+                DevicePtr::NULL
+            },
+        };
+        // 2026-09-25: On the replay-safe path the grid and the shared-memory request are set
+        // at the context ceiling and the live extents come from `geom_dev`, so one graph
+        // serves every context length.
+        let launch = if replay_safe {
+            super::super::select::DsaSelectLaunch::Ceiling {
+                max_pools: super::super::select::contiguous_pool_count(
+                    self.cfg.index_kpool,
+                    super::super::state::max_dsa_context(&self.cfg),
+                ),
+            }
+        } else {
+            super::super::select::DsaSelectLaunch::Exact
+        };
+        let t = crate::glm5next_layer::profile::start();
+        // 2026-09-25: Row `row` of the `[max_rows, out_width]` selection output. The kernels
+        // run one query row (`q_rows == 1`) into this row's slot, so `attend_rows` reads all
+        // rows in one launch.
+        select_tokens(
+            gpu,
+            &self.select_kernels,
+            &self.cfg,
+            &geom,
+            &inputs,
+            &w.select.row(row, &self.cfg),
+            launch,
+            stream,
+        )?;
+        use crate::glm5next_layer::profile;
+        profile::end(profile::DSA_SELECT, t, gpu, stream);
+        Ok(())
+    }
+
     /// 2026-09-26: `indexer_forward`'s last step: places the projected `k_normed` and `gate`
     /// at row `pos` (through `dsa_indexer_store` at `pos_dev` when given), marks the row
     /// valid, and advances `state` by one row.

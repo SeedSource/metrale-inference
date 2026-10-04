@@ -387,6 +387,24 @@ impl Glm5NextWeightLoader {
             }
             None => None,
         };
+        // 2026-10-03: `METRALE_GLM_DSA_XSEQ_BATCH=1`: one cross-sequence DSA arena for
+        // `decode_xseq` (`DENSE_GEMV_BATCHM_MAX_M` rows), shared by every DSA layer like the
+        // wide arena. GLM-5.3 TP2: 89,728 B per row, 1.4 MB (`DsaXseqArena` doc).
+        let dsa_xseq = if crate::glm5next_dsa::layer::dsa_xseq_batch() {
+            let r = metrale_model_layers::layers::ops::DENSE_GEMV_BATCHM_MAX_M as usize;
+            let a = crate::glm5next_dsa::layer::DsaXseqArena::new(gpu, &dsa_cfg, r)?;
+            tracing::warn!(
+                "GLM DSA cross-sequence arena (METRALE_GLM_DSA_XSEQ_BATCH): 1 x {:.2} MB for \
+                 {} rows, shared by the DSA layers",
+                (crate::glm5next_dsa::layer::DsaXseqArena::bytes_per_row(&dsa_cfg) * a.max_rows())
+                    as f64
+                    / 1e6,
+                a.max_rows()
+            );
+            Some(std::sync::Arc::new(a))
+        } else {
+            None
+        };
         let last = skeleton.layers.len() - 1;
         let mut out: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(skeleton.layers.len());
         // 2026-10-01: Decode L2 prefetch (`METRALE_GLM_DECODE_L2_PREFETCH`): the kernel, optional
@@ -463,8 +481,12 @@ impl Glm5NextWeightLoader {
                             let ws = crate::glm5next_dsa::layer::Glm5NextDsaWorkspace::new(
                                 gpu, &dsa_cfg, verify_k,
                             )?;
-                            match &dsa_wide {
+                            let ws = match &dsa_wide {
                                 Some(a) => ws.with_wide(a.clone()),
+                                None => ws,
+                            };
+                            match &dsa_xseq {
+                                Some(a) => ws.with_xseq(a.clone()),
                                 None => ws,
                             }
                         },

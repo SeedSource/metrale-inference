@@ -45,6 +45,7 @@ fn the_layer_takes_the_vanilla_rmsnorm_not_the_plus_one_variant() {
         ("layer/proj_gemm.rs", include_str!("proj_gemm.rs")),
         ("layer/row_batch.rs", include_str!("row_batch.rs")),
         ("layer/wide.rs", include_str!("wide.rs")),
+        ("layer/xseq.rs", include_str!("xseq.rs")),
     ] {
         assert!(
             !text.contains(r#""rms_norm", "rms_norm""#),
@@ -162,8 +163,8 @@ fn the_indexer_checks_capacity_before_it_writes() {
         .split_once("pub fn indexer_forward")
         .expect("indexer_forward must exist")
         .1
-        .split_once("fn select_row")
-        .expect("select_row follows indexer_forward")
+        .split_once("fn attend_rows")
+        .expect("attend_rows follows indexer_forward")
         .0;
     let guard = body
         .find("state.ensure_room(1)?")

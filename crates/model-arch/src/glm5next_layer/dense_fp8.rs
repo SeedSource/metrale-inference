@@ -8,7 +8,12 @@
 //! Invariants:
 //! - Off (the default), nothing is quantized, freed or allocated, and [`route`] returns
 //!   `Route::Weight(b)` for the caller's own `b` without launching, so every projection runs
-//!   exactly as before.
+//!   exactly as before, unless `METRALE_GLM_GEMV_TC=1` (next item).
+//! - 2026-10-04: `METRALE_GLM_GEMV_TC=1` (`ops::dense_gemv_tcm`, independent of this lever):
+//!   [`route`] runs every 1..=16-row call made with the BF16-out `dense_gemv_bf16` handle on
+//!   the row-invariant tensor-core GEMV, over the FP8 copy when the weight is registered
+//!   here and over the BF16 weight otherwise, and returns `Route::Done`; a shape the TC
+//!   entry declines (k not a multiple of 64 / 128) falls through to the rules below.
 //! - On, the loader ([`register_layer`]) quantizes, per text layer (0..num_hidden_layers;
 //!   the MTP block is loaded elsewhere and never registered), the BF16 weights listed in
 //!   [`register_layer`] to `[N, K]` E4M3 + one FP32 scale per output row
@@ -245,6 +250,13 @@ pub fn lookup(ptr: DevicePtr, n: usize, k: usize) -> Option<Fp8DenseWeight> {
     m.get(&ptr.0).filter(|e| e.n == n && e.k == k).map(|e| e.w)
 }
 
+/// 2026-10-04: `dense_gemv_bf16` (module `gemv`), the BF16-out GEMV handle the three GLM
+/// `gemm` wrappers pass; resolved once, `KernelHandle(0)` when absent.
+fn bf16_gemv_handle(gpu: &dyn GpuBackend) -> KernelHandle {
+    static H: OnceLock<KernelHandle> = OnceLock::new();
+    *H.get_or_init(|| metrale_model_layers::layers::try_kernel(gpu, "gemv", "dense_gemv_bf16"))
+}
+
 /// 2026-10-03: The BF16 weight `C[m, n] = A[m, k] @ W^T` must read for weight pointer `b`,
 /// running the FP8 GEMV itself when it applies (module doc). Output rows of an FP8 GEMV are
 /// packed at stride `n`, as `ops::dense_mm_bf16` writes them.
@@ -260,6 +272,36 @@ pub fn route(
     k: usize,
     stream: u64,
 ) -> Result<Route> {
+    // 2026-10-04: `METRALE_GLM_GEMV_TC=1`: 1..=16 rows on the BF16-out GEMV run the
+    // row-invariant tensor-core GEMV (`ops::dense_gemv_tcm`) on the FP8 copy when this
+    // weight has one, else on the BF16 weight. Every M of a weight takes it, M = 1 included,
+    // so decode and verify rows agree; a shape it declines (k not a multiple of the k-block)
+    // declines at every M and falls through below.
+    if ops::dense_gemv_tcm::gemv_tc_enabled()
+        && (1..=ops::dense_gemv_tcm::TCM_MAX_M as usize).contains(&m)
+        && gemv.0 != 0
+        && gemv.0 == bf16_gemv_handle(gpu).0
+    {
+        let done = match if dense_fp8() { find(b, n, k)? } else { None } {
+            Some(e) => ops::dense_gemv_tcm::try_fp8(
+                gpu, a, &e.w, c, m as u32, n as u32, k as u32, n as u32, stream,
+            )?,
+            None => ops::dense_gemv_tcm::try_bf16(
+                gpu,
+                a,
+                &DenseWeight { weight: b },
+                c,
+                m as u32,
+                n as u32,
+                k as u32,
+                n as u32,
+                stream,
+            )?,
+        };
+        if done {
+            return Ok(Route::Done);
+        }
+    }
     if !dense_fp8() {
         return Ok(Route::Weight(b));
     }

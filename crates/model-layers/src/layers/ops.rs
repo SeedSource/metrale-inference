@@ -127,6 +127,9 @@ mod norm;
 pub mod dense_gemv_tc;
 #[path = "ops/gemv_tc.rs"]
 pub mod gemv_tc;
+// 2026-10-04: METRALE_GLM_GEMV_TC: small-M tensor-core dense GEMVs (BF16 and FP8 weights).
+#[path = "ops/dense_gemv_tcm.rs"]
+pub mod dense_gemv_tcm;
 #[cfg(test)]
 #[path = "ops/kquant_fold_tests.rs"]
 mod kquant_fold_tests;

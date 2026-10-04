@@ -143,6 +143,12 @@ fn project_bf16_lm_head(
     m16_tc: LmHeadM16Tc,
     stream: u64,
 ) -> Result<()> {
+    // 2026-10-04: `METRALE_GLM_GEMV_TC=1` goes before every other arm: 1..=16 rows on the
+    // row-invariant tensor-core GEMV (`ops::dense_gemv_tcm`), the kernel the 1-row and
+    // verify heads also take under that lever.
+    if ops::dense_gemv_tcm::try_bf16(gpu, input, weight, output, m, n, k, n, stream)? {
+        return Ok(());
+    }
     // 2026-09-25: The tensor-core arm goes first, at 5..=16 rows (`lm_head_m16_tc_route`). It
     // reassociates the K reduction, so it is not bit-identical to the batched GEMV; it runs
     // only where the target declares `lm_head_m16_tc` or `METRALE_LM_HEAD_M16_TC` turns it on.

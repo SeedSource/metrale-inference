@@ -145,7 +145,10 @@ impl TransformerModel {
         {
             return Ok(logits);
         }
-        if let Some(ref fp8) = self.lm_head_fp8 {
+        if self.lm_head_bf16_tc(hidden, num_tokens, logits, stream)? {
+            // 2026-10-04: `METRALE_GLM_GEMV_TC=1` ran the BF16 head on the row-invariant
+            // tensor-core GEMV (`lm_head_bf16_tc`).
+        } else if let Some(ref fp8) = self.lm_head_fp8 {
             // 2026-09-25: FP8 E4M3 head. Two rows use the dual GEMV; any other
             // row count, or a missing dual kernel, runs one GEMV per row.
             let bf16 = 2usize;
@@ -322,6 +325,67 @@ impl TransformerModel {
         Ok(logits)
     }
 
+    /// 2026-10-04: `METRALE_GLM_GEMV_TC=1`: the BF16 head (no FP8 / NVFP4 / Q6_K head) for
+    /// `rows` in 1..=16 on the row-invariant tensor-core GEMV (`ops::dense_gemv_tcm`): this
+    /// rank's vocab slice into zeroed logits plus the all-reduce when `lmhead_vocab_shard`
+    /// splits the vocab, else the whole vocab. A row's logits do not depend on `rows`, so the
+    /// 1-row `lm_head` and `lm_head_batched` agree. Returns `false` having launched nothing
+    /// when the lever is off, the head is not BF16, or the shape or entry does not route.
+    fn lm_head_bf16_tc(
+        &self,
+        hidden: DevicePtr,
+        rows: u32,
+        logits: DevicePtr,
+        stream: u64,
+    ) -> Result<bool> {
+        let h = self.config.hidden_size as u32;
+        let v = self.config.vocab_size as u32;
+        if self.lm_head_fp8.is_some()
+            || self.lm_head_nvfp4.is_some()
+            || self.lm_head_q6k.is_some()
+            || !ops::dense_gemv_tcm::ready(self.gpu.as_ref(), rows, v, h, false)
+        {
+            return Ok(false);
+        }
+        let Some((begin, len)) = self.lmhead_vocab_shard(v) else {
+            return ops::dense_gemv_tcm::try_bf16(
+                self.gpu.as_ref(),
+                hidden,
+                &self.lm_head_weight,
+                logits,
+                rows,
+                v,
+                h,
+                v,
+                stream,
+            );
+        };
+        self.gpu
+            .memset_async(logits, 0, rows as usize * v as usize * 2, stream)?;
+        let launched = ops::dense_gemv_tcm::try_bf16(
+            self.gpu.as_ref(),
+            hidden,
+            &DenseWeight {
+                weight: self.lm_head_weight.weight.offset(begin * h as usize * 2),
+            },
+            logits.offset(begin * 2),
+            rows,
+            len as u32,
+            h,
+            // Rows of `logits` are a full vocab apart even when this rank writes a slice.
+            v,
+            stream,
+        )?;
+        anyhow::ensure!(
+            launched,
+            "lm_head_bf16_tc: the vocab slice [{begin}, +{len}) did not route"
+        );
+        if let Some(comm) = self.comm_ref() {
+            comm.all_reduce_async(logits.0, rows as usize * v as usize * 2, stream)?;
+        }
+        Ok(true)
+    }
+
     /// 2026-09-25: `(begin, len)` rows of the BF16 LM head this rank computes,
     /// or `None` for the whole-vocab projection.
     ///
@@ -405,6 +469,9 @@ impl TransformerModel {
                 h,
                 stream,
             )?;
+        } else if self.lm_head_bf16_tc(hidden, 1, logits, stream)? {
+            // 2026-10-04: `METRALE_GLM_GEMV_TC=1`: the same tensor-core GEMV as the batched
+            // head, so a decode row and a verify row get the same logits.
         } else if let Some((begin, len)) = self.lmhead_vocab_shard(v) {
             // 2026-09-25: Vocab-parallel BF16 head. Each rank holds the whole head
             // but computes only its row range (`lmhead_vocab_shard`) into a zeroed

@@ -19,7 +19,7 @@ fn stream_names(chunks: &[&str]) -> Vec<String> {
         // 2026-09-26: As in `handle_token_inner`, read the in-body flag before feeding
         // this delta.
         let inside_tool_call = det.inside_tool_call();
-        strip_bare_role_literal(&mut delta, inside_tool_call);
+        strip_bare_role_literal(&mut delta, inside_tool_call, true);
         if delta.is_empty() {
             continue;
         }
@@ -82,13 +82,13 @@ fn ordinary_name_streams_intact() {
     assert_eq!(names, vec!["get_weather".to_string()]);
 }
 
-/// 2026-09-26: Outside a tool call, each bare role literal (also padded with spaces) is
-/// cleared.
+/// 2026-09-26: Outside a tool call, each unspaced bare role literal at the start of content is
+/// cleared (2026-10-03: a spaced or mid-sentence one is prose, see `role_word_*`).
 #[test]
 fn bare_role_literal_still_stripped_outside_tool_call() {
-    for lit in ["user", "assistant", "tool", "  tool  "] {
+    for lit in ["user", "assistant", "tool"] {
         let mut d = lit.to_string();
-        strip_bare_role_literal(&mut d, false);
+        strip_bare_role_literal(&mut d, false, true);
         assert!(
             d.is_empty(),
             "bare role literal {lit:?} must be stripped in content"
@@ -100,7 +100,7 @@ fn bare_role_literal_still_stripped_outside_tool_call() {
 fn bare_role_literal_preserved_inside_tool_call() {
     for lit in ["user", "assistant", "tool"] {
         let mut d = lit.to_string();
-        strip_bare_role_literal(&mut d, true);
+        strip_bare_role_literal(&mut d, true, true);
         assert_eq!(d, lit, "fragment {lit:?} must survive inside a tool call");
     }
 }
@@ -121,7 +121,7 @@ fn dsml_split_opener_preserves_tool_fragment_and_streams_call() {
     let mut outputs = Vec::new();
     for chunk in chunks {
         let mut delta = chunk.to_string();
-        strip_bare_role_literal(&mut delta, det.inside_tool_call());
+        strip_bare_role_literal(&mut delta, det.inside_tool_call(), true);
         if !delta.is_empty() {
             outputs.extend(det.process(&delta));
         }
@@ -148,35 +148,42 @@ fn dsml_split_opener_preserves_tool_fragment_and_streams_call() {
 fn ordinary_content_untouched() {
     for inside in [false, true] {
         let mut d = "the tool ran".to_string();
-        strip_bare_role_literal(&mut d, inside);
+        strip_bare_role_literal(&mut d, inside, true);
         assert_eq!(d, "the tool ran");
     }
 }
 
-/// 2026-10-03: E1/L17. Replays the content-phase strip over token-sized deltas
-/// (as `handle_token_inner` feeds them: `delta` = newly decoded bytes of one token).
+/// 2026-10-03: E1/L17. Replays the content-phase strip over token-sized deltas the way
+/// `handle_token_inner` feeds them (`at_line_start` = nothing emitted yet or last byte `\n`).
 fn replay(chunks: &[&str], inside: bool) -> String {
     let mut out = String::new();
     for &c in chunks {
         let mut d = c.to_string();
-        strip_bare_role_literal(&mut d, inside);
+        let at_line_start = out.is_empty() || out.ends_with('\n');
+        strip_bare_role_literal(&mut d, inside, at_line_start);
         out.push_str(&d);
     }
     out
 }
 
+/// Old failure (fixed 2026-10-03): `["a"," tool","."]` came out as "a.".
 #[test]
-fn role_word_split_outside_envelope_loses_word_before_fix() {
-    let whole = replay(&["a tool."], false);
-    let split = replay(&["a", " tool", "."], false);
-    println!("E1 L17 whole={whole:?} split={split:?}");
-    assert_eq!(whole, "a tool.");
-    assert_eq!(split, "a."); // FIXFLIP: want "a tool."
-    assert_eq!(replay(&["the", " user", " asked"], false), "the asked"); // FIXFLIP
-    assert_eq!(replay(&["I", " am", " an", " assistant"], false), "I am an"); // FIXFLIP
+fn role_word_split_mid_sentence_is_preserved() {
+    assert_eq!(replay(&["a tool."], false), "a tool.");
+    assert_eq!(replay(&["a", " tool", "."], false), "a tool.");
+    assert_eq!(replay(&["the", " user", " asked"], false), "the user asked");
+    assert_eq!(replay(&["I", " am", " an", " assistant"], false), "I am an assistant");
+    assert_eq!(replay(&["use", " the", " tool"], false), "use the tool");
 }
 
 #[test]
-fn role_word_split_inside_envelope_is_preserved() {
+fn role_word_inside_envelope_is_preserved() {
     assert_eq!(replay(&["a", " tool", "."], true), "a tool.");
+}
+
+/// The leak case still works: bare literal at the very start, or after a newline.
+#[test]
+fn leaked_role_literal_at_start_or_line_start_is_still_stripped() {
+    assert_eq!(replay(&["user", " hello"], false), " hello");
+    assert_eq!(replay(&["ok.\n", "assistant", " fine"], false), "ok.\n fine");
 }

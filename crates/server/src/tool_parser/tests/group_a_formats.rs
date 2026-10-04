@@ -112,12 +112,14 @@ fn parse_qwen3_coder_empty_body_then_backfill() {
     };
     backfill_required_params(&mut calls, std::slice::from_ref(&tool));
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
-    assert_eq!(
-        args["command"], "",
-        "backfill must add the required string key with an empty default"
+    // 2026-10-03: backfill no longer fabricates `""`; the key stays absent and
+    // `assess_tool_call` still refuses the shell call (hard).
+    assert!(
+        args.get("command").is_none(),
+        "backfill must not add an omitted required string key"
     );
     let err = validate_single_tool_call(&calls[0], std::slice::from_ref(&tool))
-        .expect_err("SHELL_FAMILY rejects `exec` with an empty command");
+        .expect_err("SHELL_FAMILY rejects `exec` with no command");
     assert!(
         err.contains("non-empty 'command'"),
         "rejection must name the offending key so the model can recover; got {err:?}"

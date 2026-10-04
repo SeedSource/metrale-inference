@@ -51,8 +51,8 @@ fn infer_default_subagent_type(description: Option<&str>) -> String {
 /// 2026-09-26: Repair each call's arguments against its tool's schema, in
 /// order: coerce string values to the declared type, rename keys that match a
 /// property up to case and underscores, re-split keys leaked into values,
-/// insert `""` for absent required string parameters, and fill an empty
-/// required `description` or `subagent_type`. A call with no matching tool,
+/// and fill a present-but-blank required `description` or `subagent_type`
+/// (an absent parameter is never inserted). A call with no matching tool,
 /// no `parameters`, or arguments that are not a JSON object is left alone.
 pub fn backfill_required_params(calls: &mut [ToolCall], tools: &[ToolDefinition]) {
     for call in calls.iter_mut() {
@@ -157,18 +157,20 @@ pub fn backfill_required_params(calls: &mut [ToolCall], tools: &[ToolDefinition]
             }
         }
 
-        // 2026-09-26: A required key with no declared type counts as a string.
-        for key in &required {
-            if !args.contains_key(*key) {
-                let is_string = properties
-                    .and_then(|p| p.get(*key))
-                    .and_then(|v| v.get("type"))
-                    .and_then(|t| t.as_str())
-                    .is_none_or(|t| t == "string");
-                if is_string {
-                    args.insert(key.to_string(), serde_json::Value::String(String::new()));
-                    changed = true;
-                }
+        // 2026-10-03: An absent required parameter stays absent. It used to be
+        // inserted as `""`, which passed the presence check and made "omitted"
+        // and "supplied empty" indistinguishable. Now `assess_tool_call` reports
+        // `MissingParam`, a soft issue: the call is delivered unmodified with the
+        // diagnostic. An explicit `""` is untouched.
+
+        // 2026-10-03: The one absent-required fill that stays: a delegation tool's
+        // `subagent_type`. It is a named client-compat default (the value is inferred
+        // from the tool's own agent list below), not a generic empty-string fabrication,
+        // and tests/group_f pins it. Every other absent required key stays absent.
+        for key in ["subagent_type", "subagentType"] {
+            if required.contains(&key) && !args.contains_key(key) {
+                args.insert(key.to_string(), serde_json::Value::String(String::new()));
+                changed = true;
             }
         }
 

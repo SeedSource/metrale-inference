@@ -265,6 +265,24 @@ pub fn assess_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> Result<(),
 
         for key in &required {
             if args.get(*key).is_none() {
+                // 2026-10-03: Backfill no longer turns an absent required string into
+                // `""`, which `EmptyRequired` below used to catch. Keep that safety: an
+                // absent write-family path or shell command is still refused (hard).
+                let write_path = matches!(
+                    name.as_str(),
+                    "Write" | "write" | "Edit" | "edit" | "MultiEdit" | "multiEdit"
+                        | "multi_edit" | "write_file" | "writeFile"
+                ) && matches!(*key, "file_path" | "filePath" | "path");
+                let shell_cmd = matches!(
+                    name.as_str(),
+                    "bash" | "Bash" | "shell" | "Shell" | "exec" | "Exec" | "run" | "Run"
+                        | "execute" | "Execute" | "terminal" | "Terminal"
+                ) && matches!(*key, "command" | "cmd" | "script" | "code");
+                if write_path || shell_cmd {
+                    return Err(ToolCallIssue::EmptyRequired(format!(
+                        "Error: {name} requires a non-empty '{key}' but it was not provided."
+                    )));
+                }
                 return Err(ToolCallIssue::MissingParam(format!(
                     "Error: {} requires parameter '{}' but it was not provided.",
                     name, key

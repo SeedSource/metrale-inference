@@ -59,16 +59,22 @@ type DeltaVec = Vec<StreamDelta>;
 /// tool-markup opener) before `handle_token` ends the stream.
 const MAX_SUPPRESS_STREAK_TOKENS: u32 = 256;
 
-/// 2026-09-26: Clear a delta shorter than 20 bytes that trims to `user`, `assistant` or
-/// `tool`. Nothing is cleared while `inside_tool_call`: there a lone `tool` can be the
-/// first fragment of a `tool_*` tool name, which the detector is reassembling.
-pub(super) fn strip_bare_role_literal(delta: &mut String, inside_tool_call: bool) {
-    if inside_tool_call {
+/// 2026-10-03: Clear a delta that is exactly a bare role literal (`user`, `assistant`,
+/// `tool`, no surrounding whitespace, under 20 bytes) at the very start of the content
+/// or right after a newline (`at_line_start`): the leaked-role-markup case. A spaced
+/// mid-sentence token such as `" tool"` is prose and is kept. Nothing is cleared while
+/// `inside_tool_call`: there a lone `tool` can be the first fragment of a `tool_*`
+/// tool name, which the detector is reassembling.
+pub(super) fn strip_bare_role_literal(
+    delta: &mut String,
+    inside_tool_call: bool,
+    at_line_start: bool,
+) {
+    if inside_tool_call || !at_line_start {
         return;
     }
-    let trimmed = delta.trim();
-    if delta.len() < 20 && matches!(trimmed, "user" | "assistant" | "tool") {
-        tracing::debug!("role-literal strip: dropped bare '{trimmed}' delta");
+    if delta.len() < 20 && matches!(delta.as_str(), "user" | "assistant" | "tool") {
+        tracing::debug!("role-literal strip: dropped bare '{delta}' delta");
         delta.clear();
     }
 }
@@ -340,6 +346,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
     state.content_decoded.push_str(&delta_stable);
     let stable_end = state.content_decoded.len();
     let _ = tok;
+    // 2026-10-03: Whether the content emitted before this token is empty or ends in a
+    // newline, for `strip_bare_role_literal`.
+    let at_line_start =
+        state.content_decoded[..state.emitted].is_empty() || state.content_decoded[..state.emitted].ends_with('\n');
     let mut delta = if stable_end > state.emitted {
         // 2026-09-26: Debug line when the first stable content bytes exist on the stream
         // side.
@@ -387,7 +397,7 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
             .detector
             .as_ref()
             .is_some_and(|d| d.inside_tool_call());
-        strip_bare_role_literal(&mut delta, inside_tool_call);
+        strip_bare_role_literal(&mut delta, inside_tool_call, at_line_start);
     }
 
     if delta.is_empty() {

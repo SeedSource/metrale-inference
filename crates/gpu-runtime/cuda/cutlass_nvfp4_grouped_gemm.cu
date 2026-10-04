@@ -9,6 +9,11 @@
 //   it, -120. Any other nonzero return is a failure; the cudaMemcpyAsync uploads and the
 //   batched A-pack launch are not checked, so their failures are not reported.
 // - A group's B and SFB pointers are checked for null before its GEMM launches (-140).
+// - 2026-10-03: The `_w4a4` entry points (global activation scale, GLM-5.3 prefill lever
+//   METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4) and metrale_cutlass_pack_weight_sfb_batched are
+//   additions; the pre-existing entry points launch exactly what they launched before (the
+//   new prep_grouped_a / launch_projection parameters default to the old behaviour).
+// - CUTLASS (BSD-3-Clause, NVIDIA) headers only; see THIRD_PARTY_NOTICES.md.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -284,6 +289,193 @@ __global__ void pack_weight_sfb_group(
   cutlass_scales[layout_sfb(col, group * 16, 0)] = *reinterpret_cast<unsigned char*>(&sf);
 }
 
+// 2026-10-03: W4A4 with a global activation scale (the `_w4a4` entry points below; GLM-5.3
+// routed-MoE prefill, METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1). The kernels in this block are
+// launched only by those entry points and metrale_cutlass_pack_weight_sfb_batched; the kernels
+// above and the pre-existing entry points are unchanged.
+
+// 2026-10-03: Round-to-nearest-even E2M1 code, saturating at 6: sign bit 8, magnitude code
+// 0..7 = {0, 0.5, 1, 1.5, 2, 3, 4, 6}. This is the rounding of PTX `cvt.rn.satfinite.e2m1x2.f32`
+// (ties to the even code: 0.75 -> 1.0, 1.75 -> 2.0, 3.5 -> 4.0), where float_to_e2m1_g above
+// rounds those three ties down. A NaN input gives magnitude code 7.
+__device__ __forceinline__ unsigned char float_to_e2m1_rne(float x) {
+  unsigned char sign = (x < 0.0f) ? 8u : 0u;
+  float ax = fabsf(x);
+  unsigned char mag;
+  if (ax <= 0.25f) {
+    mag = 0;
+  } else if (ax < 0.75f) {
+    mag = 1;
+  } else if (ax <= 1.25f) {
+    mag = 2;
+  } else if (ax < 1.75f) {
+    mag = 3;
+  } else if (ax <= 2.5f) {
+    mag = 4;
+  } else if (ax < 3.5f) {
+    mag = 5;
+  } else if (ax <= 5.0f) {
+    mag = 6;
+  } else {
+    mag = 7;
+  }
+  return sign | mag;
+}
+
+// 2026-10-03: pack_act_grouped_batched with an NVFP4 global scale per group, gs_arr[g] > 0
+// (the checkpoint's `input_scale`, i.e. calibrated amax / (6 * 448), or the dynamic value
+// resolve_act_gs wrote). Per 16 values: block scale sf = UE4M3(min(amax / 6 / gs, 448)), codes
+// E2M1_rne(v / (sf * gs)); the GEMM epilogue multiplies by alpha = weight_scale_2 * gs. The
+// two-level recipe of the ModelOpt/TensorRT NVFP4 activation quantizer (vLLM passes
+// 1 / input_scale as its `a1_gscale`). layout_sfa_dummy is unused.
+template <class LayoutSFA_t>
+__global__ void pack_act_grouped_gs(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ ms_arr,
+    const int* __restrict__ m_arr,
+    unsigned char* const* __restrict__ packed_arr,
+    unsigned char* const* __restrict__ scales_arr,
+    const float* __restrict__ gs_arr,
+    int k,
+    LayoutSFA_t layout_sfa_dummy) {
+  const int e = blockIdx.z;
+  const int m_e = m_arr[e];
+  int row = blockIdx.x;
+  if (row >= m_e) {
+    return;
+  }
+  int group = blockIdx.y * blockDim.x + threadIdx.x;
+  const int groups = k / 16;
+  if (group >= groups) {
+    return;
+  }
+  auto layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(m_e, 1, k, 1));
+  (void)layout_sfa_dummy;
+
+  unsigned char* packed = packed_arr[e];
+  unsigned char* scales = scales_arr[e];
+  const int ms = ms_arr[e];
+  const float gs = gs_arr[e];
+  const float inv_gs = 1.0f / gs;
+
+  int gid = ms + row;
+  int tok = sorted_token_ids ? sorted_token_ids[gid] : gid;
+  const __nv_bfloat16* arow = act_global + (unsigned long long)tok * k;
+  int base = group * 16;
+  float v[16];
+  float max_abs = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    v[i] = __bfloat162float(arow[base + i]);
+    max_abs = fmaxf(max_abs, fabsf(v[i]));
+  }
+  float sf_val = fminf((max_abs / 6.0f) * inv_gs, 448.0f);
+  cutlass::float_ue4m3_t sf(sf_val);
+  scales[layout_sfa(row, base, 0)] = *reinterpret_cast<unsigned char*>(&sf);
+  float dec = static_cast<float>(sf);
+  float out_scale = dec > 0.0f ? 1.0f / (dec * gs) : 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; i += 2) {
+    packed[(unsigned long long)row * (k / 2) + base / 2 + i / 2] = static_cast<unsigned char>(
+        float_to_e2m1_rne(v[i] * out_scale) | (float_to_e2m1_rne(v[i + 1] * out_scale) << 4));
+  }
+}
+
+// 2026-10-03: Dynamic per-tensor amax for the groups without a static scale (gs_arr[g] not
+// > 0): the max |value| over every row those groups read, as float bits in *amax_bits (zeroed
+// by the caller; non-negative floats order like their bits). Grid (max m_e, 1, G), 256 threads.
+__global__ void act_amax_grouped(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ ms_arr,
+    const int* __restrict__ m_arr,
+    const float* __restrict__ gs_arr,
+    int k,
+    unsigned int* __restrict__ amax_bits) {
+  const int e = blockIdx.z;
+  if (gs_arr[e] > 0.0f) {
+    return;
+  }
+  const int row = blockIdx.x;
+  if (row >= m_arr[e]) {
+    return;
+  }
+  const int gid = ms_arr[e] + row;
+  const int tok = sorted_token_ids ? sorted_token_ids[gid] : gid;
+  const __nv_bfloat16* arow = act_global + (unsigned long long)tok * k;
+  float m = 0.0f;
+  for (int c = threadIdx.x; c < k; c += blockDim.x) {
+    m = fmaxf(m, fabsf(__bfloat162float(arow[c])));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(amax_bits, __float_as_uint(m));
+  }
+}
+
+// 2026-10-03: Every gs[g] that is not > 0 becomes amax / (6 * 448) from act_amax_grouped, the
+// value a calibrated input_scale has for that amax; 1.0 when that amax is zero or not finite.
+__global__ void resolve_act_gs(
+    float* __restrict__ gs, int G, const unsigned int* __restrict__ amax_bits) {
+  const int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= G) {
+    return;
+  }
+  if (!(gs[g] > 0.0f)) {
+    const float amax = __uint_as_float(*amax_bits);
+    gs[g] = (amax > 0.0f && isfinite(amax)) ? amax / (6.0f * 448.0f) : 1.0f;
+  }
+}
+
+// 2026-10-03: alpha[g] = s2[g] * gs[g], the epilogue scale of a W4A4 projection.
+__global__ void make_alpha_w4a4(
+    const float* __restrict__ gs, const float* __restrict__ s2, float* __restrict__ alpha, int G) {
+  const int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g < G) {
+    alpha[g] = s2[g] * gs[g];
+  }
+}
+
+// 2026-10-03: pack_weight_sfb_group for `count` experts in one launch: slot s swizzles
+// src_ptrs[first + s] (skipped when null) into out_base + s * out_stride. Grid
+// (ceil(n * k/16 / 256), count), 256 threads, one scale byte per thread.
+template <class LayoutSFB_t>
+__global__ void pack_weight_sfb_batched_k(
+    const unsigned long long* __restrict__ src_ptrs,
+    int first,
+    unsigned char* __restrict__ out_base,
+    unsigned long long out_stride,
+    int n,
+    int k,
+    int src_n_major,
+    LayoutSFB_t layout_sfb) {
+  const int slot = blockIdx.y;
+  const unsigned char* src = reinterpret_cast<const unsigned char*>(src_ptrs[first + slot]);
+  if (src == nullptr) {
+    return;
+  }
+  const int groups = k / 16;
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)n * groups) {
+    return;
+  }
+  const int col = (int)(idx / groups);
+  const int group = (int)(idx % groups);
+  unsigned char metrale_scale =
+      src_n_major ? src[(unsigned long long)col * groups + group]
+                  : src[(unsigned long long)group * n + col];
+  __nv_fp8_e4m3 in;
+  *reinterpret_cast<unsigned char*>(&in) = metrale_scale;
+  cutlass::float_ue4m3_t sf(static_cast<float>(in));
+  out_base[(unsigned long long)slot * out_stride + layout_sfb(col, group * 16, 0)] =
+      *reinterpret_cast<unsigned char*>(&sf);
+}
+
 #endif
 
 
@@ -327,8 +519,59 @@ extern "C" int metrale_cutlass_pack_weight_sfb(
 #endif
 }
 
-
-
+// 2026-10-03: The load/prefill-time SFB swizzle of `count` experts in one launch: slot s reads
+// the E4M3 scales at scale_ptrs_dev[first + s] (a DEVICE pointer table; a null entry is skipped)
+// and writes the swizzled SFB at out_base + s * out_stride. Same source layouts and the same
+// M-independence assumption as metrale_cutlass_pack_weight_sfb. Returns -1 for bad arguments,
+// -3 when out_stride is smaller than one expert's SFB (size(filter_zeros(layout))), else
+// -cudaError of the launch.
+extern "C" int metrale_cutlass_pack_weight_sfb_batched(
+    const unsigned long long* scale_ptrs_dev,
+    int first,
+    int count,
+    void* out_base,
+    unsigned long long out_stride,
+    int n,
+    int k,
+    int src_n_major,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (scale_ptrs_dev == nullptr || out_base == nullptr || first < 0 || count <= 0 ||
+      count > 65535 || n <= 0 || k <= 0 || (k % 16) != 0) {
+    return -1;
+  }
+  auto layout_sfb =
+      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(1, n, k, 1));
+  if ((unsigned long long)size(filter_zeros(layout_sfb)) > out_stride) {
+    return -3;
+  }
+  const long long elems = (long long)n * (k / 16);
+  dim3 block(256);
+  dim3 grid((unsigned int)((elems + 255) / 256), (unsigned int)count);
+  pack_weight_sfb_batched_k<<<grid, block, 0, stream>>>(
+      scale_ptrs_dev,
+      first,
+      static_cast<unsigned char*>(out_base),
+      out_stride,
+      n,
+      k,
+      src_n_major,
+      layout_sfb);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? 0 : -static_cast<int>(err);
+#else
+  (void)scale_ptrs_dev;
+  (void)first;
+  (void)count;
+  (void)out_base;
+  (void)out_stride;
+  (void)n;
+  (void)k;
+  (void)src_n_major;
+  (void)stream;
+  return -120;
+#endif
+}
 
 // 2026-09-25: prep_grouped_a gathers and packs A once per call; launch_projection runs one
 // kGrouped GEMM against it. gate_up shares one A between gate and up; down packs its own.
@@ -351,6 +594,9 @@ struct GroupedAPrep {
   StrideA* dsA = nullptr;
   LayoutSFA* dlSFA = nullptr;
   size_t cursor = 0;
+  // 2026-10-03: W4A4 global-scale mode only (act_gs_host non-null): device alpha arrays,
+  // alpha[j][g] = (j-th projection's scale2 of group g's expert) * (group g's global scale).
+  float* dAlpha[2] = {nullptr, nullptr};
 };
 
 
@@ -369,6 +615,12 @@ struct GroupedAPrep {
 // loader left null (deepseek_v4 does so for experts a rank does not hold): it gets no
 // group, and its C rows keep their contents (forward_prefill_routed zeroes them first
 // when `comm` is set).
+// 2026-10-03: With act_gs_host null (every pre-existing caller) nothing below changes. With it
+// set (the `_w4a4` entry points): act_gs_host[e] is expert e's NVFP4 global activation scale
+// (> 0 static, else dynamic: amax / (6 * 448) over the rows of the dynamic groups), A is packed
+// by pack_act_grouped_gs, and for j < n_alpha (at most 2) p.dAlpha[j][g] = alpha_s2_host[j][e]
+// * gs. Before any launch the A side is checked against workspace_size: on overflow p.status =
+// -2 and p.G = 0, nothing launched.
 static GroupedAPrep prep_grouped_a(
     const __nv_bfloat16* A_global,
     const int* sorted_token_ids,
@@ -378,7 +630,11 @@ static GroupedAPrep prep_grouped_a(
     int n,
     int k,
     unsigned char* ws,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const float* act_gs_host = nullptr,
+    int n_alpha = 0,
+    const float* const* alpha_s2_host = nullptr,
+    size_t workspace_size = 0) {
 
 
   // 2026-09-25: METRALE_CUTLASS_EP_NULL_GUARD starting with '0' turns the guard off: every
@@ -421,6 +677,24 @@ static GroupedAPrep prep_grouped_a(
   size_t a_off = 0;
   size_t sfa_off = align_up_(a_acc, 256);
   size_t cursor = align_up_(sfa_off + sfa_acc, 256);
+
+  // 2026-10-03: W4A4 mode: the whole A side (packed A, SFA, every [G] array below) plus one
+  // projection's B-side [G] arrays (launch_projection writes those before its own room check),
+  // each array 256-aligned, must fit before anything is written.
+  if (act_gs_host != nullptr) {
+    const size_t g_est = a_grp_off.size();
+    const size_t per_group = 2 * sizeof(int) + 4 * sizeof(void*) +
+                             (2 + 2 * (size_t)n_alpha) * sizeof(float) + sizeof(ProblemShape) +
+                             sizeof(StrideA) + sizeof(LayoutSFA) + 5 * sizeof(void*) +
+                             sizeof(StrideB) + sizeof(StrideC) + sizeof(StrideD) +
+                             sizeof(LayoutSFB) + sizeof(float);
+    const size_t arrays = g_est * per_group + 48 * 256;
+    if (cursor + arrays > workspace_size) {
+      p.status = -2;
+      p.cursor = cursor;
+      return p;
+    }
+  }
 
   // 2026-09-25: Second pass: collect each group's A-pack scalars and A-side arguments;
   // the A-pack is one launch after the loop.
@@ -480,9 +754,52 @@ static GroupedAPrep prep_grouped_a(
         cute::make_shape(max_me, n, k, 1));
     dim3 blk(256);
     dim3 grd(max_me, (k / 16 + blk.x - 1) / blk.x, G);
-    pack_act_grouped_batched<<<grd, blk, 0, stream>>>(
-        A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
-        (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, k, lsa0);
+    if (act_gs_host == nullptr) {
+      pack_act_grouped_batched<<<grd, blk, 0, stream>>>(
+          A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
+          (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, k, lsa0);
+    } else {
+      // 2026-10-03: Per-group global scales (eidx is complete: the loop above pushed one
+      // entry per group), the dynamic amax when a group has no static scale, the pack, then
+      // each projection's alpha.
+      const size_t f_b = align_up_((size_t)G * sizeof(float), 256);
+      std::vector<float> h_gs(G);
+      bool any_dyn = false;
+      for (int g = 0; g < G; ++g) {
+        const float v = act_gs_host[p.eidx[g]];
+        const bool ok = v > 0.0f && v < 3.0e38f;
+        h_gs[g] = ok ? v : 0.0f;
+        any_dyn = any_dyn || !ok;
+      }
+      float* d_gs = reinterpret_cast<float*>(ws + cursor);
+      unsigned int* d_amax = reinterpret_cast<unsigned int*>(ws + cursor + f_b);
+      cursor = align_up_(cursor + f_b + 256, 256);
+      cudaMemcpyAsync(d_gs, h_gs.data(), G * sizeof(float), cudaMemcpyHostToDevice, stream);
+      if (any_dyn) {
+        cudaMemsetAsync(d_amax, 0, sizeof(unsigned int), stream);
+        dim3 ablk(256);
+        dim3 agrd(max_me, 1, G);
+        act_amax_grouped<<<agrd, ablk, 0, stream>>>(
+            A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me, d_gs, k, d_amax);
+        resolve_act_gs<<<(G + 255) / 256, 256, 0, stream>>>(d_gs, G, d_amax);
+      }
+      pack_act_grouped_gs<<<grd, blk, 0, stream>>>(
+          A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
+          (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, d_gs, k, lsa0);
+      for (int j = 0; j < n_alpha && j < 2; ++j) {
+        std::vector<float> h_s2(G);
+        for (int g = 0; g < G; ++g) {
+          h_s2[g] = alpha_s2_host[j][p.eidx[g]];
+        }
+        float* d_s2 = reinterpret_cast<float*>(ws + cursor);
+        cursor = align_up_(cursor + f_b, 256);
+        float* d_alpha = reinterpret_cast<float*>(ws + cursor);
+        cursor = align_up_(cursor + f_b, 256);
+        cudaMemcpyAsync(d_s2, h_s2.data(), G * sizeof(float), cudaMemcpyHostToDevice, stream);
+        make_alpha_w4a4<<<(G + 255) / 256, 256, 0, stream>>>(d_gs, d_s2, d_alpha, G);
+        p.dAlpha[j] = d_alpha;
+      }
+    }
   }
 
   p.G = (int)p.host_shapes.size();
@@ -527,7 +844,8 @@ static int launch_projection(
     size_t cursor_start,
     size_t workspace_size,
     cudaStream_t stream,
-    int tag) {
+    int tag,
+    const float* d_alpha = nullptr) {
   int G = a.G;
   if (G == 0) {
     return 0;
@@ -579,7 +897,12 @@ static int launch_projection(
   auto* dsC = (StrideC*)put(sC.data(), G * sizeof(StrideC));
   auto* dsD = (StrideD*)put(sD.data(), G * sizeof(StrideD));
   auto* dlSFB = (LayoutSFB*)put(lSFB.data(), G * sizeof(LayoutSFB));
-  auto* dAlpha = (float*)put(alpha_host.data(), G * sizeof(float));
+  // 2026-10-03: d_alpha (W4A4 mode: per-group device alphas from prep_grouped_a) replaces the
+  // host scale2 upload; null (every pre-existing caller) uploads alpha_host as before.
+  const float* dAlpha = d_alpha;
+  if (dAlpha == nullptr) {
+    dAlpha = (const float*)put(alpha_host.data(), G * sizeof(float));
+  }
 
   // 2026-09-25: Group g reads its alpha through alpha_ptr_array[g] = &dAlpha[g].
   std::vector<const float*> hAlphaPtr(G);
@@ -737,6 +1060,133 @@ extern "C" int metrale_cutlass_nvfp4_grouped_down(
   (void)packed_ptrs;
   (void)sfb_ptrs;
   (void)scale2_vals;
+  (void)C_bf16;
+  (void)expert_offsets_host;
+  (void)num_experts;
+  (void)n;
+  (void)k;
+  (void)workspace;
+  (void)workspace_size;
+  (void)stream;
+  return -120;
+#endif
+}
+
+// 2026-10-03: W4A4 grouped gate/up with an NVFP4 global activation scale: as
+// metrale_cutlass_nvfp4_grouped_gate_up_fused, except that A is quantized against
+// act_gscale_vals[e] (host, per expert; > 0 = static, the checkpoint's input_scale, shared by
+// gate and up; otherwise dynamic per-tensor amax / (6 * 448) over those experts' rows), and
+// gate's / up's epilogue alpha is scale2[e] * that scale. Status: as the fused entry, plus -2
+// when the A side does not fit the workspace (nothing launched). Tags 100000 gate, 200000 up.
+extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
+    const void* A_bf16,
+    const int* sorted_token_ids,
+    const unsigned long long* gate_packed_ptrs,
+    const unsigned long long* gate_sfb_ptrs,
+    const float* gate_scale2_vals,
+    const unsigned long long* up_packed_ptrs,
+    const unsigned long long* up_sfb_ptrs,
+    const float* up_scale2_vals,
+    const float* act_gscale_vals,
+    void* C_gate_bf16,
+    void* C_up_bf16,
+    const int* expert_offsets_host,
+    int num_experts,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0 || act_gscale_vals == nullptr) {
+    return -1;
+  }
+  unsigned char* ws = static_cast<unsigned char*>(workspace);
+  const float* s2[2] = {gate_scale2_vals, up_scale2_vals};
+  GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16),
+                                  sorted_token_ids, expert_offsets_host,
+                                  gate_packed_ptrs, num_experts,
+                                  n, k, ws, stream, act_gscale_vals, 2, s2, workspace_size);
+  if (a.status != 0) {
+    return a.status;
+  }
+  if (a.G == 0) {
+    return 0;
+  }
+  int rc = launch_projection(a, gate_packed_ptrs, gate_sfb_ptrs, gate_scale2_vals,
+                             static_cast<__nv_bfloat16*>(C_gate_bf16), n, k, ws,
+                             a.cursor, workspace_size, stream, 100000, a.dAlpha[0]);
+  if (rc) {
+    return rc;
+  }
+  return launch_projection(a, up_packed_ptrs, up_sfb_ptrs, up_scale2_vals,
+                           static_cast<__nv_bfloat16*>(C_up_bf16), n, k, ws, a.cursor,
+                           workspace_size, stream, 200000, a.dAlpha[1]);
+#else
+  (void)A_bf16;
+  (void)sorted_token_ids;
+  (void)gate_packed_ptrs;
+  (void)gate_sfb_ptrs;
+  (void)gate_scale2_vals;
+  (void)up_packed_ptrs;
+  (void)up_sfb_ptrs;
+  (void)up_scale2_vals;
+  (void)act_gscale_vals;
+  (void)C_gate_bf16;
+  (void)C_up_bf16;
+  (void)expert_offsets_host;
+  (void)num_experts;
+  (void)n;
+  (void)k;
+  (void)workspace;
+  (void)workspace_size;
+  (void)stream;
+  return -120;
+#endif
+}
+
+// 2026-10-03: W4A4 grouped down with an NVFP4 global activation scale: as
+// metrale_cutlass_nvfp4_grouped_down (A in sorted-row order, no gather), with act_gscale_vals
+// and alpha as in metrale_cutlass_nvfp4_grouped_gate_up_w4a4. Status tag 300000; -2 when the
+// A side does not fit the workspace (nothing launched).
+extern "C" int metrale_cutlass_nvfp4_grouped_down_w4a4(
+    const void* A_bf16,
+    const unsigned long long* packed_ptrs,
+    const unsigned long long* sfb_ptrs,
+    const float* scale2_vals,
+    const float* act_gscale_vals,
+    void* C_bf16,
+    const int* expert_offsets_host,
+    int num_experts,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0 || act_gscale_vals == nullptr) {
+    return -1;
+  }
+  unsigned char* ws = static_cast<unsigned char*>(workspace);
+  const float* s2[1] = {scale2_vals};
+  GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16), nullptr,
+                                  expert_offsets_host, packed_ptrs, num_experts, n, k,
+                                  ws, stream, act_gscale_vals, 1, s2, workspace_size);
+  if (a.status != 0) {
+    return a.status;
+  }
+  if (a.G == 0) {
+    return 0;
+  }
+  return launch_projection(a, packed_ptrs, sfb_ptrs, scale2_vals,
+                           static_cast<__nv_bfloat16*>(C_bf16), n, k, ws, a.cursor,
+                           workspace_size, stream, 300000, a.dAlpha[0]);
+#else
+  (void)A_bf16;
+  (void)packed_ptrs;
+  (void)sfb_ptrs;
+  (void)scale2_vals;
+  (void)act_gscale_vals;
   (void)C_bf16;
   (void)expert_offsets_host;
   (void)num_experts;

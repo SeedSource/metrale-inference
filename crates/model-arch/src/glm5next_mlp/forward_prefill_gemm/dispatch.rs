@@ -95,6 +95,16 @@ pub(crate) fn forward_moe_grouped_prefill(
         .arg_u32(cfg.top_k as u32)
         .launch(stream)?;
 
+    // 2026-10-03: `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1`: gate/up, SwiGLU and down on the
+    // CUTLASS NVFP4 grouped GEMM (`cutlass_w4a4.rs`), same buffers and row order. Off (default):
+    // one cached env read, nothing else. A refusal (logged) returns false before any output is
+    // trusted and the W4A16 paths below run unchanged.
+    if super::cutlass_w4a4::lever_on()
+        && super::cutlass_w4a4::forward(gpu, k, cfg, w, x, te, ws, stream)?
+    {
+        return Ok(());
+    }
+
     // 2026-10-01: `METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1`: tile list + fused gate/up/SwiGLU +
     // down (`w4a16_mma.rs`), writing `ws.a_act` and `ws.expert_out` as below. Off (default), or
     // a contract miss: `usable` is false and everything below runs unchanged.

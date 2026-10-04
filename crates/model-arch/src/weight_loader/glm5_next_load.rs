@@ -115,6 +115,75 @@ fn is_full_width_mtp_expert(name: &str, dtype: WeightDtype, num_layers: usize) -
     idx.parse::<usize>().ok() == Some(num_layers) && rel.starts_with("mlp.experts.")
 }
 
+/// 2026-10-03: Whether a store tensor is an NVFP4 activation scale (`*.input_scale`). Under
+/// `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1` the server keeps these names and
+/// [`Glm5NextWeightLoader::defer_predicate`] defers every one of them: about 37k F32 scalars
+/// across the checkpoint, each of which would otherwise be its own padded device allocation.
+fn is_activation_scale(name: &str) -> bool {
+    name.ends_with(".input_scale")
+}
+
+/// 2026-10-03: The defer rule: the MTP layer's full-width routed experts always, plus every
+/// activation scale when `defer_activation_scales` (the CUTLASS W4A4 lever).
+fn defer_rule(
+    name: &str,
+    dtype: WeightDtype,
+    num_layers: usize,
+    defer_activation_scales: bool,
+) -> bool {
+    is_full_width_mtp_expert(name, dtype, num_layers)
+        || (defer_activation_scales && is_activation_scale(name))
+}
+
+/// 2026-10-03: The value of an activation-scale tensor's bytes: one F32 (any shape with one
+/// element) that is finite and positive; `None` otherwise.
+fn input_scale_value(bytes: &[u8], dtype: WeightDtype, numel: usize) -> Option<f32> {
+    if dtype != WeightDtype::FP32 || numel != 1 || bytes.len() != 4 {
+        return None;
+    }
+    let v = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+/// 2026-10-03: Routed expert projection `base`'s (`mlp.experts.{id}.{proj}`) `input_scale` of
+/// layer `layer`, read from its shard when deferred (the lever's normal case) or back from the
+/// device when resident. 0.0 when absent or not one finite positive F32, which the CUTLASS W4A4
+/// prefill treats as "no static scale" (dynamic per-tensor amax); a present but unusable tensor
+/// is logged.
+fn read_input_scale(gpu: &dyn GpuBackend, store: &WeightStore, layer: usize, base: &str) -> f32 {
+    let name = qualify(layer, &format!("{base}.input_scale"));
+    let got = if let Some(d) = store.deferred(&name) {
+        let numel = d.shape.iter().product::<usize>();
+        match d.read_host_bytes() {
+            Ok(b) => Some(input_scale_value(&b, d.dtype, numel)),
+            Err(e) => {
+                tracing::warn!("glm5_next: {name}: reading the deferred input_scale failed: {e:#}");
+                Some(None)
+            }
+        }
+    } else if let Ok(t) = store.get(&name) {
+        let numel = t.shape.iter().product::<usize>();
+        Some(host_bytes(gpu, t).ok().and_then(|b| input_scale_value(&b, t.dtype, numel)))
+    } else {
+        None
+    };
+    match got {
+        Some(Some(v)) => v,
+        Some(None) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "glm5_next: {name} is present but not one finite positive F32 — that \
+                     projection's CUTLASS W4A4 prefill uses a dynamic activation scale (first \
+                     such tensor; later ones are not logged)"
+                );
+            });
+            0.0
+        }
+        None => 0.0,
+    }
+}
+
 /// 2026-09-25: Read a device tensor back as host bytes.
 fn host_bytes(gpu: &dyn GpuBackend, t: &WeightTensor) -> Result<Vec<u8>> {
     let mut b = vec![0u8; t.byte_size()];
@@ -341,10 +410,17 @@ pub(super) fn bind_expert(
                 let [s2] = s2[..] else {
                     bail!("{base}.weight_scale_2 is not a scalar");
                 };
+                // 2026-10-03: Lever off: never looked up (the server skipped the tensors).
+                let input_scale = if metrale_config::glm_moe_prefill_cutlass_w4a4() {
+                    read_input_scale(gpu, store, layer, &base)
+                } else {
+                    0.0
+                };
                 Ok(Nvfp4Proj {
                     packed: w.ptr,
                     scale: scale.ptr,
                     scale_2: s2,
+                    input_scale,
                 })
             }
             WeightDtype::BF16 => quantize_expert_proj(gpu, store, w, &base),

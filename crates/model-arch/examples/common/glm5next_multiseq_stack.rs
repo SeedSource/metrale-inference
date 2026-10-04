@@ -165,6 +165,7 @@ fn nvfp4(g: &dyn GpuBackend, s: &mut Lcg, out: usize, inn: usize) -> Result<Nvfp
         packed: up(g, &packed)?,
         scale: up(g, &scale)?,
         scale_2: 0.02,
+        input_scale: 0.0,
     })
 }
 

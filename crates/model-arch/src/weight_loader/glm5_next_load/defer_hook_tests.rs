@@ -12,7 +12,7 @@ use metrale_gpu_runtime::gpu::GpuBackend;
 use metrale_gpu_runtime::gpu::mock::MockGpuBackend;
 use metrale_model_weights::weights::{DeferredTensor, WeightDtype, WeightStore, WeightTensor};
 
-use super::{bind_expert, is_full_width_mtp_expert};
+use super::{bind_expert, defer_rule, input_scale_value, is_full_width_mtp_expert, read_input_scale};
 use crate::weight_loader::ModelWeightLoader;
 
 const LAYERS: usize = 45;
@@ -224,5 +224,69 @@ fn a_deferred_expert_at_an_unsupported_width_is_refused() {
         .to_string();
     assert!(err.contains("deferred"), "{err}");
 
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 2026-10-03: The CUTLASS W4A4 lever adds every `*.input_scale` to the defer rule and nothing
+/// else; off, the rule is exactly `is_full_width_mtp_expert`.
+#[test]
+fn the_cutlass_w4a4_lever_defers_activation_scales_only() {
+    let names = [
+        qualified(3, "mlp.experts.7.gate_proj.input_scale"),
+        qualified(3, "mlp.experts.7.down_proj.input_scale"),
+        qualified(0, "mlp.gate_proj.input_scale"),
+        qualified(3, "mlp.shared_experts.up_proj.input_scale"),
+    ];
+    for n in &names {
+        assert!(defer_rule(n, WeightDtype::FP32, LAYERS, true), "{n}");
+        assert!(!defer_rule(n, WeightDtype::FP32, LAYERS, false), "{n}");
+    }
+    for leaf in [
+        "mlp.experts.7.gate_proj.weight_scale",
+        "mlp.experts.7.gate_proj.weight_scale_2",
+        "mlp.experts.7.gate_proj.weight",
+        "mlp.gate.e_score_correction_bias",
+    ] {
+        for dtype in [WeightDtype::FP32, WeightDtype::UInt8, WeightDtype::FP8E4M3] {
+            assert!(!defer_rule(&qualified(3, leaf), dtype, LAYERS, true), "{leaf}");
+        }
+    }
+    // 2026-10-03: The MTP experts stay deferred either way.
+    let mtp = qualified(LAYERS, "mlp.experts.0.gate_proj.weight");
+    assert!(defer_rule(&mtp, WeightDtype::BF16, LAYERS, false));
+    assert!(defer_rule(&mtp, WeightDtype::BF16, LAYERS, true));
+}
+
+/// 2026-10-03: Only one finite positive F32 is a usable activation scale.
+#[test]
+fn an_input_scale_must_be_one_finite_positive_f32() {
+    let b = |v: f32| v.to_le_bytes().to_vec();
+    assert_eq!(input_scale_value(&b(0.0123), WeightDtype::FP32, 1), Some(0.0123));
+    for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+        assert_eq!(input_scale_value(&b(bad), WeightDtype::FP32, 1), None, "{bad}");
+    }
+    assert_eq!(input_scale_value(&b(1.0), WeightDtype::BF16, 1), None);
+    assert_eq!(input_scale_value(&[0u8; 8], WeightDtype::FP32, 2), None);
+}
+
+/// 2026-10-03: A deferred `input_scale` is read from its shard; an absent one is 0.0.
+#[test]
+fn a_deferred_input_scale_is_read_from_its_shard() {
+    let v = 2.5e-4f32;
+    let path = stage_shard("input-scale", 41, &v.to_le_bytes());
+    let gpu = MockGpuBackend::new();
+    let mut store = WeightStore::from_map(std::collections::HashMap::new());
+    store.defer(
+        qualified(5, "mlp.experts.9.up_proj.input_scale"),
+        DeferredTensor {
+            path: path.clone(),
+            offset: 41,
+            shape: vec![],
+            dtype: WeightDtype::FP32,
+        },
+    );
+    assert_eq!(read_input_scale(&gpu, &store, 5, "mlp.experts.9.up_proj"), v);
+    assert_eq!(read_input_scale(&gpu, &store, 5, "mlp.experts.9.gate_proj"), 0.0);
+    assert_eq!(read_input_scale(&gpu, &store, 6, "mlp.experts.9.up_proj"), 0.0);
     let _ = std::fs::remove_file(&path);
 }

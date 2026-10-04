@@ -31,14 +31,18 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
     /// device (`is_full_width_mtp_expert`); `bind_expert` quantises them from
     /// disk. The layer is `num_hidden_layers`. A checkpoint whose MTP experts
     /// are U8 defers nothing.
+    /// 2026-10-03: Under `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1` also every `*.input_scale`
+    /// (`defer_rule`); `bind_expert` reads the routed experts' from disk. Off, the rule is the
+    /// one above.
     fn defer_predicate(
         &self,
         config: &ModelConfig,
     ) -> Option<metrale_model_weights::weights::DeferHook> {
         let num_layers = config.num_hidden_layers;
-        Some(std::sync::Arc::new(
-            move |name: &str, dtype: WeightDtype| is_full_width_mtp_expert(name, dtype, num_layers),
-        ))
+        let defer_scales = metrale_config::glm_moe_prefill_cutlass_w4a4();
+        Some(std::sync::Arc::new(move |name: &str, dtype: WeightDtype| {
+            defer_rule(name, dtype, num_layers, defer_scales)
+        }))
     }
 
     /// 2026-09-25: DSA, KDA and the MLP all shard under TP (see `glm5_next_load.rs`);
@@ -321,6 +325,12 @@ impl Glm5NextWeightLoader {
             }
         }
         let kda_ws = std::sync::Arc::new(kda_ws_inner);
+
+        // 2026-10-03: `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1` adds the per-layer swizzled
+        // weight-scale cache (216 MB at GLM-5.3 EP=2) and the CUTLASS workspace, here at load
+        // before the KV pool is sized. Off, nothing is allocated; a build without CUTLASS or an
+        // unsupported shape logs the refusal and the routed-MoE prefill stays W4A16.
+        crate::glm5next_mlp::forward_prefill_gemm::cutlass_w4a4::prepare_at_load(gpu, &mlp_cfg)?;
 
         // 2026-09-25: Unless `METRALE_GLM_MLP_WS_SHARED=0`, one MLP workspace serves
         // every layer; otherwise each layer allocates its own. Either way it is

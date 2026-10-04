@@ -175,12 +175,15 @@ committed here, but binaries built with them incorporate it.
 - **License**: BSD-3-Clause. Text at [`LICENSES/BSD-3-Clause.txt`](LICENSES/BSD-3-Clause.txt).
 - **Copyright**: `Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES.
   All rights reserved.` (upstream `LICENSE.txt`).
-- **Upstream**: https://github.com/NVIDIA/cutlass, pinned by `CUTLASS_SHA`; and, for the
+- **Upstream**: https://github.com/NVIDIA/cutlass, pinned by `CUTLASS_SHA`
+  (`cf064d2e6bad2886238ac565b3b49007764f4939`, v4.6.0) in `docker/gb10/Dockerfile.builder` and
+  `docker/gb10/glm-5.3-flash/nvfp4/Dockerfile`; and, for the
   vendored FlashKDA (section 11), at FlashKDA's submodule pin
   `5c149f52a436782210263fb2f19b354443a61c6a` (v4.3.2) by `FLASHKDA_CUTLASS_SHA` in
   `docker/gb10/Dockerfile` and `docker/gb10/glm-5.3-flash/nvfp4/Dockerfile`.
 - **Used by**: `crates/gpu-runtime/cuda/cutlass_*.cu`, `crates/gpu-runtime/src/cutlass.rs`
-  and `crates/gpu-runtime/src/cutlass/`; `vendor/flashkda/` and
+  and `crates/gpu-runtime/src/cutlass/` (including the GLM-5.3 routed-MoE W4A4 prefill,
+  `crates/model-arch/src/glm5next_mlp/forward_prefill_gemm/cutlass_w4a4.rs`); `vendor/flashkda/` and
   `crates/gpu-runtime/cuda/flashkda_kda_fwd.cu` (headers, `FLASHKDA_CUTLASS_HOME`).
 
 ### 8b. FlashInfer and its pinned CCCL — Apache-2.0

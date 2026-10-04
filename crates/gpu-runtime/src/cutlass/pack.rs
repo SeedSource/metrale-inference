@@ -53,6 +53,64 @@ pub fn pack_weight_sfb(
     }
 }
 
+/// 2026-10-03: Bytes of one expert's swizzled SFB for an `n x k` projection:
+/// `round_up(n, 128) * round_up(k / 16, 4)` (the Sm1xx 128 x 4 scale atom; the formula
+/// `MoeLayer::build_cutlass_grouped_sfb` sizes its buffers with).
+/// [`pack_weight_sfb_batched`] checks it against the CUTLASS layout and refuses a smaller
+/// stride.
+pub fn sfb_bytes(n: usize, k: usize) -> usize {
+    n.div_ceil(128) * 128 * (k / 16).div_ceil(4) * 4
+}
+
+/// 2026-10-03: [`pack_weight_sfb`] for `count` experts in one launch. `scale_ptrs_dev` is a
+/// DEVICE table of `u64` scale pointers; slot `s` swizzles entry `first + s` (a null entry is
+/// skipped) into `out_base + s * out_stride`. `out_stride` must be at least
+/// [`sfb_bytes`]`(n, k)`.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_weight_sfb_batched(
+    scale_ptrs_dev: u64,
+    first: u32,
+    count: u32,
+    out_base: u64,
+    out_stride: usize,
+    n: u32,
+    k: u32,
+    src_n_major: bool,
+    stream: u64,
+) -> Result<()> {
+    if out_stride < sfb_bytes(n as usize, k as usize) {
+        bail!(
+            "CUTLASS batched SFB pack: stride {out_stride} < {} bytes for {n}x{k}",
+            sfb_bytes(n as usize, k as usize)
+        );
+    }
+    #[cfg(metrale_cutlass)]
+    {
+        let status = unsafe {
+            metrale_cutlass_pack_weight_sfb_batched(
+                scale_ptrs_dev as *const u64,
+                first as i32,
+                count as i32,
+                out_base as *mut c_void,
+                out_stride as u64,
+                n as i32,
+                k as i32,
+                i32::from(src_n_major),
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("CUTLASS batched SFB pack failed: status {status} for {count} x {n}x{k}");
+        }
+        Ok(())
+    }
+    #[cfg(not(metrale_cutlass))]
+    {
+        let _ = (scale_ptrs_dev, first, count, out_base, n, k, src_n_major, stream);
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
 /// 2026-09-25: Pack a row-major BF16 weight `[N,K]` into CUTLASS NVFP4: packed
 /// `[N,K/2]` (K-contiguous) and E4M3 scales `[K/16,N]`, each scale the group's
 /// max magnitude / 6. The scales carry no second-level factor, so pass
@@ -120,5 +178,19 @@ pub fn transpose_nvfp4_packed_kton(
     {
         let _ = (src_packed_t, dst_packed, n, k, stream);
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+#[cfg(test)]
+mod sfb_bytes_tests {
+    use super::sfb_bytes;
+
+    /// 2026-10-03: GLM-5.3 shapes and the padding of both dimensions.
+    #[test]
+    fn pads_n_to_128_and_k_groups_to_4() {
+        assert_eq!(sfb_bytes(2048, 4096), 2048 * 256);
+        assert_eq!(sfb_bytes(4096, 2048), 4096 * 128);
+        assert_eq!(sfb_bytes(1, 16), 128 * 4);
+        assert_eq!(sfb_bytes(129, 80), 256 * 8);
     }
 }

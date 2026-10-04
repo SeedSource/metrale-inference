@@ -76,10 +76,12 @@ fn quantize_and_upload(
     let blob = nvfp4_quant::quantize_to_nvfp4(base, values, rows, cols)?;
     let packed = upload_bytes(gpu, store, &blob.packed)?;
     let scale = upload_bytes(gpu, store, &blob.scales)?;
+    // 2026-10-03: A projection quantised at load has no calibrated activation scale.
     Ok(Nvfp4Proj {
         packed,
         scale,
         scale_2: blob.scale_2,
+        input_scale: 0.0,
     })
 }
 

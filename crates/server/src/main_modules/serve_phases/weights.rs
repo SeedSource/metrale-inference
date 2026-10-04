@@ -444,8 +444,26 @@ pub(crate) fn load_lora_adapters(
 /// `.weight_scale_2` still load. The skip is listed per model because some
 /// loaders read `input_scale`: `step3p7` on its own path, and
 /// `weight_map/model_a.rs` whenever the tensor is present.
+///
+/// 2026-10-03: `glm5_next` keeps the names when
+/// `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1`: its loader then DEFERS every `*.input_scale`
+/// (`Glm5NextWeightLoader::defer_predicate`), so none is uploaded, and reads the routed
+/// experts' from disk at bind time.
 fn skip_activation_scales(config: &ModelConfig) -> bool {
-    matches!(config.model_type.as_str(), "qwen4_exp" | "glm5_next")
+    skip_activation_scales_for(
+        config.model_type.as_str(),
+        metrale_config::glm_moe_prefill_cutlass_w4a4(),
+    )
+}
+
+/// 2026-10-03: The policy half of [`skip_activation_scales`], with the GLM CUTLASS W4A4 lever
+/// passed in.
+fn skip_activation_scales_for(model_type: &str, glm_cutlass_w4a4: bool) -> bool {
+    match model_type {
+        "qwen4_exp" => true,
+        "glm5_next" => !glm_cutlass_w4a4,
+        _ => false,
+    }
 }
 
 /// 2026-09-26: Whether `mtp.*` is left unloaded: `qwen4_exp`, whose

@@ -306,6 +306,174 @@ pub fn nvfp4_grouped_down(
     }
 }
 
+/// 2026-10-03: [`nvfp4_grouped_gate_up_fused`] in W4A4 mode with an NVFP4 global activation
+/// scale per expert: `act_gscale_vals[e] > 0` (finite) is expert `e`'s static scale (the
+/// checkpoint's `input_scale`, calibrated amax / (6 * 448)), shared by gate and up; any other
+/// value makes that expert dynamic (amax / (6 * 448) over the rows of the dynamic experts, on
+/// the device). Each 16-value block: UE4M3 scale `amax / 6 / gs` (saturated at 448), E2M1 codes
+/// rounded to nearest even; epilogue alpha `scale2[e] * gs`. Not bit-identical to any W4A16 path.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_gate_up_w4a4(
+    a: u64,
+    sorted_token_ids: u64,
+    gate_packed_ptrs: &[u64],
+    gate_sfb_ptrs: &[u64],
+    gate_scale2_vals: &[f32],
+    up_packed_ptrs: &[u64],
+    up_sfb_ptrs: &[u64],
+    up_scale2_vals: &[f32],
+    act_gscale_vals: &[f32],
+    c_gate: u64,
+    c_up: u64,
+    expert_offsets_host: &[i32],
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let num_experts = gate_packed_ptrs.len();
+    ensure_group_arrays(
+        "nvfp4_grouped_gate_up_w4a4",
+        num_experts,
+        &[
+            ("gate_sfb_ptrs", gate_sfb_ptrs.len()),
+            ("gate_scale2_vals", gate_scale2_vals.len()),
+            ("up_packed_ptrs", up_packed_ptrs.len()),
+            ("up_sfb_ptrs", up_sfb_ptrs.len()),
+            ("up_scale2_vals", up_scale2_vals.len()),
+            ("act_gscale_vals", act_gscale_vals.len()),
+        ],
+        expert_offsets_host,
+    )?;
+    #[cfg(metrale_cutlass)]
+    {
+        let ctx = ctx()?;
+        let status = unsafe {
+            metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
+                a as *const c_void,
+                sorted_token_ids as *const i32,
+                gate_packed_ptrs.as_ptr(),
+                gate_sfb_ptrs.as_ptr(),
+                gate_scale2_vals.as_ptr(),
+                up_packed_ptrs.as_ptr(),
+                up_sfb_ptrs.as_ptr(),
+                up_scale2_vals.as_ptr(),
+                act_gscale_vals.as_ptr(),
+                c_gate as *mut c_void,
+                c_up as *mut c_void,
+                expert_offsets_host.as_ptr(),
+                num_experts as i32,
+                n as i32,
+                k as i32,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "CUTLASS nvfp4 grouped W4A4 gate_up failed: status {status} (-2: workspace \
+                 {} MiB too small, METRALE_CUTLASS_WORKSPACE_MB)",
+                ctx.ws_size >> 20
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(metrale_cutlass))]
+    {
+        let _ = (
+            a,
+            sorted_token_ids,
+            gate_packed_ptrs,
+            gate_sfb_ptrs,
+            gate_scale2_vals,
+            up_packed_ptrs,
+            up_sfb_ptrs,
+            up_scale2_vals,
+            act_gscale_vals,
+            c_gate,
+            c_up,
+            expert_offsets_host,
+            n,
+            k,
+            stream,
+        );
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+/// 2026-10-03: [`nvfp4_grouped_down`] in W4A4 mode, `act_gscale_vals` as in
+/// [`nvfp4_grouped_gate_up_w4a4`] (the down projection's own `input_scale`).
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_down_w4a4(
+    a: u64,
+    packed_ptrs: &[u64],
+    sfb_ptrs: &[u64],
+    scale2_vals: &[f32],
+    act_gscale_vals: &[f32],
+    c: u64,
+    expert_offsets_host: &[i32],
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let num_experts = packed_ptrs.len();
+    ensure_group_arrays(
+        "nvfp4_grouped_down_w4a4",
+        num_experts,
+        &[
+            ("sfb_ptrs", sfb_ptrs.len()),
+            ("scale2_vals", scale2_vals.len()),
+            ("act_gscale_vals", act_gscale_vals.len()),
+        ],
+        expert_offsets_host,
+    )?;
+    #[cfg(metrale_cutlass)]
+    {
+        let ctx = ctx()?;
+        let status = unsafe {
+            metrale_cutlass_nvfp4_grouped_down_w4a4(
+                a as *const c_void,
+                packed_ptrs.as_ptr(),
+                sfb_ptrs.as_ptr(),
+                scale2_vals.as_ptr(),
+                act_gscale_vals.as_ptr(),
+                c as *mut c_void,
+                expert_offsets_host.as_ptr(),
+                num_experts as i32,
+                n as i32,
+                k as i32,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "CUTLASS nvfp4 grouped W4A4 down failed: status {status} (-2: workspace \
+                 {} MiB too small, METRALE_CUTLASS_WORKSPACE_MB)",
+                ctx.ws_size >> 20
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(metrale_cutlass))]
+    {
+        let _ = (
+            a,
+            packed_ptrs,
+            sfb_ptrs,
+            scale2_vals,
+            act_gscale_vals,
+            c,
+            expert_offsets_host,
+            n,
+            k,
+            stream,
+        );
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ensure_group_arrays;

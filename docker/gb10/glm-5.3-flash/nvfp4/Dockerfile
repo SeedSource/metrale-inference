@@ -35,6 +35,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_HOME=/usr/local/cuda
 
+# 2026-10-03: CUTLASS v4.6.0 (the pin in docker/gb10/Dockerfile.builder) for the native CUTLASS
+# objects crates/gpu-runtime/build.rs compiles when CUTLASS_HOME is set (nvcc -O3 -std=c++17
+# --expt-relaxed-constexpr -arch=sm_121f, cfg `metrale_cutlass`): the NVFP4 grouped GEMM behind
+# the opt-in METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1 (GLM-5.3 routed-MoE prefill, W4A4). Every
+# CUTLASS path is env-opt-in, so the default serve is unchanged. BSD-3-Clause
+# (THIRD_PARTY_NOTICES.md 8a).
+ARG CUTLASS_SHA=cf064d2e6bad2886238ac565b3b49007764f4939
+ENV CUTLASS_HOME=/opt/cutlass
+RUN git clone --filter=blob:none https://github.com/NVIDIA/cutlass.git ${CUTLASS_HOME} && \
+    git -C ${CUTLASS_HOME} checkout ${CUTLASS_SHA}
+
 # 2026-10-03: CUTLASS headers for the vendored FlashKDA (vendor/flashkda, MIT) at FlashKDA's own
 # submodule pin (v4.3.2). crates/gpu-runtime/build.rs compiles FlashKDA only when
 # FLASHKDA_CUTLASS_HOME is set; it is reached at run time only through the opt-in

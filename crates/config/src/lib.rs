@@ -157,6 +157,46 @@ mod glm_vision_gate_tests {
     }
 }
 
+/// 2026-10-03: Whether GLM-5.3's routed-MoE prefill runs W4A4 on the CUTLASS grouped NVFP4 GEMM
+/// (`METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4`, see [`glm_moe_prefill_cutlass_w4a4_from`]); off by
+/// default. Read once per process.
+///
+/// Three places read it and must agree: the server's weight-load skip list (the lever keeps the
+/// `*.input_scale` names so the GLM loader can defer them), `Glm5NextWeightLoader`'s defer
+/// predicate and expert binder (which read the deferred scales from disk), and the GLM prefill
+/// dispatch.
+pub fn glm_moe_prefill_cutlass_w4a4() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        glm_moe_prefill_cutlass_w4a4_from(
+            std::env::var("METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-03: The policy half of [`glm_moe_prefill_cutlass_w4a4`]: only `1` (trimmed) turns
+/// it on, like its neighbour levers (`METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1`).
+pub fn glm_moe_prefill_cutlass_w4a4_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+#[cfg(test)]
+mod glm_moe_cutlass_w4a4_gate_tests {
+    use super::glm_moe_prefill_cutlass_w4a4_from as on;
+
+    #[test]
+    fn only_one_turns_it_on() {
+        for off in [None, Some(""), Some("0"), Some("true"), Some("on"), Some("11"), Some("1x")] {
+            assert!(!on(off), "{off:?} must leave the lever off");
+        }
+        for v in ["1", " 1", "1\n"] {
+            assert!(on(Some(v)), "{v:?} must turn the lever on");
+        }
+    }
+}
+
 /// 2026-09-26: Vision tower configuration: `parse_vision_config` for the Qwen family, and the
 /// GLM-5.3 parser, which also fills the fields the Qwen parser leaves at their defaults.
 #[derive(Debug, Clone)]

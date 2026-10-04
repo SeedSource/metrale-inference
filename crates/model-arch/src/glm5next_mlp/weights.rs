@@ -20,6 +20,11 @@ pub struct Nvfp4Proj {
     pub scale: DevicePtr,
     /// 2026-09-25: The single global F32 scale.
     pub scale_2: f32,
+    /// 2026-10-03: The checkpoint's static F32 activation scale (`input_scale`, the W4A4 export
+    /// contract: calibrated activation amax / (6 * 448)), or 0.0 when absent or not read. Read
+    /// only under `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1` (the loader skips the tensors
+    /// otherwise); only that prefill path uses it. Host value.
+    pub input_scale: f32,
 }
 
 /// 2026-09-25: A BF16 SwiGLU MLP: the dense layers `0..first_k_dense_replace`, and the shared

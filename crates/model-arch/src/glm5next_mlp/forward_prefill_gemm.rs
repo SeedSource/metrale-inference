@@ -18,6 +18,7 @@
 //!   id, and writes nothing for an expert whose `packed` pointer is null.
 //! - Every buffer the path uses is in `Glm5NextMlpWorkspace`; the path allocates nothing.
 
+pub mod cutlass_w4a4;
 mod dispatch;
 mod tile;
 mod w4a16_mma;

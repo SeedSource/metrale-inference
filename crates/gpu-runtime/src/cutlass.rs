@@ -25,8 +25,34 @@ mod grouped;
 mod pack;
 
 pub use gemm::{bf16_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t};
-pub use grouped::{nvfp4_grouped_down, nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused};
-pub use pack::{pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, transpose_nvfp4_packed_kton};
+pub use grouped::{
+    nvfp4_grouped_down, nvfp4_grouped_down_w4a4, nvfp4_grouped_gate_up,
+    nvfp4_grouped_gate_up_fused, nvfp4_grouped_gate_up_w4a4,
+};
+pub use pack::{
+    pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched, sfb_bytes,
+    transpose_nvfp4_packed_kton,
+};
+
+/// 2026-10-03: Whether this build carries the CUTLASS objects (`CUTLASS_HOME` was set at build
+/// time, `cfg(metrale_cutlass)`). Without them every wrapper here returns an error.
+pub fn available() -> bool {
+    cfg!(metrale_cutlass)
+}
+
+/// 2026-10-03: Allocate the shared CUTLASS workspace now (it is otherwise allocated on first
+/// use) and return its size in bytes, so a caller can reserve it at load, before the KV pool is
+/// sized. Errors without CUTLASS or when the allocation fails.
+pub fn warm_workspace() -> anyhow::Result<usize> {
+    #[cfg(metrale_cutlass)]
+    {
+        Ok(ctx()?.ws_size)
+    }
+    #[cfg(not(metrale_cutlass))]
+    {
+        anyhow::bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
 
 #[cfg(all(test, metrale_cutlass))]
 mod tests;
@@ -122,6 +148,52 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         src_n_major: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn metrale_cutlass_pack_weight_sfb_batched(
+        scale_ptrs_dev: *const u64,
+        first: i32,
+        count: i32,
+        out_base: *mut c_void,
+        out_stride: u64,
+        n: i32,
+        k: i32,
+        src_n_major: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
+        a_bf16: *const c_void,
+        sorted_token_ids: *const i32,
+        gate_packed_ptrs: *const u64,
+        gate_sfb_ptrs: *const u64,
+        gate_scale2_vals: *const f32,
+        up_packed_ptrs: *const u64,
+        up_sfb_ptrs: *const u64,
+        up_scale2_vals: *const f32,
+        act_gscale_vals: *const f32,
+        c_gate_bf16: *mut c_void,
+        c_up_bf16: *mut c_void,
+        expert_offsets_host: *const i32,
+        num_experts: i32,
+        n: i32,
+        k: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn metrale_cutlass_nvfp4_grouped_down_w4a4(
+        a_bf16: *const c_void,
+        packed_ptrs: *const u64,
+        sfb_ptrs: *const u64,
+        scale2_vals: *const f32,
+        act_gscale_vals: *const f32,
+        c_bf16: *mut c_void,
+        expert_offsets_host: *const i32,
+        num_experts: i32,
+        n: i32,
+        k: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
         stream: *mut c_void,
     ) -> i32;
     pub(crate) fn metrale_cutlass_transpose_nvfp4_packed_kton(

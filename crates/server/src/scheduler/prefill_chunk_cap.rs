@@ -17,8 +17,8 @@
 //! - Unset, empty, `0` or unparsable: off; every plan is the uncapped one.
 //! - On: the cap is a positive multiple of [`GRANULE`], and at plan time of the KV block size.
 //! - The cap only shortens a chunk, and only while a decoder is active.
-//! - Under `METRALE_PREFIX_GRID_RESTORE` the grid sets every chunk length (`plan_chunk_len_grid`
-//!   ignores the proposal), so the cap does not apply.
+//! - Under `METRALE_PREFIX_GRID_RESTORE` a capped chunk never crosses a grid point: every grid
+//!   point is still a chunk end, so the grid snapshots are saved where they always were.
 
 use metrale_model_engine::prefill_plan::plan_chunk_len_grid;
 
@@ -102,7 +102,8 @@ pub(crate) fn decoders(active: &[super::types::ActiveSeq]) -> usize {
 /// `uncapped` is `plan_chunk_len_grid(offset, total, proposed, ..)`, the plan without the lever.
 /// With `cap = Some(c)` (from [`active_cap`]) and `uncapped > c`, `capped` is the plan of a
 /// `c`-token proposal (so it ends on a block boundary, or at the tail split point when it would
-/// span it, exactly as an uncapped chunk does); otherwise `capped == uncapped`.
+/// span it, exactly as an uncapped chunk does); under the grid (which ignores the proposal) it is
+/// `c`, which stays below the next grid point. Otherwise `capped == uncapped`.
 pub(crate) fn plan_capped(
     offset: usize,
     total: usize,
@@ -114,6 +115,7 @@ pub(crate) fn plan_capped(
 ) -> (usize, usize) {
     let uncapped = plan_chunk_len_grid(offset, total, proposed, block_size, split, grid);
     let capped = match cap {
+        Some(c) if uncapped > c && grid.is_some() => c,
         Some(c) if uncapped > c => {
             plan_chunk_len_grid(offset, total, c, block_size, split, grid).min(uncapped)
         }

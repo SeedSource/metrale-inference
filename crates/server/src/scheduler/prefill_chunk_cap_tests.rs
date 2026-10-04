@@ -157,12 +157,31 @@ fn chunk0_from_the_capped_budget_matches_plan_capped() {
 }
 
 #[test]
-fn grid_ignores_the_cap() {
+fn grid_chunks_are_capped_without_crossing_a_grid_point() {
+    // 2026-10-03: G = 8192, cap 3072: pieces of 3072, 3072, 2048 per grid span; every grid
+    // point stays a chunk end, and the uncapped grid plan is unchanged with the cap off.
     let g = Some(8192);
+    assert_eq!(plan_capped(0, 32772, 8192, BS, None, g, None), (8192, 8192));
     assert_eq!(
-        plan_capped(0, 32772, 8192, BS, None, g, Some(2048)),
-        (8192, 8192)
+        plan_capped(0, 32772, 8192, BS, None, g, Some(3072)),
+        (3072, 8192)
     );
+    let mut off = 0;
+    let mut ends = Vec::new();
+    while off < 32772 {
+        let (len, uncapped) = plan_capped(off, 32772, 8192, BS, None, g, Some(3072));
+        assert!(len <= 3072 && len <= uncapped && len % 16 == 0 || off + len == 32772);
+        off += len;
+        ends.push(off);
+    }
+    for k in 1..=4 {
+        assert!(
+            ends.contains(&(k * 8192)),
+            "grid point {} missing: {ends:?}",
+            k * 8192
+        );
+    }
+    assert_eq!(&ends[..3], &[3072, 6144, 8192]);
 }
 
 #[test]

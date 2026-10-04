@@ -165,9 +165,12 @@ impl TransformerModel {
         // 2026-10-03: Under the grid the scheduler plans every chunk with `grid_chunk_len`
         // (`Model::prefill_grid`); a chunk off that plan means a caller bypassed it, and a warm
         // pass then no longer matches a cold one (the restore itself stays correct).
+        // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING` (server `prefill_chunk_cap`) may
+        // end a chunk short of the next grid point, never past it, so only a chunk that crosses
+        // a grid point is off the plan.
         if seq.prefix_grid_refs
             && let Some(g) = self.prefix_grid_active_bs(kv_cache.block_size())
-            && chunk_len != crate::prefill_plan::grid_chunk_len(chunk_start, total, g)
+            && chunk_len > crate::prefill_plan::grid_chunk_len(chunk_start, total, g)
         {
             static W: std::sync::Once = std::sync::Once::new();
             W.call_once(|| {

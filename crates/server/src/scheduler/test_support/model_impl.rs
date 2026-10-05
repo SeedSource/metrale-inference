@@ -82,14 +82,20 @@ impl ModelForward for PreemptStubModel {
     }
     fn prefill_chunk(
         &self,
-        _t: &[u32],
-        _s: &mut SequenceState,
-        _cs: usize,
-        _cl: usize,
+        t: &[u32],
+        s: &mut SequenceState,
+        cs: usize,
+        cl: usize,
         _last: bool,
         _st: u64,
     ) -> Result<DevicePtr> {
-        anyhow::bail!("unused in preempt tests")
+        // 2026-10-04: only a first-token stub (`first_token`) prefills.
+        if self.first_token.is_none() {
+            anyhow::bail!("unused in preempt tests")
+        }
+        s.tokens.extend_from_slice(&t[cs..cs + cl]);
+        s.seq_len = s.tokens.len();
+        Ok(DevicePtr::NULL)
     }
     fn decode_batch(
         &self,
@@ -123,7 +129,8 @@ impl ModelLogits for PreemptStubModel {
         DevicePtr::NULL
     }
     fn argmax_on_device(&self, _p: DevicePtr, _st: u64) -> Result<u32> {
-        anyhow::bail!("unused in preempt tests")
+        self.first_token
+            .ok_or_else(|| anyhow::anyhow!("unused in preempt tests"))
     }
     fn argmax_batch(&self, _p: DevicePtr, n: usize, _st: u64) -> Result<Vec<u32>> {
         Ok(vec![0; n])

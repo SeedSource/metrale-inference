@@ -366,6 +366,7 @@ fn promoting_the_head_preserves_the_order_of_the_remainder() {
         None,
         None,
         4096,
+        true,
     );
 
     let order: Vec<u64> = prefilling.iter().map(|p| p.session_hash).collect();
@@ -405,6 +406,7 @@ fn promoting_several_at_once_preserves_the_order_of_the_remainder() {
         None,
         None,
         4096,
+        true,
     );
 
     let order: Vec<u64> = prefilling.iter().map(|p| p.session_hash).collect();
@@ -446,6 +448,7 @@ fn a_failed_prefill_answers_its_client_with_the_reason() {
         None,
         None,
         4096,
+        true,
     );
 
     let sent = rx1

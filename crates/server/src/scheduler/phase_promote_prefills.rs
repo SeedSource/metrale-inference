@@ -26,6 +26,9 @@ pub(super) fn promote_completed_prefills(
     tool_call_end_token: Option<u32>,
     // 2026-09-25: The served context ceiling, passed to `finish_sequence`.
     max_seq_len: usize,
+    // 2026-10-04: `SchedLevers::think_end_at_token0` (A95, see
+    // `end_thinking_at_token0`).
+    think_end_at_token0: bool,
 ) {
     // 2026-09-25: Reverse index order, so a removal never shifts an index
     // still to be removed.
@@ -112,6 +115,9 @@ pub(super) fn promote_completed_prefills(
         if immediate_finish {
             finish_sequence(io, &mut a, max_seq_len);
         } else {
+            // 2026-10-04: A95: a token-0 `</think>` ends thinking here, as a
+            // later one does on the decode paths.
+            end_thinking_at_token0(&mut a, first, think_end_at_token0);
             active.push(a);
         }
     }

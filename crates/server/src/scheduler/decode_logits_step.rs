@@ -14,6 +14,8 @@ use crate::scheduler::io::{DecodeRows, Readback, StepOutcome};
 mod content_emit;
 mod host_sample;
 mod per_token;
+#[cfg(test)]
+mod token0_tests;
 
 thread_local! {
     /// 2026-09-25: Dequant scratch for one rayon worker on the parallel host-sampling arm.

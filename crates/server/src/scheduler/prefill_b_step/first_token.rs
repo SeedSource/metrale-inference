@@ -187,7 +187,7 @@ pub(super) fn finish_first_token(
         return Ok(None);
     }
 
-    Ok(Some(ActiveSeq {
+    let mut a = ActiveSeq {
         seq,
         session_hash: req_session_hash,
         last_token: first,
@@ -278,5 +278,9 @@ pub(super) fn finish_first_token(
         logprobs_data: Vec::new(),
         timeout_at: req_timeout_at,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
-    }))
+    };
+    // 2026-10-04: A95: a token-0 `</think>` ends thinking here, as a later one
+    // does on the decode paths.
+    end_thinking_at_token0(&mut a, first, sched.levers.think_end_at_token0);
+    Ok(Some(a))
 }

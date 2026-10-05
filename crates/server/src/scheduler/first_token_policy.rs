@@ -8,13 +8,21 @@
 //! `ActiveSeq::inside_thinking` exists, so the same rule is applied here
 //! from [`born_inside_thinking`].
 //!
+//! 2026-10-04: A95: a token 0 that is the model's `</think>` ends thinking
+//! at birth ([`end_thinking_at_token0`]), as a later sampled `</think>`
+//! does.
+//!
 //! Owner: scheduler.
 //! Invariants:
 //! - With a grammar, [`first_token_with`] either hands it to the sampler
 //!   and, when sampling succeeds, advances it past token 0, or, when
 //!   `policy.grammar_suspended`, leaves it untouched.
+//! - 2026-10-04: [`end_thinking_at_token0`] resets the same fields as the
+//!   `</think>` branches of `decode_logits_step/per_token.rs`,
+//!   `emit_step/token.rs` and `verify_pipeline_helper/pick_positions.rs`.
 
 use crate::grammar::GrammarState;
+use crate::scheduler::ActiveSeq;
 use anyhow::Result;
 
 /// 2026-09-25: Whether a new sequence starts inside `<think>`: thinking is
@@ -88,4 +96,33 @@ where
     let tok = sample(suppress_ids, Some(&mut *gs))?;
     gs.accept_token(tok);
     Ok(tok)
+}
+
+/// 2026-10-04: A95: when a sequence born inside `<think>` samples the
+/// model's `</think>` as token 0, end thinking now, with the same field
+/// resets as a later sampled `</think>`: `inside_thinking` false,
+/// `think_ended` and the one-shot `think_just_ended` set,
+/// `thinking_tokens` left at 0. The stream has already switched to content
+/// on that token; without this the scheduler stayed inside thinking,
+/// counted the answer against the thinking budget, held back EOS, and
+/// forced a second `</think>` mid-answer.
+///
+/// `enabled` is `SchedLevers::think_end_at_token0`
+/// (`METRALE_THINK_END_AT_TOKEN0`, default on; `0` keeps the sequence
+/// inside thinking, the behaviour before 2026-10-04). Token 0 was sampled
+/// with the grammar suspended, so the matcher has not seen it, as with a
+/// later `</think>`. Logs at info like `emit_token`'s close, so a serve log
+/// shows when it fires.
+pub(super) fn end_thinking_at_token0(a: &mut ActiveSeq, first: u32, enabled: bool) {
+    if !enabled || !a.inside_thinking || a.think_end_token != Some(first) {
+        return;
+    }
+    a.inside_thinking = false;
+    a.force_end_thinking = false;
+    a.sentence_defer_count = 0;
+    a.consecutive_confident = 0;
+    a.in_code_fence = false;
+    a.think_ended = true;
+    a.think_just_ended = true;
+    tracing::info!("Thinking ended at token 0 (budget={:?})", a.thinking_budget);
 }

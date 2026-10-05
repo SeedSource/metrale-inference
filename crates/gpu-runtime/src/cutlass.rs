@@ -30,8 +30,8 @@ pub use grouped::{
     nvfp4_grouped_gate_up_fused, nvfp4_grouped_gate_up_w4a4,
 };
 pub use pack::{
-    pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched, pack_weight_sfb_batched_mode, sfb_bytes,
-    transpose_nvfp4_packed_kton,
+    pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched, pack_weight_sfb_batched_mode,
+    sfb_bytes, transpose_nvfp4_packed_kton,
 };
 
 /// 2026-10-03: Whether this build carries the CUTLASS objects (`CUTLASS_HOME` was set at build

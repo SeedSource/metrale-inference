@@ -52,6 +52,31 @@
 //!   recurrence gates `f_a`, `f_b` (forget-gate decay) and `b_proj` (beta), `embed_tokens`,
 //!   `lm_head` (its FP8 option is `--lm-head-dtype fp8`), the mHC `hc_fn` (not a GEMV), the
 //!   MTP block and any DFlash drafter. Together they are < 0.4 GB/rank of decode reads.
+//! - 2026-10-05: `METRALE_GLM_DENSE_FP8_W8A8=1` (inert, warned once, without
+//!   `METRALE_GLM_DENSE_FP8=1`): [`route`] on a registered weight with more than
+//!   `DENSE_GEMV_FP8W_BATCHM_MAX_M` rows, at least [`W8A8_MIN_ROWS`], `k % 128 == 0`,
+//!   `n % 64 == 0`, a 4-byte-aligned `c`, the caller's GEMV handle the BF16-out
+//!   `dense_gemv_bf16` (so its output is BF16) and an activation that fits the W8A8 scratch
+//!   (`m * k` FP8 bytes, `m * k / 128` scales) quantizes `a` (`per_token_group_quant_fp8`, per
+//!   token per 128-K group) into the scratch, runs `fp8_gemm_t_rowscale` over the FP8 copy into
+//!   `c` and returns `Route::Done`; the dequant arena and its cache are not touched. Any other
+//!   call takes the dequant path above (each skip reason logged once). NOT byte-identical to
+//!   the dequant path (activation quantization). [`route`] writes `c` as packed `[m, n]` BF16
+//!   at row stride `n`, the layout the callers' wide arm (cuBLASLt, ld `n`) already writes:
+//!   audited 2026-10-05, every wide call of the three wrappers passes a packed `[m, k]` input
+//!   and a packed `[m, n]` output (KDA `glm5next_kda/mod.rs` front/back end, `qkv_parts` at
+//!   `i * t * qkv`; DSA `wide.rs`, `xseq/group.rs`, `row_batch.rs` arenas; MLP
+//!   `forward/dense.rs` row slices at `a * inter` / `a * hidden`), and the FP32-out DSA calls
+//!   pass M = 1 on unregistered weights.
+//!   W8A8 scratch: one allocation made in [`finish_load`] (before the KV pool is sized) of
+//!   `rows * max_k` FP8 bytes + `rows * max_k / 128` FP32 scales + `max_k / 128` FP32 ones
+//!   (filled once), `max_k` the largest `k % 128 == 0` registered weight, `rows` from
+//!   `METRALE_GLM_DENSE_FP8_W8A8_ROWS` or, unset, the largest row count the loader sizes a
+//!   prefill workspace for ([`dense_fp8_w8a8_rows`]). Written and read on the caller's stream;
+//!   an eager call on a different stream than the previous one first synchronizes that stream.
+//!   Under CUDA graph capture the quant and GEMM are captured; ASSUMED (not enforced), as for
+//!   the arena: a captured graph that writes the scratch is never replayed concurrently with
+//!   the eager GLM forward.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -76,6 +101,73 @@ pub fn dense_fp8() -> bool {
         }
         on
     })
+}
+
+/// 2026-10-05: `METRALE_GLM_DENSE_FP8_W8A8=1` opts in (module doc); read once. False, with a
+/// warning, when set without `METRALE_GLM_DENSE_FP8=1`.
+pub fn dense_fp8_w8a8() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        if std::env::var("METRALE_GLM_DENSE_FP8_W8A8").as_deref() != Ok("1") {
+            return false;
+        }
+        if !dense_fp8() {
+            tracing::warn!(
+                "METRALE_GLM_DENSE_FP8_W8A8=1 is ignored without METRALE_GLM_DENSE_FP8=1 (it only \
+                 changes the prefill GEMMs of the FP8 weight copies)"
+            );
+            return false;
+        }
+        tracing::warn!(
+            "METRALE_GLM_DENSE_FP8_W8A8=1 - GLM-5.3 prefill GEMMs of >= {W8A8_MIN_ROWS} rows on \
+             FP8 dense weight copies quantize the activations to FP8 E4M3 (per token, per 128-K \
+             group) and run the W8A8 fp8_gemm_rowscale_pipe_128x64 instead of dequant + cuBLASLt \
+             BF16; NOT byte-identical"
+        );
+        true
+    })
+}
+
+/// 2026-10-05: Fewest rows a W8A8 GEMM takes; narrower calls keep the dequant path.
+/// PROVISIONAL: not swept; the 128-row tile wastes most of its MMAs below it.
+pub const W8A8_MIN_ROWS: usize = 64;
+
+/// 2026-10-05: Rows the W8A8 activation scratch holds at the widest registered `k`:
+/// `METRALE_GLM_DENSE_FP8_W8A8_ROWS` (an integer >= 1), else [`w8a8_workspace_rows`]. Read once.
+pub fn dense_fp8_w8a8_rows() -> usize {
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DENSE_FP8_W8A8_ROWS").ok();
+        let parsed = raw
+            .as_deref()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|r| *r >= 1);
+        if let (Some(r), None) = (raw.as_deref(), parsed)
+            && !r.trim().is_empty()
+        {
+            tracing::warn!(
+                "METRALE_GLM_DENSE_FP8_W8A8_ROWS={r} is not an integer >= 1 - using the prefill \
+                 workspace rows ({})",
+                w8a8_workspace_rows()
+            );
+        }
+        parsed.unwrap_or_else(w8a8_workspace_rows)
+    })
+}
+
+/// 2026-10-05: The largest row count the GLM-5.3 loader sizes a prefill workspace for, the
+/// same terms as `glm5_next_load/loader.rs` (`verify_k`, `kda_rows`, `mlp_rows`, the DSA wide
+/// arena): `DENSE_GEMV_BATCHM_MAX_M`, `PREFILL_ROWS`, `prefill_rows()`, `prefill_rows_ffn()`,
+/// `fullwidth_rows()` and `batched_verify_rows()`. A GEMM wider than its workspace cannot
+/// happen; a wider one anyway (a sizing this list misses) falls back to the dequant path.
+pub fn w8a8_workspace_rows() -> usize {
+    use crate::glm5next_layer as gl;
+    (ops::DENSE_GEMV_BATCHM_MAX_M as usize)
+        .max(gl::PREFILL_ROWS)
+        .max(gl::prefill_rows())
+        .max(gl::prefill_rows_ffn())
+        .max(gl::fullwidth_rows().unwrap_or(0))
+        .max(gl::levers::batched_verify_rows())
 }
 
 /// 2026-10-03: What [`route`] did: `Done` (an FP8 GEMV wrote the output, or there were no
@@ -128,6 +220,60 @@ static FIRST_DEQUANT: AtomicBool = AtomicBool::new(false);
 static HANDLE_MISMATCH: AtomicBool = AtomicBool::new(false);
 
 const ARENA_ALIGN: usize = 256;
+
+/// 2026-10-05: The W8A8 kernels (activation quantizer, per-row-scale GEMM), resolved once.
+#[derive(Clone, Copy)]
+struct W8a8Kernels {
+    quant: ops::Fp8ActQuant,
+    gemm: KernelHandle,
+}
+
+/// 2026-10-05: The W8A8 activation scratch (module doc): one allocation at `base`.
+#[derive(Clone, Copy)]
+struct W8a8Scratch {
+    base: DevicePtr,
+    bytes: usize,
+    a_fp8: DevicePtr,
+    fp8_cap: usize,
+    a_scale: DevicePtr,
+    scale_cap: usize,
+    /// `ones_len` FP32 1.0 values.
+    ones: DevicePtr,
+    ones_len: usize,
+}
+
+struct W8a8State {
+    scratch: Option<W8a8Scratch>,
+    /// The stream of the last eager W8A8 launch pair.
+    last_stream: Option<u64>,
+}
+
+/// 2026-10-05: Why a wide call on a registered weight skipped W8A8; each is logged once.
+#[derive(Clone, Copy)]
+enum W8a8Skip {
+    FewRows = 0,
+    Shape = 1,
+    NoKernels = 2,
+    NoScratch = 3,
+    TooWide = 4,
+    NotBf16Out = 5,
+}
+
+static W8A8_KERNELS: OnceLock<Option<W8a8Kernels>> = OnceLock::new();
+static W8A8: Mutex<W8a8State> = Mutex::new(W8a8State {
+    scratch: None,
+    last_stream: None,
+});
+static W8A8_GEMMS: AtomicU64 = AtomicU64::new(0);
+static W8A8_FIRST: AtomicBool = AtomicBool::new(false);
+static W8A8_SKIP_LOGGED: [AtomicBool; 6] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
 fn map() -> &'static RwLock<BTreeMap<u64, Entry>> {
     MAP.get_or_init(|| RwLock::new(BTreeMap::new()))
@@ -340,8 +486,225 @@ pub fn route(
             );
         }
     }
+    // 2026-10-05: `METRALE_GLM_DENSE_FP8_W8A8=1`: a wide call runs the W8A8 GEMM into `c`
+    // when it can (module doc), else falls through to the dequant.
+    if dense_fp8_w8a8()
+        && m > ops::DENSE_GEMV_FP8W_BATCHM_MAX_M as usize
+        && w8a8(gpu, gemv.0 == kk.bf16_gemv.0, a, &e, c, m, stream)?
+    {
+        return Ok(Route::Done);
+    }
     let p = dequant(gpu, &kk, b.0, &e, m, stream)?;
     Ok(Route::Weight(p))
+}
+
+/// 2026-10-05: The W8A8 kernels, resolved once; `None` (logged) when the target lacks either.
+fn w8a8_kernels(gpu: &dyn GpuBackend) -> Option<W8a8Kernels> {
+    *W8A8_KERNELS.get_or_init(|| {
+        let quant = ops::Fp8ActQuant::resolve(gpu);
+        let gemm = match ops::fp8_gemm_rowscale_kernel(gpu) {
+            Ok(Some(h)) => Some(h),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("METRALE_GLM_DENSE_FP8_W8A8: {e:#}");
+                None
+            }
+        };
+        match gemm {
+            Some(gemm) if quant.available() => Some(W8a8Kernels { quant, gemm }),
+            _ => {
+                tracing::warn!(
+                    "METRALE_GLM_DENSE_FP8_W8A8: this target lacks {}::{} or \
+                     per_token_group_quant_fp8; prefill GEMMs keep the dequant path",
+                    ops::FP8_GEMM_PIPE_MODULE,
+                    ops::FP8_GEMM_ROWSCALE_ENTRY
+                );
+                None
+            }
+        }
+    })
+}
+
+/// 2026-10-05: Log, once per reason, that a wide call kept the dequant path.
+fn w8a8_skip(why: W8a8Skip, m: usize, n: usize, k: usize) -> Result<bool> {
+    if !W8A8_SKIP_LOGGED[why as usize].swap(true, Ordering::Relaxed) {
+        let text = match why {
+            W8a8Skip::FewRows => format!("fewer than {W8A8_MIN_ROWS} rows"),
+            W8a8Skip::Shape => {
+                "k not a multiple of 128, n not a multiple of 64, or c not 4-byte aligned".into()
+            }
+            W8a8Skip::NoKernels => "the W8A8 kernels are missing".into(),
+            W8a8Skip::NotBf16Out => {
+                "the caller's GEMV is not dense_gemv_bf16 (its output may not be BF16)".into()
+            }
+            W8a8Skip::NoScratch => "no W8A8 scratch (finish_load did not allocate one)".into(),
+            W8a8Skip::TooWide => format!(
+                "the activation does not fit the W8A8 scratch ({} rows at the widest k; \
+                 METRALE_GLM_DENSE_FP8_W8A8_ROWS)",
+                dense_fp8_w8a8_rows()
+            ),
+        };
+        if matches!(why, W8a8Skip::FewRows) {
+            tracing::info!(
+                "METRALE_GLM_DENSE_FP8_W8A8: first {m}-row GEMM ({n}x{k}) kept the dequant \
+                 path: {text}"
+            );
+        } else {
+            tracing::warn!(
+                "METRALE_GLM_DENSE_FP8_W8A8: first {m}-row GEMM ({n}x{k}) kept the dequant \
+                 path: {text}"
+            );
+        }
+    }
+    Ok(false)
+}
+
+/// 2026-10-05: `c[m, n] = W8A8(a, e)` when every condition in the module doc holds (and
+/// `bf16_out`: the caller passed the BF16-out `dense_gemv_bf16` handle): quantize
+/// `a` into the scratch, then the per-row-scale GEMM over the FP8 copy, both on `stream`.
+/// `Ok(false)`, launching nothing, otherwise.
+fn w8a8(
+    gpu: &dyn GpuBackend,
+    bf16_out: bool,
+    a: DevicePtr,
+    e: &Entry,
+    c: DevicePtr,
+    m: usize,
+    stream: u64,
+) -> Result<bool> {
+    let (n, k) = (e.n, e.k);
+    // The rowscale GEMM writes BF16; a caller passing another GEMV family (the FP32-out
+    // `gemv_f32` sites, all M = 1 on unregistered weights today) keeps its own path.
+    if !bf16_out {
+        return w8a8_skip(W8a8Skip::NotBf16Out, m, n, k);
+    }
+    if m < W8A8_MIN_ROWS {
+        return w8a8_skip(W8a8Skip::FewRows, m, n, k);
+    }
+    if !k.is_multiple_of(ops::FP8_GEMM_PIPE_KGROUP as usize)
+        || !n.is_multiple_of(ops::FP8_GEMM_PIPE_BN as usize)
+        || !c.0.is_multiple_of(4)
+    {
+        return w8a8_skip(W8a8Skip::Shape, m, n, k);
+    }
+    let Some(kk) = w8a8_kernels(gpu) else {
+        return w8a8_skip(W8a8Skip::NoKernels, m, n, k);
+    };
+    let mut st = W8A8.lock().unwrap();
+    let Some(s) = st.scratch else {
+        return w8a8_skip(W8a8Skip::NoScratch, m, n, k);
+    };
+    let groups = k / ops::FP8_GEMM_PIPE_KGROUP as usize;
+    if m * k > s.fp8_cap || m * groups * 4 > s.scale_cap || groups > s.ones_len {
+        return w8a8_skip(W8a8Skip::TooWide, m, n, k);
+    }
+    if !gpu.stream_is_capturing(stream) {
+        if let Some(prev) = st.last_stream
+            && prev != stream
+        {
+            // Earlier W8A8 GEMMs on `prev` may still read the scratch this quant overwrites.
+            gpu.synchronize(prev)?;
+        }
+        st.last_stream = Some(stream);
+    }
+    ops::per_token_group_quant_fp8(
+        gpu, kk.quant, a, s.a_fp8, s.a_scale, m as u32, k as u32, stream,
+    )?;
+    ops::fp8_gemm_t_rowscale(
+        gpu,
+        kk.gemm,
+        s.a_fp8,
+        s.a_scale,
+        s.ones,
+        e.w.weight,
+        e.w.row_scale,
+        c,
+        m as u32,
+        n as u32,
+        k as u32,
+        stream,
+    )?;
+    W8A8_GEMMS.fetch_add(1, Ordering::Relaxed);
+    if !W8A8_FIRST.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "METRALE_GLM_DENSE_FP8_W8A8: first W8A8 GEMM routed ({m} rows, {n}x{k}); scratch \
+             {:.1} MB",
+            s.bytes as f64 / 1e6
+        );
+    }
+    Ok(true)
+}
+
+/// 2026-10-05: Allocate the W8A8 scratch (module doc) once the weights are registered.
+/// Returns its bytes; 0, allocating nothing, when the lever is off, the kernels are missing or
+/// no registered weight has `k % 128 == 0` and `n % 64 == 0`.
+fn finish_load_w8a8(gpu: &dyn GpuBackend) -> Result<usize> {
+    if !dense_fp8_w8a8() || w8a8_kernels(gpu).is_none() {
+        return Ok(0);
+    }
+    let kg = ops::FP8_GEMM_PIPE_KGROUP as usize;
+    let max_k = map()
+        .read()
+        .unwrap()
+        .values()
+        .filter(|e| e.k.is_multiple_of(kg) && e.n.is_multiple_of(ops::FP8_GEMM_PIPE_BN as usize))
+        .map(|e| e.k)
+        .max()
+        .unwrap_or(0);
+    if max_k == 0 {
+        return Ok(0);
+    }
+    let rows = dense_fp8_w8a8_rows();
+    let groups = max_k / kg;
+    let fp8_cap = rows * max_k;
+    let scale_cap = rows * groups * 4;
+    let scale_off = fp8_cap.next_multiple_of(ARENA_ALIGN);
+    let ones_off = (scale_off + scale_cap).next_multiple_of(ARENA_ALIGN);
+    let bytes = ones_off + groups * 4;
+    let mut st = W8A8.lock().unwrap();
+    if let Some(have) = st.scratch
+        && have.fp8_cap >= fp8_cap
+        && have.scale_cap >= scale_cap
+        && have.ones_len >= groups
+    {
+        return Ok(have.bytes);
+    }
+    if let Some(old) = st.scratch.take() {
+        gpu.free(old.base)?;
+    }
+    let base = gpu.alloc(bytes)?;
+    let ones: Vec<u8> = (0..groups).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+    gpu.copy_h2d(&ones, base.offset(ones_off))?;
+    st.scratch = Some(W8a8Scratch {
+        base,
+        bytes,
+        a_fp8: base,
+        fp8_cap,
+        a_scale: base.offset(scale_off),
+        scale_cap,
+        ones: base.offset(ones_off),
+        ones_len: groups,
+    });
+    st.last_stream = None;
+    tracing::warn!(
+        "METRALE_GLM_DENSE_FP8_W8A8: activation scratch {:.1} MB ({rows} rows x K {max_k}: FP8 \
+         {:.1} MB + scales {:.1} MB + {groups} ones), allocated at load",
+        bytes as f64 / 1e6,
+        fp8_cap as f64 / 1e6,
+        scale_cap as f64 / 1e6
+    );
+    Ok(bytes)
+}
+
+/// 2026-10-05: W8A8 GEMM launches issued by [`route`] so far (host-side; graph replays are not
+/// counted).
+pub fn w8a8_gemms() -> u64 {
+    W8A8_GEMMS.load(Ordering::Relaxed)
+}
+
+/// 2026-10-05: Bytes of the W8A8 scratch [`finish_load`] allocated; 0 when none.
+pub fn w8a8_scratch_bytes() -> usize {
+    W8A8.lock().unwrap().scratch.map_or(0, |s| s.bytes)
 }
 
 /// 2026-10-03: The arena address holding the BF16 dequant of `key`, dequantizing into it
@@ -518,7 +881,12 @@ pub fn convert_weight(
 /// 2026-10-03: After every text layer is registered: allocate the dequant arena (the
 /// largest per-layer span). Returns its bytes; 0, allocating nothing, when the lever is off
 /// or nothing was converted. Must run before the KV pool is sized so the ledger counts it.
+/// 2026-10-05: Also allocates the W8A8 activation scratch under `METRALE_GLM_DENSE_FP8_W8A8=1`
+/// (module doc; logged with its size, not in the returned bytes, [`w8a8_scratch_bytes`]).
 pub fn finish_load(gpu: &dyn GpuBackend) -> Result<usize> {
+    // 2026-10-05: Resolve the W8A8 lever here, at load, so `METRALE_GLM_DENSE_FP8_W8A8=1`
+    // without `METRALE_GLM_DENSE_FP8=1` is warned about (nothing else reads it then).
+    let _ = dense_fp8_w8a8();
     if !dense_fp8() {
         return Ok(0);
     }
@@ -526,6 +894,14 @@ pub fn finish_load(gpu: &dyn GpuBackend) -> Result<usize> {
     if need == 0 {
         return Ok(0);
     }
+    let arena = alloc_arena(gpu, need)?;
+    finish_load_w8a8(gpu)?;
+    Ok(arena)
+}
+
+/// 2026-10-03: The dequant arena of [`finish_load`], at least `need` bytes (2026-10-05: moved
+/// out of `finish_load` unchanged).
+fn alloc_arena(gpu: &dyn GpuBackend, need: usize) -> Result<usize> {
     let mut a = ARENA.lock().unwrap();
     if let Some((_, have)) = *a
         && have >= need

@@ -245,4 +245,39 @@ __device__ __forceinline__ void tile_store(
     }
 }
 
+// 2026-10-05: `tile_store` with a per-output-column FP32 scale applied before the BF16 round: tile row r, column c goes
+// to C row `row_base + r` as bf16_rn(outer * col_scale[c]) for r < rows_valid. `col_scale` is indexed by the absolute
+// output column (cta_n + ...), so it is the full [N] array. Used by `fp8_gemm_rowscale_pipe_*` (one FP32 scale per
+// weight row = per output column); `tile_store` and its users are unchanged.
+template <int BM, int BN, int WARPS_M, int WARPS_N>
+__device__ __forceinline__ void tile_store_colscale(
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned long long row_base,
+    int rows_valid,
+    unsigned int cta_n,
+    const float* __restrict__ col_scale,
+    const float (&outer)[BM / WARPS_M / 16][BN / WARPS_N / 8][4]
+) {
+    constexpr int WM = BM / WARPS_M, WN = BN / WARPS_N, MI = WM / 16, NI = WN / 8;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned wm0 = (warp / WARPS_N) * WM, wn0 = (warp % WARPS_N) * WN;
+    const unsigned gid = lane >> 2, tig = lane & 3u;
+    #pragma unroll
+    for (int ni = 0; ni < NI; ni++) {
+        const unsigned col = cta_n + wn0 + ni * 8 + tig * 2;
+        const float s0 = col_scale[col], s1 = col_scale[col + 1];
+        #pragma unroll
+        for (int mi = 0; mi < MI; mi++) {
+            const int r0 = (int)(wm0 + mi * 16 + gid), r1 = r0 + 8;
+            if (r0 < rows_valid)
+                *(__nv_bfloat162*)&C[(row_base + r0) * N + col] =
+                    __floats2bfloat162_rn(outer[mi][ni][0] * s0, outer[mi][ni][1] * s1);
+            if (r1 < rows_valid)
+                *(__nv_bfloat162*)&C[(row_base + r1) * N + col] =
+                    __floats2bfloat162_rn(outer[mi][ni][2] * s0, outer[mi][ni][3] * s1);
+        }
+    }
+}
+
 }

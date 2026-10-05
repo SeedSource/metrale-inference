@@ -23,6 +23,9 @@
 //! windows with the DSA core at `rows`, and each FFN window's MLP runs its dense GEMMs as one
 //! slice as wide as the window. Ownership stays per sub-chunk (`SpPlan::spans` clips it to a
 //! window), and each owned `hc_pre` takes the mix kernel of the call it belongs to.
+//! 2026-10-05: With `METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1` ownership is cut per `rows_ffn`
+//! window instead (`seq_parallel::owner_chunks`): one span per rank per call. Nothing below
+//! depends on where the ownership cuts fall.
 //!
 //! Why this is byte-identical to `prefill_staged_run` (its module notes give the base case):
 //! - `hc_expand`, `hc_pre`, the RMSNorm, `hc_post` and `hc_head_mean` are one block (or one
@@ -101,7 +104,7 @@ impl Glm5NextLayer {
         ENGAGED.call_once(|| {
             tracing::warn!(
                 "METRALE_GLM_PREFILL_SEQ_PARALLEL=1: ENGAGED (first prefill: {num_tokens} rows, \
-                 each rank owns half of every {}-row sub-chunk; full-width arm {})",
+                 each rank owns half of every {}-row ownership chunk; full-width arm {})",
                 plan.width,
                 prefill_fullwidth_gemm()
             );

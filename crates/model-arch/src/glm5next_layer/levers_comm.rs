@@ -137,3 +137,28 @@ pub fn prefill_seq_parallel() -> bool {
         on
     })
 }
+
+/// 2026-10-05: `METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1` (with
+/// `METRALE_GLM_PREFILL_SEQ_PARALLEL=1` and `METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1`): the
+/// sequence-parallel ownership is cut per `rows_ffn` window instead of per `rows` sub-chunk
+/// (`seq_parallel::owner_chunks`), so rank 0 owns the first half of every window. Every
+/// sequence-parallel call is then one span per rank: one send/recv pair per exchange instead
+/// of one per sub-chunk (an 8192-row window at `rows` 256: 1 x 32 MiB instead of 32 x 1 MiB),
+/// and one owned mHC / norm / add launch per call instead of one per sub-chunk.
+/// Byte-identical by the same argument as the base lever (every owned-row launch is per
+/// token; `steps/staged/sp.rs`); changes the collective sequence, so the ranks must agree
+/// (startup check). Off unless set to `1`; read once; inert without the two levers above.
+pub fn prefill_sp_window_owner() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_PREFILL_SP_WINDOW_OWNER").as_deref() == Ok("1")
+            && prefill_seq_parallel();
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1 - sequence-parallel row ownership per \
+                 full-width window (one send/recv pair per exchange; byte-identical)"
+            );
+        }
+        on
+    })
+}

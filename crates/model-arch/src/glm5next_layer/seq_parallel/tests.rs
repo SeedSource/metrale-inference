@@ -203,3 +203,50 @@ fn calls_must_tile_the_chunk() {
     assert!(!calls_tile(&[(0, 4), (4, 0), (4, 3)], 7), "empty call");
     assert!(!calls_tile(&[(4, 3), (0, 4)], 7), "order");
 }
+
+/// 2026-10-05: Window ownership (`owner_chunks(.., true)`, `METRALE_GLM_PREFILL_SP_WINDOW_OWNER`):
+/// off it is the sub-chunk plan; on, the two ranks' spans tile every item the passes issue,
+/// a full-width attention call (a `rows_ffn` window) is one span per rank, and an FFN window
+/// whose `rows_ffn` is a multiple of `rows` has one span per rank per window it meets.
+#[test]
+fn window_ownership_is_one_span_per_rank_per_window() {
+    for (n, rows, ffn) in SHAPES {
+        assert_eq!(owner_chunks(n, rows, ffn, false), sub_chunks(n, rows));
+        let plan = SpPlan::new(&owner_chunks(n, rows, ffn, true)).unwrap();
+        for item in items(n, rows, ffn) {
+            let mut all = rows_of_both(plan, item);
+            all.sort_unstable();
+            assert_eq!(all, (item.0..item.0 + item.1).collect::<Vec<_>>(), "{n} {rows} {ffn}");
+        }
+        let w = ffn.max(rows);
+        for call in sub_chunks(n, w) {
+            for rank in 0..2 {
+                assert!(plan.spans(rank, call).len() <= 1, "{n} {rows} {ffn} {call:?}");
+            }
+        }
+        if ffn % rows == 0 {
+            let subs = sub_chunks(n, rows);
+            for merge in [false, true] {
+                for win in ffn_windows(&subs, ffn, merge, |_| true) {
+                    let met = (win.0 / w..(win.0 + win.1).div_ceil(w)).count();
+                    for rank in 0..2 {
+                        assert!(plan.spans(rank, win).len() <= met, "{n} {rows} {ffn} {win:?}");
+                    }
+                }
+            }
+        }
+    }
+    // 8192-row window at 256-row sub-chunks: one 4096-row span each (32 before).
+    let plan = SpPlan::new(&owner_chunks(8192, 256, 8192, true)).unwrap();
+    assert_eq!(plan.spans(0, (0, 8192)), vec![(0, 4096)]);
+    assert_eq!(plan.spans(1, (0, 8192)), vec![(4096, 4096)]);
+    let old = SpPlan::new(&sub_chunks(8192, 256)).unwrap();
+    assert_eq!(old.spans(0, (0, 8192)).len(), 32);
+}
+
+/// 2026-10-05: Both ranks' rows of `item` under `plan`.
+fn rows_of_both(plan: SpPlan, item: Span) -> Vec<usize> {
+    let mut v = rows(&plan.spans(0, item));
+    v.extend(rows(&plan.spans(1, item)));
+    v
+}

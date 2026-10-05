@@ -64,6 +64,11 @@ pub(super) fn assert_rank_levers_agree(
                 "METRALE_GLM_PREFILL_SEQ_PARALLEL",
                 u64::from(metrale_model_arch::glm5next_layer::prefill_seq_parallel()),
             ),
+            // 2026-10-05: Window ownership changes how many send/recv pairs each exchange posts.
+            (
+                "METRALE_GLM_PREFILL_SP_WINDOW_OWNER",
+                u64::from(metrale_model_arch::glm5next_layer::prefill_sp_window_owner()),
+            ),
             // 2026-10-01: Each DSA prefill sub-chunk swaps its index-selection halves with
             // one grouped send/recv; a rank without it would leave the peer waiting.
             (

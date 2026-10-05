@@ -90,6 +90,18 @@ impl SpPlan {
     }
 }
 
+/// 2026-10-05: The chunks `SpPlan::new` cuts ownership by for a staged prefill of
+/// `num_tokens` rows: the `rows` sub-chunks, or with `window` (the full-width arm and
+/// `METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1`) the `rows_ffn` windows, which are exactly the
+/// full-width attention calls; the FFN windows (`ffn_windows`) are runs of whole sub-chunks of
+/// at most `rows_ffn` rows from row 0, so each lies inside one window or, with a merged tail,
+/// covers whole windows. Any plan is correct (`spans` clips ownership to any item); the window
+/// plan only gives every call one span per rank.
+pub fn owner_chunks(num_tokens: usize, rows: usize, rows_ffn: usize, window: bool) -> Vec<Span> {
+    let w = if window { rows_ffn.max(rows) } else { rows };
+    super::sub_chunks(num_tokens, w)
+}
+
 /// 2026-10-04: `rms_norm_vanilla` over `rows` contiguous `[hidden]` BF16 rows in one launch,
 /// one block of `min(hidden, 1024)` threads per row (`token = blockIdx.x`; the blocks share
 /// nothing and the kernel never reads `gridDim`): the launch `Glm5NextLayer::norm` issues

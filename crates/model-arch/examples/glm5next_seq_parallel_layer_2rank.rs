@@ -38,6 +38,8 @@
 //! sets `METRALE_GLM_PREFILL_STAGED=1` and `METRALE_GLM_PREFILL_ROWS_FFN=8192` before anything
 //! reads them, and `METRALE_GLM_MHC_TOKMAJOR=1` (the shipping mix kernel; run once more with
 //! `=0` for the other). Set `SP_GATE_CASES=<n>` to run only the first n cases.
+//! 2026-10-05: With `METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1` the full-width cases cut ownership
+//! per `rows_ffn` window (`seq_parallel::owner_chunks`), as the serve does under that lever.
 //!
 //! Owner: model-arch examples.
 //! Invariants: none beyond the types.
@@ -57,7 +59,7 @@ use metrale_gpu_runtime::cuda_backend::MetraleCudaBackend;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_arch::glm5next_layer::seq_parallel::{
-    SpPlan, SpRows, SpSite, Span, rms_norm_rows, sp_pass, swap_owned,
+    SpPlan, SpRows, SpSite, Span, owner_chunks, rms_norm_rows, sp_pass, swap_owned,
 };
 use metrale_model_arch::glm5next_layer::{ffn_windows, sub_chunks};
 use metrale_model_arch::glm5next_mhc::{
@@ -331,6 +333,14 @@ fn calls(&(n, rows, ffn, wide, merge): &Case) -> (Vec<Span>, Vec<Span>) {
     (attn, ffn_windows(&subs, ffn, merge, |_| true))
 }
 
+/// 2026-10-05: The ownership chunks of case `c`, as `staged.rs` cuts them: per window under
+/// the full-width arm with `METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1`, else per sub-chunk (the
+/// lever also needs `METRALE_GLM_PREFILL_SEQ_PARALLEL`, so this reads the variable itself).
+fn owners(&(n, rows, ffn, wide, _): &Case) -> Vec<Span> {
+    let window = std::env::var("METRALE_GLM_PREFILL_SP_WINDOW_OWNER").as_deref() == Ok("1");
+    owner_chunks(n, rows, ffn, wide && window)
+}
+
 /// 2026-10-04: The row-local gate (module doc) for one case; returns the differing bytes.
 fn row_local_case(
     g: &dyn GpuBackend,
@@ -340,7 +350,7 @@ fn row_local_case(
     stream: u64,
 ) -> Result<usize> {
     let (n, rows) = (c.0, c.1);
-    let plan = SpPlan::new(&sub_chunks(n, rows)).context("no sub-chunks")?;
+    let plan = SpPlan::new(&owners(c)).context("no sub-chunks")?;
     let (attn_calls, ffn_wins) = calls(c);
     let mut rng = Lcg(0x5EED_5000 ^ (n as u64) << 20 ^ rows as u64);
     let (attn, ffn) = (site(g, &mut rng)?, site(g, &mut rng)?);
@@ -499,7 +509,7 @@ fn layer_case(
     let (n, rows) = (c.0, c.1);
     let rank = comm.rank();
     let rb = H * 2;
-    let plan = SpPlan::new(&sub_chunks(n, rows)).context("no sub-chunks")?;
+    let plan = SpPlan::new(&owners(c)).context("no sub-chunks")?;
     let (attn_calls, ffn_wins) = calls(c);
     let window = attn_calls
         .iter()

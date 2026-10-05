@@ -124,7 +124,15 @@ impl Glm5NextLayer {
         // row-local work split by rows across the two ranks (`sp.rs`).
         // 2026-10-04: Under the full-width arm too: `prefill_staged_sp` then issues the
         // full-width calls (`wide`). Before, the full-width arm left it inert.
-        if let Some(plan) = self.sp_plan(num_tokens, &subs, ctx) {
+        // 2026-10-05: Ownership per window under `METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1`.
+        let window_owner = wide && crate::glm5next_layer::prefill_sp_window_owner();
+        let owners = crate::glm5next_layer::seq_parallel::owner_chunks(
+            num_tokens,
+            rows,
+            rows_ffn,
+            window_owner,
+        );
+        if let Some(plan) = self.sp_plan(num_tokens, &owners, ctx) {
             return self.prefill_staged_sp(
                 hidden,
                 &subs,

@@ -84,7 +84,8 @@ pub(crate) use levers::{
 pub use levers::{
     PREFILL_ROWS_FFN_MAX, batched_verify, decode_multi_seq, dsa_index_split, dsa_index_split_wide,
     fullwidth_rows, prefill_comm_overlap, prefill_fullwidth_gemm, prefill_rows, prefill_rows_ffn,
-    prefill_seq_parallel, prefill_staged, prefill_tail_merge, staged_merge_signature,
+    prefill_seq_parallel, prefill_sp_window_owner, prefill_staged, prefill_tail_merge,
+    staged_merge_signature,
 };
 pub use steps::staged::{ffn_windows, sub_chunks};
 pub use types::{Glm5NextLayer, Glm5NextMhc, Glm5NextMixer, Glm5NextMlpSite};

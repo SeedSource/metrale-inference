@@ -38,8 +38,8 @@
 //! sets `METRALE_GLM_PREFILL_STAGED=1` and `METRALE_GLM_PREFILL_ROWS_FFN=8192` before anything
 //! reads them, and `METRALE_GLM_MHC_TOKMAJOR=1` (the shipping mix kernel; run once more with
 //! `=0` for the other). Set `SP_GATE_CASES=<n>` to run only the first n cases.
-//! 2026-10-05: With `METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1` the full-width cases cut ownership
-//! per `rows_ffn` window (`seq_parallel::owner_chunks`), as the serve does under that lever.
+//! 2026-10-05: With `METRALE_GLM_PREFILL_SP_WINDOW_OWNER` (default on; `=0` off) the full-width
+//! cases cut ownership per `rows_ffn` window (`seq_parallel::owner_chunks`), as the serve does under that lever.
 //!
 //! Owner: model-arch examples.
 //! Invariants: none beyond the types.
@@ -337,7 +337,7 @@ fn calls(&(n, rows, ffn, wide, merge): &Case) -> (Vec<Span>, Vec<Span>) {
 /// the full-width arm with `METRALE_GLM_PREFILL_SP_WINDOW_OWNER=1`, else per sub-chunk (the
 /// lever also needs `METRALE_GLM_PREFILL_SEQ_PARALLEL`, so this reads the variable itself).
 fn owners(&(n, rows, ffn, wide, _): &Case) -> Vec<Span> {
-    let window = std::env::var("METRALE_GLM_PREFILL_SP_WINDOW_OWNER").as_deref() == Ok("1");
+    let window = std::env::var("METRALE_GLM_PREFILL_SP_WINDOW_OWNER").as_deref() != Ok("0");
     owner_chunks(n, rows, ffn, wide && window)
 }
 

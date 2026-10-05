@@ -148,10 +148,13 @@ pub fn prefill_seq_parallel() -> bool {
 /// Byte-identical by the same argument as the base lever (every owned-row launch is per
 /// token; `steps/staged/sp.rs`); changes the collective sequence, so the ranks must agree
 /// (startup check). Off unless set to `1`; read once; inert without the two levers above.
+/// 2026-10-05: Default ON (race-pf-spwin-L12 / race-pf-spwinrr-L12: serve byte-identical, comb14
+/// 8K TTFT 5.46 -> 5.31 s and 32K 25.57 -> 20.99 s over 7 reps, NCCL SendRecv 546 -> 337 ms per
+/// 8K prefill); `0` turns it off.
 pub fn prefill_sp_window_owner() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {
-        let on = std::env::var("METRALE_GLM_PREFILL_SP_WINDOW_OWNER").as_deref() == Ok("1")
+        let on = std::env::var("METRALE_GLM_PREFILL_SP_WINDOW_OWNER").as_deref() != Ok("0")
             && prefill_seq_parallel();
         if on {
             tracing::warn!(

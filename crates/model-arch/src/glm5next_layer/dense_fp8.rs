@@ -545,6 +545,16 @@ fn convert_weight_with(
     Ok(true)
 }
 
+/// 2026-10-05: Whether [`register_mtp`] converts the MTP block: `METRALE_GLM_DENSE_FP8=1` and
+/// `METRALE_GLM_MTP_DENSE_FP8` not `0` (comb13: its own off switch, so the draft-only MTP part
+/// can be turned off without a rebuild; with it off the MTP block stays BF16 as before).
+pub fn mtp_dense_fp8() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        dense_fp8() && std::env::var("METRALE_GLM_MTP_DENSE_FP8").as_deref() != Ok("0")
+    })
+}
+
 /// 2026-10-05: Convert the MTP block's dense weights (module doc) and grow the dequant arena to
 /// cover them. Runs from `load_glm5next_mtp_module`, after every text layer is registered and
 /// before the KV pool is sized. `eh_proj` is `[hidden, 2 * hidden]` and store-owned (its BF16
@@ -556,7 +566,7 @@ pub fn register_mtp(
     eh_proj: &mut DenseWeight,
 ) -> Result<LayerFp8> {
     use crate::glm5next_layer::{Glm5NextMixer, Glm5NextMlpSite};
-    if !dense_fp8() {
+    if !mtp_dense_fp8() {
         return Ok(LayerFp8::default());
     }
     let hid = layer.mlp_cfg.hidden;

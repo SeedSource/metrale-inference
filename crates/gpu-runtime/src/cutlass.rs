@@ -30,7 +30,7 @@ pub use grouped::{
     nvfp4_grouped_gate_up_fused, nvfp4_grouped_gate_up_w4a4,
 };
 pub use pack::{
-    pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched, sfb_bytes,
+    pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched, pack_weight_sfb_batched_mode, sfb_bytes,
     transpose_nvfp4_packed_kton,
 };
 
@@ -159,6 +159,18 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         src_n_major: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn metrale_cutlass_pack_weight_sfb_batched_mode(
+        scale_ptrs_dev: *const u64,
+        first: i32,
+        count: i32,
+        out_base: *mut c_void,
+        out_stride: u64,
+        n: i32,
+        k: i32,
+        src_n_major: i32,
+        mode: i32,
         stream: *mut c_void,
     ) -> i32;
     pub(crate) fn metrale_cutlass_nvfp4_grouped_gate_up_w4a4(

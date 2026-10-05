@@ -133,6 +133,22 @@ pub fn pack_weight_sfb_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn pack_weight_sfb_batched_mode(
+    _scale_ptrs_dev: u64,
+    _first: u32,
+    _count: u32,
+    _out_base: u64,
+    _out_stride: usize,
+    _n: u32,
+    _k: u32,
+    _src_n_major: bool,
+    _mode: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::pack_weight_sfb_batched_mode is cuda-only (not built for metal)")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn nvfp4_grouped_gate_up_w4a4(
     _a: u64,
     _sorted_token_ids: u64,

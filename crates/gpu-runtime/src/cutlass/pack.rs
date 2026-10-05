@@ -111,6 +111,60 @@ pub fn pack_weight_sfb_batched(
     }
 }
 
+/// 2026-10-05: [`pack_weight_sfb_batched`] with an explicit kernel: `mode` 0 follows
+/// `METRALE_CUTLASS_SFB_PACK_TILED`, 1 runs the scalar kernel, 2 the tiled kernel (an error
+/// when it does not apply: `src_n_major`, `n % 128 == 0`, `k % 64 == 0`, 16-byte aligned
+/// `out_base` and `out_stride`). Both write the same bytes (`glm_cutlass_sfb_pack_microtest`).
+#[allow(clippy::too_many_arguments)]
+pub fn pack_weight_sfb_batched_mode(
+    scale_ptrs_dev: u64,
+    first: u32,
+    count: u32,
+    out_base: u64,
+    out_stride: usize,
+    n: u32,
+    k: u32,
+    src_n_major: bool,
+    mode: u32,
+    stream: u64,
+) -> Result<()> {
+    if out_stride < sfb_bytes(n as usize, k as usize) {
+        bail!(
+            "CUTLASS batched SFB pack: stride {out_stride} < {} bytes for {n}x{k}",
+            sfb_bytes(n as usize, k as usize)
+        );
+    }
+    #[cfg(metrale_cutlass)]
+    {
+        let status = unsafe {
+            metrale_cutlass_pack_weight_sfb_batched_mode(
+                scale_ptrs_dev as *const u64,
+                first as i32,
+                count as i32,
+                out_base as *mut c_void,
+                out_stride as u64,
+                n as i32,
+                k as i32,
+                i32::from(src_n_major),
+                mode as i32,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "CUTLASS batched SFB pack (mode {mode}) failed: status {status} for {count} x \
+                 {n}x{k}"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(metrale_cutlass))]
+    {
+        let _ = (scale_ptrs_dev, first, count, out_base, n, k, src_n_major, mode, stream);
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
 /// 2026-09-25: Pack a row-major BF16 weight `[N,K]` into CUTLASS NVFP4: packed
 /// `[N,K/2]` (K-contiguous) and E4M3 scales `[K/16,N]`, each scale the group's
 /// max magnitude / 6. The scales carry no second-level factor, so pass

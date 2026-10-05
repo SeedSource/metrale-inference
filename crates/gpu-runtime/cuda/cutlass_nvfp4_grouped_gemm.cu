@@ -476,6 +476,69 @@ __global__ void pack_weight_sfb_batched_k(
       *reinterpret_cast<unsigned char*>(&sf);
 }
 
+// 2026-10-05: pack_weight_sfb_batched_k with coalesced stores, for src_n_major scales and
+// n % 128 == 0, k % 64 == 0 (METRALE_CUTLASS_SFB_PACK_TILED). One warp per 128 x 64 SFB tile
+// (128 rows x 4 scale groups = one 512-byte Sm1xx SfAtom, contiguous in the output): the atom
+// puts row n0 + 32 * n1 (n0 < 32, n1 < 4) and group k1 (< 4) of the tile at byte
+// n0 * 16 + n1 * 4 + k1 (Stride<Stride<_16,_4>, Stride<_0,_1>>), so lane n0 gathers rows
+// n0, n0 + 32, n0 + 64, n0 + 96 (4 groups each, one 4-byte read when aligned) and writes its 16
+// bytes with one uint4 store at tile base + n0 * 16. The tile base is `layout_sfb` at the tile
+// origin. Each byte is converted with the expression the scalar kernel uses, so the output
+// bytes are the same. Grid (ceil(tiles / 8), count), 256 threads; consecutive warps take
+// consecutive k-tiles of one 128-row block, so a CTA reads 32 contiguous bytes of each row.
+template <class LayoutSFB_t>
+__global__ void pack_weight_sfb_batched_tiled_k(
+    const unsigned long long* __restrict__ src_ptrs,
+    int first,
+    unsigned char* __restrict__ out_base,
+    unsigned long long out_stride,
+    int n,
+    int k,
+    LayoutSFB_t layout_sfb) {
+  const int slot = blockIdx.y;
+  const unsigned char* src = reinterpret_cast<const unsigned char*>(src_ptrs[first + slot]);
+  if (src == nullptr) {
+    return;
+  }
+  const int groups = k / 16;
+  const int k_tiles = k / 64;
+  const long long tiles = (long long)(n / 128) * k_tiles;
+  const long long tile = (long long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (tile >= tiles) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nb = (int)(tile / k_tiles);
+  const int kb = (int)(tile % k_tiles);
+  const bool aligned =
+      ((reinterpret_cast<unsigned long long>(src) | (unsigned long long)groups) & 3ull) == 0;
+  unsigned int words[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const unsigned long long row = (unsigned long long)(nb * 128 + j * 32 + lane);
+    const unsigned long long at = row * groups + kb * 4;
+    unsigned int in4;
+    if (aligned) {
+      in4 = *reinterpret_cast<const unsigned int*>(src + at);
+    } else {
+      in4 = (unsigned int)src[at] | ((unsigned int)src[at + 1] << 8) |
+            ((unsigned int)src[at + 2] << 16) | ((unsigned int)src[at + 3] << 24);
+    }
+    unsigned int w = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      __nv_fp8_e4m3 in;
+      *reinterpret_cast<unsigned char*>(&in) = (unsigned char)((in4 >> (8 * i)) & 0xFFu);
+      cutlass::float_ue4m3_t sf(static_cast<float>(in));
+      w |= (unsigned int)(*reinterpret_cast<unsigned char*>(&sf)) << (8 * i);
+    }
+    words[j] = w;
+  }
+  unsigned char* dst = out_base + (unsigned long long)slot * out_stride +
+                       layout_sfb(nb * 128, kb * 64, 0) + (unsigned long long)lane * 16;
+  *reinterpret_cast<uint4*>(dst) = make_uint4(words[0], words[1], words[2], words[3]);
+}
+
 #endif
 
 
@@ -519,6 +582,85 @@ extern "C" int metrale_cutlass_pack_weight_sfb(
 #endif
 }
 
+// 2026-10-05: `METRALE_CUTLASS_SFB_PACK_TILED=1` routes the batched pack to the tiled kernel
+// when it applies (src_n_major, n % 128 == 0, k % 64 == 0, out_base and out_stride 16-byte
+// aligned); the scalar kernel runs otherwise. Read once.
+static bool sfb_pack_tiled_lever() {
+  static const bool on = [] {
+    const char* v = std::getenv("METRALE_CUTLASS_SFB_PACK_TILED");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
+}
+
+// 2026-10-05: The batched pack with an explicit kernel: mode 0 follows the lever, 1 is the
+// scalar kernel, 2 the tiled kernel (-2 when it does not apply). Other returns as
+// metrale_cutlass_pack_weight_sfb_batched.
+extern "C" int metrale_cutlass_pack_weight_sfb_batched_mode(
+    const unsigned long long* scale_ptrs_dev,
+    int first,
+    int count,
+    void* out_base,
+    unsigned long long out_stride,
+    int n,
+    int k,
+    int src_n_major,
+    int mode,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (scale_ptrs_dev == nullptr || out_base == nullptr || first < 0 || count <= 0 ||
+      count > 65535 || n <= 0 || k <= 0 || (k % 16) != 0 || mode < 0 || mode > 2) {
+    return -1;
+  }
+  auto layout_sfb =
+      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(1, n, k, 1));
+  if ((unsigned long long)size(filter_zeros(layout_sfb)) > out_stride) {
+    return -3;
+  }
+  const bool fits = src_n_major != 0 && (n % 128) == 0 && (k % 64) == 0 &&
+                    ((reinterpret_cast<unsigned long long>(out_base) | out_stride) & 15ull) == 0;
+  const bool tiled = mode == 2 || (mode == 0 && sfb_pack_tiled_lever() && fits);
+  if (tiled) {
+    if (!fits) {
+      return -2;
+    }
+    const long long tiles = (long long)(n / 128) * (k / 64);
+    dim3 block(256);
+    dim3 grid((unsigned int)((tiles + 7) / 8), (unsigned int)count);
+    pack_weight_sfb_batched_tiled_k<<<grid, block, 0, stream>>>(
+        scale_ptrs_dev, first, static_cast<unsigned char*>(out_base), out_stride, n, k,
+        layout_sfb);
+  } else {
+    const long long elems = (long long)n * (k / 16);
+    dim3 block(256);
+    dim3 grid((unsigned int)((elems + 255) / 256), (unsigned int)count);
+    pack_weight_sfb_batched_k<<<grid, block, 0, stream>>>(
+        scale_ptrs_dev,
+        first,
+        static_cast<unsigned char*>(out_base),
+        out_stride,
+        n,
+        k,
+        src_n_major,
+        layout_sfb);
+  }
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? 0 : -static_cast<int>(err);
+#else
+  (void)scale_ptrs_dev;
+  (void)first;
+  (void)count;
+  (void)out_base;
+  (void)out_stride;
+  (void)n;
+  (void)k;
+  (void)src_n_major;
+  (void)mode;
+  (void)stream;
+  return -120;
+#endif
+}
+
 // 2026-10-03: The load/prefill-time SFB swizzle of `count` experts in one launch: slot s reads
 // the E4M3 scales at scale_ptrs_dev[first + s] (a DEVICE pointer table; a null entry is skipped)
 // and writes the swizzled SFB at out_base + s * out_stride. Same source layouts and the same
@@ -535,42 +677,9 @@ extern "C" int metrale_cutlass_pack_weight_sfb_batched(
     int k,
     int src_n_major,
     cudaStream_t stream) {
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
-  if (scale_ptrs_dev == nullptr || out_base == nullptr || first < 0 || count <= 0 ||
-      count > 65535 || n <= 0 || k <= 0 || (k % 16) != 0) {
-    return -1;
-  }
-  auto layout_sfb =
-      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(1, n, k, 1));
-  if ((unsigned long long)size(filter_zeros(layout_sfb)) > out_stride) {
-    return -3;
-  }
-  const long long elems = (long long)n * (k / 16);
-  dim3 block(256);
-  dim3 grid((unsigned int)((elems + 255) / 256), (unsigned int)count);
-  pack_weight_sfb_batched_k<<<grid, block, 0, stream>>>(
-      scale_ptrs_dev,
-      first,
-      static_cast<unsigned char*>(out_base),
-      out_stride,
-      n,
-      k,
-      src_n_major,
-      layout_sfb);
-  cudaError_t err = cudaGetLastError();
-  return err == cudaSuccess ? 0 : -static_cast<int>(err);
-#else
-  (void)scale_ptrs_dev;
-  (void)first;
-  (void)count;
-  (void)out_base;
-  (void)out_stride;
-  (void)n;
-  (void)k;
-  (void)src_n_major;
-  (void)stream;
-  return -120;
-#endif
+  // 2026-10-05: The lever-selected kernel (metrale_cutlass_pack_weight_sfb_batched_mode).
+  return metrale_cutlass_pack_weight_sfb_batched_mode(
+      scale_ptrs_dev, first, count, out_base, out_stride, n, k, src_n_major, 0, stream);
 }
 
 // 2026-09-25: prep_grouped_a gathers and packs A once per call; launch_projection runs one

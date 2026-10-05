@@ -49,6 +49,10 @@ name = "glm5next_dense_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_dense_w8a8_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_gemv_tc_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -90,6 +94,10 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "fp8_gemm_blockscaled_pipe_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_fp8_vs_bf16_dense_microbench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

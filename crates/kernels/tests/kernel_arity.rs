@@ -34,6 +34,13 @@ const PINS: &[(&str, &str, usize)] = &[
     // 2026-09-25: The 32-row W8A16 tile. `ops::w8a16_gemm_pipelined_m32_strided`
     // packs 9, and the contiguous entry passes K and N as the row pitches.
     ("w8a16_gemm_pipelined_m32", "w8a16_gemm_pipelined_m32", 9),
+    // 2026-10-05: The per-row-scale W8A8 GEMM; `ops::fp8_gemm_t_rowscale` packs 9
+    // (A, a_scale, ones, B, w_row_scale, C, M, N, K).
+    (
+        "fp8_gemm_blockscaled_pipe",
+        "fp8_gemm_rowscale_pipe_128x64",
+        9,
+    ),
 ];
 
 /// 2026-09-25: The arity a target's copy of a kernel must have. No target

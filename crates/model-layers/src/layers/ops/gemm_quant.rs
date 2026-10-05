@@ -174,12 +174,10 @@ pub fn fp8_gemm_t_blockscaled(
 ) -> Result<()> {
     super::log_gemm_shape(gpu, "fp8_gemm_t_blockscaled", m, n, k);
     if let Some(pipe) = fp8_gemm_pipe_kernel(gpu, m, n, k)? {
-        // 2026-09-27: `fp8_gemm_blockscaled_pipe_128x64`: 128 x 64 tiles, 256 threads, SmemBytes<128, 64, 3>.
-        const PIPE_SMEM: u32 = 3 * (128 + 64) * 64 + 3 * 128 * 4 + 128 * 4;
         return KernelLaunch::new(gpu, pipe)
-            .grid([n / 64, div_ceil(m, 128), 1])
-            .block([256, 1, 1])
-            .shared_mem(PIPE_SMEM)
+            .grid(fp8_gemm_pipe_grid(m, n))
+            .block([FP8_GEMM_PIPE_THREADS, 1, 1])
+            .shared_mem(FP8_GEMM_PIPE_SMEM)
             .arg_ptr(a_fp8)
             .arg_ptr(a_scale)
             .arg_ptr(b_fp8)
@@ -202,6 +200,97 @@ pub fn fp8_gemm_t_blockscaled(
         .arg_u32(n)
         .arg_u32(k)
         .launch(stream)
+}
+
+/// 2026-09-27: `fp8_gemm_blockscaled_pipe_128x64` and (2026-10-05) `fp8_gemm_rowscale_pipe_128x64`:
+/// 128 x 64 tiles, 256 threads, `e4m3g::SmemBytes<128, 64, 3>` of dynamic shared memory.
+const FP8_GEMM_PIPE_SMEM: u32 = 3 * (128 + 64) * 64 + 3 * 128 * 4 + 128 * 4;
+const FP8_GEMM_PIPE_THREADS: u32 = 256;
+/// 2026-10-05: Output-tile width (N) of the pipelined 128x64 entries; N must be a multiple.
+pub const FP8_GEMM_PIPE_BN: u32 = 64;
+/// 2026-10-05: K-group of the activation scales the pipelined entries read; K must be a multiple.
+pub const FP8_GEMM_PIPE_KGROUP: u32 = 128;
+/// 2026-10-05: Module (file stem) of the pipelined entries.
+pub const FP8_GEMM_PIPE_MODULE: &str = "fp8_gemm_blockscaled_pipe";
+/// 2026-10-05: Entry point of the per-row-scale pipelined GEMM ([`fp8_gemm_t_rowscale`]).
+pub const FP8_GEMM_ROWSCALE_ENTRY: &str = "fp8_gemm_rowscale_pipe_128x64";
+
+/// 2026-10-05: Grid of the pipelined 128x64 entries: (N / 64, ceil(M / 128), 1).
+fn fp8_gemm_pipe_grid(m: u32, n: u32) -> [u32; 3] {
+    [n / FP8_GEMM_PIPE_BN, div_ceil(m, 128), 1]
+}
+
+/// 2026-10-05: W8A8 GEMM for a weight with ONE FP32 scale per output row (`Fp8DenseWeight`,
+/// `[N, K]` E4M3 + `[N]` row scales) and per-token, per-128-K-group activation scales:
+///
+///   C[M, N] = bf16( w_row_scale[N] × Σ_g (FP8 MMA over K-group g) × a_scale[M, g] )
+///
+/// on `fp8_gemm_rowscale_pipe_128x64` (`kernels/gb10/common/fp8_gemm_blockscaled_pipe.cu`),
+/// the launch of [`fp8_gemm_t_blockscaled`]'s pipelined arm. Inputs:
+///   - `a_fp8`       [M, K] FP8 E4M3, `a_scale` [M, K/128] FP32 (from [`per_token_group_quant_fp8`])
+///   - `ones`        [K/128] FP32, every value 1.0 (the kernel's per-block weight scale row)
+///   - `b_fp8`       [N, K] FP8 E4M3, `w_row_scale` [N] FP32
+///   - `output`      [M, N] BF16, row stride N
+///
+/// Errors when K % 128 != 0 or N % 64 != 0; M == 0 launches nothing. `kernel` is the
+/// handle of [`FP8_GEMM_ROWSCALE_ENTRY`] in [`FP8_GEMM_PIPE_MODULE`].
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_t_rowscale(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_fp8: DevicePtr,
+    a_scale: DevicePtr,
+    ones: DevicePtr,
+    b_fp8: DevicePtr,
+    w_row_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        n > 0
+            && k > 0
+            && k.is_multiple_of(FP8_GEMM_PIPE_KGROUP)
+            && n.is_multiple_of(FP8_GEMM_PIPE_BN),
+        "fp8_gemm_t_rowscale: [{n}, {k}] needs K a multiple of {FP8_GEMM_PIPE_KGROUP} and N a \
+         multiple of {FP8_GEMM_PIPE_BN}"
+    );
+    ensure!(kernel.0 != 0, "fp8_gemm_t_rowscale: kernel handle is 0");
+    if m == 0 {
+        return Ok(());
+    }
+    super::log_gemm_shape(gpu, "fp8_gemm_t_rowscale", m, n, k);
+    KernelLaunch::new(gpu, kernel)
+        .grid(fp8_gemm_pipe_grid(m, n))
+        .block([FP8_GEMM_PIPE_THREADS, 1, 1])
+        .shared_mem(FP8_GEMM_PIPE_SMEM)
+        .arg_ptr(a_fp8)
+        .arg_ptr(a_scale)
+        .arg_ptr(ones)
+        .arg_ptr(b_fp8)
+        .arg_ptr(w_row_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// 2026-10-05: The handle of [`FP8_GEMM_ROWSCALE_ENTRY`], memoized in the backend's
+/// `OpCache`; `None` when the backend lacks the module (only `kernels/gb10` ships it).
+pub fn fp8_gemm_rowscale_kernel(gpu: &dyn GpuBackend) -> Result<Option<KernelHandle>> {
+    if !gpu.has_module(FP8_GEMM_PIPE_MODULE) {
+        return Ok(None);
+    }
+    // 2026-10-05: The entry as a literal (= FP8_GEMM_ROWSCALE_ENTRY) so
+    // crates/kernels/tests/kernel_lookups.rs checks it against the tree.
+    Ok(Some(gpu.op_cache().kernel(
+        gpu,
+        FP8_GEMM_PIPE_MODULE,
+        "fp8_gemm_rowscale_pipe_128x64",
+    )?))
 }
 
 /// 2026-09-27: The pipelined twin of `fp8_gemm_t_blockscaled`

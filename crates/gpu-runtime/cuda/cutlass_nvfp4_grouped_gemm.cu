@@ -582,13 +582,13 @@ extern "C" int metrale_cutlass_pack_weight_sfb(
 #endif
 }
 
-// 2026-10-05: `METRALE_CUTLASS_SFB_PACK_TILED=1` routes the batched pack to the tiled kernel
-// when it applies (src_n_major, n % 128 == 0, k % 64 == 0, out_base and out_stride 16-byte
+// 2026-10-05: `METRALE_CUTLASS_SFB_PACK_TILED` (default on; `0` turns it off) routes the
+// batched pack to the tiled kernel when it applies (src_n_major, n % 128 == 0, k % 64 == 0, out_base and out_stride 16-byte
 // aligned); the scalar kernel runs otherwise. Read once.
 static bool sfb_pack_tiled_lever() {
   static const bool on = [] {
     const char* v = std::getenv("METRALE_CUTLASS_SFB_PACK_TILED");
-    return v != nullptr && v[0] == '1' && v[1] == '\0';
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
   }();
   return on;
 }

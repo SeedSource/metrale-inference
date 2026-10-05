@@ -105,8 +105,8 @@ use std::sync::{Mutex, OnceLock, RwLock};
 
 use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use metrale_model_layers::layers::ops;
 use metrale_gpu_runtime::kernel_args::{KernelLaunch, div_ceil};
+use metrale_model_layers::layers::ops;
 use metrale_model_layers::weight_map::{DenseWeight, Fp8DenseWeight, QuantizedWeight};
 
 /// 2026-10-03: `METRALE_GLM_DENSE_FP8=1` opts in; read once.

@@ -155,7 +155,7 @@ fn nv4_dequant(g: &dyn GpuBackend, q: &QuantizedWeight, n: usize, kd: usize) -> 
     for r in 0..n {
         for i in 0..kd {
             let b = pk[(r * kd + i) / 2];
-            let nib = if i % 2 == 0 { b & 0xF } else { b >> 4 };
+            let nib = if i.is_multiple_of(2) { b & 0xF } else { b >> 4 };
             w[r * kd + i] = E2M1[nib as usize] * e4m3(sc[r * (kd / 16) + i / 16]) * s2;
         }
     }

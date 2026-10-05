@@ -133,8 +133,25 @@ impl Glm5NextDsaLayer {
         // 2026-10-03: The indexer projections of every row, as `indexer_rows_batched` and
         // `qidx_rows_batched` run them, into the arena instead of the caches.
         let t = profile::start();
-        let bm = kn.gemv_batchm;
-        batchm_rows(gpu, bm, 2, hidden, wt.wk, a.k_normed, r, d, hid, stream)?;
+        // 2026-10-05: `wk` and `compress_gate` go through `gemm`, the dispatch the per-sequence
+        // decode uses (`dense_fp8::route`: the row-invariant TC GEMV under
+        // `METRALE_GLM_GEMV_TC=1`), so a sequence's indexer keys do not depend on whether it
+        // decodes alone or in a cross-sequence group. `batchm_rows` on `dense_gemv_bf16_batchm`
+        // matched the per-sequence path only with TC off (race-dec-lmhbf-L34: C=2/4 texts
+        // diverged from C=1 under the ship env).
+        gemm(
+            gpu,
+            kn.gemm,
+            kn.gemv,
+            kn.gemv_batchm,
+            hidden,
+            wt.wk,
+            a.k_normed,
+            r,
+            d,
+            hid,
+            stream,
+        )?;
         // 2026-10-03: `nllb_layernorm_bf16` normalises row `blockIdx.x` in place; every block
         // does the same arithmetic on its own row at any `rows` (`indexer_rows_batched`).
         KernelLaunch::new(gpu, self.select_kernels.k_norm)
@@ -148,10 +165,11 @@ impl Glm5NextDsaLayer {
             .arg_u32(d as u32)
             .arg_f32(self.rms_eps)
             .launch(stream)?;
-        batchm_rows(
+        gemm(
             gpu,
-            bm,
-            2,
+            kn.gemm,
+            kn.gemv,
+            kn.gemv_batchm,
             hidden,
             wt.compress_gate,
             a.gate,

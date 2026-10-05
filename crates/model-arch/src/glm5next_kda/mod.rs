@@ -237,7 +237,8 @@ fn chunked_tc_refusal(
     t_pad: usize,
     kernels: bool,
 ) -> Option<&'static str> {
-    // 2026-10-01: Each borrowed buffer holds `t_pad * qkv_dim()` FP32 (`Glm5NextKdaWorkspace`).
+    // 2026-10-01: Each borrowed buffer holds `t_pad * qkv_dim()` FP32 (`Glm5NextKdaWorkspace`); 2026-10-04: the
+    // caller passes the padded `chunk_tokens` rows, which is what the chunk buffers were sized to.
     let buf_bytes = t_pad * cfg.qkv_dim() * 4;
     let recs = k.div_ceil(KDA_TC_C) * cfg.heads;
     if !kernels {

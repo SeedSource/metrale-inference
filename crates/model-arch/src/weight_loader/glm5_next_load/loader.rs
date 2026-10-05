@@ -132,6 +132,18 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
              binders; routed experts and the MTP block kept",
             bytes as f64 / 1e9,
         );
+        // 2026-10-05: The MTP `eh_proj` BF16 original, when `METRALE_GLM_DENSE_FP8=1` kept only an
+        // FP8 copy of it (`dense_fp8::register_mtp`); the store owns the buffer, so it is freed here.
+        let eh_name = format!("model.language_model.layers.{n}.eh_proj.weight");
+        if let Ok(t) = store.get(&eh_name)
+            && crate::glm5next_layer::dense_fp8::take_deferred_free(t.ptr)
+        {
+            let (c, b) = store.free_matching(gpu, |name| name == eh_name)?;
+            tracing::info!(
+                "glm5_next: released {c} MTP eh_proj tensor ({:.1} MB) replaced by its FP8 copy",
+                b as f64 / 1e6
+            );
+        }
         let quantized: std::collections::BTreeSet<String> = store
             .names()
             .filter(|n| {

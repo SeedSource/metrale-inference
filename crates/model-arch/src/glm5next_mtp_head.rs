@@ -159,6 +159,52 @@ fn drafter_context_rows(max_seq_len: usize, cfg: &crate::glm5next_dsa::Glm5NextD
 }
 
 impl Glm5NextMtpHead {
+    /// 2026-10-05: `eh_proj` on one `[2 * hidden]` row: `dense_fp8::route` (the FP8 copy under
+    /// `METRALE_GLM_DENSE_FP8=1`, the tensor-core GEMV under `METRALE_GLM_GEMV_TC=1`), else the
+    /// BF16 `dense_gemv_bf16` it always ran.
+    fn eh_proj_one(
+        &self,
+        gpu: &dyn GpuBackend,
+        a: DevicePtr,
+        c: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        use crate::glm5next_layer::dense_fp8::{Route, route};
+        let (h, w) = (self.hidden, self.module.eh_proj.weight);
+        match route(gpu, self.gemv_k, a, w, c, 1, h, 2 * h, stream)? {
+            Route::Done => Ok(()),
+            Route::Weight(p) => ops::dense_gemv(
+                gpu,
+                self.gemv_k,
+                a,
+                &DenseWeight { weight: p },
+                c,
+                h as u32,
+                (2 * h) as u32,
+                stream,
+            ),
+        }
+    }
+
+    /// 2026-10-05: `eh_proj` on a tile of `t > 16` rows as one cuBLASLt GEMM; under
+    /// `METRALE_GLM_DENSE_FP8=1` it reads the BF16 dequant of the FP8 copy (`route`, dequant arena).
+    fn eh_proj_wide(
+        &self,
+        gpu: &dyn GpuBackend,
+        a: DevicePtr,
+        c: DevicePtr,
+        t: usize,
+        stream: u64,
+    ) -> Result<()> {
+        use crate::glm5next_layer::dense_fp8::{Route, route};
+        let (h, w) = (self.hidden, self.module.eh_proj.weight);
+        let w = match route(gpu, self.gemv_k, a, w, c, t, h, 2 * h, stream)? {
+            Route::Done => return Ok(()),
+            Route::Weight(p) => p,
+        };
+        ops::cublas_bf16_proj_dense(a, w, c, t as u32, h as u32, (2 * h) as u32, stream)
+    }
+
     fn norm(
         &self,
         gpu: &dyn GpuBackend,
@@ -230,16 +276,7 @@ impl Glm5NextMtpHead {
             h,
             stream,
         )?;
-        ops::dense_gemv(
-            gpu,
-            self.gemv_k,
-            st.concat,
-            &self.module.eh_proj,
-            st.x,
-            h as u32,
-            (2 * h) as u32,
-            stream,
-        )?;
+        self.eh_proj_one(gpu, st.concat, st.x, stream)?;
 
         // 2026-09-25: The block writes its output back over `st.x` (plain residual, in place).
         if skip_block() {
@@ -467,25 +504,13 @@ impl Glm5NextMtpHead {
                 // 2026-10-03: eh_proj as one GEMM over the tile (GEMV order differs from
                 // cuBLASLt's: bf16-level only). Tiles of up to 16 rows keep the GEMV.
                 if t > ops::DENSE_GEMV_BATCHM_MAX_M as usize {
-                    ops::cublas_bf16_proj_dense(
-                        sc.concat,
-                        self.module.eh_proj.weight,
-                        sc.xo,
-                        t as u32,
-                        h as u32,
-                        (2 * h) as u32,
-                        stream,
-                    )?;
+                    self.eh_proj_wide(gpu, sc.concat, sc.xo, t, stream)?;
                 } else {
                     for i in 0..t {
-                        ops::dense_gemv(
+                        self.eh_proj_one(
                             gpu,
-                            self.gemv_k,
                             sc.concat.offset(i * 2 * h * 2),
-                            &self.module.eh_proj,
                             sc.xo.offset(i * h * 2),
-                            h as u32,
-                            (2 * h) as u32,
                             stream,
                         )?;
                     }
@@ -522,16 +547,7 @@ impl Glm5NextMtpHead {
                 h,
                 stream,
             )?;
-            ops::dense_gemv(
-                gpu,
-                self.gemv_k,
-                *concat,
-                &self.module.eh_proj,
-                *x,
-                h as u32,
-                (2 * h) as u32,
-                stream,
-            )?;
+            self.eh_proj_one(gpu, *concat, *x, stream)?;
             let dsa_state: &mut dyn LayerState = dsa;
             // 2026-09-25: Diagnostic arm `METRALE_GLM_MTP_PREFILL_FULL=1`: build the row through
             // the full block path a propose uses (`decode_one_for_drafter`) instead of the

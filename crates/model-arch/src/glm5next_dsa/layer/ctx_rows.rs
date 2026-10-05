@@ -74,7 +74,7 @@ impl Glm5NextDsaLayer {
             self.cfg.index_head_dim,
         );
         // 2026-10-04: these reads bypass `proj_gemm::gemm`, so `dense_fp8::route` never sees
-        // them; the MTP layer is not registered, and this keeps it a checked fact.
+        // them; `register_mtp` leaves these three BF16 on purpose, and this keeps it a checked fact.
         {
             use crate::glm5next_layer::dense_fp8::ensure_bf16;
             ensure_bf16(self.weights.kv_a_proj, kvr, h, "write_kv_rows kv_a_proj")?;

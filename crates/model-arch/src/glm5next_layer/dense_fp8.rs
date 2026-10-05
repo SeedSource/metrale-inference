@@ -14,8 +14,8 @@
 //!   the row-invariant tensor-core GEMV, over the FP8 copy when the weight is registered
 //!   here and over the BF16 weight otherwise, and returns `Route::Done`; a shape the TC
 //!   entry declines (k not a multiple of 64 / 128) falls through to the rules below.
-//! - On, the loader ([`register_layer`]) quantizes, per text layer (0..num_hidden_layers;
-//!   the MTP block is loaded elsewhere and never registered), the BF16 weights listed in
+//! - On, the loader ([`register_layer`]) quantizes, per text layer (0..num_hidden_layers), the
+//!   BF16 weights listed in
 //!   [`register_layer`] to `[N, K]` E4M3 + one FP32 scale per output row
 //!   (`quantize_bf16_to_fp8`, max|row| / 448), FREES the BF16 original, and rewrites the
 //!   layer's weight field to the FP8 copy's device pointer, which is the registry key. A
@@ -25,6 +25,15 @@
 //!   The one direct BF16 reader, the MTP drafter's `write_kv_rows` (`batchm_rows` on
 //!   `kv_a_proj`, `wk`, `compress_gate`), reads only unregistered weights and checks that with
 //!   [`ensure_bf16`] (2026-10-04).
+//! - 2026-10-05: The MTP block is registered too ([`register_mtp`], called by
+//!   `load_glm5next_mtp_module`): its DSA `q_a_proj`, `q_absorb`, `o_absorb`, its shared-expert
+//!   `gate_proj`, `up_proj`, `down_proj` and the head's `eh_proj` (`[hidden, 2 * hidden]`, read
+//!   only through [`route`] by `glm5next_mtp_head`). Its `kv_a_proj` stays BF16 (`write_kv_rows`
+//!   reads it directly). The MTP weights get their own span from arena offset 0 (the drafter
+//!   runs between, never inside, a text layer's forward on the one stream), and
+//!   [`register_mtp`] re-runs [`finish_load`], which grows the arena if that span is larger than
+//!   every text layer's. `eh_proj` is store-owned: its BF16 original is freed by
+//!   `Glm5NextWeightLoader::prune_after_load` ([`take_deferred_free`]), not here.
 //!   Keys are live allocations that are never freed, so a later allocation can never alias
 //!   one; a pointer strictly inside a registered FP8 allocation, or a registered key passed
 //!   with another `[n, k]`, is an error, never a silent BF16 read of FP8 bytes.
@@ -51,7 +60,7 @@
 //!   (`wk`, `compress_gate`, `weights_proj`, `wq_b`: top-k token selection), the KDA
 //!   recurrence gates `f_a`, `f_b` (forget-gate decay) and `b_proj` (beta), `embed_tokens`,
 //!   `lm_head` (its FP8 option is `--lm-head-dtype fp8`), the mHC `hc_fn` (not a GEMV), the
-//!   MTP block and any DFlash drafter. Together they are < 0.4 GB/rank of decode reads.
+//!   MTP block's `kv_a_proj`, indexer, router and head, and any DFlash drafter. Together they are < 0.4 GB/rank of decode reads.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -121,6 +130,8 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache {
     poisoned: false,
     last_stream: None,
 });
+/// 2026-10-05: BF16 originals [`register`] quantized but left to their owner to free.
+static DEFERRED_FREE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static HITS: AtomicU64 = AtomicU64::new(0);
 static DEQUANTS: AtomicU64 = AtomicU64::new(0);
 static FIRST_HIT: AtomicBool = AtomicBool::new(false);
@@ -165,6 +176,7 @@ fn register(
     n: usize,
     k: usize,
     off: usize,
+    free_original: bool,
 ) -> Result<Option<Fp8DenseWeight>> {
     if !dense_fp8() || n == 0 || k == 0 || !k.is_multiple_of(16) || bf16.is_null() {
         return Ok(None);
@@ -185,7 +197,12 @@ fn register(
         s,
     )?;
     // `quantize_to_fp8` synchronized `s`; nothing reads the original after this.
-    gpu.free(bf16)?;
+    if free_original {
+        gpu.free(bf16)?;
+    } else {
+        // 2026-10-05: store-owned original (MTP `eh_proj`): the store's `prune_after_load` frees it.
+        DEFERRED_FREE.lock().unwrap().push(bf16.0);
+    }
     map()
         .write()
         .unwrap()
@@ -503,8 +520,21 @@ pub fn convert_weight(
     k: usize,
     acc: &mut LayerFp8,
 ) -> Result<bool> {
+    convert_weight_with(gpu, field, n, k, acc, true)
+}
+
+/// 2026-10-05: [`convert_weight`], with `free_original = false` for a store-owned BF16 original
+/// that the caller must not free (see [`take_deferred_free`]).
+fn convert_weight_with(
+    gpu: &dyn GpuBackend,
+    field: &mut DevicePtr,
+    n: usize,
+    k: usize,
+    acc: &mut LayerFp8,
+    free_original: bool,
+) -> Result<bool> {
     let off = acc.arena_bytes;
-    let Some(w) = register(gpu, *field, n, k, off)? else {
+    let Some(w) = register(gpu, *field, n, k, off, free_original)? else {
         return Ok(false);
     };
     *field = w.weight;
@@ -513,6 +543,73 @@ pub fn convert_weight(
     acc.arena_bytes = (off + n * k * 2).next_multiple_of(ARENA_ALIGN);
     ARENA_NEED.fetch_max(acc.arena_bytes, Ordering::Relaxed);
     Ok(true)
+}
+
+/// 2026-10-05: Convert the MTP block's dense weights (module doc) and grow the dequant arena to
+/// cover them. Runs from `load_glm5next_mtp_module`, after every text layer is registered and
+/// before the KV pool is sized. `eh_proj` is `[hidden, 2 * hidden]` and store-owned (its BF16
+/// original is freed later by `prune_after_load`); the block's own weights are freed here.
+/// A no-op (`LayerFp8::default()`) with the lever off.
+pub fn register_mtp(
+    gpu: &dyn GpuBackend,
+    layer: &mut crate::glm5next_layer::Glm5NextLayer,
+    eh_proj: &mut DenseWeight,
+) -> Result<LayerFp8> {
+    use crate::glm5next_layer::{Glm5NextMixer, Glm5NextMlpSite};
+    if !dense_fp8() {
+        return Ok(LayerFp8::default());
+    }
+    let hid = layer.mlp_cfg.hidden;
+    let mut out = LayerFp8::default();
+    convert_weight_with(gpu, &mut eh_proj.weight, hid, 2 * hid, &mut out, false)?;
+    let mut list: Vec<(&mut DevicePtr, usize, usize)> = Vec::new();
+    match &mut layer.mixer {
+        Glm5NextMixer::Dsa(l) => {
+            let l = &mut **l;
+            let (c, w) = (&l.cfg, &mut l.weights);
+            let heads_lat = c.local_heads * c.kv_lora_rank;
+            list.push((&mut w.q_a_proj, c.q_lora_rank, c.hidden));
+            list.push((&mut w.q_absorb, heads_lat, c.q_lora_rank));
+            // `kv_a_proj` stays BF16: `write_kv_rows` reads it directly.
+            list.push((&mut w.o_absorb, c.hidden, heads_lat));
+        }
+        Glm5NextMixer::Kda { .. } => {
+            bail!("METRALE_GLM_DENSE_FP8: the MTP block is not a DSA layer")
+        }
+    }
+    let mlp_cfg = &layer.mlp_cfg;
+    let (w, inter) = match &mut layer.mlp {
+        Glm5NextMlpSite::Dense(w) => (w, mlp_cfg.local_dense_intermediate),
+        Glm5NextMlpSite::Moe(w) => (&mut w.shared, mlp_cfg.local_shared_intermediate),
+    };
+    list.push((&mut w.gate_proj, inter, mlp_cfg.hidden));
+    list.push((&mut w.up_proj, inter, mlp_cfg.hidden));
+    list.push((&mut w.down_proj, mlp_cfg.hidden, inter));
+    for (field, n, k) in list {
+        convert_weight(gpu, field, n, k, &mut out)?;
+    }
+    let arena = finish_load(gpu)?;
+    tracing::info!(
+        "METRALE_GLM_DENSE_FP8: MTP block: {:.1} MB of BF16 dense weights replaced by {:.1} MB of          FP8 copies (eh_proj's {:.1} MB BF16 is freed by prune_after_load); dequant arena {:.1} MB",
+        out.bf16_freed as f64 / 1e6,
+        out.fp8_bytes as f64 / 1e6,
+        (2 * hid * hid * 2) as f64 / 1e6,
+        arena as f64 / 1e6,
+    );
+    Ok(out)
+}
+
+/// 2026-10-05: True, once, when `original` is a BF16 pointer [`register_mtp`] quantized and left
+/// to its owner to free; the caller then frees it.
+pub fn take_deferred_free(original: DevicePtr) -> bool {
+    let mut v = DEFERRED_FREE.lock().unwrap();
+    match v.iter().position(|&p| p == original.0) {
+        Some(i) => {
+            v.swap_remove(i);
+            true
+        }
+        None => false,
+    }
 }
 
 /// 2026-10-03: After every text layer is registered: allocate the dequant arena (the

@@ -59,3 +59,37 @@ fn the_cap_tracks_the_indexer_reservation_not_a_constant() {
         "whole pools only"
     );
 }
+
+/// 2026-10-05: `METRALE_GLM_DENSE_FP8=1` converts `eh_proj` (`dense_fp8::register_mtp`), so no
+/// head code may read `module.eh_proj` through a direct GEMV or GEMM: every read goes through
+/// `dense_fp8::route`, and the registered pointer never reaches a BF16 kernel.
+#[test]
+fn eh_proj_is_read_only_through_route() {
+    let files = [
+        ("glm5next_mtp_head.rs", include_str!("glm5next_mtp_head.rs")),
+        (
+            "glm5next_mtp_head/batch.rs",
+            include_str!("glm5next_mtp_head/batch.rs"),
+        ),
+        (
+            "glm5next_mtp_head/proposer.rs",
+            include_str!("glm5next_mtp_head/proposer.rs"),
+        ),
+    ];
+    let mut routed = 0;
+    for (name, src) in files {
+        for (i, line) in src.lines().enumerate() {
+            if line.contains("module.eh_proj") {
+                // The only allowed mentions: the pointer handed to `route` (the `let` in
+                // `eh_proj_one` / `eh_proj_wide`, or batch.rs' `route` argument).
+                assert!(
+                    line.contains("let (h, w) =") || line.trim() == "self.module.eh_proj.weight,",
+                    "{name}:{}: direct eh_proj read: {line}",
+                    i + 1
+                );
+                routed += 1;
+            }
+        }
+    }
+    assert_eq!(routed, 3, "eh_proj_one, eh_proj_wide and the batched route");
+}

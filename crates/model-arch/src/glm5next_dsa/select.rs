@@ -356,8 +356,33 @@ impl DsaSelectScratch {
         cfg: &Glm5NextDsaConfig,
         geom: &DsaSelectGeometry,
     ) -> Result<Self> {
-        let capacity = geom.scratch_bytes();
-        let tokens_bytes = geom.q_rows * cfg.out_width() * 4;
+        Self::alloc_sized(gpu, Self::plan_bytes(cfg, std::slice::from_ref(geom)))
+    }
+
+    /// 2026-10-05: Region bytes (field order) and `tokens` bytes that cover every pass in
+    /// `geoms`: the per-region maximum. For one geometry, exactly what [`Self::alloc`] has
+    /// always reserved. `METRALE_GLM_DSA_SELECT_SCRATCH_SHARED` (`shared.rs`) sizes the one
+    /// scratch every DSA workspace shares with it.
+    pub fn plan_bytes(cfg: &Glm5NextDsaConfig, geoms: &[DsaSelectGeometry]) -> ([usize; 6], usize) {
+        let mut capacity = [0usize; 6];
+        let mut tokens_bytes = 0;
+        for g in geoms {
+            for (c, w) in capacity.iter_mut().zip(g.scratch_bytes()) {
+                *c = (*c).max(w);
+            }
+            tokens_bytes = tokens_bytes.max(g.q_rows * cfg.out_width() * 4);
+        }
+        (capacity, tokens_bytes)
+    }
+
+    /// 2026-10-05: Total bytes of a scratch planned by [`Self::plan_bytes`].
+    pub fn planned_total(plan: &([usize; 6], usize)) -> usize {
+        plan.0.iter().sum::<usize>() + plan.1
+    }
+
+    /// 2026-10-05: Allocate `plan` (from [`Self::plan_bytes`]), in field order.
+    pub fn alloc_sized(gpu: &dyn GpuBackend, plan: ([usize; 6], usize)) -> Result<Self> {
+        let (capacity, tokens_bytes) = plan;
         Ok(Self {
             pool_keys: gpu.alloc(capacity[0])?,
             pool_indices: gpu.alloc(capacity[1])?,
@@ -369,6 +394,11 @@ impl DsaSelectScratch {
             capacity,
             tokens_bytes,
         })
+    }
+
+    /// 2026-10-05: Bytes this scratch reserved, all regions and `tokens`.
+    pub fn bytes(&self) -> usize {
+        Self::planned_total(&(self.capacity, self.tokens_bytes))
     }
 
     /// 2026-09-25: `[q_rows, out_width]` i32 selection produced by the last pass.
@@ -433,6 +463,7 @@ impl DsaSelectScratch {
 
 mod launch;
 pub use launch::select_tokens;
+pub mod shared;
 pub mod split;
 
 #[cfg(test)]

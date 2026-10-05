@@ -80,7 +80,17 @@ pub fn load_glm5next_mtp_module(
         select_kernels: dsa_kernels,
         decode_kernel: crate::glm5next_dsa::attend::Glm5NextDsaDecodeKernel::resolve(gpu)?,
         // 2026-09-25: Single-row workspace: the drafter runs this layer one row at a time.
-        workspace: Glm5NextDsaWorkspace::new(gpu, &dsa_cfg, 1)?,
+        // 2026-10-05: Its select scratch is the text layers' shared one under
+        // `METRALE_GLM_DSA_SELECT_SCRATCH_SHARED=1` (`select::shared::for_mtp`), else its own.
+        workspace: {
+            use crate::glm5next_dsa::select::shared::{MTP_ROWS, for_mtp};
+            Glm5NextDsaWorkspace::new_with_select(
+                gpu,
+                &dsa_cfg,
+                MTP_ROWS,
+                for_mtp(&dsa_cfg, MTP_ROWS),
+            )?
+        },
         layer_idx: idx,
         // 2026-09-25: Sole consumer of its own one-layer KV pool.
         attn_layer_idx: 0,

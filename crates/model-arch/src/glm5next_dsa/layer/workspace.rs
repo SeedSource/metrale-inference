@@ -106,6 +106,20 @@ impl Glm5NextDsaWorkspace {
     /// selection scratch, which is planned at [`super::super::state::max_dsa_context`] tokens and
     /// `max_rows` query rows. The staging rows and `bt` do not depend on it.
     pub fn new(gpu: &dyn GpuBackend, cfg: &Glm5NextDsaConfig, max_rows: usize) -> Result<Self> {
+        Self::new_with_select(gpu, cfg, max_rows, None)
+    }
+
+    /// 2026-10-05: [`Self::new`], but with `select` (the scratch
+    /// `METRALE_GLM_DSA_SELECT_SCRATCH_SHARED` shares across every DSA workspace,
+    /// `select::shared`) in place of a scratch of its own; errors when it does not fit this
+    /// workspace's largest pass. `None` is exactly `new`: the same allocations in the same
+    /// order.
+    pub fn new_with_select(
+        gpu: &dyn GpuBackend,
+        cfg: &Glm5NextDsaConfig,
+        max_rows: usize,
+        select: Option<DsaSelectScratch>,
+    ) -> Result<Self> {
         let rows = max_rows.max(1);
         let geom = super::super::select::DsaSelectGeometry::plan(
             cfg,
@@ -176,7 +190,13 @@ impl Glm5NextDsaWorkspace {
             stage_k: gpu.alloc(cfg.index_head_dim * 2)?,
             stage_gate: gpu.alloc(cfg.index_head_dim * 2)?,
             geom_dev: gpu.alloc(5 * 4)?,
-            select: DsaSelectScratch::alloc(gpu, cfg, &geom)?,
+            select: match select {
+                Some(s) => {
+                    s.fits(cfg, &geom)?;
+                    s
+                }
+                None => DsaSelectScratch::alloc(gpu, cfg, &geom)?,
+            },
             row_batch: if row_batch {
                 Some(super::row_batch::DsaRowBatch::new(gpu, rows, bt_cap)?)
             } else {

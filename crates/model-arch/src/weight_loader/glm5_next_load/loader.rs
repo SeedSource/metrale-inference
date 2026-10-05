@@ -458,6 +458,24 @@ impl Glm5NextWeightLoader {
         } else {
             None
         };
+        // 2026-10-05: `METRALE_GLM_DSA_SELECT_SCRATCH_SHARED=1`: one DSA select scratch (sized
+        // to the largest of the `verify_k`-row layers and the 1-row MTP head, at
+        // `max_dsa_context`) for every DSA workspace instead of one each; the layers and the MTP
+        // head run one after another on one stream and no selection outlives its layer call
+        // (`glm5next_dsa::select::shared`). Off: `None`, each workspace allocates its own.
+        let dsa_select_shared = if crate::glm5next_dsa::select::shared::dsa_select_scratch_shared()
+        {
+            let n = skeleton
+                .layers
+                .iter()
+                .filter(|l| matches!(l.mixer, Mixer::Dsa))
+                .count();
+            Some(crate::glm5next_dsa::select::shared::install(
+                gpu, &dsa_cfg, verify_k, n,
+            )?)
+        } else {
+            None
+        };
         let last = skeleton.layers.len() - 1;
         let mut out: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(skeleton.layers.len());
         // 2026-10-01: Decode L2 prefetch (`METRALE_GLM_DECODE_L2_PREFETCH`): the kernel, optional
@@ -531,9 +549,13 @@ impl Glm5NextWeightLoader {
                         decode_kernel:
                             crate::glm5next_dsa::attend::Glm5NextDsaDecodeKernel::resolve(gpu)?,
                         workspace: {
-                            let ws = crate::glm5next_dsa::layer::Glm5NextDsaWorkspace::new(
-                                gpu, &dsa_cfg, verify_k,
-                            )?;
+                            let ws =
+                                crate::glm5next_dsa::layer::Glm5NextDsaWorkspace::new_with_select(
+                                    gpu,
+                                    &dsa_cfg,
+                                    verify_k,
+                                    dsa_select_shared,
+                                )?;
                             let ws = match &dsa_wide {
                                 Some(a) => ws.with_wide(a.clone()),
                                 None => ws,

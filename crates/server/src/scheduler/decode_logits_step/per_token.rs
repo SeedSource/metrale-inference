@@ -254,12 +254,11 @@ pub(super) fn process_decoded_token(
     // `tool_request`), after `</think>`, hold EOS back until the output holds
     // `POST_THINK_MIN_CONTENT` tokens beyond the thinking ones, so the model
     // has room to open a tool call.
-    const POST_THINK_MIN_CONTENT: u32 = 16;
-    let post_think_content_tokens =
-        (a.output_tokens.len() as u32).saturating_sub(a.thinking_tokens);
-    let tools_armed = a.require_tool_call || a.tool_request;
-    let post_think_suppresses_eos =
-        tools_armed && a.think_ended && post_think_content_tokens < POST_THINK_MIN_CONTENT;
+    // 2026-10-04: A103: the held token is still `last_token`, the next input.
+    // `METRALE_TOOL_EOS_HOLD_MASK=1` masks the stop tokens before sampling
+    // instead (`logit_processors::tool_eos_hold`), so this hold is off then.
+    let post_think_suppresses_eos = !sched.levers.tool_eos_hold_mask
+        && crate::scheduler::logit_processors::tool_eos_hold::applies(a);
     let suppress_eos = grammar_suppresses_eos
         || legacy_suppresses_eos
         || min_tokens_suppresses

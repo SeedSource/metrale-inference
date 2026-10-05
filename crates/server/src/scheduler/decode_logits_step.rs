@@ -16,6 +16,8 @@ mod host_sample;
 mod per_token;
 #[cfg(test)]
 mod token0_tests;
+#[cfg(test)]
+mod tool_eos_hold_tests;
 
 thread_local! {
     /// 2026-09-25: Dequant scratch for one rayon worker on the parallel host-sampling arm.
@@ -157,6 +159,9 @@ pub(super) fn decode_row_uses_gpu_argmax(
 /// 2026-09-29: per-row eligibility is [`decode_row_uses_gpu_argmax`] (A144),
 /// term for term the earlier `all(temperature == 0) && !any_grammar &&
 /// !needs_host_logits` conjunction.
+///
+/// 2026-10-04: A103: with `METRALE_TOOL_EOS_HOLD_MASK` on, a row under the
+/// tool-turn EOS hold needs the host, where its stop tokens are masked.
 pub(super) fn argmax_readback_eligible<'a>(
     rows: impl Iterator<Item = &'a ActiveSeq> + Clone,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
@@ -164,8 +169,12 @@ pub(super) fn argmax_readback_eligible<'a>(
     let mut active = rows;
     let model_logits_fp32 = sched.io.dev.model().decode_logits_fp32();
     let admit_think_ended = sched.levers.think_ended_gpu_argmax;
+    let mask = sched.levers.tool_eos_hold_mask;
     !model_logits_fp32
-        && active.all(|a| decode_row_uses_gpu_argmax(a, a.output_tokens.len(), admit_think_ended))
+        && active.all(|a| {
+            decode_row_uses_gpu_argmax(a, a.output_tokens.len(), admit_think_ended)
+                && !(mask && crate::scheduler::logit_processors::tool_eos_hold::applies(a))
+        })
 }
 
 /// 2026-09-25: The readback for a decode block a lane produced beside its own forward

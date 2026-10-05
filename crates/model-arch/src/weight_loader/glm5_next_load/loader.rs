@@ -283,7 +283,10 @@ impl Glm5NextWeightLoader {
         // off it adds 0.
         let bv_rows = crate::glm5next_layer::levers::batched_verify_rows();
         let kda_rows = verify_k.max(wide_rows.unwrap_or(0)).max(bv_rows);
-        let kda_chunk_rows = if crate::glm5next_layer::kda_chunk_prefill() {
+        // 2026-10-04: METRALE_GLM_KDA_PREFILL_CHUNKED_TC borrows the same chunk buffers for its records.
+        let kda_chunk_rows = if crate::glm5next_layer::kda_chunk_prefill()
+            || crate::glm5next_kda::kda_prefill_chunked_tc()
+        {
             kda_rows
         } else {
             verify_k

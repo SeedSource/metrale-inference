@@ -336,18 +336,35 @@ impl Glm5NextMtpHead {
                     stream,
                 )?;
             }
-            ops::dense_gemv_batchm(
+            // 2026-10-05: through `dense_fp8::route` like `forward_one`'s `eh_proj_one`, so each row
+            // equals the one-row launch (FP8 copy: `dense_gemv_fp8w_batchm` vs `dense_gemv_fp8w`;
+            // tensor-core GEMV: row-invariant); the BF16 fallback is the batched GEMV as before.
+            // `n <= MTP_BATCH_DRAFT_MAX = 16`, so `route` never needs the dequant arena here.
+            match crate::glm5next_layer::dense_fp8::route(
                 gpu,
-                sc.gemv_batchm,
+                self.gemv_k,
                 sc.concat,
-                &self.module.eh_proj,
+                self.module.eh_proj.weight,
                 sc.x,
-                n as u32,
-                h as u32,
-                (2 * h) as u32,
-                h as u32,
+                n,
+                h,
+                2 * h,
                 stream,
-            )?;
+            )? {
+                crate::glm5next_layer::dense_fp8::Route::Done => {}
+                crate::glm5next_layer::dense_fp8::Route::Weight(p) => ops::dense_gemv_batchm(
+                    gpu,
+                    sc.gemv_batchm,
+                    sc.concat,
+                    &DenseWeight { weight: p },
+                    sc.x,
+                    n as u32,
+                    h as u32,
+                    (2 * h) as u32,
+                    h as u32,
+                    stream,
+                )?,
+            }
             {
                 let mut dsa_refs: Vec<&mut dyn LayerState> = Vec::with_capacity(n);
                 let mut kv_refs: Vec<&mut PagedKvCache> = Vec::with_capacity(n);

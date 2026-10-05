@@ -9,6 +9,9 @@
 //!   of [`crate::glm5next_layer::Glm5NextLayer`].
 //! - Its DSA layer uses `attn_layer_idx = 0` of the drafter's own one-layer KV pool
 //!   (`glm5next_mtp_head`), never the target's.
+//! - 2026-10-05: With `METRALE_GLM_DENSE_FP8=1` the block's `q_a_proj`, `q_absorb`, `o_absorb`,
+//!   shared-expert projections and `eh_proj` hold FP8 copies (`dense_fp8::register_mtp`); every
+//!   read of them goes through `dense_fp8::route`. `kv_a_proj` stays BF16.
 //! - `Glm5NextWeightLoader::prune_after_load` keeps this layer's tensors: `is_reuploaded`
 //!   matches only layer indices below `num_hidden_layers`.
 
@@ -97,47 +100,53 @@ pub fn load_glm5next_mtp_module(
 
     let up =
         |n: &str| -> Result<DevicePtr> { super::glm5_next_load::upload_bf16(gpu, &src.f32(n)?) };
+    let mut layer = Glm5NextLayer {
+        layer_idx: idx,
+        mixer,
+        mlp,
+        mlp_cfg,
+        mlp_kernels,
+        // 2026-09-25: Its own one-row workspace, not the text stack's shared one, which
+        // is sized for a prefill sub-chunk. 2026-10-04: `MTP_BATCH_DRAFT_MAX` rows under
+        // `METRALE_GLM_MTP_BATCH_DRAFT=1`, which runs one row per sequence through it.
+        mlp_ws: std::sync::Arc::new(crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new(
+            gpu,
+            &mlp_cfg,
+            if crate::glm5next_mtp_head::mtp_batch_draft() {
+                crate::glm5next_mtp_head::MTP_BATCH_DRAFT_MAX
+            } else {
+                1
+            },
+        )?),
+        // 2026-09-25: No hyper-connection: nothing here binds `hc_*` tensors, and
+        // `mhc: None` selects the plain residual path.
+        mhc: None,
+        input_norm: up("input_layernorm.weight")?,
+        post_attn_norm: up("post_attention_layernorm.weight")?,
+        rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
+        add_k: metrale_model_layers::layers::try_kernel(gpu, "bf16_add", "bf16_add_inplace"),
+        rms_eps: config.rms_norm_eps as f32,
+        hidden: config.hidden_size,
+        // 2026-09-25: Row-parallel `o_proj`, as in the DSA text layers.
+        mixer_all_reduce: dsa_plan.needs_output_all_reduce(),
+        // 2026-09-25: No mHC highway to expand or collapse.
+        is_first: false,
+        is_last: false,
+        // 2026-10-01: No decode L2 prefetch plan: the MTP block runs the plain path.
+        prefetch: Default::default(),
+        // 2026-10-01: The MTP block is never a DFlash tap.
+        dflash_tap: false,
+    };
+    let mut eh_proj = DenseWeight {
+        weight: store.get(&format!("{prefix}eh_proj.weight"))?.ptr,
+    };
+    // 2026-10-05: `METRALE_GLM_DENSE_FP8=1`: FP8 copies of the block's dense GEMV weights and
+    // `eh_proj`, read through `dense_fp8::route`; a no-op with the lever off.
+    crate::glm5next_layer::dense_fp8::register_mtp(gpu, &mut layer, &mut eh_proj)
+        .context("glm5_next MTP: METRALE_GLM_DENSE_FP8")?;
     Ok(Some(Glm5NextMtpModule {
-        layer: Glm5NextLayer {
-            layer_idx: idx,
-            mixer,
-            mlp,
-            mlp_cfg,
-            mlp_kernels,
-            // 2026-09-25: Its own one-row workspace, not the text stack's shared one, which
-            // is sized for a prefill sub-chunk. 2026-10-04: `MTP_BATCH_DRAFT_MAX` rows under
-            // `METRALE_GLM_MTP_BATCH_DRAFT=1`, which runs one row per sequence through it.
-            mlp_ws: std::sync::Arc::new(crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new(
-                gpu,
-                &mlp_cfg,
-                if crate::glm5next_mtp_head::mtp_batch_draft() {
-                    crate::glm5next_mtp_head::MTP_BATCH_DRAFT_MAX
-                } else {
-                    1
-                },
-            )?),
-            // 2026-09-25: No hyper-connection: nothing here binds `hc_*` tensors, and
-            // `mhc: None` selects the plain residual path.
-            mhc: None,
-            input_norm: up("input_layernorm.weight")?,
-            post_attn_norm: up("post_attention_layernorm.weight")?,
-            rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
-            add_k: metrale_model_layers::layers::try_kernel(gpu, "bf16_add", "bf16_add_inplace"),
-            rms_eps: config.rms_norm_eps as f32,
-            hidden: config.hidden_size,
-            // 2026-09-25: Row-parallel `o_proj`, as in the DSA text layers.
-            mixer_all_reduce: dsa_plan.needs_output_all_reduce(),
-            // 2026-09-25: No mHC highway to expand or collapse.
-            is_first: false,
-            is_last: false,
-            // 2026-10-01: No decode L2 prefetch plan: the MTP block runs the plain path.
-            prefetch: Default::default(),
-            // 2026-10-01: The MTP block is never a DFlash tap.
-            dflash_tap: false,
-        },
-        eh_proj: DenseWeight {
-            weight: store.get(&format!("{prefix}eh_proj.weight"))?.ptr,
-        },
+        layer,
+        eh_proj,
         enorm: up("enorm.weight")?,
         hnorm: up("hnorm.weight")?,
         final_norm: up("shared_head.norm.weight")?,

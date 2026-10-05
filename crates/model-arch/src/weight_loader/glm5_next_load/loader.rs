@@ -311,12 +311,46 @@ impl Glm5NextWeightLoader {
                 (b(kda_rows, kda_chunk_rows) - b(verify_k, verify_k)) / 1e6,
             );
         }
-        let mut kda_ws_inner = crate::glm5next_kda::Glm5NextKdaWorkspace::new_split(
-            gpu,
-            &kda_cfg,
-            kda_rows,
-            kda_chunk_rows,
-        )?;
+        // 2026-09-29: The staged prefill (`METRALE_GLM_PREFILL_STAGED=1`) runs the MLP over
+        // windows of `prefill_rows_ffn()` rows, so the MLP scratch holds that many; `u_slot`
+        // stays at `verify_k` rows (`mlp_ws_bytes_sized`). Staged off, `mlp_rows == verify_k`
+        // and the allocation is the unstaged one.
+        let mlp_rows = verify_k.max(crate::glm5next_layer::prefill_rows_ffn()).max(bv_rows);
+        // 2026-10-05: `METRALE_GLM_PREFILL_SCRATCH_UNION=1`: the KDA workspace, the shared MLP
+        // workspace and the DSA wide arena start at one base in ONE allocation sized to the
+        // largest. Invariant: all three are pure per-call scratch on one stream (nothing carried
+        // across sublayers/windows/layers/requests); decode/verify graphs bake KDA/MLP pointers,
+        // so the union is allocated here, at load, and never moved, freed or resized. Out of the
+        // union: FlashKDA scratch, CUTLASS workspace/SFB cache, W8A8 scratch, DSA xseq arena,
+        // per-layer DSA workspaces, the MTP head's workspaces (`glm5next_layer::scratch_union`).
+        // Off: `None`, and every member below is built by its plain constructor as before.
+        let scratch = if crate::glm5next_layer::scratch_union::scratch_union() {
+            crate::glm5next_layer::scratch_union::plan_glm(
+                gpu,
+                (&kda_cfg, kda_rows, kda_chunk_rows),
+                crate::glm5next_mlp::forward::mlp_ws_shared()
+                    .then_some((&mlp_cfg, mlp_rows, verify_k)),
+                wide_rows.map(|r| (&dsa_cfg, r)),
+            )?
+        } else {
+            None
+        };
+        let mut kda_ws_inner = match &scratch {
+            Some(u) => u.place(crate::glm5next_layer::scratch_union::KDA, |a| {
+                crate::glm5next_kda::Glm5NextKdaWorkspace::new_split_in(
+                    &kda_cfg,
+                    kda_rows,
+                    kda_chunk_rows,
+                    a,
+                )
+            })?,
+            None => crate::glm5next_kda::Glm5NextKdaWorkspace::new_split(
+                gpu,
+                &kda_cfg,
+                kda_rows,
+                kda_chunk_rows,
+            )?,
+        };
         // 2026-10-03: `METRALE_GLM_KDA_PREFILL_FLASHKDA=1` adds the FlashKDA scratch (library
         // workspace for min(kda_rows, 4096) rows plus one transposed recurrent state; 9.2 MB at
         // 256 rows, 115 MB at 4096 rows for GLM-5.3 TP2), here at load before the KV pool is
@@ -347,11 +381,7 @@ impl Glm5NextWeightLoader {
         // 2026-09-25: Unless `METRALE_GLM_MLP_WS_SHARED=0`, one MLP workspace serves
         // every layer; otherwise each layer allocates its own. Either way it is
         // allocated here, at load, before the KV pool is sized.
-        // 2026-09-29: The staged prefill (`METRALE_GLM_PREFILL_STAGED=1`) runs the MLP over
-        // windows of `prefill_rows_ffn()` rows, so the MLP scratch holds that many; `u_slot`
-        // stays at `verify_k` rows (`mlp_ws_bytes_sized`). Staged off, `mlp_rows == verify_k`
-        // and the allocation is the unstaged one.
-        let mlp_rows = verify_k.max(crate::glm5next_layer::prefill_rows_ffn()).max(bv_rows);
+        // 2026-09-29: `mlp_rows` (computed above the KDA workspace) is the staged-prefill width.
         let mlp_ws_bytes =
             crate::glm5next_mlp::forward::mlp_ws_total_bytes_sized(&mlp_cfg, mlp_rows, verify_k);
         let shared_mlp_ws = if crate::glm5next_mlp::forward::mlp_ws_shared() {
@@ -362,11 +392,16 @@ impl Glm5NextWeightLoader {
                 skeleton.layers.len(),
                 (mlp_ws_bytes * skeleton.layers.len()) as f64 / 1e6,
             );
-            Some(std::sync::Arc::new(
-                crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new_sized(
+            Some(std::sync::Arc::new(match &scratch {
+                Some(u) => u.place(crate::glm5next_layer::scratch_union::MLP, |a| {
+                    crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new_sized_in(
+                        &mlp_cfg, mlp_rows, verify_k, a,
+                    )
+                })?,
+                None => crate::glm5next_mlp::forward::Glm5NextMlpWorkspace::new_sized(
                     gpu, &mlp_cfg, mlp_rows, verify_k,
                 )?,
-            ))
+            }))
         } else {
             tracing::warn!(
                 "GLM MLP workspace: PER-LAYER, {} x {:.1} MB at {mlp_rows} rows",
@@ -393,9 +428,12 @@ impl Glm5NextWeightLoader {
                      {r} rows, shared by the DSA layers",
                     (per_row * r) as f64 / 1e6
                 );
-                Some(std::sync::Arc::new(
-                    crate::glm5next_dsa::layer::DsaWideArena::new(gpu, &dsa_cfg, r)?,
-                ))
+                Some(std::sync::Arc::new(match &scratch {
+                    Some(u) => u.place(crate::glm5next_layer::scratch_union::DSA_WIDE, |a| {
+                        crate::glm5next_dsa::layer::DsaWideArena::new_in(&dsa_cfg, r, a)
+                    })?,
+                    None => crate::glm5next_dsa::layer::DsaWideArena::new(gpu, &dsa_cfg, r)?,
+                }))
             }
             None => None,
         };

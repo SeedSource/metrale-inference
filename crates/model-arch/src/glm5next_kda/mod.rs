@@ -52,6 +52,8 @@ use metrale_gpu_runtime::kernel_args::{KernelLaunch, div_ceil};
 use metrale_model_layers::layers::ops;
 use metrale_model_layers::weight_map::DenseWeight;
 
+use crate::glm5next_layer::scratch_union::ScratchAlloc;
+
 /// 2026-09-25: Largest shared memory a prefill chunk may need. [`Glm5NextKdaConfig::validate`]
 /// refuses a `chunk` whose `smem_prepare` or `smem_scan` exceeds it.
 pub const SMEM_CEILING: usize = 49_152;
@@ -345,6 +347,18 @@ impl Glm5NextKdaWorkspace {
         max_tokens: usize,
         chunk_tokens: usize,
     ) -> Result<Self> {
+        Self::new_split_in(cfg, max_tokens, chunk_tokens, &mut |b| gpu.alloc(b))
+    }
+
+    /// 2026-10-05: [`Self::new_split`] taking each buffer from `alloc`, in the same order and
+    /// sizes (`METRALE_GLM_PREFILL_SCRATCH_UNION` places them in a shared scratch union). It
+    /// only allocates: no memset, no upload.
+    pub fn new_split_in(
+        cfg: &Glm5NextKdaConfig,
+        max_tokens: usize,
+        chunk_tokens: usize,
+        alloc: &mut ScratchAlloc,
+    ) -> Result<Self> {
         cfg.validate()?;
         if max_tokens == 0 {
             bail!("workspace needs max_tokens >= 1");
@@ -357,24 +371,24 @@ impl Glm5NextKdaWorkspace {
         // 2026-10-01: Equal to `n` unless `chunk_tokens < max_tokens`.
         let n_chunk = chunk_tokens.div_ceil(cfg.chunk) * cfg.chunk * qkv;
         Ok(Self {
-            qkv_parts: gpu.alloc(3 * t * qkv * 2)?,
-            qkv_proj: gpu.alloc(t * cd * 2)?,
-            conv_out: gpu.alloc(t * cd * 2)?,
-            q_f32: gpu.alloc(n_chunk * 4)?,
-            k_f32: gpu.alloc(n_chunk * 4)?,
-            v_f32: gpu.alloc(n_chunk * 4)?,
-            gate: gpu.alloc(n * 4)?,
-            beta: gpu.alloc(t_pad * h * 4)?,
-            core: gpu.alloc(n * 4)?,
-            g_raw: gpu.alloc(t * qkv * 2)?,
-            out_gate: gpu.alloc(t * qkv * 2)?,
-            o_norm_out: gpu.alloc(t * qkv * 2)?,
-            final_out: gpu.alloc(t * cfg.hidden * 2)?,
-            lowrank: gpu.alloc(t * hd * 2)?,
-            beta_bf16: gpu.alloc(t * h * 2)?,
-            chunk_gc: gpu.alloc(n_chunk * 4)?,
-            chunk_u: gpu.alloc(n_chunk * 4)?,
-            chunk_w: gpu.alloc(n_chunk * 4)?,
+            qkv_parts: alloc(3 * t * qkv * 2)?,
+            qkv_proj: alloc(t * cd * 2)?,
+            conv_out: alloc(t * cd * 2)?,
+            q_f32: alloc(n_chunk * 4)?,
+            k_f32: alloc(n_chunk * 4)?,
+            v_f32: alloc(n_chunk * 4)?,
+            gate: alloc(n * 4)?,
+            beta: alloc(t_pad * h * 4)?,
+            core: alloc(n * 4)?,
+            g_raw: alloc(t * qkv * 2)?,
+            out_gate: alloc(t * qkv * 2)?,
+            o_norm_out: alloc(t * qkv * 2)?,
+            final_out: alloc(t * cfg.hidden * 2)?,
+            lowrank: alloc(t * hd * 2)?,
+            beta_bf16: alloc(t * h * 2)?,
+            chunk_gc: alloc(n_chunk * 4)?,
+            chunk_u: alloc(n_chunk * 4)?,
+            chunk_w: alloc(n_chunk * 4)?,
             max_tokens: t,
             t_pad,
             chunk_tokens,

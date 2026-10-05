@@ -48,6 +48,7 @@ use super::super::select::{DsaSelectInputs, DsaSelectLaunch::Exact, select_token
 use super::super::state::Glm5NextDsaState;
 use super::decode_k::bt_entries_needed;
 use super::{Glm5NextDsaLayer, gemm};
+use crate::glm5next_layer::scratch_union::ScratchAlloc;
 
 /// 2026-10-01: Window-wide DSA activations for `decode_k_wide`, `max_rows` rows each. The
 /// loader allocates one at `prefill_rows_ffn()` rows when `METRALE_GLM_PREFILL_FULLWIDTH_GEMM`
@@ -95,18 +96,23 @@ impl DsaWideArena {
 
     /// 2026-10-01: Allocate an arena for windows of up to `max_rows` (at least 1) rows.
     pub fn new(gpu: &dyn GpuBackend, cfg: &Glm5NextDsaConfig, max_rows: usize) -> Result<Self> {
+        Self::new_in(cfg, max_rows, &mut |b| gpu.alloc(b))
+    }
+
+    /// 2026-10-05: [`Self::new`] taking each buffer from `a`, same order and sizes.
+    pub fn new_in(cfg: &Glm5NextDsaConfig, max_rows: usize, a: &mut ScratchAlloc) -> Result<Self> {
         let r = max_rows.max(1);
         let lat = cfg.local_heads * cfg.kv_lora_rank;
         Ok(Self {
             max_rows: r,
-            q_a: gpu.alloc(r * cfg.q_lora_rank * 2)?,
-            q_resid: gpu.alloc(r * cfg.q_lora_rank * 2)?,
-            q_abs: gpu.alloc(r * lat * 2)?,
-            kv_a: gpu.alloc(r * cfg.kv_lora_rank * 2)?,
-            q_idx: gpu.alloc(r * cfg.index_heads * cfg.index_head_dim * 4)?,
-            head_weights: gpu.alloc(r * cfg.index_heads * 4)?,
-            attn_out: gpu.alloc(r * lat * 2)?,
-            meta: gpu.alloc(r * 16)?,
+            q_a: a(r * cfg.q_lora_rank * 2)?,
+            q_resid: a(r * cfg.q_lora_rank * 2)?,
+            q_abs: a(r * lat * 2)?,
+            kv_a: a(r * cfg.kv_lora_rank * 2)?,
+            q_idx: a(r * cfg.index_heads * cfg.index_head_dim * 4)?,
+            head_weights: a(r * cfg.index_heads * 4)?,
+            attn_out: a(r * lat * 2)?,
+            meta: a(r * 16)?,
         })
     }
 

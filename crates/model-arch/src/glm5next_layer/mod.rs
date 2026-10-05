@@ -74,6 +74,7 @@ pub(crate) mod levers;
 pub mod dense_fp8;
 // 2026-10-01: Decode L2 weight prefetch plan and launcher (`METRALE_GLM_DECODE_L2_PREFETCH`).
 pub mod prefetch;
+pub mod scratch_union;
 pub mod seq_parallel;
 mod steps;
 mod types;

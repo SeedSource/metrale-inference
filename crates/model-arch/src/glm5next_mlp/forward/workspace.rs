@@ -11,6 +11,7 @@ use anyhow::Result;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::Glm5NextMlpWorkspace;
+use crate::glm5next_layer::scratch_union::ScratchAlloc;
 use crate::glm5next_mlp::Glm5NextMlpConfig;
 
 /// 2026-09-25: Byte size of each `Glm5NextMlpWorkspace` buffer, in the order `new` allocates
@@ -100,6 +101,18 @@ impl Glm5NextMlpWorkspace {
         max_rows: usize,
         union_rows: usize,
     ) -> Result<Self> {
+        Self::new_sized_in(cfg, max_rows, union_rows, &mut |b| gpu.alloc(b))
+    }
+
+    /// 2026-10-05: [`Self::new_sized`] taking each buffer from `alloc`, in the same order and
+    /// sizes (`METRALE_GLM_PREFILL_SCRATCH_UNION` places them in a shared scratch union). It
+    /// only allocates: no memset, no upload.
+    pub fn new_sized_in(
+        cfg: &Glm5NextMlpConfig,
+        max_rows: usize,
+        union_rows: usize,
+        alloc: &mut ScratchAlloc,
+    ) -> Result<Self> {
         let rows = max_rows.max(1);
         let ur = union_rows.clamp(1, rows);
         let max_inter = cfg
@@ -119,27 +132,27 @@ impl Glm5NextMlpWorkspace {
         let permute_on = crate::glm5next_mlp::forward_prefill_gemm::prefill_gemm_permute();
         let moe_perm_bytes = mlp_ws_permute_bytes(cfg, rows, permute_on);
         let moe_perm = if moe_perm_bytes > 0 {
-            gpu.alloc(moe_perm_bytes)?
+            alloc(moe_perm_bytes)?
         } else {
             DevicePtr::NULL
         };
         Ok(Self {
-            a_gate: gpu.alloc(act_elems * 2)?,
-            a_up: gpu.alloc(act_elems * 2)?,
-            a_act: gpu.alloc(act_elems * 2)?,
-            logits: gpu.alloc(rows * cfg.num_experts * 4)?,
-            ids: gpu.alloc(rows * cfg.top_k * 4)?,
-            wts: gpu.alloc(rows * cfg.top_k * 4)?,
-            expert_out: gpu.alloc(rows * cfg.top_k * cfg.hidden * 2)?,
-            shared_out: gpu.alloc(rows * cfg.hidden * 2)?,
-            u_eid: gpu.alloc(rows * cfg.top_k * 4)?,
-            u_slot: gpu.alloc(ur * cfg.top_k * ur * 4)?,
+            a_gate: alloc(act_elems * 2)?,
+            a_up: alloc(act_elems * 2)?,
+            a_act: alloc(act_elems * 2)?,
+            logits: alloc(rows * cfg.num_experts * 4)?,
+            ids: alloc(rows * cfg.top_k * 4)?,
+            wts: alloc(rows * cfg.top_k * 4)?,
+            expert_out: alloc(rows * cfg.top_k * cfg.hidden * 2)?,
+            shared_out: alloc(rows * cfg.hidden * 2)?,
+            u_eid: alloc(rows * cfg.top_k * 4)?,
+            u_slot: alloc(ur * cfg.top_k * ur * 4)?,
             // 2026-09-25: The grouped-GEMM routing tables are allocated whatever the grouped
             // levers say.
-            sorted_token_ids: gpu.alloc(rows * cfg.top_k * 4)?,
-            sorted_expert_ids: gpu.alloc(rows * cfg.top_k * 4)?,
-            expert_offsets: gpu.alloc((cfg.num_experts + 1) * 4)?,
-            token_to_perm: gpu.alloc(rows * cfg.top_k * 4)?,
+            sorted_token_ids: alloc(rows * cfg.top_k * 4)?,
+            sorted_expert_ids: alloc(rows * cfg.top_k * 4)?,
+            expert_offsets: alloc((cfg.num_experts + 1) * 4)?,
+            token_to_perm: alloc(rows * cfg.top_k * 4)?,
             moe_perm,
             max_inter,
             max_rows: rows,

@@ -53,7 +53,11 @@ impl Glm5NextKdaLayer {
             );
         }
         let kernels = self.kernels.has_chunked_tc();
-        if let Some(why) = chunked_tc_refusal(&self.cfg, k, ws.t_pad, kernels) {
+        // 2026-10-04: the borrowed q/k/v_f32 + chunk_* buffers hold `chunk_tokens` rows (padded), not
+        // `t_pad`: under METRALE_GLM_PREFILL_FULLWIDTH_GEMM the loader sized them to verify_k, so checking
+        // t_pad let an 8192-row prefill write the chunk records past their end.
+        let chunk_pad = ws.chunk_tokens.div_ceil(self.cfg.chunk) * self.cfg.chunk;
+        if let Some(why) = chunked_tc_refusal(&self.cfg, k, chunk_pad, kernels) {
             kda_chunked_tc_fallback(why);
             return self.decode_k(gpu, hidden, k, state, ws, &[], stream);
         }

@@ -83,6 +83,9 @@ fn chunked_tc_prefill_outside_its_contract_is_refused() {
     assert!(chunked_tc_refusal(&cfg, 0, 256, true).is_some());
     // 2026-10-01: More rows than the borrowed buffers were sized for.
     assert!(chunked_tc_refusal(&cfg, 300, 256, true).is_some());
+    // 2026-10-04: FULLWIDTH without CHUNK_PREFILL used to size the chunk buffers to verify_k (padded to one
+    // chunk) while the caller passed t_pad; an 8192-row prefill must be refused against those buffers.
+    assert!(chunked_tc_refusal(&cfg, 8192, cfg.chunk, true).is_some());
     let mut c = cfg;
     c.head_dim = 64;
     assert!(chunked_tc_refusal(&c, 256, 256, true).is_some());

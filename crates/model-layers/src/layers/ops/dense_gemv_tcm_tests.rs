@@ -42,6 +42,20 @@ fn shape_gate() {
     assert!(routes(4, 37, 128, true));
 }
 
+/// 2026-10-05: The FP8 LM head (`lm_head_fp8_tc`) at GLM-5.3 TP2: the whole 154880-row vocab
+/// and each rank's 77440-row slice, hidden 4096, route at every M of 1..=16 on one FP8 entry,
+/// so a 1-row decode and a 3-row verify take the same kernel.
+#[test]
+fn fp8_lm_head_shapes_route_at_every_m() {
+    for m in 1..=TCM_MAX_M {
+        for n in [154_880, 77_440] {
+            assert!(routes(m, n, 4096, true));
+            assert_eq!(variant_for(n, 4096, true), TcmVariant::Fp8);
+        }
+    }
+    assert!(!routes(TCM_MAX_M + 1, 154_880, 4096, true));
+}
+
 #[test]
 fn variant_ignores_m_and_matches_kind() {
     // The rule takes no M; this pins the kind for the GLM-5.3 shapes and the LM head.

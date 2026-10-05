@@ -35,7 +35,7 @@ use metrale_model_layers::layer::{
 };
 use metrale_model_layers::layers::ops;
 use metrale_model_layers::speculative::DraftProposer;
-use metrale_model_layers::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
+use metrale_model_layers::weight_map::{DenseWeight, Fp8DenseWeight, MtpWeights, QuantizedWeight};
 
 /// 2026-09-25: Whether the wide batched LM head arm runs. Setting
 /// `METRALE_NO_LMHEAD_BATCHED_WIDE` to any value, `0` included, turns it off
@@ -145,9 +145,11 @@ impl TransformerModel {
         {
             return Ok(logits);
         }
-        if self.lm_head_bf16_tc(hidden, num_tokens, logits, stream)? {
-            // 2026-10-04: `METRALE_GLM_GEMV_TC=1` ran the BF16 head on the row-invariant
-            // tensor-core GEMV (`lm_head_bf16_tc`).
+        if self.lm_head_bf16_tc(hidden, num_tokens, logits, stream)?
+            || self.lm_head_fp8_tc(hidden, num_tokens, logits, stream)?
+        {
+            // 2026-10-04: `METRALE_GLM_GEMV_TC=1` ran the BF16 head (`lm_head_bf16_tc`) or
+            // the FP8 head (`lm_head_fp8_tc`) on the row-invariant tensor-core GEMV.
         } else if let Some(ref fp8) = self.lm_head_fp8 {
             // 2026-09-25: FP8 E4M3 head. Two rows use the dual GEMV; any other
             // row count, or a missing dual kernel, runs one GEMV per row.
@@ -386,6 +388,73 @@ impl TransformerModel {
         Ok(true)
     }
 
+    /// 2026-10-05: `METRALE_GLM_GEMV_TC=1`: the FP8 head (`--lm-head-dtype fp8`, `[V, H]`
+    /// E4M3 plus one f32 scale per row, `Fp8DenseWeight`) for `rows` in 1..=16 on the
+    /// row-invariant tensor-core FP8 GEMV (`ops::dense_gemv_tcm::try_fp8`), laid out as
+    /// `lm_head_bf16_tc`: this rank's vocab slice (weight offset `begin * h` bytes, scale
+    /// offset `begin * 4` bytes) into zeroed logits plus the all-reduce when
+    /// `lmhead_vocab_shard` splits the vocab, else the whole vocab. A row's logits do not
+    /// depend on `rows`, so the 1-row `lm_head` and `lm_head_batched` agree. Returns `false`
+    /// having launched nothing when the lever is off, there is no FP8 head, a Q6_K head is
+    /// installed, or the shape or entry does not route.
+    fn lm_head_fp8_tc(
+        &self,
+        hidden: DevicePtr,
+        rows: u32,
+        logits: DevicePtr,
+        stream: u64,
+    ) -> Result<bool> {
+        let h = self.config.hidden_size as u32;
+        let v = self.config.vocab_size as u32;
+        let Some(ref fp8) = self.lm_head_fp8 else {
+            return Ok(false);
+        };
+        if self.lm_head_q6k.is_some()
+            || !ops::dense_gemv_tcm::ready(self.gpu.as_ref(), rows, v, h, true)
+        {
+            return Ok(false);
+        }
+        let Some((begin, len)) = self.lmhead_vocab_shard(v) else {
+            return ops::dense_gemv_tcm::try_fp8(
+                self.gpu.as_ref(),
+                hidden,
+                fp8,
+                logits,
+                rows,
+                v,
+                h,
+                v,
+                stream,
+            );
+        };
+        self.gpu
+            .memset_async(logits, 0, rows as usize * v as usize * 2, stream)?;
+        let launched = ops::dense_gemv_tcm::try_fp8(
+            self.gpu.as_ref(),
+            hidden,
+            &Fp8DenseWeight {
+                // 1 byte per FP8 element, 4 per f32 row scale.
+                weight: fp8.weight.offset(begin * h as usize),
+                row_scale: fp8.row_scale.offset(begin * 4),
+            },
+            logits.offset(begin * 2),
+            rows,
+            len as u32,
+            h,
+            // Rows of `logits` are a full vocab apart even when this rank writes a slice.
+            v,
+            stream,
+        )?;
+        anyhow::ensure!(
+            launched,
+            "lm_head_fp8_tc: the vocab slice [{begin}, +{len}) did not route"
+        );
+        if let Some(comm) = self.comm_ref() {
+            comm.all_reduce_async(logits.0, rows as usize * v as usize * 2, stream)?;
+        }
+        Ok(true)
+    }
+
     /// 2026-09-25: `(begin, len)` rows of the BF16 LM head this rank computes,
     /// or `None` for the whole-vocab projection.
     ///
@@ -424,7 +493,10 @@ impl TransformerModel {
             self.lm_head_q6k_run(hidden, 1, logits, stream)?;
             return Ok(logits);
         }
-        if let Some(ref fp8) = self.lm_head_fp8 {
+        if !fp32 && self.lm_head_fp8_tc(hidden, 1, logits, stream)? {
+            // 2026-10-05: `METRALE_GLM_GEMV_TC=1`: the same tensor-core FP8 GEMV as the
+            // batched head, so a decode row and a verify row get the same logits.
+        } else if let Some(ref fp8) = self.lm_head_fp8 {
             // 2026-09-25: FP8 E4M3 head (`--lm-head-dtype fp8`). It has no
             // FP32-output variant; with `use_fp32_logits` false, `logits` is the
             // BF16 buffer.

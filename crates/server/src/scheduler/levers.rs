@@ -164,9 +164,10 @@ pub struct SchedLevers {
     /// when `think_ended_gpu_ok` allows it; `METRALE_NO_THINKENDED_GPU_ARGMAX=1`
     /// turns it off.
     pub think_ended_gpu_argmax: bool,
-    /// 2026-10-04: A95: a token-0 `</think>` ends thinking at birth
-    /// (`first_token_policy::end_thinking_at_token0`).
-    /// `METRALE_THINK_END_AT_TOKEN0=0` keeps the old birth state.
+    /// 2026-10-04: A95: a token-0 `</think>` ends thinking at birth, and the
+    /// MTP bootstrap picks the first token after any `</think>` through the
+    /// logits pipeline. `METRALE_THINK_END_AT_TOKEN0=0` keeps the old
+    /// behaviour of both (`first_token_policy`, `bootstrap_takes_pipeline`).
     pub think_end_at_token0: bool,
     /// 2026-09-25: `METRALE_PARALLEL_SAMPLE` (default on; `0` disables).
     pub parallel_sample: bool,

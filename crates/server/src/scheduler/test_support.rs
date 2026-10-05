@@ -250,6 +250,11 @@ pub(super) struct PreemptStubModel {
     /// token-0 sample) and `prefill_chunk` records the chunk and succeeds;
     /// unset (default), both fail as before.
     pub(super) first_token: Option<u32>,
+    /// 2026-10-04: When non-empty, the logits `decode` / `decode_batch`
+    /// return, one row per sequence: `decode` succeeds, `vocab_size` is the
+    /// row length, `copy_logits_to_host` reads them as BF16 at the pointer's
+    /// offset, and the argmax calls return each row's argmax.
+    pub(super) logit_rows: Vec<Vec<f32>>,
 }
 
 impl PreemptStubModel {

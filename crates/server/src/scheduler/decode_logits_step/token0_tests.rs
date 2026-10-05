@@ -104,15 +104,12 @@ fn tool_turn_post_think_guard_treats_a_token0_close_like_a_later_one() {
                 decode(a, &sched, &model, w);
             }
             decode(a, &sched, &model, USER);
-            assert!(!a.finished, "{site:?}: short answer's EOS not held");
+            assert!(!a.finished, "{site:?}: guard expected to hold this EOS");
             for w in WORD + 100..WORD + 108 {
                 decode(a, &sched, &model, w);
             }
             decode(a, &sched, &model, USER);
-            assert!(
-                a.finished,
-                "{site:?}: EOS still held past 16 content tokens"
-            );
+            assert!(a.finished, "{site:?}: guard expected to release this EOS");
         }
     }
 }

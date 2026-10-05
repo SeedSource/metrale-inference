@@ -236,6 +236,19 @@ pub(crate) fn position_history<'h>(
     )
 }
 
+/// 2026-10-04: Whether an MTP bootstrap row picks its token through
+/// [`pick_decode_row_with_pipeline`] instead of the penalties-only sampler:
+/// inside `<think>` (A146), or, with `first_after_close`
+/// (`METRALE_THINK_END_AT_TOKEN0`, default on), on the first token after a
+/// `</think>` (`think_just_ended`). A95: a token-0 close always reaches its
+/// first answer token here, with no drafts yet. That token is the one
+/// `PinToToolCallStart` acts on, and `emit_token` clears the flag on it;
+/// `PostCloseThinkMask` and `MinTokensEosMask` act there too, as in decode
+/// and in the verify window. `=0` keeps the thinking-only rule.
+pub fn bootstrap_takes_pipeline(a: &ActiveSeq, first_after_close: bool) -> bool {
+    a.inside_thinking || (first_after_close && a.think_just_ended)
+}
+
 /// 2026-09-29: A146, spec-in-think parity: pick ONE decode row (the MTP
 /// bootstrap token) through the full host pipeline, as `process_decode_logits` does for every thinking row.
 /// The bootstrap's `sample_token_with_grammar` applies penalties and bias

@@ -11,6 +11,8 @@
 
 use super::*;
 
+#[cfg(test)]
+mod bootstrap_tests;
 mod serial_bootstrap;
 
 /// 2026-09-25: One speculative step: bootstrap the sequences without drafts,

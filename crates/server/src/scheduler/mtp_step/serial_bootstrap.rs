@@ -107,13 +107,18 @@ pub(super) fn bootstrap_seq(
     // 2026-09-29: A146, spec-in-think parity: a thinking row takes decode's
     // full host pipeline (forced `</think>`, mid-word mask, F2, pin), not the
     // penalties-only sampler below.
-    let tok = if a.inside_thinking {
+    // 2026-10-04: A95: so does the first token after a `</think>`
+    // (`bootstrap_takes_pipeline`).
+    let tok = if crate::scheduler::verify_pipeline_helper::bootstrap_takes_pipeline(
+        a,
+        sched.levers.think_end_at_token0,
+    ) {
         match crate::scheduler::verify_pipeline_helper::pick_decode_row_with_pipeline(
             model, logits, a, verify_ctx,
         ) {
             Some(t) => t,
             None => {
-                tracing::error!(target: "met::scheduler::mtp_step", "bootstrap in-think pipeline pick: D2H failed");
+                tracing::error!(target: "met::scheduler::mtp_step", "bootstrap pipeline pick: D2H failed");
                 a.finished = true;
                 return;
             }

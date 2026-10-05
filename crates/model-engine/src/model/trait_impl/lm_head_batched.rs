@@ -227,6 +227,21 @@ impl TransformerModel {
         let logits = self.buffers.logits();
         let v = self.config.vocab_size;
         if let Some(ref fp8) = self.lm_head_fp8 {
+            // 2026-10-05: `METRALE_GLM_GEMV_TC=1`: 1..=16 rows on the row-invariant
+            // tensor-core FP8 GEMV, the kernel the 1-row and verify heads also take.
+            if ops::dense_gemv_tcm::try_fp8(
+                self.gpu.as_ref(),
+                normed,
+                fp8,
+                logits,
+                padded_n as u32,
+                v as u32,
+                h as u32,
+                v as u32,
+                stream,
+            )? {
+                return Ok(logits);
+            }
             for i in 0..padded_n {
                 ops::dense_gemv_fp8w(
                     self.gpu.as_ref(),

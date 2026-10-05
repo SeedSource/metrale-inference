@@ -54,16 +54,30 @@ impl TransformerModel {
 
             let prefill_logits_ptr = logits.offset(padded_n * v * bf16);
             if let Some(ref fp8) = self.lm_head_fp8 {
-                ops::dense_gemv_fp8w(
+                // 2026-10-05: `METRALE_GLM_GEMV_TC=1`: the tensor-core FP8 GEMV for this one
+                // row too, so it matches the batched decode rows.
+                if !ops::dense_gemv_tcm::try_fp8(
                     self.gpu.as_ref(),
-                    self.dense_gemv_fp8w_kernel,
                     prefill_normed,
                     fp8,
                     prefill_logits_ptr,
+                    1,
                     v as u32,
                     h as u32,
+                    v as u32,
                     stream,
-                )?;
+                )? {
+                    ops::dense_gemv_fp8w(
+                        self.gpu.as_ref(),
+                        self.dense_gemv_fp8w_kernel,
+                        prefill_normed,
+                        fp8,
+                        prefill_logits_ptr,
+                        v as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                }
             } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
                 ops::w4a16_gemv(
                     self.gpu.as_ref(),

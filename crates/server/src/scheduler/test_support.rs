@@ -246,6 +246,15 @@ pub(super) struct PreemptStubModel {
     pub(super) reclaimable: AtomicUsize,
     /// 2026-10-03: `kv_block_size`; `None` (default) is the trait default.
     pub(super) block_size: Option<usize>,
+    /// 2026-10-04: When set, `argmax_on_device` returns it (the greedy
+    /// token-0 sample) and `prefill_chunk` records the chunk and succeeds;
+    /// unset (default), both fail as before.
+    pub(super) first_token: Option<u32>,
+    /// 2026-10-04: When non-empty, the logits `decode` / `decode_batch`
+    /// return, one row per sequence: `decode` succeeds, `vocab_size` is the
+    /// row length, `copy_logits_to_host` reads them as BF16 at the pointer's
+    /// offset, and the argmax calls return each row's argmax.
+    pub(super) logit_rows: Vec<Vec<f32>>,
 }
 
 impl PreemptStubModel {

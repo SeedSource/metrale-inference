@@ -52,6 +52,7 @@ pub mod min_tokens_eos;
 pub mod pin_tool_call;
 pub mod post_close;
 pub mod tool_during_think;
+pub(crate) mod tool_eos_hold;
 
 #[cfg(test)]
 mod pipeline_tests;
@@ -137,6 +138,10 @@ pub struct SamplingLevers {
     /// speculative paths to apply `logit_bias` exactly where decode does
     /// (A144, `sample_step::speculative_base_logit_bias`).
     pub think_ended_gpu_argmax: bool,
+    /// 2026-10-04: `METRALE_TOOL_EOS_HOLD_MASK` (off unless `1`): decode masks
+    /// the stop tokens while the post-think tool-turn EOS hold applies
+    /// (`tool_eos_hold`).
+    pub tool_eos_hold_mask: bool,
 }
 
 /// 2026-09-25: What a stage tells the driver: keep going, or emit this token and stop.
@@ -261,6 +266,12 @@ pub fn process_position_logits(
     // 2026-09-25: 2. The stages, and the AdaDec diagnostic under this position's label.
     if let Some(forced) = run_pipeline_with_path(logits, seq, ctx, kind.adadec_label()) {
         return Some(forced);
+    }
+
+    // 2026-10-04: 2b. A103: final decode position only, the tool-turn EOS
+    //    hold as a mask (`METRALE_TOOL_EOS_HOLD_MASK`, `tool_eos_hold`).
+    if kind == PositionKind::FinalDecode && ctx.sampling.tool_eos_hold_mask {
+        tool_eos_hold::mask_stops(logits, seq);
     }
 
     // 2026-09-25: 3. B1 margin observer, final decode position only. Read-only.

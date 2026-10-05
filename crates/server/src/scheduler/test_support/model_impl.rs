@@ -78,18 +78,28 @@ impl ModelForward for PreemptStubModel {
         Ok(DevicePtr::NULL)
     }
     fn decode(&self, _t: u32, _s: &mut SequenceState, _st: u64) -> Result<DevicePtr> {
-        anyhow::bail!("unused in preempt tests")
+        // 2026-10-04: only a logits stub (`logit_rows`) decodes.
+        if self.logit_rows.is_empty() {
+            anyhow::bail!("unused in preempt tests")
+        }
+        Ok(DevicePtr::NULL)
     }
     fn prefill_chunk(
         &self,
-        _t: &[u32],
-        _s: &mut SequenceState,
-        _cs: usize,
-        _cl: usize,
+        t: &[u32],
+        s: &mut SequenceState,
+        cs: usize,
+        cl: usize,
         _last: bool,
         _st: u64,
     ) -> Result<DevicePtr> {
-        anyhow::bail!("unused in preempt tests")
+        // 2026-10-04: only a first-token stub (`first_token`) prefills.
+        if self.first_token.is_none() {
+            anyhow::bail!("unused in preempt tests")
+        }
+        s.tokens.extend_from_slice(&t[cs..cs + cl]);
+        s.seq_len = s.tokens.len();
+        Ok(DevicePtr::NULL)
     }
     fn decode_batch(
         &self,
@@ -112,21 +122,52 @@ impl ModelForward for PreemptStubModel {
     }
 }
 
+/// 2026-10-04: The first index of the row's maximum.
+fn row_argmax(row: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, &v) in row.iter().enumerate() {
+        if v > row[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
 impl ModelLogits for PreemptStubModel {
     fn vocab_size(&self) -> usize {
-        0
+        self.logit_rows.first().map_or(0, Vec::len)
     }
-    fn copy_logits_to_host(&self, _p: DevicePtr, _d: &mut [u8]) -> Result<()> {
+    /// 2026-10-04: BF16 (each f32's high half) from the rows laid end to
+    /// end, starting at the pointer's element offset; a no-op without rows.
+    fn copy_logits_to_host(&self, p: DevicePtr, d: &mut [u8]) -> Result<()> {
+        let src = self.logit_rows.iter().flatten().skip(p.0 as usize / 2);
+        for (dst, v) in d.chunks_exact_mut(2).zip(src) {
+            dst.copy_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
         Ok(())
     }
     fn logits_buffer_ptr(&self) -> DevicePtr {
         DevicePtr::NULL
     }
-    fn argmax_on_device(&self, _p: DevicePtr, _st: u64) -> Result<u32> {
-        anyhow::bail!("unused in preempt tests")
+    fn argmax_on_device(&self, p: DevicePtr, _st: u64) -> Result<u32> {
+        let row = p.0 as usize / 2 / self.vocab_size().max(1);
+        match self.logit_rows.get(row) {
+            Some(r) => Ok(row_argmax(r)),
+            None => self
+                .first_token
+                .ok_or_else(|| anyhow::anyhow!("unused in preempt tests")),
+        }
     }
     fn argmax_batch(&self, _p: DevicePtr, n: usize, _st: u64) -> Result<Vec<u32>> {
-        Ok(vec![0; n])
+        if self.logit_rows.is_empty() {
+            return Ok(vec![0; n]);
+        }
+        Ok(self
+            .logit_rows
+            .iter()
+            .take(n)
+            .map(|r| row_argmax(r))
+            .collect())
     }
     fn hidden_after_norm(&self) -> DevicePtr {
         DevicePtr::NULL

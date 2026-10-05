@@ -234,7 +234,7 @@ pub(super) fn finish_first_chunk(
             finish_sequence(&sched.io, &mut a, sched.limits.max_seq_len);
             Ok(StartPrefillResult::Finished)
         } else {
-            Ok(StartPrefillResult::Active(ActiveSeq {
+            let mut a = ActiveSeq {
                 seq,
                 session_hash: req_session_hash,
                 last_token: first,
@@ -329,7 +329,11 @@ pub(super) fn finish_first_chunk(
                 logprobs_data: Vec::new(),
                 timeout_at: req_timeout_at,
                 adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
-            }))
+            };
+            // 2026-10-04: A95: a token-0 `</think>` ends thinking here, as a
+            // later one does on the decode paths.
+            end_thinking_at_token0(&mut a, first, sched.levers.think_end_at_token0);
+            Ok(StartPrefillResult::Active(a))
         }
     } else {
         Ok(StartPrefillResult::InProgress(

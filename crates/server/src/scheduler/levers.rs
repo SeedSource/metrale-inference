@@ -164,6 +164,14 @@ pub struct SchedLevers {
     /// when `think_ended_gpu_ok` allows it; `METRALE_NO_THINKENDED_GPU_ARGMAX=1`
     /// turns it off.
     pub think_ended_gpu_argmax: bool,
+    /// 2026-10-04: A95: a token-0 `</think>` ends thinking at birth, and the
+    /// MTP bootstrap picks the first token after any `</think>` through the
+    /// logits pipeline. `METRALE_THINK_END_AT_TOKEN0=0` keeps the old
+    /// behaviour of both (`first_token_policy`, `bootstrap_takes_pipeline`).
+    pub think_end_at_token0: bool,
+    /// 2026-10-04: A103: `METRALE_TOOL_EOS_HOLD_MASK=1` turns decode's
+    /// post-think tool-turn EOS hold into a pre-sample mask (`tool_eos_hold`).
+    pub tool_eos_hold_mask: bool,
     /// 2026-09-25: `METRALE_PARALLEL_SAMPLE` (default on; `0` disables).
     pub parallel_sample: bool,
     /// 2026-09-25: Batched MTP bootstrap; kill switch
@@ -384,6 +392,8 @@ impl SchedLevers {
                 metrale_config::levers::var("METRALE_GRAMMAR_BUDGET_CLOSE").as_deref(),
             ),
             think_ended_gpu_argmax: on_unless("METRALE_NO_THINKENDED_GPU_ARGMAX"),
+            think_end_at_token0: on_unless_zero("METRALE_THINK_END_AT_TOKEN0"),
+            tool_eos_hold_mask: opt_in("METRALE_TOOL_EOS_HOLD_MASK"),
             parallel_sample: on_unless_zero("METRALE_PARALLEL_SAMPLE"),
             mtp_batch_bootstrap: !present("METRALE_NO_MTP_BATCH_BOOTSTRAP"),
             mtp_boot_argmax: !present("METRALE_NO_MTP_BOOT_ARGMAX"),
@@ -453,6 +463,8 @@ impl SchedLevers {
             prefill_chunk_while_decoding: None,
             grammar_budget_close: true,
             think_ended_gpu_argmax: true,
+            think_end_at_token0: true,
+            tool_eos_hold_mask: false,
             parallel_sample: true,
             mtp_batch_bootstrap: true,
             mtp_boot_argmax: true,
@@ -499,6 +511,7 @@ impl SchedLevers {
             forced_token_fastpath: self.forced_token_fastpath,
             mtp_minp: self.mtp_minp,
             think_ended_gpu_argmax: self.think_ended_gpu_argmax,
+            tool_eos_hold_mask: self.tool_eos_hold_mask,
         }
     }
 

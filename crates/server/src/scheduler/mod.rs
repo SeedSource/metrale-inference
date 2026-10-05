@@ -80,6 +80,8 @@ mod teardown;
 mod test_support;
 mod think_commit;
 #[cfg(test)]
+mod think_end_token0_tests;
+#[cfg(test)]
 mod think_skip_tests;
 #[cfg(test)]
 mod trace_harness;

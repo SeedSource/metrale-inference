@@ -33,7 +33,8 @@
 //! Invariants: none beyond the types.
 //!
 //! Exit: 0 and a `PASS` line when everything is bit-identical and the controls fire; 1 and a
-//! line saying so otherwise; 2 when a kernel is absent from this target.
+//! line saying so otherwise; 2 when a kernel, or `dsa_indexer_grid_stride_v1` (the marker a
+//! `dsa_indexer.cu` defines iff both kernels carry the loop), is absent from this target.
 //!
 //! Run (both kernels are gb10 common kernels):
 //!   METRALE_TARGET_HW=gb10 METRALE_TARGET_MODEL=glm-5.3-flash METRALE_TARGET_QUANT=nvfp4 \
@@ -45,7 +46,7 @@ use metrale_gpu_runtime::cuda_backend::MetraleCudaBackend;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_model_arch::glm5next_dsa::DSA_MODULE;
 use metrale_model_arch::glm5next_dsa::select::grid_stride::{
-    STRIDE_BLOCKS_PER_SM, ceiling_grids, stride_blocks,
+    GRID_STRIDE_MARKER, STRIDE_BLOCKS_PER_SM, ceiling_grids, stride_blocks,
 };
 
 #[path = "common/dsa_grid_stride_rig.rs"]
@@ -333,11 +334,15 @@ fn timing(g: &dyn GpuBackend, d: &Dev, a: &Arena, live: usize) -> Result<()> {
 fn main() -> Result<()> {
     let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
-    let (Ok(compress_k), Ok(scores_k)) = (
+    let (Ok(compress_k), Ok(scores_k), Ok(_marker)) = (
         g.kernel(DSA_MODULE, "dsa_kpool_compress"),
         g.kernel(DSA_MODULE, "dsa_index_scores"),
+        g.kernel(DSA_MODULE, GRID_STRIDE_MARKER),
     ) else {
-        println!("dsa_kpool_compress / dsa_index_scores absent from this target - SKIP");
+        println!(
+            "dsa_kpool_compress / dsa_index_scores / {GRID_STRIDE_MARKER} absent from this \
+             target (its dsa_indexer.cu has no stride loop) - SKIP"
+        );
         std::process::exit(2);
     };
     let d = Dev::new(g, compress_k, scores_k)?;

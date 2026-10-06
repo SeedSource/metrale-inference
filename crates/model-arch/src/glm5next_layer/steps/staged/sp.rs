@@ -165,6 +165,19 @@ impl Glm5NextLayer {
         } else {
             subs.to_vec()
         };
+        // 2026-10-06: `METRALE_GLM_MHC_POST_MIX=1`: the attention back writes the FFN site's mix
+        // (`glm_hc_post_mix`) and the FFN front runs `hc_finish` only. Both passes cover this
+        // rank's rows of the same chunk (the owner of a row depends only on the plan), so every
+        // FFN-front row was post-mixed first; the mix scratch is indexed by chunk row, so the
+        // chunk must fit it.
+        let post_mix = crate::glm5next_mhc::mhc_post_mix()
+            && crate::glm5next_mhc::post_mix_usable(
+                &mhc.kernels,
+                &mhc.ffn,
+                self.hidden as u32,
+                mhc.hc_mult as u32,
+            )
+            && num_tokens <= crate::glm5next_mhc::mhc_mix_max_tokens();
         let attn = SpSite {
             weights: &mhc.attn,
             norm: self.input_norm,
@@ -172,6 +185,8 @@ impl Glm5NextLayer {
             last: false,
             reduce: self.mixer_all_reduce,
             attn: true,
+            post_mix: post_mix.then_some(&mhc.ffn),
+            premixed: false,
         };
         let mixer = |(t, k): (usize, usize), x: DevicePtr| {
             self.attn_mixer(
@@ -205,6 +220,8 @@ impl Glm5NextLayer {
             last: self.is_last,
             reduce: self.mlp_cfg.needs_all_reduce(),
             attn: false,
+            post_mix: None,
+            premixed: post_mix,
         };
         let mlp = |(_, k): (usize, usize), x: DevicePtr| {
             // 2026-10-04: Full width: the window's dense GEMMs in one slice, as

@@ -48,6 +48,10 @@ pub struct Glm5NextMhcKernels {
     pub hc_finish: KernelHandle,
     pub hc_post: KernelHandle,
     pub hc_head: KernelHandle,
+    /// 2026-10-06: `glm5next_hc_post_mix_bf16`: `hc_post` fused with the next site's token-major
+    /// mix (`glm_hc_post_mix`, `METRALE_GLM_MHC_POST_MIX`). Optional (`try_kernel`, 0 when
+    /// absent).
+    pub hc_post_mix_bf16: KernelHandle,
 }
 
 /// 2026-09-25: The kernel module every GLM mHC kernel resolves from.
@@ -75,6 +79,11 @@ impl Glm5NextMhcKernels {
             hc_finish: gpu.kernel(GLM5NEXT_MHC_MODULE, "glm5next_hc_finish")?,
             hc_post: gpu.kernel(GLM5NEXT_MHC_MODULE, "glm5next_hc_post")?,
             hc_head: gpu.kernel(GLM5NEXT_MHC_MODULE, "glm5next_hc_head")?,
+            hc_post_mix_bf16: metrale_model_layers::layers::try_kernel(
+                gpu,
+                GLM5NEXT_MHC_MODULE,
+                "glm5next_hc_post_mix_bf16",
+            ),
         })
     }
 }
@@ -530,6 +539,123 @@ pub fn glm_hc_post(
         .launch(stream)
 }
 
+/// 2026-10-06: `METRALE_GLM_MHC_POST_MIX` is on only for `1`.
+pub(crate) fn parse_mhc_post_mix(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// 2026-10-06: `METRALE_GLM_MHC_POST_MIX=1`: the sequence-parallel staged prefill fuses the
+/// attention sublayer's `hc_post` with the FFN sublayer's mix (`glm_hc_post_mix`), and the FFN
+/// pre then runs `hc_finish` only (`glm_hc_pre_part_premixed`). Byte-identical by construction.
+/// Off unless set to `1`; read once.
+pub fn mhc_post_mix() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let on = parse_mhc_post_mix(std::env::var("METRALE_GLM_MHC_POST_MIX").ok().as_deref());
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_MHC_POST_MIX=1 - GLM mHC: attention hc_post fused with the FFN \
+                 site's mix (glm5next_hc_post_mix_bf16; byte-identical by construction)"
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-06: Whether `glm5next_hc_post_mix_bf16` can stand in for `hc_post` followed by the
+/// token-major mix of `next`: the handle resolved, `next.hc_fn` BF16, and the kernel's fixed
+/// GLM-5.3 shape (`hidden` 4096, `hc_mult` 4).
+pub fn post_mix_usable(
+    kernels: &Glm5NextMhcKernels,
+    next: &Glm5NextMhcSiteWeights,
+    hidden_size: u32,
+    hc_mult: u32,
+) -> bool {
+    kernels.hc_post_mix_bf16.0 != 0 && next.hc_fn_bf16 && hidden_size == 4096 && hc_mult == 4
+}
+
+/// 2026-10-06: `glm_hc_post` of `num_tokens` rows (`out` may alias `residual`) and, from the same
+/// pass, the token-major mix of the next site (`next_hc_fn`, BF16) into `mix_out`
+/// (`[num_tokens, mix_hc]` FP32): the bytes `glm_hc_post` then that site's `hc_mix_bf16_tokmajor`
+/// would write. The caller checks `post_mix_usable`.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_hc_post_mix(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextMhcKernels,
+    block_out: DevicePtr,
+    residual: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    out: DevicePtr,
+    next_hc_fn: DevicePtr,
+    mix_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    if num_tokens == 0 {
+        return Ok(());
+    }
+    KernelLaunch::new(gpu, kernels.hc_post_mix_bf16)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(block_out)
+        .arg_ptr(residual)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_ptr(out)
+        .arg_ptr(next_hc_fn)
+        .arg_ptr(mix_out)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_f32(norm_eps)
+        .launch(stream)
+}
+
+/// 2026-10-06: `glm_hc_pre_part` when `w.mix` already holds this call's mix rows (written by
+/// `glm_hc_post_mix`): the same `hc_finish` launches over the same `MHC_SLICE_ROWS` slices, no
+/// mix launch.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_hc_pre_part_premixed(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextMhcKernels,
+    streams: DevicePtr,
+    w: &Glm5NextMhcSiteWeights,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    hc_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    let mix_hc = (2 + hc_mult) * hc_mult;
+    let (h, hc) = (hidden_size as usize, hc_mult as usize);
+    for (t0, k) in mhc_slices(num_tokens, MHC_SLICE_ROWS) {
+        let t0 = t0 as usize;
+        KernelLaunch::new(gpu, kernels.hc_finish)
+            .grid([k, 1 + collapse_blocks(hidden_size), 1])
+            .block([256, 1, 1])
+            .arg_ptr(streams.offset(t0 * hc * h * 4))
+            .arg_ptr(w.mix.offset(t0 * mix_hc as usize * 4))
+            .arg_ptr(w.hc_scale)
+            .arg_ptr(w.hc_base)
+            .arg_ptr(y_out.offset(t0 * h * 2))
+            .arg_ptr(post_out.offset(t0 * hc * 4))
+            .arg_ptr(comb_out.offset(t0 * hc * hc * 4))
+            .arg_u32(hidden_size)
+            .arg_u32(hc_mult)
+            .arg_u32(sinkhorn_iters)
+            .arg_f32(hc_eps)
+            .launch(stream)?;
+    }
+    Ok(())
+}
+
 /// 2026-09-25: Blocks along grid y for `hc_finish`'s collapse and for `hc_post`: `ceil(H / 256)`,
 /// at least 1, where 256 is the block width both launch at. Each output element is computed on
 /// its own, so the block count does not change the result.
@@ -628,6 +754,16 @@ mod mhc_shape_tests {
             mhc_slices(1000, MHC_SLICE_ROWS).collect::<Vec<_>>(),
             vec![(0, 256), (256, 256), (512, 256), (768, 232)]
         );
+    }
+
+    /// 2026-10-06: `METRALE_GLM_MHC_POST_MIX` is on only for `1`.
+    #[test]
+    fn post_mix_lever_parses_one_as_on_and_everything_else_as_off() {
+        assert!(parse_mhc_post_mix(Some("1")));
+        assert!(parse_mhc_post_mix(Some(" 1 ")));
+        for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("01")] {
+            assert!(!parse_mhc_post_mix(v), "{v:?}");
+        }
     }
 
     /// 2026-10-01: `METRALE_GLM_MHC_TOKMAJOR` is on only for `1`.

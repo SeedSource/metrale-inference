@@ -19,6 +19,9 @@
 // - 2026-10-01: glm5next_hc_mix_bf16_tokmajor (one block per token) writes the same mix bytes
 //   as glm5next_hc_mix_bf16 (argument above the kernel; checked on a GPU by model-arch
 //   examples/mhc_tokmajor_bitparity_microtest.rs).
+// - 2026-10-06: glm5next_hc_post_mix_bf16 writes the same highway bytes as glm5next_hc_post and
+//   the same mix bytes as glm5next_hc_mix_bf16_tokmajor run after it (argument above the kernel;
+//   checked by model-arch examples/hc_post_mix_bitparity_microtest.rs).
 //
 // All of them resolve from the module glm5next_mhc (GLM5NEXT_MHC_MODULE in model-arch
 // glm5next_mhc.rs), so a target without the DeepSeek-V4 model directory has every GLM mHC
@@ -684,6 +687,116 @@ extern "C" __global__ void glm5next_hc_post(
 
 
 
+
+
+
+// 2026-10-06: glm5next_hc_post_mix_bf16: glm5next_hc_post of one sublayer fused with
+// glm5next_hc_mix_bf16_tokmajor of the NEXT sublayer over the same tokens (METRALE_GLM_MHC_POST_MIX,
+// model-arch glm5next_mhc.rs glm_hc_post_mix): the new highway row is written as before and,
+// from the same registers, the next site's mix row (hc_fn = that site's BF16 [mix_hc, hc*H]) is
+// written to mix_out [T, mix_hc], so the next pre runs glm5next_hc_finish only. GLM-5.3 shape
+// only (H = 4096, hc = 4, mix_hc = 24; the host checks it, the kernel returns otherwise). Grid
+// (T, 1, 1), one block per token. Every output bit equals post-then-mix:
+// - Highway: thread tid owns columns d = tid + 256 m, m = 0..15, as glm5next_hc_post does for a
+//   grid y of 1 (the grid split never changes a value); per (d, j) the same
+//   acc = s_p[j] * xd; acc += s_c[i * hc + j] * rv[i] (i ascending), stored to out[j * H + d].
+//   out may alias residual: column d's residual values are read before column d is written.
+// - Mix: in glm5next_hc_mix_bf16_tokmajor thread tid walks k = tid + 256 jj, jj ascending, with
+//   k = j * H + d, i.e. jj = j * 16 + m for the same thread's columns. Here v[j * 16 + m] holds
+//   exactly the float that kernel would load from out[k], and the ss / acc[m] chains run over
+//   jj ascending with the same multiply-then-add per term (--fmad=false); then the same tree and
+//   the same final multiply.
+#define GLM_HC_PM_H 4096
+#define GLM_HC_PM_HC 4
+#define GLM_HC_PM_M (GLM_HC_PM_H / GLM_HC_BLOCK)
+#define GLM_HC_PM_MIX ((2 + GLM_HC_PM_HC) * GLM_HC_PM_HC)
+extern "C" __global__ void __launch_bounds__(GLM_HC_BLOCK) glm5next_hc_post_mix_bf16(
+    const __nv_bfloat16* __restrict__ block_out,
+    const float* __restrict__ residual,
+    const float* __restrict__ post,
+    const float* __restrict__ comb,
+    float* __restrict__ out,
+    const __nv_bfloat16* __restrict__ hc_fn,
+    float* __restrict__ mix_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const float norm_eps
+) {
+    if (hidden_size != GLM_HC_PM_H || hc_mult != GLM_HC_PM_HC) return;
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = GLM_HC_PM_H;
+    const unsigned int hc = GLM_HC_PM_HC;
+    const unsigned int hc_dim = GLM_HC_PM_HC * GLM_HC_PM_H;
+
+    const __nv_bfloat16* x = block_out + (size_t)t * H;
+    const float* res = residual + (size_t)t * hc * H;
+    const float* p = post + (size_t)t * hc;
+    const float* c = comb + (size_t)t * hc * hc;
+    float* o = out + (size_t)t * hc * H;
+
+    __shared__ float s_p[GLM_HC_MAX_MULT];
+    __shared__ float s_c[GLM_HC_MAX_MULT * GLM_HC_MAX_MULT];
+    __shared__ float red[1 + GLM_HC_MAX_MIX][GLM_HC_BLOCK];
+    if (tid < hc) s_p[tid] = p[tid];
+    if (tid < hc * hc) s_c[tid] = c[tid];
+    __syncthreads();
+
+    // 2026-10-06: Post, glm5next_hc_post's arithmetic per column; v keeps every value written.
+    float v[GLM_HC_PM_HC * GLM_HC_PM_M];
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_PM_M; ++m) {
+        const unsigned int d = tid + GLM_HC_BLOCK * m;
+        float xd = (float)x[d];
+        float rv[GLM_HC_PM_HC];
+#pragma unroll
+        for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) rv[i] = res[i * H + d];
+#pragma unroll
+        for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j) {
+            float acc = s_p[j] * xd;
+#pragma unroll
+            for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) acc += s_c[i * hc + j] * rv[i];
+            o[j * H + d] = acc;
+            v[j * GLM_HC_PM_M + m] = acc;
+        }
+    }
+
+    // 2026-10-06: Mix of the next site, glm5next_hc_mix_bf16_tokmajor's chains.
+    float ss = 0.f;
+    float acc[GLM_HC_PM_MIX];
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_PM_MIX; ++m) acc[m] = 0.f;
+#pragma unroll
+    for (unsigned int jj = 0; jj < GLM_HC_PM_HC * GLM_HC_PM_M; ++jj) {
+        const unsigned int k = tid + GLM_HC_BLOCK * jj;
+        const float vv = v[jj];
+        ss += vv * vv;
+#pragma unroll
+        for (unsigned int m = 0; m < GLM_HC_PM_MIX; ++m)
+            acc[m] += __bfloat162float(hc_fn[(size_t)m * hc_dim + k]) * vv;
+    }
+    red[0][tid] = ss;
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_PM_MIX; ++m) red[1 + m][tid] = acc[m];
+    __syncthreads();
+
+    const unsigned int nred = 1 + GLM_HC_PM_MIX;
+    for (unsigned int s = GLM_HC_BLOCK / 2; s > 0; s >>= 1) {
+        for (unsigned int i = tid; i < nred * s; i += GLM_HC_BLOCK) {
+            const unsigned int a = i / s;
+            const unsigned int e = i - a * s;
+            red[a][e] += red[a][e + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid < GLM_HC_PM_MIX) {
+        const float ssum = red[0][0];
+        const float rsqrt = rsqrtf(ssum / (float)hc_dim + norm_eps);
+        const float r = red[1 + tid][0];
+        mix_out[(size_t)t * GLM_HC_PM_MIX + tid] = r * rsqrt;
+    }
+}
 
 
 

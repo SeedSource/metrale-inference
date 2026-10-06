@@ -358,6 +358,10 @@ name = "mhc_tokmajor_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "hc_post_mix_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_blend_microtest"
 required-features = ["cuda", "gpu-examples"]
 

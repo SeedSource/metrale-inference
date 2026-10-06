@@ -30,8 +30,8 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
 use super::profile;
 use crate::glm5next_mhc::{
-    Glm5NextMhcKernels, Glm5NextMhcSiteWeights, glm_hc_expand, glm_hc_post, glm_hc_pre_part,
-    hc_head_mean,
+    Glm5NextMhcKernels, Glm5NextMhcSiteWeights, glm_hc_expand, glm_hc_post, glm_hc_post_mix,
+    glm_hc_pre_part, glm_hc_pre_part_premixed, hc_head_mean, mix_hc,
 };
 
 /// 2026-10-01: A row range, `(first row, rows)`.
@@ -158,6 +158,13 @@ pub struct SpSite<'a> {
     pub last: bool,
     pub reduce: bool,
     pub attn: bool,
+    /// 2026-10-06: `METRALE_GLM_MHC_POST_MIX`: the back of this pass also writes the mix of this
+    /// site (the next pass's), at each row's chunk position in its `mix` scratch
+    /// (`glm_hc_post_mix`).
+    pub post_mix: Option<&'a Glm5NextMhcSiteWeights>,
+    /// 2026-10-06: The front finds its mix rows already in `weights.mix` at the chunk positions
+    /// (the previous pass's `post_mix`) and runs `hc_finish` only.
+    pub premixed: bool,
 }
 
 impl SpRows<'_> {
@@ -184,23 +191,44 @@ impl SpRows<'_> {
         if site.expand {
             glm_hc_expand(gpu, self.mhc.hc_expand, x, streams, kt, ht, hct, stream)?;
         }
-        glm_hc_pre_part(
-            gpu,
-            self.mhc,
-            streams,
-            site.weights,
-            x,
-            post,
-            comb,
-            kt,
-            call_rows as u32,
-            ht,
-            hct,
-            self.sinkhorn_iters,
-            self.rms_eps,
-            self.hc_eps,
-            stream,
-        )?;
+        if site.premixed {
+            // 2026-10-06: Rows `[t, t + k)` of the mix sit at rows `t..` of the scratch.
+            let mut w = *site.weights;
+            w.mix = w.mix.offset(t * mix_hc(hc) * 4);
+            glm_hc_pre_part_premixed(
+                gpu,
+                self.mhc,
+                streams,
+                &w,
+                x,
+                post,
+                comb,
+                kt,
+                ht,
+                hct,
+                self.sinkhorn_iters,
+                self.hc_eps,
+                stream,
+            )?;
+        } else {
+            glm_hc_pre_part(
+                gpu,
+                self.mhc,
+                streams,
+                site.weights,
+                x,
+                post,
+                comb,
+                kt,
+                call_rows as u32,
+                ht,
+                hct,
+                self.sinkhorn_iters,
+                self.rms_eps,
+                self.hc_eps,
+                stream,
+            )?;
+        }
         profile::end(profile::MHC, t_mhc, gpu, stream);
         let t_norm = profile::start();
         let out = self.normed.offset(t * h * 2);
@@ -217,6 +245,7 @@ impl SpRows<'_> {
         hidden: DevicePtr,
         (t, k): Span,
         last: bool,
+        post_mix: Option<&Glm5NextMhcSiteWeights>,
         stream: u64,
     ) -> Result<()> {
         let (h, hc) = (self.hidden, self.hc_mult);
@@ -226,8 +255,29 @@ impl SpRows<'_> {
         let x = hidden.offset(t * h * 2);
         let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
         let t_post = profile::start();
-        let post_k = self.mhc.hc_post;
-        glm_hc_post(gpu, post_k, x, streams, post, comb, streams, kt, ht, hct, stream)?;
+        if let Some(next) = post_mix {
+            // 2026-10-06: The next site's mix rows go to rows `t..` of its scratch.
+            let mix_out = next.mix.offset(t * mix_hc(hc) * 4);
+            glm_hc_post_mix(
+                gpu,
+                self.mhc,
+                x,
+                streams,
+                post,
+                comb,
+                streams,
+                next.hc_fn,
+                mix_out,
+                kt,
+                ht,
+                hct,
+                self.rms_eps,
+                stream,
+            )?;
+        } else {
+            let post_k = self.mhc.hc_post;
+            glm_hc_post(gpu, post_k, x, streams, post, comb, streams, kt, ht, hct, stream)?;
+        }
         if last {
             hc_head_mean(gpu, self.mhc.hc_head, streams, x, kt, ht, hct, stream)?;
         }
@@ -302,7 +352,7 @@ pub fn sp_pass(
     }
     for &c in calls {
         for s in plan.spans(rank, c) {
-            rows.back(gpu, hidden, s, site.last, stream)?;
+            rows.back(gpu, hidden, s, site.last, site.post_mix, stream)?;
         }
     }
     Ok(())

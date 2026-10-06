@@ -30,6 +30,8 @@ use parking_lot::Mutex;
 
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 
+use super::WeightArena;
+
 /// One adopted buffer: the pointer to free, its size, and a label for the
 /// residency report.
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +39,8 @@ struct Derived {
     label: &'static str,
     ptr: DevicePtr,
     bytes: usize,
+    /// 2026-10-06: A sub-allocation of [`DerivedStore::arena`]: never freed alone.
+    in_arena: bool,
 }
 
 /// Device buffers a loader derived from this store's tensors.
@@ -44,6 +48,9 @@ struct Derived {
 pub struct DerivedStore {
     // parking_lot: no poisoning, so a panic elsewhere cannot block teardown.
     owned: Mutex<Vec<Derived>>,
+    /// 2026-10-06: The arena [`Self::upload_in_arena`] places buffers in; disabled until a
+    /// loader plans it (`METRALE_GLM_WEIGHT_ARENA=1`). Freed whole by [`Self::release`].
+    arena: WeightArena,
 }
 
 impl DerivedStore {
@@ -56,7 +63,38 @@ impl DerivedStore {
         if ptr.0 == 0 {
             return;
         }
-        self.owned.lock().push(Derived { label, ptr, bytes });
+        self.owned.lock().push(Derived {
+            label,
+            ptr,
+            bytes,
+            in_arena: false,
+        });
+    }
+
+    /// 2026-10-06: The arena derived buffers can be placed in; a loader enables it with
+    /// [`WeightArena::plan`].
+    pub fn arena(&self) -> &WeightArena {
+        &self.arena
+    }
+
+    /// 2026-10-06: Upload `src` into the arena and own it under `label`; `Ok(None)`, having done
+    /// nothing, when the arena is not active, so the caller runs its own `alloc` + `adopt`.
+    pub fn upload_in_arena(
+        &self,
+        gpu: &dyn GpuBackend,
+        label: &'static str,
+        src: &[u8],
+    ) -> anyhow::Result<Option<DevicePtr>> {
+        let Some(ptr) = self.arena.upload(gpu, src)? else {
+            return Ok(None);
+        };
+        self.owned.lock().push(Derived {
+            label,
+            ptr,
+            bytes: src.len(),
+            in_arena: true,
+        });
+        Ok(Some(ptr))
     }
 
     /// Give up ownership of a buffer the caller is about to free itself.
@@ -66,9 +104,20 @@ impl DerivedStore {
     /// (`qwen35_dense.rs`, the GDN `[QKV|Z]` arm). Without this the pointer
     /// would be freed twice — once there, once at teardown. Returns the bytes
     /// that left the ledger, or `None` if this store never held it.
+    ///
+    /// 2026-10-06: An arena buffer cannot be freed alone, so it is never disowned: `None`,
+    /// logged, and it stays owned until [`Self::release`].
     pub fn disown(&self, ptr: DevicePtr) -> Option<usize> {
         let mut owned = self.owned.lock();
         let i = owned.iter().position(|d| d.ptr == ptr)?;
+        if owned[i].in_arena {
+            tracing::error!(
+                "derived weight ({}) at {ptr} lives in the weight arena and cannot be freed \
+                 alone; not disowned",
+                owned[i].label
+            );
+            return None;
+        }
         Some(owned.swap_remove(i).bytes)
     }
 
@@ -107,11 +156,20 @@ impl DerivedStore {
         let doomed: Vec<Derived> = self.owned.lock().drain(..).collect();
         let mut first_error = None;
         for d in doomed {
+            // 2026-10-06: Freed with the arena's chunks, below.
+            if d.in_arena {
+                continue;
+            }
             if let Err(e) = gpu.free(d.ptr)
                 && first_error.is_none()
             {
                 first_error = Some(e.context(format!("freeing derived weight ({})", d.label)));
             }
+        }
+        if let Err(e) = self.arena.release(gpu)
+            && first_error.is_none()
+        {
+            first_error = Some(e);
         }
         match first_error {
             Some(e) => Err(e),
@@ -167,6 +225,26 @@ mod tests {
         assert!(d.is_empty());
         // A pointer this store never held is not silently "disowned".
         assert_eq!(d.disown(transient), None);
+    }
+
+    #[test]
+    fn arena_buffers_are_released_with_their_chunk_and_never_disowned() {
+        let gpu = MockGpuBackend::new();
+        let d = DerivedStore::default();
+        // Not planned: the caller's own path runs.
+        assert_eq!(d.upload_in_arena(&gpu, "x", &[1; 8]).unwrap(), None);
+        d.arena().plan("test", [8, 300]);
+        let a = d.upload_in_arena(&gpu, "x", &[1; 8]).unwrap().unwrap();
+        let b = d.upload_in_arena(&gpu, "x", &[2; 300]).unwrap().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(d.bytes(), 308);
+        assert_eq!(d.disown(b), None, "an arena buffer cannot be freed alone");
+        assert_eq!(d.len(), 2);
+        // The mock refuses to free a non-base pointer, so this passes only if the
+        // sub-allocations are skipped and the chunk is freed whole.
+        d.release(&gpu).unwrap();
+        assert!(d.is_empty());
+        assert_eq!(d.arena().stats().chunks, 0);
     }
 
     #[test]

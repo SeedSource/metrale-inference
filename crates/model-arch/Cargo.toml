@@ -65,6 +65,10 @@ name = "glm5next_expert_tp_g1_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_weight_arena_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_dense_w8a8_microtest"
 required-features = ["cuda", "gpu-examples"]
 

@@ -103,6 +103,10 @@ pub fn load_glm5next_mtp_module(
 
     // 2026-10-05: `mlp_cfg` is the text layers' layout (`Glm5NextMlpConfig::from_config`), so
     // under `METRALE_GLM_EXPERT_TP=1` the MTP experts are sliced the same way.
+    // 2026-10-06: `METRALE_GLM_WEIGHT_ARENA=1`: plan the MTP experts' uploads (EP2: the
+    // full-width BF16 experts quantised at bind) into the derived weight arena.
+    let on = metrale_config::glm_weight_arena();
+    super::glm5_next_load::expert_arena::plan_expert_layer(store, idx, &mlp_cfg, on);
     let expert =
         |id: usize| super::glm5_next_load::bind_expert_cfg(gpu, store, idx, id, &mlp_cfg);
     let mlp = Glm5NextMlpSite::Moe(Box::new(mlp_build::build_moe(

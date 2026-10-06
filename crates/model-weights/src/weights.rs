@@ -196,8 +196,17 @@ pub struct WeightStore {
     /// quantize-on-load or straight off NVMe by `NgramRowCache`, both of
     /// which need only this (path, offset) locator.
     deferred: HashMap<String, DeferredTensor>,
+    /// 2026-10-06: Where the checkpoint tensors an [`ArenaHook`] claimed live (the fast loader,
+    /// `METRALE_GLM_WEIGHT_ARENA=1`); disabled and empty otherwise. `free_matching` and
+    /// `release` never pass one of its pointers to `GpuBackend::free`; see `arena.rs`.
+    arena: WeightArena,
 }
 
+mod arena;
+pub use arena::{
+    ArenaHook, ArenaStats, WEIGHT_ARENA_ALIGN, WEIGHT_ARENA_CHUNK_CAP, WeightArena,
+    arena_footprint, pack_chunks,
+};
 mod deferred;
 pub use deferred::{DeferHook, DeferredTensor};
 mod store;

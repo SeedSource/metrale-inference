@@ -40,6 +40,7 @@ use metrale_model_layers::weight_map::DenseWeight;
 
 #[cfg(test)]
 mod defer_hook_tests;
+pub mod expert_arena;
 mod expert_quant;
 mod expert_tp_bind;
 #[cfg(test)]
@@ -163,7 +164,8 @@ fn is_routed_expert_tensor(name: &str) -> bool {
 /// the expert (`expert_tp_bind::bind_expert_tp`). The text and MTP loaders both bind through
 /// here with the same `cfg` layout, so the two never mix layouts. Lever off, exactly
 /// [`bind_expert`].
-pub(super) fn bind_expert_cfg(
+/// 2026-10-06: `pub` for `examples/glm5next_weight_arena_microtest.rs`, which binds through it.
+pub fn bind_expert_cfg(
     gpu: &dyn GpuBackend,
     store: &WeightStore,
     layer: usize,

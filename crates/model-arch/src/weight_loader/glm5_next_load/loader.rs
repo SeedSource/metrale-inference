@@ -51,6 +51,21 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         }))
     }
 
+    /// 2026-10-06: Under `METRALE_GLM_WEIGHT_ARENA=1`, every routed-expert tensor that is not
+    /// BF16 (`expert_arena::arena_rule`): resident until teardown, never freed by name. Off,
+    /// `None`.
+    fn arena_predicate(
+        &self,
+        _config: &ModelConfig,
+    ) -> Option<metrale_model_weights::weights::ArenaHook> {
+        if !metrale_config::glm_weight_arena() {
+            return None;
+        }
+        let rule: metrale_model_weights::weights::ArenaHook =
+            std::sync::Arc::new(expert_arena::arena_rule);
+        Some(rule)
+    }
+
     /// 2026-09-25: DSA, KDA and the MLP all shard under TP (see `glm5_next_load.rs`);
     /// routed experts are also split by EP (`local_expert_range`).
     fn supports_tp(&self) -> bool {
@@ -132,6 +147,9 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
         let n = config.num_hidden_layers;
+        // 2026-10-06: The derived weight arena's boot-log line, now that every routed expert,
+        // the MTP block's included, is bound; silent when it never allocated.
+        store.derived().arena().log_summary();
         let (count, bytes) = store.free_matching(gpu, |name| is_reuploaded(name, n))?;
         tracing::info!(
             "glm5_next: released {count} store tensors ({:.2} GB) already re-uploaded by the \
@@ -601,6 +619,10 @@ impl Glm5NextWeightLoader {
                     &load,
                 )?),
                 Mlp::RoutedMoe => {
+                    // 2026-10-06: `METRALE_GLM_WEIGHT_ARENA=1`: plan this layer's uploads into
+                    // the derived weight arena; a no-op when the lever is off.
+                    let on = metrale_config::glm_weight_arena();
+                    expert_arena::plan_expert_layer(store, idx, &mlp_cfg, on);
                     let expert = |id: usize| bind_expert_cfg(gpu, store, idx, id, &mlp_cfg);
                     Glm5NextMlpSite::Moe(Box::new(mlp_build::build_moe(
                         gpu,

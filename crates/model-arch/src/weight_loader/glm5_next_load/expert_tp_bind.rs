@@ -199,6 +199,11 @@ fn scalar_f32(gpu: &dyn GpuBackend, store: &WeightStore, name: &str) -> Result<f
 /// ledger adopts both buffers, so the store owns them. The host bytes are dropped on return.
 fn upload_slice(gpu: &dyn GpuBackend, store: &WeightStore, h: Nvfp4Host) -> Result<Nvfp4Proj> {
     let up = |b: &[u8]| -> Result<DevicePtr> {
+        // 2026-10-06: Into the derived weight arena when this layer planned it
+        // (`METRALE_GLM_WEIGHT_ARENA=1`, `expert_arena::plan_expert_layer`); else one allocation.
+        if let Some(p) = store.derived().upload_in_arena(gpu, EXPERT_TP_LABEL, b)? {
+            return Ok(p);
+        }
         let p = gpu.alloc(b.len().max(1))?;
         gpu.copy_h2d(b, p)?;
         store.derived().adopt(EXPERT_TP_LABEL, p, b.len());

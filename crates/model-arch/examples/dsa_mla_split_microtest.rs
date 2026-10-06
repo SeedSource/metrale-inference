@@ -322,6 +322,10 @@ fn main() -> Result<()> {
         );
         "FAIL"
     } else {
+        println!(
+            "PASS: {arms} split arm(s) within cos >= {COS_MIN} / err <= {MAX_ULP} BF16 ULP of hg8; \
+             zero / no-write contract held"
+        );
         "PASS"
     };
     println!(

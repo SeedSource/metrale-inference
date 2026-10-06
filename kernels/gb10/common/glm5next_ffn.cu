@@ -261,3 +261,45 @@ extern "C" __global__ void glm5next_moe_combine_indexed(
         out[(size_t)t * hidden + d] = __float2bfloat16(acc);
     }
 }
+
+// 2026-10-06: glm5next_moe_combine_indexed_local: glm5next_moe_combine_indexed that skips slot k
+// when its sorted row perm[k] lies outside this rank's experts, [expert_offsets[local_first],
+// expert_offsets[local_end]) (rows are sorted by expert id, so that span is contiguous), so the
+// caller need not zero expert_out for the experts another EP rank owns
+// (METRALE_GLM_MOE_COMBINE_LOCAL, model-arch glm5next_mlp/forward.rs). Same output bits as
+// glm5next_moe_combine_indexed over a zeroed expert_out:
+// - A skipped slot there adds w[k] * 0.0f = +-0.0f (w finite). acc starts at +0.0f, and under
+//   round-to-nearest a sum is -0.0f only when both addends are -0.0f, so acc is never -0.0f and
+//   acc + (+-0.0f) == acc bit for bit. The other slots run the same adds in the same k order,
+//   then the shared add and the single rounding.
+// - Local slots read the same rows (every grouped down path writes every row of every local
+//   expert).
+// Grid (T, 1, 1); the block's threads stride over hidden.
+extern "C" __global__ void glm5next_moe_combine_indexed_local(
+    const __nv_bfloat16* __restrict__ expert_out,
+    const int* __restrict__ token_to_perm,
+    const float* __restrict__ weights,
+    const __nv_bfloat16* __restrict__ shared,
+    __nv_bfloat16* __restrict__ out,
+    const unsigned int hidden,
+    const unsigned int top_k,
+    const int* __restrict__ expert_offsets,
+    const unsigned int local_first,
+    const unsigned int local_end
+) {
+    const unsigned int t = blockIdx.x;
+    const int* __restrict__ perm = token_to_perm + (size_t)t * top_k;
+    const float* w = weights + (size_t)t * top_k;
+    const int lo = expert_offsets[local_first];
+    const int hi = expert_offsets[local_end];
+    for (unsigned int d = threadIdx.x; d < hidden; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned int k = 0; k < top_k; ++k) {
+            const int r = perm[k];
+            if (r < lo || r >= hi) continue;
+            acc += w[k] * (float)expert_out[(size_t)r * hidden + d];
+        }
+        acc += (float)shared[(size_t)t * hidden + d];
+        out[(size_t)t * hidden + d] = __float2bfloat16(acc);
+    }
+}

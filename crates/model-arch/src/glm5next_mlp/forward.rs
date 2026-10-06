@@ -415,7 +415,14 @@ pub fn forward_moe_sliced(
 
     // 2026-09-25: Zero every routed output first: an expert this rank does not own writes
     // nothing, and its slots must add zero to the sum.
-    gpu.memset_async(ws.expert_out, 0, rows * cfg.top_k * cfg.hidden * 2, stream)?;
+    // 2026-10-06: `METRALE_GLM_MOE_COMBINE_LOCAL=1` on the grouped prefill: no zeroing; the
+    // combine below skips those slots instead (`glm5next_moe_combine_indexed_local`).
+    let combine_local = grouped_prefill
+        && k.combine_indexed_local.0 != 0
+        && metrale_config::glm_moe_combine_local();
+    if !combine_local {
+        gpu.memset_async(ws.expert_out, 0, rows * cfg.top_k * cfg.hidden * 2, stream)?;
+    }
 
     let site = moe_experts::MoeSite {
         gpu,
@@ -463,7 +470,23 @@ pub fn forward_moe_sliced(
     // 2026-09-25: One combine launch for all rows (row = `blockIdx.x`). After the grouped GEMM
     // the routed rows are in expert-sorted order, so that path uses
     // `glm5next_moe_combine_indexed`, which finds each slot's row through `token_to_perm`.
-    if grouped_prefill {
+    if combine_local {
+        let local = cfg.local_expert_range();
+        KernelLaunch::new(gpu, k.combine_indexed_local)
+            .grid([rows as u32, 1, 1])
+            .block([ACT_BLOCK, 1, 1])
+            .arg_ptr(ws.expert_out)
+            .arg_ptr(ws.token_to_perm)
+            .arg_ptr(ws.wts)
+            .arg_ptr(ws.shared_out)
+            .arg_ptr(out)
+            .arg_u32(cfg.hidden as u32)
+            .arg_u32(cfg.top_k as u32)
+            .arg_ptr(ws.expert_offsets())
+            .arg_u32(local.start as u32)
+            .arg_u32(local.end as u32)
+            .launch(stream)?;
+    } else if grouped_prefill {
         KernelLaunch::new(gpu, k.combine_indexed)
             .grid([rows as u32, 1, 1])
             .block([ACT_BLOCK, 1, 1])

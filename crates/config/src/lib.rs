@@ -218,6 +218,26 @@ pub fn glm_moe_w4a4_dynamic_scale_from(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// 2026-10-06: Whether the grouped routed-MoE prefill skips zeroing `expert_out` and combines
+/// with `glm5next_moe_combine_indexed_local`, which skips the slots of experts another EP rank
+/// owns (`METRALE_GLM_MOE_COMBINE_LOCAL`, see [`glm_moe_combine_local_from`]). Off by default.
+/// Read once per process.
+pub fn glm_moe_combine_local() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        glm_moe_combine_local_from(
+            std::env::var("METRALE_GLM_MOE_COMBINE_LOCAL")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-06: The policy half of [`glm_moe_combine_local`]: only `1` (trimmed) turns it on.
+pub fn glm_moe_combine_local_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// 2026-10-06: Whether the CUTLASS W4A4 routed-MoE prefill runs the clamped SwiGLU over the
 /// local experts' sorted rows only (`METRALE_GLM_MOE_SWIGLU_LOCAL_ROWS`, see
 /// [`glm_moe_swiglu_local_rows_from`]) instead of every routed row; rows of experts another EP rank
@@ -295,7 +315,7 @@ mod glm_expert_tp_gate_tests {
 #[cfg(test)]
 mod glm_moe_w4a4_fix_lever_tests {
     use super::{
-        glm_moe_swiglu_local_rows_from, glm_moe_w4a4_down_w4a16_from,
+        glm_moe_combine_local_from, glm_moe_swiglu_local_rows_from, glm_moe_w4a4_down_w4a16_from,
         glm_moe_w4a4_dynamic_scale_from,
     };
 
@@ -305,6 +325,7 @@ mod glm_moe_w4a4_fix_lever_tests {
             glm_moe_w4a4_dynamic_scale_from,
             glm_moe_w4a4_down_w4a16_from,
             glm_moe_swiglu_local_rows_from,
+            glm_moe_combine_local_from,
         ] {
             for off in [
                 None,

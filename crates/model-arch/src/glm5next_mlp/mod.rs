@@ -137,6 +137,10 @@ pub struct Glm5NextMlpKernels {
     /// 2026-09-25: [`Self::combine`] reading the routed rows in expert-sorted order through
     /// `token_to_perm`, with the same accumulation order and single rounding.
     pub combine_indexed: KernelHandle,
+    /// 2026-10-06: `glm5next_moe_combine_indexed_local` (`METRALE_GLM_MOE_COMBINE_LOCAL`):
+    /// [`Self::combine_indexed`] skipping the slots of experts another EP rank owns; 0 when the
+    /// PTX lacks it (the lever then stays off).
+    pub combine_indexed_local: KernelHandle,
     /// 2026-09-30: `moe_permute_tokens` (`moe_permute.cu`, same module as
     /// [`Self::moe_sort_by_expert`]): `permuted[row] = hidden_states[sorted_token_ids[row]]`,
     /// the `METRALE_GLM_MOE_PREFILL_PERMUTE=1` gather-once lever for gate/up
@@ -258,6 +262,11 @@ impl Glm5NextMlpKernels {
                 gpu,
                 FFN_MODULE,
                 "glm5next_moe_combine_indexed",
+            ),
+            combine_indexed_local: metrale_model_layers::layers::try_kernel(
+                gpu,
+                FFN_MODULE,
+                "glm5next_moe_combine_indexed_local",
             ),
             moe_permute_tokens: metrale_model_layers::layers::try_kernel(
                 gpu,

@@ -30,13 +30,13 @@ pub const FLOOR_MIN_ROWS: usize = 17;
 /// 2026-10-06: Parse a lever value: `None` (unset or blank) is the default; an integer is
 /// clamped to at least [`FLOOR_MIN_ROWS`]; anything else is `Err` (the caller warns and uses the
 /// default).
-pub fn parse_min_rows(raw: Option<&str>) -> Result<usize, ()> {
+pub fn parse_min_rows(raw: Option<&str>) -> Result<usize, String> {
     match raw.map(str::trim) {
         None | Some("") => Ok(DEFAULT_MIN_ROWS),
         Some(v) => v
             .parse::<usize>()
             .map(|r| r.max(FLOOR_MIN_ROWS))
-            .map_err(|_| ()),
+            .map_err(|e| e.to_string()),
     }
 }
 
@@ -57,7 +57,7 @@ pub fn w8a8_min_rows() -> usize {
                 }
                 r
             }
-            Err(()) => {
+            Err(_) => {
                 tracing::warn!(
                     "METRALE_GLM_DENSE_FP8_W8A8_MIN_ROWS={} is not an integer - using \
                      {DEFAULT_MIN_ROWS}",
@@ -82,12 +82,12 @@ mod tests {
         assert_eq!(parse_min_rows(Some("1")), Ok(17));
         assert_eq!(parse_min_rows(Some("0")), Ok(17));
         assert_eq!(parse_min_rows(Some("128")), Ok(128));
-        assert_eq!(parse_min_rows(Some("x")), Err(()));
-        assert_eq!(parse_min_rows(Some("-5")), Err(()));
+        assert!(parse_min_rows(Some("x")).is_err());
+        assert!(parse_min_rows(Some("-5")).is_err());
     }
 
-    #[test]
-    fn w8min_floor_is_past_every_gemv_tier() {
+    // 2026-10-06: The floor is past every decode/verify GEMV tier (checked at compile time).
+    const _: () = {
         assert!(FLOOR_MIN_ROWS > super::super::dense_fp8::NV4_MAX_M);
         assert!(
             FLOOR_MIN_ROWS > metrale_model_layers::layers::ops::dense_gemv_tcm::TCM_MAX_M as usize
@@ -96,5 +96,5 @@ mod tests {
             FLOOR_MIN_ROWS
                 > metrale_model_layers::layers::ops::DENSE_GEMV_FP8W_BATCHM_MAX_M as usize
         );
-    }
+    };
 }

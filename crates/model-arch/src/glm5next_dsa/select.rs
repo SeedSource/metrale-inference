@@ -327,7 +327,9 @@ pub enum DsaSelectLaunch {
     /// `geom_dev`.
     /// 2026-10-05: The two pool-indexed grids are capped at a few waves of blocks that walk
     /// the live pools with a grid stride ([`grid_stride`], `METRALE_GLM_DSA_GRID_STRIDE`,
-    /// default on); `=0` launches one block per ceiling pool again.
+    /// default on), when the kernel module defines `dsa_indexer_grid_stride_v1`
+    /// (`Glm5NextDsaKernels::grid_stride_marker`); `=0`, or a module without it, launches one
+    /// block per ceiling pool.
     Ceiling { max_pools: usize },
 }
 

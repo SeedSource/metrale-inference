@@ -271,8 +271,13 @@ fn main() -> Result<()> {
             println!("MISMATCH: tokens={t} local={first}..{end}");
             bad += 1;
         }
-        // 2026-10-06: Known-bad: the span one expert later must change the output.
-        let shifted = (first + 1).min(experts);
+        // 2026-10-06: Known-bad: the span starting one past its first expert that has rows
+        // (one expert later is blind when that expert is empty, as at 7 tokens) must change the
+        // output.
+        let busy = (first..end)
+            .find(|&e| r.offsets[e + 1] > r.offsets[e])
+            .unwrap_or(first);
+        let shifted = (busy + 1).min(experts);
         launch_local(g, k_loc, &b, shifted, (end + 1).min(experts))?;
         let kb = read_out(g, &b)?;
         let kd = want

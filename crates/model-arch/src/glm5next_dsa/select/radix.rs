@@ -357,3 +357,7 @@ pub fn launch_topk_radix(
 #[cfg(test)]
 #[path = "radix_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "radix_model_tests.rs"]
+mod model_tests;

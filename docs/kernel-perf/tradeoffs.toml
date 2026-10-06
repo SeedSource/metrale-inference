@@ -309,7 +309,7 @@ source = "kernels/gb10/common/dflash2.cu:68"
 
 [[t]]
 match = "kernels/gb10/common/dsa_indexer.cu"
-text = "Replay-safe geometry: under CUDA-graph capture the selector kernels read S, pool counts, select_k and the top-k tile from a device geom vector, and the grid is fixed at the context ceiling with blocks past the live pool count returning at once (idle blocks traded for graph replay)."
+text = "Replay-safe geometry: under CUDA-graph capture the selector kernels read S, pool counts, select_k and the top-k tile from a device geom vector. dsa_kpool_compress and dsa_index_scores stride over the live pools on a few waves of blocks (8 per SM; METRALE_GLM_DSA_GRID_STRIDE, default on); =0 restores one block per ceiling pool, idle blocks returning at once."
 prs = []
 source = "kernels/gb10/common/dsa_indexer.cu:53"
 

@@ -325,6 +325,9 @@ pub enum DsaSelectLaunch {
     Exact,
     /// 2026-09-25: Grid and shared memory fixed at `max_pools`; live extents come from
     /// `geom_dev`.
+    /// 2026-10-05: The two pool-indexed grids are capped at a few waves of blocks that walk
+    /// the live pools with a grid stride ([`grid_stride`], `METRALE_GLM_DSA_GRID_STRIDE`,
+    /// default on); `=0` launches one block per ceiling pool again.
     Ceiling { max_pools: usize },
 }
 
@@ -463,6 +466,7 @@ impl DsaSelectScratch {
 
 mod launch;
 pub use launch::select_tokens;
+pub mod grid_stride;
 pub mod shared;
 pub mod split;
 

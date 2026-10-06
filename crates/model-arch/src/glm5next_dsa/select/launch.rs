@@ -5,6 +5,7 @@
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants: none beyond the types.
 
+use super::grid_stride::{ceiling_grids, device_sms, dsa_grid_stride, log_grid_stride};
 use super::*;
 
 /// 2026-09-25: Run the selection kernels, leaving `[q_rows, out_width]` token ids in
@@ -72,10 +73,28 @@ pub fn select_tokens(
     // `dsa_index_scores` blocks return at once and `dsa_topk_pools` selects nothing.
     let has_pools = geom.n_pools > 0 || ceiling.is_some();
 
+    // 2026-10-05: Grid x of the two pool-indexed kernels. An exact launch is one block per pool.
+    // A ceiling launch makes the kernels walk the live pools with a grid stride, so under
+    // `METRALE_GLM_DSA_GRID_STRIDE` (default on) its grid is a few waves of blocks
+    // (`grid_stride::stride_blocks`), not one per ceiling pool: a graph replay pays for the
+    // grid, and every block past the live pool count was a block that did nothing. With the
+    // lever off it is the ceiling grid, `m + 1` blocks for compress (the trailing partial
+    // pool's slot) and `m` for the scores.
+    let (compress_x, scores_x) = match ceiling {
+        None => (geom.n_pools_full, geom.n_pools),
+        Some(m) => {
+            let stride = dsa_grid_stride();
+            let sms = if stride { device_sms(gpu) } else { 0 };
+            let grids = ceiling_grids(m, sms, stride);
+            log_grid_stride(stride, sms, m, grids.0, grids.1);
+            grids
+        }
+    };
+
     // 2026-09-25: Pool compression over the full pool count; the trailing partial pool is
     // written and marked invalid, and no later kernel reads it.
     KernelLaunch::new(gpu, kernels.kpool_compress)
-        .grid([ceiling.map_or(geom.n_pools_full, |m| m + 1) as u32, 1, 1])
+        .grid([compress_x as u32, 1, 1])
         .block([d.min(1024) as u32, 1, 1])
         .arg_ptr(inputs.k_normed)
         .arg_ptr(inputs.gate)
@@ -137,11 +156,7 @@ pub fn select_tokens(
         } else {
             (
                 kernels.index_scores,
-                [
-                    ceiling.unwrap_or(geom.n_pools) as u32,
-                    geom.q_rows as u32,
-                    1,
-                ],
+                [scores_x as u32, geom.q_rows as u32, 1],
                 SCORES_BLOCK,
                 // 2026-09-25: `dsa_index_scores` keeps one f32 per index head in shared
                 // memory and sums them in head order.

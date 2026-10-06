@@ -54,6 +54,7 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use half::bf16;
 use metrale_gpu_runtime::cuda_backend::MetraleCudaBackend;
+use metrale_gpu_runtime::cutlass;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_arch::glm5next_mlp::Glm5NextExpertWeights;
@@ -871,6 +872,61 @@ fn main() -> Result<()> {
                 t_a / t_b,
                 t_a - t_b
             );
+            // 2026-10-06: Arm (f), dynamic mode only (the only mode with an amax): the dedup amax
+            // (`METRALE_CUTLASS_W4A4_AMAX_DEDUP`) against `act_amax_grouped` on the same inputs.
+            // The whole act and out buffers must be bitwise equal; a known-bad run (one routed
+            // token's first value raised to 2x the amax, so the global scale changes) must differ.
+            if mode == "dynamic" {
+                let run_f = |dedup: bool| -> Result<(Vec<u8>, Vec<u8>)> {
+                    cutlass::set_w4a4_amax_dedup_override(Some(dedup));
+                    g.memset_async(act_b, 0, te * mi() * 2, 0)?;
+                    g.memset_async(out_b, 0, te * H * 2, 0)?;
+                    run(g, &args, 0)?;
+                    g.synchronize(0)?;
+                    Ok((dn(g, act_b, te * mi() * 2)?, dn(g, out_b, te * H * 2)?))
+                };
+                let ndiff = |x: &[u8], y: &[u8]| x.iter().zip(y).filter(|(a, b)| a != b).count();
+                let (a0, o0) = run_f(false)?;
+                let (a1, o1) = run_f(true)?;
+                let diff = ndiff(&a0, &a1) + ndiff(&o0, &o1);
+                println!(
+                    "f_amax_dedup tokens={tokens}: {diff} differing bytes of {} (act + out, \
+                     dedup vs per-group amax)",
+                    a0.len() + o0.len()
+                );
+                if diff != 0 {
+                    problems.push(format!(
+                        "tokens={tokens}: dedup amax output differs in {diff} bytes"
+                    ));
+                }
+                let tok0 = stid[local.iter().find(|r| r.1 > r.0).map_or(0, |r| r.0)];
+                let at = DevicePtr(d_x.0 + (tok0 * H * 2) as u64);
+                let mut keep = [0u8; 2];
+                g.copy_d2h(at, &mut keep)?;
+                g.copy_h2d(&bf16::from_f32(2.0 * gu_dyn_amax.max(1.0)).to_le_bytes(), at)?;
+                let (a2, o2) = run_f(true)?;
+                g.copy_h2d(&keep, at)?;
+                let kd = ndiff(&a1, &a2) + ndiff(&o1, &o2);
+                if kd == 0 {
+                    problems.push(format!(
+                        "tokens={tokens}: KNOWN_BAD not detected (raised amax left the output \
+                         unchanged)"
+                    ));
+                } else {
+                    println!("KNOWN_BAD detected: raised amax changes {kd} bytes");
+                }
+                cutlass::set_w4a4_amax_dedup_override(Some(false));
+                let t_f0 = time_ms(g, iters, || run(g, &args, 0))?;
+                cutlass::set_w4a4_amax_dedup_override(Some(true));
+                let t_f1 = time_ms(g, iters, || run(g, &args, 0))?;
+                cutlass::set_w4a4_amax_dedup_override(None);
+                println!(
+                    "TIMING tokens={tokens} arm=f_amax_dedup per_group_ms={t_f0:.3} \
+                     dedup_ms={t_f1:.3} saved_ms_per_window={:.3}",
+                    t_f0 - t_f1
+                );
+                summary.push(format!("{tokens}/dedup identical"));
+            }
             // 2026-10-04: Arm (e), informational only (no FAIL condition, not in the PASS line):
             // the `METRALE_GLM_MOE_W4A4_DOWN_W4A16=1` split: W4A4 gate/up + SwiGLU
             // (`skip_down`), then the REAL W4A16 down (the arm-(a) `va2` kernel) over `act_b`.

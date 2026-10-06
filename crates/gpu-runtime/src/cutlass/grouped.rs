@@ -474,6 +474,20 @@ pub fn nvfp4_grouped_down_w4a4(
     }
 }
 
+/// 2026-10-06: Test hook for the W4A4 dynamic activation amax: `None` follows
+/// `METRALE_CUTLASS_W4A4_AMAX_DEDUP`, `Some(false)` / `Some(true)` force the per-group kernel /
+/// the dedup kernels for every later [`nvfp4_grouped_gate_up_w4a4`] and
+/// [`nvfp4_grouped_down_w4a4`] call in this process. Both give the same bytes
+/// (`glm_moe_w4a4_cutlass_microtest`); the microtest uses it to compare them in one process.
+pub fn set_w4a4_amax_dedup_override(force: Option<bool>) {
+    #[cfg(metrale_cutlass)]
+    unsafe {
+        metrale_cutlass_set_w4a4_amax_dedup_override(force.map_or(-1, i32::from));
+    }
+    #[cfg(not(metrale_cutlass))]
+    let _ = force;
+}
+
 #[cfg(test)]
 mod tests {
     use super::ensure_group_arrays;

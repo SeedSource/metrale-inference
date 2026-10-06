@@ -184,3 +184,7 @@ pub fn nvfp4_grouped_down_w4a4(
 ) -> Result<()> {
     unreachable!("cutlass::nvfp4_grouped_down_w4a4 is cuda-only (not built for metal)")
 }
+
+pub fn set_w4a4_amax_dedup_override(_force: Option<bool>) {
+    unreachable!("cutlass::set_w4a4_amax_dedup_override is cuda-only (not built for metal)")
+}

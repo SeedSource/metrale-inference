@@ -18,6 +18,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <vector>
 
@@ -418,6 +420,127 @@ __global__ void act_amax_grouped(
   }
 }
 
+// 2026-10-06: METRALE_CUTLASS_W4A4_AMAX_DEDUP: the same per-tensor amax as act_amax_grouped
+// (the max |value| over every row the dynamic groups read; max is order-free and fmaxf drops
+// NaN either way, so the bits are identical), without its (max m_e x G) grid of mostly empty
+// blocks and, for gathered A (gate/up), without reading a token's row once per local route.
+// Dynamic groups are listed as (dyn_ms[d], rows dyn_pre[d + 1] - dyn_pre[d]); flat row i maps
+// to the last d with dyn_pre[d] <= i.
+__device__ __forceinline__ int amax_dyn_group(const int* __restrict__ dyn_pre, int gd, int i) {
+  int lo = 0, hi = gd - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) >> 1;
+    if (dyn_pre[mid] <= i) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+// 2026-10-06: Block max of |row| over k BF16 values, all threads of the block; returns the
+// thread's partial (the caller reduces). 16-byte loads when `vec` (row and k % 8 aligned).
+__device__ __forceinline__ float amax_row_partial(
+    const __nv_bfloat16* __restrict__ arow, int k, bool vec, float m) {
+  if (vec) {
+    const uint4* r4 = reinterpret_cast<const uint4*>(arow);
+    for (int c = threadIdx.x; c < k / 8; c += blockDim.x) {
+      const uint4 q = r4[c];
+      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&q);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float2 f = __bfloat1622float2(h[j]);
+        m = fmaxf(m, fabsf(f.x));
+        m = fmaxf(m, fabsf(f.y));
+      }
+    }
+  } else {
+    for (int c = threadIdx.x; c < k; c += blockDim.x) {
+      m = fmaxf(m, fabsf(__bfloat162float(arow[c])));
+    }
+  }
+  return m;
+}
+
+__device__ __forceinline__ void amax_block_commit(float m, unsigned int* __restrict__ amax_bits) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(amax_bits, __float_as_uint(m));
+  }
+}
+
+// 2026-10-06: Gathered A: flags[tok] = 1 for every token a dynamic group reads (one thread per
+// routed row). A token id outside [0, flag_len) is folded into the amax here (one thread reads
+// its row), so the result never depends on the flag array's bound.
+__global__ void act_amax_mark_tokens(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ dyn_ms,
+    const int* __restrict__ dyn_pre,
+    int gd,
+    int k,
+    unsigned char* __restrict__ flags,
+    int flag_len,
+    unsigned int* __restrict__ amax_bits) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= dyn_pre[gd]) {
+    return;
+  }
+  const int d = amax_dyn_group(dyn_pre, gd, i);
+  const int tok = sorted_token_ids[dyn_ms[d] + (i - dyn_pre[d])];
+  if (tok >= 0 && tok < flag_len) {
+    flags[tok] = 1;
+    return;
+  }
+  const __nv_bfloat16* arow = act_global + (long long)tok * k;
+  float m = 0.0f;
+  for (int c = 0; c < k; ++c) {
+    m = fmaxf(m, fabsf(__bfloat162float(arow[c])));
+  }
+  atomicMax(amax_bits, __float_as_uint(m));
+}
+
+// 2026-10-06: Gathered A: amax over the flagged token rows, grid-stride over [0, flag_len).
+__global__ void act_amax_flagged(
+    const __nv_bfloat16* __restrict__ act_global,
+    const unsigned char* __restrict__ flags,
+    int flag_len,
+    int k,
+    int vec,
+    unsigned int* __restrict__ amax_bits) {
+  float m = 0.0f;
+  for (int t = blockIdx.x; t < flag_len; t += gridDim.x) {
+    if (flags[t]) {
+      m = amax_row_partial(act_global + (unsigned long long)t * k, k, vec != 0, m);
+    }
+  }
+  amax_block_commit(m, amax_bits);
+}
+
+// 2026-10-06: Row-ordered A (down): amax over the dynamic groups' rows, grid-stride over the
+// flat row index (no gather, no duplicates).
+__global__ void act_amax_rows_flat(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ dyn_ms,
+    const int* __restrict__ dyn_pre,
+    int gd,
+    int k,
+    int vec,
+    unsigned int* __restrict__ amax_bits) {
+  float m = 0.0f;
+  const int total = dyn_pre[gd];
+  for (int i = blockIdx.x; i < total; i += gridDim.x) {
+    const int d = amax_dyn_group(dyn_pre, gd, i);
+    const int row = dyn_ms[d] + (i - dyn_pre[d]);
+    m = amax_row_partial(act_global + (unsigned long long)row * k, k, vec != 0, m);
+  }
+  amax_block_commit(m, amax_bits);
+}
+
 // 2026-10-03: Every gs[g] that is not > 0 becomes amax / (6 * 448) from act_amax_grouped, the
 // value a calibrated input_scale has for that amax; 1.0 when that amax is zero or not finite.
 __global__ void resolve_act_gs(
@@ -585,6 +708,29 @@ extern "C" int metrale_cutlass_pack_weight_sfb(
 // 2026-10-05: `METRALE_CUTLASS_SFB_PACK_TILED` (default on; `0` turns it off) routes the
 // batched pack to the tiled kernel when it applies (src_n_major, n % 128 == 0, k % 64 == 0, out_base and out_stride 16-byte
 // aligned); the scalar kernel runs otherwise. Read once.
+// 2026-10-06: `METRALE_CUTLASS_W4A4_AMAX_DEDUP=1` computes the W4A4 dynamic activation amax with
+// act_amax_mark_tokens + act_amax_flagged (gathered A) or act_amax_rows_flat (row-ordered A)
+// instead of act_amax_grouped: the same value, read once per distinct row. Read once.
+static bool amax_dedup_lever() {
+  static const bool on = [] {
+    const char* v = std::getenv("METRALE_CUTLASS_W4A4_AMAX_DEDUP");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
+}
+
+// 2026-10-06: Test hook (glm_moe_w4a4_cutlass_microtest): -1 follows amax_dedup_lever, 0 / 1
+// force the act_amax_grouped / dedup path, so one process can compare both.
+static int g_amax_dedup_override = -1;
+
+extern "C" void metrale_cutlass_set_w4a4_amax_dedup_override(int v) {
+  g_amax_dedup_override = v;
+}
+
+static bool amax_dedup_on() {
+  return g_amax_dedup_override >= 0 ? g_amax_dedup_override != 0 : amax_dedup_lever();
+}
+
 static bool sfb_pack_tiled_lever() {
   static const bool on = [] {
     const char* v = std::getenv("METRALE_CUTLASS_SFB_PACK_TILED");
@@ -786,6 +932,8 @@ static GroupedAPrep prep_grouped_a(
   size_t a_off = 0;
   size_t sfa_off = align_up_(a_acc, 256);
   size_t cursor = align_up_(sfa_off + sfa_acc, 256);
+  bool dedup_ok = false;
+  size_t dedup_room = 0;
 
   // 2026-10-03: W4A4 mode: the whole A side (packed A, SFA, every [G] array below) plus one
   // projection's B-side [G] arrays (launch_projection writes those before its own room check),
@@ -802,6 +950,17 @@ static GroupedAPrep prep_grouped_a(
       p.status = -2;
       p.cursor = cursor;
       return p;
+    }
+    // 2026-10-06: The dedup amax's own arrays (dyn_ms, dyn_pre, and for gathered A one flag
+    // byte per routed row, a bound on the token count) go after everything above; when they
+    // do not fit, this call keeps act_amax_grouped.
+    if (amax_dedup_on()) {
+      const size_t total = expert_offsets_host[num_experts] > 0
+                               ? (size_t)expert_offsets_host[num_experts]
+                               : 0;
+      dedup_room = align_up_(g_est * sizeof(int), 256) + align_up_((g_est + 1) * sizeof(int), 256) +
+                   (sorted_token_ids != nullptr ? align_up_(total, 256) : 0) + 3 * 256;
+      dedup_ok = total > 0 && cursor + arrays + dedup_room <= workspace_size;
     }
   }
 
@@ -886,10 +1045,46 @@ static GroupedAPrep prep_grouped_a(
       cudaMemcpyAsync(d_gs, h_gs.data(), G * sizeof(float), cudaMemcpyHostToDevice, stream);
       if (any_dyn) {
         cudaMemsetAsync(d_amax, 0, sizeof(unsigned int), stream);
-        dim3 ablk(256);
-        dim3 agrd(max_me, 1, G);
-        act_amax_grouped<<<agrd, ablk, 0, stream>>>(
-            A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me, d_gs, k, d_amax);
+        if (dedup_ok) {
+          // 2026-10-06: METRALE_CUTLASS_W4A4_AMAX_DEDUP (amax_dedup_lever): the dynamic groups'
+          // rows as (dyn_ms, dyn_pre) prefix lists, then one read per distinct row.
+          std::vector<int> h_dms, h_dpre(1, 0);
+          for (int g = 0; g < G; ++g) {
+            if (!(h_gs[g] > 0.0f)) {
+              h_dms.push_back(h_ms[g]);
+              h_dpre.push_back(h_dpre.back() + h_me[g]);
+            }
+          }
+          const int gd = (int)h_dms.size();
+          const int rows = h_dpre.back();
+          int* d_dms = reinterpret_cast<int*>(ws + cursor);
+          cursor = align_up_(cursor + (size_t)gd * sizeof(int), 256);
+          int* d_dpre = reinterpret_cast<int*>(ws + cursor);
+          cursor = align_up_(cursor + (size_t)(gd + 1) * sizeof(int), 256);
+          cudaMemcpyAsync(d_dms, h_dms.data(), gd * sizeof(int), cudaMemcpyHostToDevice, stream);
+          cudaMemcpyAsync(d_dpre, h_dpre.data(), (gd + 1) * sizeof(int), cudaMemcpyHostToDevice,
+                          stream);
+          const int vec = ((reinterpret_cast<uintptr_t>(A_global) & 15) == 0 && k % 8 == 0) ? 1 : 0;
+          const int blocks = 48 * 8;
+          if (rows > 0 && sorted_token_ids != nullptr) {
+            const int flag_len = expert_offsets_host[num_experts];
+            unsigned char* d_flags = ws + cursor;
+            cursor = align_up_(cursor + (size_t)flag_len, 256);
+            cudaMemsetAsync(d_flags, 0, (size_t)flag_len, stream);
+            act_amax_mark_tokens<<<(rows + 255) / 256, 256, 0, stream>>>(
+                A_global, sorted_token_ids, d_dms, d_dpre, gd, k, d_flags, flag_len, d_amax);
+            act_amax_flagged<<<std::min(blocks, flag_len), 256, 0, stream>>>(
+                A_global, d_flags, flag_len, k, vec, d_amax);
+          } else if (rows > 0) {
+            act_amax_rows_flat<<<std::min(blocks, rows), 256, 0, stream>>>(
+                A_global, d_dms, d_dpre, gd, k, vec, d_amax);
+          }
+        } else {
+          dim3 ablk(256);
+          dim3 agrd(max_me, 1, G);
+          act_amax_grouped<<<agrd, ablk, 0, stream>>>(
+              A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me, d_gs, k, d_amax);
+        }
         resolve_act_gs<<<(G + 255) / 256, 256, 0, stream>>>(d_gs, G, d_amax);
       }
       pack_act_grouped_gs<<<grd, blk, 0, stream>>>(

@@ -42,6 +42,7 @@ mod lever_tests;
 mod prefill;
 mod prefill_flashkda;
 mod prefill_tc;
+mod snap_fuse;
 pub use config::{Glm5NextKdaConfig, Glm5NextKdaWeights};
 pub use kernels::Glm5NextKdaKernels;
 

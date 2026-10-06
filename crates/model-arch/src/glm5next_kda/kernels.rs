@@ -13,6 +13,8 @@
 //! - 2026-10-03: The three `kda_flashkda_glue` entry points resolve to handle 0 when absent;
 //!   [`Glm5NextKdaKernels::has_flashkda_glue`] is false unless they and `kda_tc_conv_rows` /
 //!   `kda_tc_conv_state_tail` resolved.
+//! - 2026-10-06: The two `kda_snap_fuse` entry points resolve to handle 0 when absent;
+//!   [`Glm5NextKdaKernels::has_snap_fuse`] is false unless both resolved.
 
 use super::*;
 
@@ -62,6 +64,12 @@ pub struct Glm5NextKdaKernels {
     pub flk_beta_t: KernelHandle,
     pub flk_state_t: KernelHandle,
     pub flk_o_norm: KernelHandle,
+    /// 2026-10-06: The out-of-place twins of `conv_decode` and `recurrent_smem` the fused verify
+    /// snapshot launches (`METRALE_GLM_KDA_SNAP_FUSE=1`, snap_fuse.rs),
+    /// kernels/gb10/common/kda_snap_fuse.cu. Resolved with `try_kernel`; either `0` keeps the
+    /// walk with its snapshot copies.
+    pub conv_io: KernelHandle,
+    pub recurrent_io: KernelHandle,
     pub o_norm: KernelHandle,
     pub split_widen: KernelHandle,
     pub sigmoid: KernelHandle,
@@ -139,6 +147,16 @@ impl Glm5NextKdaKernels {
                 "kda_flashkda_glue",
                 "kda_o_norm_gated_bf16in",
             ),
+            conv_io: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_snap_fuse",
+                "causal_conv1d_update_l2norm_io",
+            ),
+            recurrent_io: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_snap_fuse",
+                "kda_recurrent_decode_bf16_smem_io",
+            ),
             o_norm: gpu.kernel("kda_layer_ops", "kda_o_norm_gated_bf16")?,
             split_widen: gpu.kernel("kda_layer_ops", "kda_split_widen")?,
             sigmoid: gpu.kernel("kda_layer_ops", "kda_sigmoid_bf16_f32")?,
@@ -172,5 +190,10 @@ impl Glm5NextKdaKernels {
         ]
         .iter()
         .all(|h| h.0 != 0)
+    }
+
+    /// 2026-10-06: Whether both `kda_snap_fuse` kernels resolved.
+    pub fn has_snap_fuse(&self) -> bool {
+        self.conv_io.0 != 0 && self.recurrent_io.0 != 0
     }
 }

@@ -349,6 +349,10 @@ name = "kda_tokenloop_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "kda_snap_fuse_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kda_chunk_tc_microtest"
 required-features = ["cuda", "gpu-examples"]
 

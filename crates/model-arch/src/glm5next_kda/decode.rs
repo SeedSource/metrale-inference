@@ -13,6 +13,9 @@
 //!   it splits the token loop's launches there but changes no output or state.
 //! - `METRALE_GLM_KDA_PREFETCH=1` changes only which recurrent kernel the token loop launches,
 //!   never whether the loop runs.
+//! - 2026-10-06: `METRALE_GLM_KDA_SNAP_FUSE=1` changes only where a snapshot-taking walk's rows
+//!   read and write the state (snap_fuse.rs); every output, snapshot and final state is the
+//!   walk's.
 
 use super::*;
 use metrale_model_layers::layer::InpassSplit;
@@ -315,7 +318,8 @@ impl Glm5NextKdaLayer {
         snapshots: &[(DevicePtr, DevicePtr)],
         stream: u64,
     ) -> Result<()> {
-        self.decode_k_impl(gpu, hidden, k, state, ws, snapshots, None, stream)
+        let fuse = super::snap_fuse::kda_snap_fuse();
+        self.decode_k_impl(gpu, hidden, k, state, ws, snapshots, None, fuse, stream)
     }
 
     /// 2026-10-03: [`Self::decode_k`] for a prefill call that also captures an in-pass snapshot
@@ -341,11 +345,14 @@ impl Glm5NextKdaLayer {
                 capture.row
             );
         }
-        self.decode_k_impl(gpu, hidden, k, state, ws, &[], Some(capture), stream)
+        self.decode_k_impl(gpu, hidden, k, state, ws, &[], Some(capture), false, stream)
     }
 
+    /// 2026-10-06: `fuse_snaps` (`METRALE_GLM_KDA_SNAP_FUSE`, or the microtest's arm) sends a
+    /// snapshot-taking walk to [`Self::snap_walk`], which falls back to the walk below when it
+    /// cannot run.
     #[allow(clippy::too_many_arguments)]
-    fn decode_k_impl(
+    pub(super) fn decode_k_impl(
         &self,
         gpu: &dyn GpuBackend,
         hidden: DevicePtr,
@@ -354,6 +361,7 @@ impl Glm5NextKdaLayer {
         ws: &Glm5NextKdaWorkspace,
         snapshots: &[(DevicePtr, DevicePtr)],
         capture: Option<&InpassSplit>,
+        fuse_snaps: bool,
         stream: u64,
     ) -> Result<()> {
         if k == 0 || k > ws.max_tokens {
@@ -377,7 +385,14 @@ impl Glm5NextKdaLayer {
             && k > 1
             && kda_token_loop()
             && self.stateful_rows(gpu, k, capture, state, ws, stream)?;
-        if !looped {
+        // 2026-10-06: Fused snapshots (snap_fuse.rs): the same row kernels, each row writing its
+        // snapshot slot directly; never with an in-pass capture.
+        let fused = !looped
+            && fuse_snaps
+            && capture.is_none()
+            && !snapshots.is_empty()
+            && self.snap_walk(gpu, 0, k, state, ws, snapshots, stream)?;
+        if !looped && !fused {
             for row in 0..k {
                 self.stateful_row(gpu, row, state, ws, stream)?;
                 if let Some((h_dst, conv_dst)) = snapshots.get(row) {
@@ -486,8 +501,18 @@ impl Glm5NextKdaLayer {
         self.front_end(gpu, hidden, r, ws, stream)?;
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
         let t_recur = profile::start();
+        let fuse = super::snap_fuse::kda_snap_fuse();
         let mut base = 0usize;
         for ((&k, state), snaps) in ks.iter().zip(states).zip(snapshots) {
+            // 2026-10-06: `METRALE_GLM_KDA_SNAP_FUSE=1`: this sequence's walk with fused
+            // snapshots (snap_fuse.rs); the loop below when it cannot run.
+            if fuse
+                && !snaps.is_empty()
+                && self.snap_walk(gpu, base, k, state, ws, snaps, stream)?
+            {
+                base += k;
+                continue;
+            }
             for t in 0..k {
                 self.stateful_row(gpu, base + t, state, ws, stream)?;
                 if let Some((h_dst, conv_dst)) = snaps.get(t) {

@@ -21,6 +21,10 @@
 
 # ── Build stage ──────────────────────────────────────────────────
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS builder
+# One NCCL for every build. An unpinned `apt-get install` takes whatever the node's cached layer
+# resolved, so the same tag carried NCCL 2.32.3 on n1 and 2.31.2 on n3 (2026-10-05). Override with
+# --build-arg NCCL_PKG=<apt version> only for a deliberate NCCL A/B.
+ARG NCCL_PKG=2.32.3-1+cuda13.4
 
 RUN apt-get update -qq && \
     apt-get install -y -qq curl build-essential pkg-config git cmake libclang-dev libibverbs-dev && \
@@ -28,7 +32,7 @@ RUN apt-get update -qq && \
     # required to link (the devel image's bundled NCCL exports what metrale-comm
     # uses, and `-lnccl` is dynamic) but builder == runtime avoids symmetric-memory
     # ABI surprises and keeps the image reproducible.
-    apt-get install -y -qq --allow-change-held-packages libnccl-dev libnccl2 && \
+    apt-get install -y -qq --allow-change-held-packages libnccl-dev=${NCCL_PKG} libnccl2=${NCCL_PKG} && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -81,13 +85,14 @@ RUN cargo build --release -p metrale-server
 
 # ── Runtime stage ────────────────────────────────────────────────
 FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04
+ARG NCCL_PKG=2.32.3-1+cuda13.4
 
 LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 # NCCL for the 2-node collectives, RDMA userspace for the RoCE transport.
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends --allow-change-held-packages \
-      libnccl2 libibverbs1 librdmacm1 ibverbs-providers \
+      libnccl2=${NCCL_PKG} libibverbs1 librdmacm1 ibverbs-providers \
       libnl-3-200 libnl-route-3-200 && \
     rm -rf /var/lib/apt/lists/* && \
     NCCL_VER=$(dpkg-query -W -f='${Version}' libnccl2) && \

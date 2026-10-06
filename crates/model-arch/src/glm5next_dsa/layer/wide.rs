@@ -311,6 +311,10 @@ impl Glm5NextDsaLayer {
         // 2026-10-01: The shared projections, the q chain and the latent write, all `k` rows.
         let t_proj = profile::start();
         let (g, gv, bm) = (self.kernels.gemm, self.kernels.gemv, self.kernels.gemv_batchm);
+        // 2026-10-06: q_a and kv_a both read `hidden`; kv_a is issued right after q_a (see
+        // `decode_k`), so under `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT` their W8A8 activation
+        // quant runs once. Nothing writes `hidden` until `o_absorb`.
+        let share = crate::glm5next_layer::dense_fp8::w8a8_share_input(hidden, k * h * 2);
         gemm(
             gpu,
             g,
@@ -324,6 +328,20 @@ impl Glm5NextDsaLayer {
             h,
             stream,
         )?;
+        gemm(
+            gpu,
+            g,
+            gv,
+            bm,
+            hidden,
+            self.weights.kv_a_proj,
+            arena.kv_a,
+            k,
+            kvl,
+            h,
+            stream,
+        )?;
+        drop(share);
         KernelLaunch::new(gpu, self.kernels.rms_norm)
             // 2026-10-01: One block per row, as in `decode_k`.
             .grid([k as u32, 1, 1])
@@ -345,19 +363,6 @@ impl Glm5NextDsaLayer {
             k,
             lat,
             ql,
-            stream,
-        )?;
-        gemm(
-            gpu,
-            g,
-            gv,
-            bm,
-            hidden,
-            self.weights.kv_a_proj,
-            arena.kv_a,
-            k,
-            kvl,
-            h,
             stream,
         )?;
         // 2026-10-01: One block per token; block `r` reads `kv_a` row `r` and slot `r`.

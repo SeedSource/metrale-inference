@@ -98,6 +98,17 @@
 //!   Under CUDA graph capture the quant and GEMM are captured; ASSUMED (not enforced), as for
 //!   the arena: a captured graph that writes the scratch is never replayed concurrently with
 //!   the eager GLM forward.
+//! - 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT=1` (inert without W8A8): inside a
+//!   [`w8a8_share_input`] scope, a W8A8 call whose `a` lies in the scope's byte range and whose
+//!   `(a, m, k, stream)` equal those of the quant the scratch holds (made in the same scope)
+//!   skips the quant and runs the GEMM on the held FP8 bytes and scales. Those are exactly what
+//!   the quant would write again, because the caller promises (the scope's contract) that
+//!   nothing writes the range while the scope lives; any other quant into the scratch replaces
+//!   the held entry, so a later call re-quantizes. Byte-identical to the lever off. Eager only:
+//!   a capturing stream always quantizes and clears the held entry. Callers (2026-10-06): KDA
+//!   `front_end_with` (q/k/v/g_a over `hidden`), DSA `decode_k` / `decode_k_wide` (q_a and
+//!   kv_a over `hidden`, kv_a issued right after q_a), MLP `forward_dense_sliced` (gate/up
+//!   over each row slice).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -417,6 +428,98 @@ struct W8a8State {
     scratch: Option<W8a8Scratch>,
     /// The stream of the last eager W8A8 launch pair.
     last_stream: Option<u64>,
+    /// 2026-10-06: The quant the scratch holds, when it was made inside a share scope
+    /// (`METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT`); `None` after any other quant.
+    held: Option<W8a8Held>,
+}
+
+/// 2026-10-06: What the W8A8 scratch holds: the input `a` (device address), `m`, `k`, the
+/// stream and the share scope's generation it was quantized under.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct W8a8Held {
+    a: u64,
+    m: usize,
+    k: usize,
+    stream: u64,
+    generation: u64,
+}
+
+/// 2026-10-06: A live share scope: the byte range `[lo, hi)` its caller keeps unwritten, and its
+/// generation (unique per scope).
+#[derive(Clone, Copy)]
+struct ShareScope {
+    lo: u64,
+    hi: u64,
+    generation: u64,
+}
+
+static SHARE_SCOPE: Mutex<Option<ShareScope>> = Mutex::new(None);
+static SHARE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static W8A8_REUSED: AtomicU64 = AtomicU64::new(0);
+static W8A8_REUSE_FIRST: AtomicBool = AtomicBool::new(false);
+
+/// 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT=1`: W8A8 GEMMs inside a
+/// [`w8a8_share_input`] scope that read the input the scratch already holds reuse its FP8
+/// bytes and scales instead of quantizing again (module doc). Off unless `1`; inert without
+/// `METRALE_GLM_DENSE_FP8_W8A8=1`. Read once.
+pub fn w8a8_share_quant() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT=1 - W8A8 GEMMs that share an input inside \
+                 a share scope quantize it once (byte-identical by construction)"
+            );
+        }
+        on && dense_fp8_w8a8()
+    })
+}
+
+/// 2026-10-06: A share scope over `[a, a + bytes)` (module doc); it ends when dropped. The
+/// caller promises that nothing writes that range while the guard lives. Opening a scope ends
+/// any open one. Inert (no state) when [`w8a8_share_quant`] is off.
+#[must_use = "the scope ends when the guard is dropped"]
+pub struct W8a8ShareInput {
+    generation: Option<u64>,
+}
+
+/// 2026-10-06: Open a share scope over the `bytes` bytes at `a` (see [`W8a8ShareInput`]).
+pub fn w8a8_share_input(a: DevicePtr, bytes: usize) -> W8a8ShareInput {
+    if !w8a8_share_quant() {
+        return W8a8ShareInput { generation: None };
+    }
+    let generation = SHARE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    *SHARE_SCOPE.lock().unwrap() = Some(ShareScope {
+        lo: a.0,
+        hi: a.0 + bytes as u64,
+        generation,
+    });
+    W8a8ShareInput {
+        generation: Some(generation),
+    }
+}
+
+impl Drop for W8a8ShareInput {
+    fn drop(&mut self) {
+        if let Some(g) = self.generation {
+            let mut s = SHARE_SCOPE.lock().unwrap();
+            if s.is_some_and(|x| x.generation == g) {
+                *s = None;
+            }
+        }
+    }
+}
+
+/// 2026-10-06: The open scope's generation when `a .. a + bytes` lies inside its range.
+fn share_generation_for(a: DevicePtr, bytes: usize) -> Option<u64> {
+    let s = (*SHARE_SCOPE.lock().unwrap())?;
+    (a.0 >= s.lo && a.0 + bytes as u64 <= s.hi).then_some(s.generation)
+}
+
+/// 2026-10-06: W8A8 GEMMs that reused a held quant, for the load summary / tests.
+pub fn w8a8_reused_quants() -> u64 {
+    W8A8_REUSED.load(Ordering::Relaxed)
 }
 
 /// 2026-10-05: Why a wide call on a registered weight skipped W8A8; each is logged once.
@@ -434,6 +537,7 @@ static W8A8_KERNELS: OnceLock<Option<W8a8Kernels>> = OnceLock::new();
 static W8A8: Mutex<W8a8State> = Mutex::new(W8a8State {
     scratch: None,
     last_stream: None,
+    held: None,
 });
 static W8A8_GEMMS: AtomicU64 = AtomicU64::new(0);
 static W8A8_FIRST: AtomicBool = AtomicBool::new(false);
@@ -897,7 +1001,8 @@ fn w8a8(
     if m * k > s.fp8_cap || m * groups * 4 > s.scale_cap || groups > s.ones_len {
         return w8a8_skip(W8a8Skip::TooWide, m, n, k);
     }
-    if !gpu.stream_is_capturing(stream) {
+    let capturing = gpu.stream_is_capturing(stream);
+    if !capturing {
         if let Some(prev) = st.last_stream
             && prev != stream
         {
@@ -906,9 +1011,33 @@ fn w8a8(
         }
         st.last_stream = Some(stream);
     }
-    ops::per_token_group_quant_fp8(
-        gpu, kk.quant, a, s.a_fp8, s.a_scale, m as u32, k as u32, stream,
-    )?;
+    // 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT` (module doc): reuse the held quant
+    // when this input is the one it was made from, inside the same share scope.
+    let generation = if w8a8_share_quant() && !capturing {
+        share_generation_for(a, m * k * 2)
+    } else {
+        None
+    };
+    let want = generation.map(|generation| W8a8Held {
+        a: a.0,
+        m,
+        k,
+        stream,
+        generation,
+    });
+    if want.is_some() && st.held == want {
+        W8A8_REUSED.fetch_add(1, Ordering::Relaxed);
+        if !W8A8_REUSE_FIRST.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT: first reused quant ({m} rows, k {k})"
+            );
+        }
+    } else {
+        ops::per_token_group_quant_fp8(
+            gpu, kk.quant, a, s.a_fp8, s.a_scale, m as u32, k as u32, stream,
+        )?;
+        st.held = want;
+    }
     ops::fp8_gemm_t_rowscale(
         gpu,
         kk.gemm,
@@ -968,6 +1097,8 @@ fn finish_load_w8a8(gpu: &dyn GpuBackend) -> Result<usize> {
     {
         return Ok(have.bytes);
     }
+    // 2026-10-06: A new scratch holds no quant.
+    st.held = None;
     if let Some(old) = st.scratch.take() {
         gpu.free(old.base)?;
     }

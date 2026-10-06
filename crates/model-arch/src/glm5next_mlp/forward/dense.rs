@@ -70,6 +70,10 @@ pub fn forward_dense_sliced(
             ws.max_rows
         );
     }
+    // 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT`: gate and up read the same slice of
+    // `x`, which this loop does not write, so its W8A8 activation quant runs once per slice
+    // (`dense_fp8::w8a8_share_input`). The scope ends before the down projection writes `out`.
+    let share = crate::glm5next_layer::dense_fp8::w8a8_share_input(x, m * cfg.hidden * 2);
     for (a, n) in row_slices(m, slice) {
         let xs = x.offset(a * cfg.hidden * 2);
         let act = a * inter * 2;
@@ -100,6 +104,7 @@ pub fn forward_dense_sliced(
             stream,
         )?;
     }
+    drop(share);
     swiglu(
         gpu,
         k.swiglu,

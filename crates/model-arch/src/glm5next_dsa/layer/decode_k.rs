@@ -83,6 +83,14 @@ impl Glm5NextDsaLayer {
         let w = &self.workspace;
         let t_proj = crate::glm5next_layer::profile::start();
 
+        // 2026-10-06: q_a and kv_a both read `hidden`; kv_a is issued right after q_a (it reads
+        // nothing the q chain writes, and the q chain reads nothing it writes), so under
+        // `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT` their W8A8 activation quant runs once
+        // (`dense_fp8::w8a8_share_input`). Nothing writes `hidden` until `o_absorb`.
+        let share = crate::glm5next_layer::dense_fp8::w8a8_share_input(
+            hidden,
+            k * self.cfg.hidden * 2,
+        );
         gemm(
             gpu,
             self.kernels.gemm,
@@ -96,6 +104,20 @@ impl Glm5NextDsaLayer {
             self.cfg.hidden,
             stream,
         )?;
+        gemm(
+            gpu,
+            self.kernels.gemm,
+            self.kernels.gemv,
+            self.kernels.gemv_batchm,
+            hidden,
+            self.weights.kv_a_proj,
+            w.kv_a,
+            k,
+            self.cfg.kv_lora_rank,
+            self.cfg.hidden,
+            stream,
+        )?;
+        drop(share);
         KernelLaunch::new(gpu, self.kernels.rms_norm)
             // 2026-09-25: `rms_norm_vanilla` runs one block per row, so one launch covers all
             // k rows.
@@ -121,19 +143,6 @@ impl Glm5NextDsaLayer {
             stream,
         )?;
 
-        gemm(
-            gpu,
-            self.kernels.gemm,
-            self.kernels.gemv,
-            self.kernels.gemv_batchm,
-            hidden,
-            self.weights.kv_a_proj,
-            w.kv_a,
-            k,
-            self.cfg.kv_lora_rank,
-            self.cfg.hidden,
-            stream,
-        )?;
         // 2026-10-01: `METRALE_GLM_DSA_ROW_BATCH=1`: everything below for all rows at once
         // (`row_batch.rs`), only where the batched selector runs; otherwise the row loop.
         let select_rows =

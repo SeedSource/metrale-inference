@@ -542,6 +542,10 @@ impl Glm5NextKdaLayer {
     ) -> Result<()> {
         let c = &self.cfg;
         let (hid, qkv, hd) = (c.hidden, c.qkv_dim(), c.head_dim);
+        // 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT`: q/k/v/g_a read `hidden`, which
+        // nothing below writes (every output is a workspace buffer), so their W8A8 activation
+        // quant runs once (`dense_fp8::w8a8_share_input`).
+        let _share = crate::glm5next_layer::dense_fp8::w8a8_share_input(hidden, t * hid * 2);
 
         // 2026-09-25: Three separate `[T, qkv]` projections, then one pack (see the module doc).
         for (i, w) in [

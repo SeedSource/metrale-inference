@@ -39,9 +39,11 @@ use metrale_gpu_runtime::cuda_backend::MetraleCudaBackend;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_model_layers::layers::ops;
 
-const K_DIMS: [u32; 3] = [5120, 6144, 17408];
-const M_DIMS: [u32; 5] = [16, 17, 25, 1168, 4576];
-const M_MAX: u32 = 4576;
+// 2026-10-06: GLM-5.3 shapes added: K 4096 (KDA/DSA/MLP inputs), 1536 (q_absorb), 16384
+// (o_absorb), 2048 (shared-expert down) at the 8K prefill's 8191 rows.
+const K_DIMS: [u32; 7] = [5120, 6144, 17408, 4096, 1536, 16384, 2048];
+const M_DIMS: [u32; 6] = [16, 17, 25, 1168, 4576, 8191];
+const M_MAX: u32 = 8191;
 const GROUP: u32 = 128;
 const E4M3_MAX: f32 = 448.0;
 const GUARD: usize = 256;
@@ -364,5 +366,7 @@ fn main() -> Result<()> {
         g.free(input).ok();
     }
     eprintln!("  ALL LEGS BIT-IDENTICAL (fp8 bytes and fp32 scales), KNOWN_BAD fired on each");
+    // 2026-10-06: The build-mt verdict line (scripts/race/build-mt.sh contract).
+    println!("PASS: the twin's FP8 bytes and scales equal the shared kernel's on every leg; KNOWN_BAD fired");
     Ok(())
 }

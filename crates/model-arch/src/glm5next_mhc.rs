@@ -771,7 +771,15 @@ mod mhc_shape_tests {
     fn tokmajor_lever_parses_one_as_on_and_everything_else_as_off() {
         assert!(parse_mhc_tokmajor(Some("1")));
         assert!(parse_mhc_tokmajor(Some(" 1 ")));
-        for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("true"), Some("01")] {
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("2"),
+            Some("on"),
+            Some("true"),
+            Some("01"),
+        ] {
             assert!(!parse_mhc_tokmajor(v), "{v:?}");
         }
     }
@@ -785,8 +793,11 @@ mod mhc_shape_tests {
         assert!(!tokmajor_for(false, true, true, 24), "not requested");
         assert!(!tokmajor_for(true, false, true, 24), "FP32 hc_fn");
         assert!(!tokmajor_for(true, true, false, 24), "handle 0");
-        assert!(!tokmajor_for(true, true, true, mix_hc(5) as u32), "past GLM_HC_MAX_MIX");
-        assert!(MHC_TOKMAJOR_MIN_ROWS > 1 && MHC_TOKMAJOR_MIN_ROWS <= MHC_SLICE_ROWS);
+        assert!(
+            !tokmajor_for(true, true, true, mix_hc(5) as u32),
+            "past GLM_HC_MAX_MIX"
+        );
+        const { assert!(MHC_TOKMAJOR_MIN_ROWS > 1 && MHC_TOKMAJOR_MIN_ROWS <= MHC_SLICE_ROWS) };
     }
 
     /// 2026-10-01: `Glm5NextMhcKernels::resolve` asks for `glm5next_hc_mix_bf16_tokmajor`, and

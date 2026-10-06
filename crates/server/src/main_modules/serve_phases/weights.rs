@@ -212,10 +212,9 @@ pub(crate) fn load_dflash_drafter(
                 drafter_dir.display()
             )
         })?;
-    let mut drafter_config =
-        metrale_model_arch::weight_loader::dflash_loader::parse_dflash_config(
-            &drafter_config_json,
-        )?;
+    let mut drafter_config = metrale_model_arch::weight_loader::dflash_loader::parse_dflash_config(
+        &drafter_config_json,
+    )?;
     // 2026-10-01: `METRALE_DFLASH_CKPT_ARCH=1` loads the drafter's learned
     // mask embedding (`mask_embedding.pt`) from the drafter directory into
     // the config the head is built from; the summary line names what the
@@ -545,7 +544,7 @@ fn shareable_table_bytes(dir: &Path, vocab: usize, hidden: usize) -> u64 {
         return 0;
     };
     for e in rd.flatten() {
-        if !e.path().extension().is_some_and(|x| x == "safetensors") {
+        if e.path().extension().is_none_or(|x| x != "safetensors") {
             continue;
         }
         match read_safetensors_headers(&e.path()) {

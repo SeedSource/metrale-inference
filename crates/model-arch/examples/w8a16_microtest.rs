@@ -223,7 +223,7 @@ fn main() -> Result<()> {
         u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0x51A7)
     });
 
-    if k % FP8_BLOCK != 0 {
+    if !k.is_multiple_of(FP8_BLOCK) {
         bail!("K ({k}) must be a multiple of FP8_BLOCK ({FP8_BLOCK}) for the clean-block path");
     }
     println!("=== w8a16 microtest: kernel='{kernel}' M={m} N={n} K={k} seed=0x{seed:X} ===");

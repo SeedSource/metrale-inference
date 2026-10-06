@@ -97,9 +97,12 @@ fn f32_mask_embedding_is_rounded_to_bf16() {
 
 #[test]
 fn wrong_element_count_is_refused() {
-    let data = vec![0u8; 16];
+    let data = [0u8; 16];
     let z = torch_zip(
-        &[("m/data.pkl", &pkl("BFloat16Storage")[..]), ("m/data/0", &data[..])],
+        &[
+            ("m/data.pkl", &pkl("BFloat16Storage")[..]),
+            ("m/data/0", &data[..]),
+        ],
         0,
     );
     assert!(parse_torch_mask_embedding(&z, 4096).is_err());
@@ -107,9 +110,12 @@ fn wrong_element_count_is_refused() {
 
 #[test]
 fn compressed_member_is_refused() {
-    let data = vec![0u8; 8];
+    let data = [0u8; 8];
     let z = torch_zip(
-        &[("m/data.pkl", &pkl("BFloat16Storage")[..]), ("m/data/0", &data[..])],
+        &[
+            ("m/data.pkl", &pkl("BFloat16Storage")[..]),
+            ("m/data/0", &data[..]),
+        ],
         8,
     );
     assert!(parse_torch_mask_embedding(&z, 4).is_err());
@@ -117,7 +123,7 @@ fn compressed_member_is_refused() {
 
 #[test]
 fn big_endian_archive_is_refused() {
-    let data = vec![0u8; 8];
+    let data = [0u8; 8];
     let z = torch_zip(
         &[
             ("m/data.pkl", &pkl("BFloat16Storage")[..]),
@@ -176,7 +182,10 @@ fn g_config_resolves_nested_theta_and_eps_only_under_the_lever() {
     assert!(c.needs_mask_embedding());
     assert!(!c.use_sliding_window);
     assert_eq!(c.layer_types.len(), 8);
-    assert!(c.mask_embedding_bf16.is_none(), "never read from config.json");
+    assert!(
+        c.mask_embedding_bf16.is_none(),
+        "never read from config.json"
+    );
     let sub = c.dflash_config.as_ref().expect("dflash_config");
     assert_eq!(sub.target_layer_ids.len(), 9);
     assert_eq!(c.effective_block_size(), 8);
@@ -230,7 +239,10 @@ fn present_mask_file_is_attached() {
     let dir = scratch_dir("present");
     let data: Vec<u8> = (0..4u16).flat_map(|i| (0x3f80 + i).to_le_bytes()).collect();
     let z = torch_zip(
-        &[("m/data.pkl", &pkl("BFloat16Storage")[..]), ("m/data/0", &data[..])],
+        &[
+            ("m/data.pkl", &pkl("BFloat16Storage")[..]),
+            ("m/data/0", &data[..]),
+        ],
         0,
     );
     std::fs::write(dir.join(MASK_EMBEDDING_FILE), &z).expect("write");

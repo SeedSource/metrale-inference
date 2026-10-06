@@ -45,10 +45,12 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         let num_layers = config.num_hidden_layers;
         let defer_scales = metrale_config::glm_moe_prefill_cutlass_w4a4();
         let expert_tp = metrale_config::glm_expert_tp();
-        Some(std::sync::Arc::new(move |name: &str, dtype: WeightDtype| {
-            defer_rule(name, dtype, num_layers, defer_scales)
-                || (expert_tp && is_routed_expert_tensor(name))
-        }))
+        Some(std::sync::Arc::new(
+            move |name: &str, dtype: WeightDtype| {
+                defer_rule(name, dtype, num_layers, defer_scales)
+                    || (expert_tp && is_routed_expert_tensor(name))
+            },
+        ))
     }
 
     /// 2026-10-06: Under `METRALE_GLM_WEIGHT_ARENA=1`, every routed-expert tensor that is not
@@ -206,8 +208,8 @@ enum StoreAccess<'a> {
 impl StoreAccess<'_> {
     fn shared(&self) -> &WeightStore {
         match self {
-            StoreAccess::Shared(s) => *s,
-            StoreAccess::Exclusive(s) => &**s,
+            StoreAccess::Shared(s) => s,
+            StoreAccess::Exclusive(s) => s,
         }
     }
 
@@ -342,7 +344,9 @@ impl Glm5NextWeightLoader {
         // windows of `prefill_rows_ffn()` rows, so the MLP scratch holds that many; `u_slot`
         // stays at `verify_k` rows (`mlp_ws_bytes_sized`). Staged off, `mlp_rows == verify_k`
         // and the allocation is the unstaged one.
-        let mlp_rows = verify_k.max(crate::glm5next_layer::prefill_rows_ffn()).max(bv_rows);
+        let mlp_rows = verify_k
+            .max(crate::glm5next_layer::prefill_rows_ffn())
+            .max(bv_rows);
         // 2026-10-05: `METRALE_GLM_PREFILL_SCRATCH_UNION=1`: the KDA workspace, the shared MLP
         // workspace and the DSA wide arena start at one base in ONE allocation sized to the
         // largest. Invariant: all three are pure per-call scratch on one stream (nothing carried
@@ -574,8 +578,7 @@ impl Glm5NextWeightLoader {
                         // under `METRALE_GLM_DSA_MLA_SPLIT` (allocated here, at load).
                         decode_kernel:
                             crate::glm5next_dsa::attend::Glm5NextDsaDecodeKernel::resolve_for(
-                                gpu,
-                                &dsa_cfg,
+                                gpu, &dsa_cfg,
                             )?,
                         workspace: {
                             let ws =

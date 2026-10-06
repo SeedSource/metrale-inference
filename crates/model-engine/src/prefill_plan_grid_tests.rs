@@ -410,3 +410,39 @@ fn chunk_grid_splits_only_at_the_deepest_snapshot_point() {
     assert_eq!(grid_restore_cap(5000, 6500, g), 4096);
     assert_eq!(chunks_c(6500, 4096, g, c), vec![(4096, 6144), (6144, 6500)]);
 }
+
+#[test]
+fn chunk_grid_with_inpass_capture_runs_the_plain_chunk_grid() {
+    let (g, c) = (2048, G);
+    for total in [1, 2048, 2049, 5000, 8192, 8193, 9000, 16385, 20001, 32768, 40000] {
+        for off in [0, 1, 2048, 4096, 8192, 16384, 20000] {
+            assert_eq!(
+                grid_chunk_len_cs(off, total, g, c, false),
+                grid_chunk_len(off, total, c),
+                "total={total} off={off}"
+            );
+            assert_eq!(
+                grid_chunk_len_cs(off, total, g, c, true),
+                grid_chunk_len_c(off, total, g, c)
+            );
+        }
+        // 2026-10-06: The in-pass cut is the deepest snapshot point unless a chunk end saves it.
+        let d = grid_insert_len(total, g);
+        let want = (d > 0 && d % c != 0).then_some(d);
+        assert_eq!(grid_inpass_cut(total, g, c), want, "total={total}");
+        if let Some(cut) = want {
+            // 2026-10-06: Exactly one plain-grid chunk strictly spans the cut.
+            let n = (0..total)
+                .step_by(c)
+                .filter(|&s| inpass_capture_spans(cut, s, grid_chunk_len(s, total, c)))
+                .count();
+            assert_eq!(n, 1, "total={total} cut={cut}");
+        }
+    }
+    assert_eq!(grid_inpass_cut(5000, g, c), Some(4096));
+    assert_eq!(grid_inpass_cut(9000, g, c), None, "8192 is a chunk end");
+    assert_eq!(grid_inpass_cut(20001, g, c), Some(18432));
+    assert_eq!(grid_inpass_cut(2048, g, c), None);
+    assert_eq!(grid_inpass_cut(5000, g, g), None, "plain grid: no in-pass snapshot");
+    assert_eq!(grid_inpass_cut(5000, 0, c), None);
+}

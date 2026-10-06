@@ -106,10 +106,18 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         // 2026-10-03: Under the absolute grid (`grid_restore.rs`) snapshots come only from grid
         // chunk ends; no tail snapshot.
-        if self.prefix_grid_for_bs(tokens, bs).is_some() {
-            return None;
-        }
-        let cut = crate::prefill_plan::tail_split_point(tokens.len(), bs)?;
+        // 2026-10-06: Except under a chunk grid coarser than the snapshot grid
+        // (`METRALE_PREFIX_GRID_CHUNK_TOKENS`): the prompt's deepest snapshot point, when it is
+        // not a chunk end, is captured inside the pass that crosses it (the planner no longer
+        // splits there, `prefill_plan::grid_split_deepest`).
+        let cut = match self.prefix_grid_for_bs(tokens, bs) {
+            Some(g) => crate::prefill_plan::grid_inpass_cut(
+                tokens.len(),
+                g,
+                crate::prefill_plan::grid_chunk_lever(g),
+            )?,
+            None => crate::prefill_plan::tail_split_point(tokens.len(), bs)?,
+        };
         if !crate::prefill_plan::inpass_capture_spans(cut, proc_start, proc_count) {
             return None;
         }

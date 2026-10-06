@@ -53,6 +53,10 @@ name = "glm5next_dense_nvfp4_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_expert_tp_g0_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_dense_w8a8_microtest"
 required-features = ["cuda", "gpu-examples"]
 

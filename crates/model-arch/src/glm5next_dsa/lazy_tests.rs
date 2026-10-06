@@ -244,3 +244,29 @@ fn eager_state_has_no_mapping_and_the_hook_is_a_no_op() {
     );
     st.free(&gpu).unwrap();
 }
+
+/// 2026-10-05: The test fault-injection limit (`METRALE_LAZY_MAP_FAIL_ABOVE_ROWS`): mapping
+/// through N rows passes, N+1 (a new granule) refuses with the floor's "KV cache exhausted"
+/// phrase and changes nothing; 0 is off.
+#[test]
+fn fail_above_rows_refuses_past_the_limit_only() {
+    let gpu = MockGpuBackend::new();
+    let pool = Arc::new(MapBudget::new("DSA indexer", 64 * G));
+    let mut s = Glm5NextDsaState::alloc_lazy(&gpu, &cfg(65_536), 0, pool.clone()).unwrap();
+    let n = ROWS_PER_GRANULE;
+    s.map_rows_limited(n, n).unwrap();
+    assert_eq!(s.mapped_rows(), Some(n));
+    let used = pool.used();
+    let e = s.map_rows_limited(n + 1, n).unwrap_err().to_string();
+    assert!(
+        e.contains("KV cache exhausted") && e.contains("METRALE_LAZY_MAP_FAIL_ABOVE_ROWS"),
+        "{e}"
+    );
+    assert_eq!(s.mapped_rows(), Some(n));
+    assert_eq!(pool.used(), used);
+    // Rows already backed never refuse; off (0) maps freely.
+    s.map_rows_limited(10, 5).unwrap();
+    s.map_rows_limited(n + 1, 0).unwrap();
+    assert_eq!(s.mapped_rows(), Some(2 * n));
+    s.free(&gpu).unwrap();
+}

@@ -170,8 +170,26 @@ impl Glm5NextDsaState {
     /// eager buffers and for rows already backed. Fails (with nothing new charged) when the
     /// indexer pool is full or a stream capture is active.
     fn map_rows(&self, end: usize) -> Result<()> {
+        self.map_rows_limited(end, super::lazy::fail_above_rows())
+    }
+
+    /// 2026-10-05: `map_rows` with the test fault-injection limit as a parameter
+    /// (`METRALE_LAZY_MAP_FAIL_ABOVE_ROWS`, 0 = off). A request whose extent
+    /// `min(end, capacity)` passes `fail_above` rows AND would map a new granule refuses with
+    /// the floor refusal's "KV cache exhausted" phrase, before anything is charged or mapped.
+    /// Rows already backed never refuse, so the rank-agreed admission (which skips the map when
+    /// the rows are backed) and the write paths stay consistent; set the limit on a granule
+    /// boundary (multiple of 8,192 rows) to refuse exactly at the next granule.
+    pub(crate) fn map_rows_limited(&self, end: usize, fail_above: usize) -> Result<()> {
         if let Some(bufs) = &self.lazy {
-            let bytes = end.min(self.capacity) * self.index_head_dim * 2;
+            let rows = end.min(self.capacity);
+            if fail_above > 0 && rows > fail_above && rows > self.mapped_rows().unwrap_or(0) {
+                anyhow::bail!(
+                    "KV cache exhausted: DSA indexer lazy map of {rows} rows refused by the \
+                     test fault-injection lever METRALE_LAZY_MAP_FAIL_ABOVE_ROWS={fail_above}"
+                );
+            }
+            let bytes = rows * self.index_head_dim * 2;
             for b in bufs {
                 b.ensure_mapped(bytes)?;
             }

@@ -48,6 +48,20 @@ pub fn dsa_indexer_lazy() -> bool {
     })
 }
 
+/// 2026-10-05: `METRALE_LAZY_MAP_FAIL_ABOVE_ROWS` (test-only fault injection, default 0 = off):
+/// a lazy map past this many token rows refuses like the free-memory floor does. Read once,
+/// per process (per rank); deliberately NOT part of any startup rank-agreement check, so a
+/// test can set it on one rank only.
+pub fn fail_above_rows() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("METRALE_LAZY_MAP_FAIL_ABOVE_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// 2026-10-03: `METRALE_DSA_INDEXER_POOL_GB` (GiB, fractional allowed), or `None` when unset or
 /// not a positive number.
 pub fn pool_gb_from_env() -> Option<f64> {

@@ -720,6 +720,7 @@ impl Glm5NextWeightLoader {
                     ffn_head,
                     next_attn_head: Vec::new(),
                 },
+                premix: Default::default(),
             };
             // 2026-10-02: Layer `idx` is built: every binder above read its own layer's store
             // tensors (host copy in `src`, or the routed experts via `bind_expert`), and
@@ -766,10 +767,21 @@ impl Glm5NextWeightLoader {
         // 2026-10-01: Layer i prefetches layer i + 1's attention head; the last layer none.
         let heads: Vec<Vec<crate::glm5next_layer::L2Span>> =
             built.iter().map(|(_, h)| h.clone()).collect();
+        // 2026-10-06: Layer i's FFN back may write layer i + 1's attention mix
+        // (`CrossLayerPremix`); every layer shares one ticket.
+        let next_attn: Vec<_> = built
+            .iter()
+            .map(|(l, _)| l.mhc.as_ref().map(|m| m.attn))
+            .collect();
+        let ticket = std::sync::Arc::new(std::sync::Mutex::new(None));
         for (i, (mut layer, _)) in built.into_iter().enumerate() {
             if let Some(next) = heads.get(i + 1) {
                 layer.prefetch.next_attn_head = next.clone();
             }
+            layer.premix = crate::glm5next_layer::seq_parallel::CrossLayerPremix {
+                next_attn: next_attn.get(i + 1).copied().flatten(),
+                ticket: ticket.clone(),
+            };
             out.push(Box::new(layer));
         }
         Ok(out)

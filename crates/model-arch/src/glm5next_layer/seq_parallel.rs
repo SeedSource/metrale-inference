@@ -454,6 +454,10 @@ pub fn reduce_item(
     Ok(())
 }
 
+// 2026-10-06: The cross-layer `METRALE_GLM_MHC_POST_MIX` handoff, in `seq_parallel/premix.rs`.
+mod premix;
+pub use premix::{CrossLayerPremix, PremixTicket};
+
 // 2026-10-04: In `seq_parallel/tests.rs` (500-line cap).
 #[cfg(test)]
 mod tests;

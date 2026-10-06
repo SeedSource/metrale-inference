@@ -80,4 +80,8 @@ pub struct Glm5NextLayer {
     /// highway into `hidden`, the tensor the drafter was trained on (mean of the `hc_mult`
     /// streams of the layer's completed output). False for the MTP block and without DFlash.
     pub dflash_tap: bool,
+    /// 2026-10-06: `METRALE_GLM_MHC_POST_MIX` across layers (`seq_parallel::CrossLayerPremix`):
+    /// the next text layer's attention site and the shared ticket, set by the loader's
+    /// post-pass. `Default` (no next site) for the MTP block.
+    pub premix: super::seq_parallel::CrossLayerPremix,
 }

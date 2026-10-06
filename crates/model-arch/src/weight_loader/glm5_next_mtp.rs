@@ -149,6 +149,7 @@ pub fn load_glm5next_mtp_module(
         prefetch: Default::default(),
         // 2026-10-01: The MTP block is never a DFlash tap.
         dflash_tap: false,
+        premix: Default::default(),
     };
     let mut eh_proj = DenseWeight {
         weight: store.get(&format!("{prefix}eh_proj.weight"))?.ptr,

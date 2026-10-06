@@ -170,14 +170,43 @@ impl Glm5NextLayer {
         // rank's rows of the same chunk (the owner of a row depends only on the plan), so every
         // FFN-front row was post-mixed first; the mix scratch is indexed by chunk row, so the
         // chunk must fit it.
-        let post_mix = crate::glm5next_mhc::mhc_post_mix()
-            && crate::glm5next_mhc::post_mix_usable(
+        // 2026-10-06: Across layers too: the FFN back also writes the next layer's attention
+        // mix (`CrossLayerPremix`) and issues a ticket for that layer and chunk; this layer's
+        // attention front runs `hc_finish` only when it takes a ticket equal to its own (the
+        // same chunk, so the same plan and the same owned rows). Any other case recomputes.
+        let post_mix_on = crate::glm5next_mhc::mhc_post_mix()
+            && num_tokens <= crate::glm5next_mhc::mhc_mix_max_tokens();
+        let usable = |site: &crate::glm5next_mhc::Glm5NextMhcSiteWeights| {
+            crate::glm5next_mhc::post_mix_usable(
                 &mhc.kernels,
-                &mhc.ffn,
+                site,
                 self.hidden as u32,
                 mhc.hc_mult as u32,
             )
-            && num_tokens <= crate::glm5next_mhc::mhc_mix_max_tokens();
+        };
+        let post_mix = post_mix_on && usable(&mhc.ffn);
+        let ticket = |layer: usize| crate::glm5next_layer::seq_parallel::PremixTicket {
+            layer,
+            seq_len_start,
+            total: num_tokens,
+            hidden: hidden.0,
+        };
+        let attn_premixed = self.premix.take_matches(ticket(self.layer_idx));
+        if attn_premixed {
+            static ENGAGED: std::sync::Once = std::sync::Once::new();
+            ENGAGED.call_once(|| {
+                tracing::warn!(
+                    "METRALE_GLM_MHC_POST_MIX: cross-layer ENGAGED (layer {} attention front \
+                     took the previous FFN back's mix rows)",
+                    self.layer_idx
+                );
+            });
+        }
+        let next_attn = self
+            .premix
+            .next_attn
+            .as_ref()
+            .filter(|n| post_mix_on && !self.is_last && usable(n));
         let attn = SpSite {
             weights: &mhc.attn,
             norm: self.input_norm,
@@ -186,7 +215,7 @@ impl Glm5NextLayer {
             reduce: self.mixer_all_reduce,
             attn: true,
             post_mix: post_mix.then_some(&mhc.ffn),
-            premixed: false,
+            premixed: attn_premixed,
         };
         let mixer = |(t, k): (usize, usize), x: DevicePtr| {
             self.attn_mixer(
@@ -220,7 +249,7 @@ impl Glm5NextLayer {
             last: self.is_last,
             reduce: self.mlp_cfg.needs_all_reduce(),
             attn: false,
-            post_mix: None,
+            post_mix: next_attn,
             premixed: post_mix,
         };
         let mlp = |(_, k): (usize, usize), x: DevicePtr| {
@@ -231,6 +260,9 @@ impl Glm5NextLayer {
                 .map(|()| ffn_out)
         };
         sp_pass(gpu, comm, add_k, plan, &lanes, hidden, &wins, ffn, mlp, stream)?;
+        if next_attn.is_some() {
+            self.premix.issue(ticket(self.layer_idx + 1));
+        }
         if self.is_last {
             // 2026-10-01: Both ranks leave with every final row, as `prefill_staged_run` does.
             swap_owned(comm, plan, hidden, (0, num_tokens), self.hidden * 2, stream)?;

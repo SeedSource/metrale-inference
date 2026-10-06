@@ -360,6 +360,7 @@ pub(crate) fn build_stack(
             is_last: idx == 2,
             prefetch: Default::default(),
             dflash_tap: false,
+            premix: Default::default(),
         });
     }
     Ok(layers)

@@ -96,10 +96,13 @@ fn radix_chunks_stay_within_the_tie_base_array() {
     assert_eq!(radix_chunks(96), 1);
     assert_eq!(radix_chunks(4096), 1);
     for q in 1..300 {
-        assert!((1..=RADIX_MAX_CHUNKS).contains(&radix_chunks(q)), "q_rows {q}");
+        assert!(
+            (1..=RADIX_MAX_CHUNKS).contains(&radix_chunks(q)),
+            "q_rows {q}"
+        );
     }
     // 2026-10-06: The pass-2 per-chunk histograms reuse the two 4096-bin histograms.
-    assert!(RADIX_MAX_CHUNKS * RADIX_BINS_LAST <= RADIX_STATE);
+    const { assert!(RADIX_MAX_CHUNKS * RADIX_BINS_LAST <= RADIX_STATE) };
 }
 
 /// 2026-10-06: Work-buffer sizing at GLM-5.3's shape: kcap 512, 9,264 words a row.
@@ -126,7 +129,11 @@ fn the_radix_region_follows_the_lever_and_the_tile() {
     let short = DsaSelectGeometry::plan(&c, 4 * topk_tile(), 3).unwrap();
     assert_eq!(radix_region_bytes(&long, &c, false), 0);
     assert_eq!(radix_region_bytes(&long, &c, true), 3 * 37_056);
-    assert_eq!(radix_region_bytes(&short, &c, true), 0, "exactly one tile of pools");
+    assert_eq!(
+        radix_region_bytes(&short, &c, true),
+        0,
+        "exactly one tile of pools"
+    );
     let (off, _) = DsaSelectScratch::plan_bytes_for(&c, &[long], false);
     let (on, _) = DsaSelectScratch::plan_bytes_for(&c, &[long], true);
     assert_eq!(off[..6], on[..6]);
@@ -136,11 +143,19 @@ fn the_radix_region_follows_the_lever_and_the_tile() {
     let n0 = gpu.live_alloc_count();
     let plan_off = DsaSelectScratch::plan_bytes_for(&c, &[long], false);
     let a = DsaSelectScratch::alloc_sized(&gpu, plan_off).unwrap();
-    assert_eq!(gpu.live_alloc_count() - n0, 7, "lever off: the seven regions as before");
+    assert_eq!(
+        gpu.live_alloc_count() - n0,
+        7,
+        "lever off: the seven regions as before"
+    );
     let n1 = gpu.live_alloc_count();
     let plan_on = DsaSelectScratch::plan_bytes_for(&c, &[long], true);
     let b = DsaSelectScratch::alloc_sized(&gpu, plan_on).unwrap();
-    assert_eq!(gpu.live_alloc_count() - n1, 8, "lever on: plus the radix region");
+    assert_eq!(
+        gpu.live_alloc_count() - n1,
+        8,
+        "lever on: plus the radix region"
+    );
     a.free(&gpu).unwrap();
     b.free(&gpu).unwrap();
     assert_eq!(gpu.live_alloc_count(), n0);
@@ -152,7 +167,10 @@ fn the_radix_region_follows_the_lever_and_the_tile() {
 fn radix_mode_table() {
     let big = topk_tile() + 1;
     assert_eq!(radix_mode(false, true, true, big), RadixMode::Off);
-    assert_eq!(radix_mode(true, false, true, big), RadixMode::MissingKernels);
+    assert_eq!(
+        radix_mode(true, false, true, big),
+        RadixMode::MissingKernels
+    );
     assert_eq!(radix_mode(true, false, true, 1), RadixMode::MissingKernels);
     assert_eq!(radix_mode(true, true, true, topk_tile()), RadixMode::Small);
     assert_eq!(radix_mode(true, true, false, big), RadixMode::NoScratch);
@@ -168,7 +186,14 @@ fn radix_mode_table() {
 fn the_lever_parses_as_a_switch() {
     assert!(parse_topk_radix(Some("1")));
     assert!(parse_topk_radix(Some(" 1 ")));
-    for v in [None, Some(""), Some("0"), Some("true"), Some("on"), Some("2")] {
+    for v in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("true"),
+        Some("on"),
+        Some("2"),
+    ] {
         assert!(!parse_topk_radix(v), "{v:?}");
     }
 }
@@ -236,7 +261,10 @@ fn launch_sequence_and_grids() {
     for (i, (launch, (grid, args))) in l.iter().zip(want).enumerate() {
         assert_eq!(launch.grid, grid, "launch {i}");
         assert_eq!(launch.block, [RADIX_THREADS, 1, 1], "launch {i}");
-        assert_eq!(launch.shared_mem, 0, "launch {i}: static shared memory only");
+        assert_eq!(
+            launch.shared_mem, 0,
+            "launch {i}: static shared memory only"
+        );
         assert_eq!(launch.stream, 7);
         assert_eq!(launch.args.len(), args, "launch {i}");
     }
@@ -263,9 +291,8 @@ fn radix_defines_and_entry_points_match_the_kernel_file() {
         .join(format!("{DSA_MODULE}.cu"));
     let src = std::fs::read_to_string(&cu).expect("dsa_indexer.cu readable");
     let params = |name: &str| -> String {
-        let head = format!(
-            "extern \"C\" __global__ void __launch_bounds__(DSA_RADIX_THREADS) {name}("
-        );
+        let head =
+            format!("extern \"C\" __global__ void __launch_bounds__(DSA_RADIX_THREADS) {name}(");
         let Some(at) = src.find(&head) else {
             panic!("{cu:?} lacks `{head}`");
         };

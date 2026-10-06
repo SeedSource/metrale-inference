@@ -250,7 +250,9 @@ fn run_case(
     let flat: Vec<f32> = rows.iter().flatten().copied().collect();
     let scores = up(g, &f32_bytes(&flat))?;
     let out_bytes = (q * sk * 4).max(4);
-    let outs = (0..4).map(|_| g.alloc(out_bytes)).collect::<Result<Vec<_>>>()?;
+    let outs = (0..4)
+        .map(|_| g.alloc(out_bytes))
+        .collect::<Result<Vec<_>>>()?;
     for &o in &outs {
         g.memset(o, POISON, out_bytes)?;
     }
@@ -312,7 +314,9 @@ fn run_depth(
     }
     let scores = up(g, &f32_bytes(&flat))?;
     let out_bytes = n * SELECT_K * 4;
-    let outs = (0..4).map(|_| g.alloc(out_bytes)).collect::<Result<Vec<_>>>()?;
+    let outs = (0..4)
+        .map(|_| g.alloc(out_bytes))
+        .collect::<Result<Vec<_>>>()?;
     for &o in &outs {
         g.memset(o, POISON, out_bytes)?;
     }
@@ -365,7 +369,9 @@ fn run_depth(
     let rad_step = time_graph(g, st, &mut |sm| {
         (0..n).try_for_each(|i| radix_topk(g, k, &row_call(i, outs[1]), b.work, ceil, sm))
     })?;
-    let old_call = time_graph(g, st, &mut |sm| old_topk(g, k, &row_call(0, outs[0]), ceil, sm))?;
+    let old_call = time_graph(g, st, &mut |sm| {
+        old_topk(g, k, &row_call(0, outs[0]), ceil, sm)
+    })?;
     let rad_call = time_graph(g, st, &mut |sm| {
         radix_topk(g, k, &row_call(0, outs[1]), b.work, ceil, sm)
     })?;
@@ -373,9 +379,8 @@ fn run_depth(
         (0..LAYERS).try_for_each(|l| old_topk(g, k, &layer_call(l, outs[2]), Mode::Exact, sm))
     })?;
     let rad_ex = time_graph(g, st, &mut |sm| {
-        (0..LAYERS).try_for_each(|l| {
-            radix_topk(g, k, &layer_call(l, outs[3]), b.work, Mode::Exact, sm)
-        })
+        (0..LAYERS)
+            .try_for_each(|l| radix_topk(g, k, &layer_call(l, outs[3]), b.work, Mode::Exact, sm))
     })?;
     let speedup = old_step / rad_step.max(1e-9);
     println!(

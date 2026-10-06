@@ -61,7 +61,11 @@ fn model(scores: &[f32], select_k: usize, chunks: usize) -> Vec<i32> {
     let mut tie_base = vec![0u32; chunks];
     let mut ngt = 0u32;
     for pass in 0..RADIX_PASSES {
-        let nbins = if pass == 2 { RADIX_BINS_LAST } else { RADIX_BINS };
+        let nbins = if pass == 2 {
+            RADIX_BINS_LAST
+        } else {
+            RADIX_BINS
+        };
         let mut ch = vec![vec![0u32; nbins]; chunks];
         for (c, h) in ch.iter_mut().enumerate() {
             for i in range(c) {
@@ -100,7 +104,10 @@ fn model(scores: &[f32], select_k: usize, chunks: usize) -> Vec<i32> {
             }
             excl += local;
         }
-        assert_eq!(found, 1, "pass {pass}: exactly one thread holds the threshold bin");
+        assert_eq!(
+            found, 1,
+            "pass {pass}: exactly one thread holds the threshold bin"
+        );
         (prefix, need) = next;
     }
     let (tau, m) = (prefix, need);
@@ -152,15 +159,36 @@ fn cases() -> Vec<(&'static str, Vec<f32>)> {
     vec![
         ("all equal", vec![1.0; 3_000]),
         ("all -FLT_MAX", vec![m; 2_500]),
-        ("half -FLT_MAX", (0..5_000).map(|_| if g.f() < 0.5 { m } else { g.f() }).collect()),
-        ("+-0 mix", (0..4_000).map(|_| g.pick(&[0.0, -0.0, 1e-3, m])).collect()),
+        (
+            "half -FLT_MAX",
+            (0..5_000)
+                .map(|_| if g.f() < 0.5 { m } else { g.f() })
+                .collect(),
+        ),
+        (
+            "+-0 mix",
+            (0..4_000).map(|_| g.pick(&[0.0, -0.0, 1e-3, m])).collect(),
+        ),
         ("exactly select_k candidates", exact_k),
         ("P = select_k", (0..512).map(|_| g.f()).collect()),
         ("P = select_k + 1", (0..513).map(|_| g.f()).collect()),
-        ("P = 2049", (0..2_049).map(|_| g.pick(&[0.5, 0.25, 0.125])).collect()),
-        ("threshold duplicates", (0..7_777).map(|_| g.pick(&[0.1, 0.2, 0.3, 0.4, m])).collect()),
+        (
+            "P = 2049",
+            (0..2_049).map(|_| g.pick(&[0.5, 0.25, 0.125])).collect(),
+        ),
+        (
+            "threshold duplicates",
+            (0..7_777)
+                .map(|_| g.pick(&[0.1, 0.2, 0.3, 0.4, m]))
+                .collect(),
+        ),
         ("spread", (0..20_011).map(|_| (g.f() - 0.5) * 1e4).collect()),
-        ("denormals", (0..3_001).map(|_| g.pick(&[1e-45, -1e-45, 0.0, -0.0, 2e-45])).collect()),
+        (
+            "denormals",
+            (0..3_001)
+                .map(|_| g.pick(&[1e-45, -1e-45, 0.0, -0.0, 2e-45]))
+                .collect(),
+        ),
     ]
 }
 
@@ -180,7 +208,11 @@ fn the_radix_model_selects_exactly_the_first_select_k() {
     let tiny = [0.0, -0.0, -f32::MAX, 1.0, -f32::MAX, 1.0, 0.0];
     for k in 0..=tiny.len() {
         for chunks in [1, 2, 32] {
-            assert_eq!(model(&tiny, k, chunks), reference(&tiny, k), "k {k}, {chunks} chunks");
+            assert_eq!(
+                model(&tiny, k, chunks),
+                reference(&tiny, k),
+                "k {k}, {chunks} chunks"
+            );
         }
     }
 }

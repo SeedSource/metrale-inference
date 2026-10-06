@@ -126,9 +126,13 @@ pub(crate) fn adversarial() -> Vec<(&'static str, Gen)> {
         }),
         case("P = 2049", |s| {
             let mut g = Lcg::new(s);
-            (0..2_049).map(|_| g.pick(&[0.5, 0.25, 0.125, 1.0])).collect()
+            (0..2_049)
+                .map(|_| g.pick(&[0.5, 0.25, 0.125, 1.0]))
+                .collect()
         }),
-        case("P = 100003 (not a chunk multiple)", |s| rig_scores(s, 100_003)),
+        case("P = 100003 (not a chunk multiple)", |s| {
+            rig_scores(s, 100_003)
+        }),
         case("threshold duplicates", move |s| {
             let mut g = Lcg::new(s);
             (0..50_000)

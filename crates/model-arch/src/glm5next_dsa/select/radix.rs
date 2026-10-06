@@ -148,7 +148,15 @@ pub(super) fn regions(
     lever: bool,
 ) -> [usize; 7] {
     let b = geom.scratch_bytes();
-    [b[0], b[1], b[2], b[3], b[4], b[5], radix_region_bytes(geom, cfg, lever)]
+    [
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        radix_region_bytes(geom, cfg, lever),
+    ]
 }
 
 /// 2026-10-06: Allocate region 6: NULL (no allocation) when `bytes` is 0, so a lever-off scratch
@@ -300,7 +308,12 @@ pub fn launch_topk_radix(
     let rows = t.q_rows as u32;
     let chunks = radix_chunks(t.q_rows) as u32;
     let block = [RADIX_THREADS, 1, 1];
-    let (p, selk, kcap, gd) = (t.n_pools as u32, t.select_k as u32, t.kcap as u32, t.geom_dev);
+    let (p, selk, kcap, gd) = (
+        t.n_pools as u32,
+        t.select_k as u32,
+        t.kcap as u32,
+        t.geom_dev,
+    );
 
     KernelLaunch::new(gpu, kernels.topk_radix_init)
         .grid([rows, 1, 1])

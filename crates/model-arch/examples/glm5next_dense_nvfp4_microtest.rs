@@ -494,6 +494,12 @@ fn parse_checks() -> usize {
             .unwrap_or(false),
         "list kda,dsa",
     );
+    check(
+        p(Some("dsa_o"))
+            .map(|c| c.dsa_o && !c.dsa && !c.kda && !c.shared && !c.mlp && !c.mtp && c.any())
+            .unwrap_or(false),
+        "list dsa_o",
+    );
     check(p(Some("kda,bogus")).is_err(), "unknown class is an error");
     fails
 }

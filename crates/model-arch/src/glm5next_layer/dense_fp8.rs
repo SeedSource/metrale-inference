@@ -159,6 +159,9 @@ pub struct Nvfp4Classes {
     pub kda: bool,
     /// DSA `q_a_proj`, `q_absorb`, `kv_a_proj`, `o_absorb`.
     pub dsa: bool,
+    /// 2026-10-05: DSA `o_absorb` only (the attention output projection; the other three
+    /// feed attention scores or the cached latent). Implied by `dsa`.
+    pub dsa_o: bool,
     /// The MoE layers' shared-expert `gate_proj`, `up_proj`, `down_proj`.
     pub shared: bool,
     /// The dense layers' (0..=2) `gate_proj`, `up_proj`, `down_proj`.
@@ -169,13 +172,14 @@ pub struct Nvfp4Classes {
 
 impl Nvfp4Classes {
     pub fn any(&self) -> bool {
-        self.kda || self.dsa || self.shared || self.mlp || self.mtp
+        self.kda || self.dsa || self.dsa_o || self.shared || self.mlp || self.mtp
     }
 
     fn has(&self, c: Class) -> bool {
         match c {
             Class::Kda => self.kda,
             Class::Dsa => self.dsa,
+            Class::DsaO => self.dsa || self.dsa_o,
             Class::Shared => self.shared,
             Class::Mlp => self.mlp,
             Class::Mtp => self.mtp,
@@ -190,6 +194,7 @@ impl Nvfp4Classes {
 enum Class {
     Kda,
     Dsa,
+    DsaO,
     Shared,
     Mlp,
     Mtp,
@@ -197,7 +202,8 @@ enum Class {
 }
 
 /// 2026-10-05: Parse a `METRALE_GLM_DENSE_NVFP4` value: unset, empty, `0` or `off` = none;
-/// `1` or `on` = `kda,shared,mlp`; else a comma list of `kda`, `dsa`, `shared`, `mlp`, `mtp`.
+/// `1` or `on` = `kda,shared,mlp`; else a comma list of `kda`, `dsa`, `dsa_o`, `shared`, `mlp`,
+/// `mtp`.
 /// An unknown name is an error.
 pub fn parse_nvfp4_classes(raw: Option<&str>) -> Result<Nvfp4Classes> {
     let mut c = Nvfp4Classes::default();
@@ -218,11 +224,12 @@ pub fn parse_nvfp4_classes(raw: Option<&str>) -> Result<Nvfp4Classes> {
         match name {
             "kda" => c.kda = true,
             "dsa" => c.dsa = true,
+            "dsa_o" => c.dsa_o = true,
             "shared" => c.shared = true,
             "mlp" => c.mlp = true,
             "mtp" => c.mtp = true,
             other => bail!(
-                "METRALE_GLM_DENSE_NVFP4: unknown class {other:?} (kda, dsa, shared, mlp, mtp; \
+                "METRALE_GLM_DENSE_NVFP4: unknown class {other:?} (kda, dsa, dsa_o, shared, mlp, mtp; \
                  or 1 = kda,shared,mlp)"
             ),
         }
@@ -1132,7 +1139,7 @@ pub fn register_layer(
             list.push((&mut w.q_a_proj, c.q_lora_rank, c.hidden, Class::Dsa));
             list.push((&mut w.q_absorb, heads_lat, c.q_lora_rank, Class::Dsa));
             list.push((&mut w.kv_a_proj, c.kv_lora_rank, c.hidden, Class::Dsa));
-            list.push((&mut w.o_absorb, c.hidden, heads_lat, Class::Dsa));
+            list.push((&mut w.o_absorb, c.hidden, heads_lat, Class::DsaO));
         }
     }
     let (w, inter, class) = match mlp {

@@ -14,6 +14,8 @@
 //   is written on every path, including a masked query.
 // - dsa_mla_masked_attn has no rope section: q and k share one head dim qd, and `scale` is
 //   an argument, never derived here.
+// - 2026-10-06: dsa_topk_radix_{init,hist,find,gather,sort} (3b, METRALE_GLM_DSA_TOPK_RADIX=1)
+//   write the same `selected` bytes as dsa_topk_pools, for pool counts above one top-k tile.
 
 
 
@@ -895,6 +897,382 @@ extern "C" __global__ void dsa_topk_pools(
 
     for (unsigned int i = tid; i < select_k; i += blockDim.x)
         selected[(size_t)r * select_k + i] = (si[i] == INT_MAX) ? DSA_INVALID : si[i];
+}
+
+// 2026-10-06: 3b. Exact radix top-k over pools (METRALE_GLM_DSA_TOPK_RADIX=1, opt-in): the
+// same output as dsa_topk_pools, byte for byte, without its per-tile bitonic sorts. The host
+// (crates/model-arch/src/glm5next_dsa/select/radix.rs) takes it only when the pool count it
+// dispatches on (n_pools, or the ceiling pool count of a graph launch) exceeds topk_tile();
+// below that dsa_topk_pools sorts one tile and is already cheap.
+//
+// Order (the contract of dsa_topk_pools): score descending, then pool index ascending, with
+// float compare semantics: -0.0 ties +0.0, and -FLT_MAX (a non-candidate) is an ordinary
+// value that ties with itself. dsa_radix_key maps a score to a uint32 that orders exactly so:
+// -0.0 is canonicalised to +0.0 first, then a non-negative float gets its sign bit set and a
+// negative one is bit-inverted. NaN is out of scope (scores are finite sums of relu terms).
+//
+// Sequence per call, all on one stream (9 launches; every block of a launch takes the same
+// early exit when select_k is 0, so no barrier is skipped by part of a block):
+//   init        (grid Q)     zero the two global histograms and the state words of each row.
+//   hist pass 0 (grid C x Q) histogram of key bits 31..20 (4096 bins) over the row's chunk,
+//                            warp-aggregated into shared memory, then atomicAdd into hist0.
+//   find pass 0 (grid Q)     scan the bins from the top until the count reaches select_k:
+//                            that bin is the threshold's top 12 bits; `need` becomes the count
+//                            still wanted inside it.
+//   hist/find pass 1         bits 19..8 (4096 bins, hist1) over keys matching the prefix.
+//   hist/find pass 2         bits 7..0 (256 bins) over keys matching the 24-bit prefix; each
+//                            chunk stores its own 256-bin histogram (no atomics), so find can
+//                            read the per-chunk count of the threshold key tau. After it:
+//                            tau, m = ties at tau to take (>= 1), n_gt = select_k - m =
+//                            count(key > tau), and tie_base[c] = ties at tau in chunks < c.
+//   gather      (grid C x Q) keys > tau go to candidate slots [0, n_gt) through an atomic
+//                            counter (any order); a key == tau at global tie rank t (index
+//                            order: tie_base[c] + rank within the chunk from a block scan) goes
+//                            to slot n_gt + t when t < m. So exactly select_k candidates, and
+//                            threshold ties are the m lowest indices, deterministically, with no
+//                            tie buffer however many -FLT_MAX ties there are.
+//   sort        (grid Q)     bitonic sort of the select_k [key, index] pairs, key descending
+//                            then index ascending (a total order over unique indices), and the
+//                            indices written to selected[r * select_k + i].
+// The candidate set equals the first select_k pools of the total order, and the sort orders it
+// by that order, so `selected` equals dsa_topk_pools'. The row stride of `scores` is P and that
+// of `selected` is select_k, both from `geom` when it is non-null, as in dsa_topk_pools.
+//
+// Ceiling launch: P and select_k come from geom; the grids are fixed (C chunks per row) and the
+// chunk width ceil(P / C) follows the live P, so a chunk past the live pools is empty (it still
+// stores its zero pass-2 histogram and gathers nothing). init re-zeroes the global scratch in
+// every call, inside the captured sequence.
+//
+// Work buffer per row (u32 words, row stride DSA_RADIX_CAND + 2 * kcap):
+//   [0, 4096) hist0, [4096, 8192) hist1; pass 2's per-chunk histograms [c * 256, c * 256 + 256)
+//   reuse [0, C * 256) (C <= 32, so at most both) once find pass 1 has read hist1.
+//   [8192, 8208) state, [8208, 8240) tie_base per chunk, then kcap candidate keys and kcap
+//   candidate indices.
+
+#define DSA_RADIX_THREADS 256u
+#define DSA_RADIX_MAX_CHUNKS 32u
+#define DSA_RADIX_BINS 4096u
+#define DSA_RADIX_BINS_LAST 256u
+#define DSA_RADIX_STATE 8192u
+#define DSA_RADIX_STATE_WORDS 16u
+#define DSA_RADIX_TIE 8208u
+#define DSA_RADIX_CAND 8240u
+#define DSA_RADIX_SORT_MAX 2048u
+
+// 2026-10-06: State word slots (offsets from DSA_RADIX_STATE).
+#define DSA_RS_PREFIX 0u
+#define DSA_RS_NEED   1u
+#define DSA_RS_GT_CNT 2u
+#define DSA_RS_NGT    3u
+
+// 2026-10-06: Monotone key: a > b as floats (with -0.0 == +0.0) iff key(a) > key(b).
+__device__ __forceinline__ unsigned int dsa_radix_key(float v) {
+    unsigned int u = __float_as_uint(v);
+    if (u == 0x80000000u) u = 0u;
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// 2026-10-06: Whether `key` matches the threshold prefix fixed by the passes before `pass`.
+__device__ __forceinline__ bool dsa_radix_match(unsigned int key, unsigned int prefix,
+                                                unsigned int pass) {
+    if (pass == 0u) return true;
+    if (pass == 1u) return (key >> 20) == (prefix >> 20);
+    return (key >> 8) == (prefix >> 8);
+}
+
+// 2026-10-06: The bin of `key` in `pass`: bits 31..20, 19..8, then 7..0.
+__device__ __forceinline__ unsigned int dsa_radix_digit(unsigned int key, unsigned int pass) {
+    if (pass == 0u) return key >> 20;
+    if (pass == 1u) return (key >> 8) & 0xFFFu;
+    return key & 0xFFu;
+}
+
+// 2026-10-06: Exclusive block scan of v over threadIdx.x (blockDim.x a multiple of 32, at most
+// 1024); `*total` gets the block sum. Every thread of the block must call it (it has barriers);
+// `ws` is a 32-word shared scratch, free again when it returns.
+__device__ __forceinline__ unsigned int dsa_radix_excl_scan(unsigned int v, unsigned int* ws,
+                                                            unsigned int* total) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int nwarps = blockDim.x >> 5;
+    unsigned int x = v;
+    for (unsigned int off = 1; off < 32u; off <<= 1) {
+        const unsigned int y = __shfl_up_sync(0xffffffffu, x, off);
+        if (lane >= off) x += y;
+    }
+    if (lane == 31u) ws[warp] = x;
+    __syncthreads();
+    if (warp == 0u) {
+        unsigned int s = (lane < nwarps) ? ws[lane] : 0u;
+        for (unsigned int off = 1; off < 32u; off <<= 1) {
+            const unsigned int y = __shfl_up_sync(0xffffffffu, s, off);
+            if (lane >= off) s += y;
+        }
+        ws[lane] = s;
+    }
+    __syncthreads();
+    const unsigned int base = (warp == 0u) ? 0u : ws[warp - 1u];
+    *total = ws[nwarps - 1u];
+    __syncthreads();
+    return base + x - v;
+}
+
+// 2026-10-06: One row's work buffer.
+__device__ __forceinline__ unsigned int* dsa_radix_row(unsigned int* work, unsigned int r,
+                                                       unsigned int kcap) {
+    return work + (size_t)r * (DSA_RADIX_CAND + 2u * kcap);
+}
+
+// 2026-10-06: Zero hist0, hist1 and the state words of row blockIdx.x.
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_init(
+    unsigned int* __restrict__ work,
+    unsigned int select_k,
+    unsigned int kcap,
+    const int* __restrict__ geom
+) {
+    if (geom) select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    if (select_k == 0u) return;
+    // 2026-10-06: The host sizes kcap >= every select_k it plans; a larger one would overrun
+    // the candidate buffer and the sort's shared arrays.
+    if (select_k > kcap || kcap > DSA_RADIX_SORT_MAX) __trap();
+    unsigned int* w = dsa_radix_row(work, blockIdx.x, kcap);
+    for (unsigned int i = threadIdx.x; i < DSA_RADIX_STATE + DSA_RADIX_STATE_WORDS; i += blockDim.x)
+        w[i] = 0u;
+}
+
+// 2026-10-06: Histogram pass `pass` over chunk blockIdx.x of row blockIdx.y.
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_hist(
+    const float* __restrict__ scores,
+    unsigned int* __restrict__ work,
+    unsigned int P,
+    unsigned int select_k,
+    unsigned int kcap,
+    unsigned int pass,
+    const int* __restrict__ geom
+) {
+    if (geom) {
+        P = (unsigned int)geom[DSA_GEOM_NPOOLS];
+        select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    }
+    if (select_k == 0u) return;
+    if (gridDim.x > DSA_RADIX_MAX_CHUNKS) __trap();
+    __shared__ unsigned int sh[DSA_RADIX_BINS];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int c = blockIdx.x;
+    const unsigned int r = blockIdx.y;
+    unsigned int* w = dsa_radix_row(work, r, kcap);
+    const unsigned int nbins = (pass == 2u) ? DSA_RADIX_BINS_LAST : DSA_RADIX_BINS;
+    for (unsigned int b = tid; b < nbins; b += blockDim.x) sh[b] = 0u;
+    __syncthreads();
+
+    const unsigned int prefix = (pass == 0u) ? 0u : w[DSA_RADIX_STATE + DSA_RS_PREFIX];
+    const unsigned int chunk = (P + gridDim.x - 1u) / gridDim.x;
+    const unsigned int lo = min(c * chunk, P);
+    const unsigned int hi = min(lo + chunk, P);
+    const float* row = scores + (size_t)r * P;
+    const unsigned int lane = tid & 31u;
+    // 2026-10-06: The trip count depends on lo, hi and blockDim only, so every lane of every
+    // warp reaches the ballot; lanes past `hi` vote false.
+    for (unsigned int base = lo; base < hi; base += blockDim.x) {
+        const unsigned int i = base + tid;
+        bool live = i < hi;
+        unsigned int digit = 0u;
+        if (live) {
+            const unsigned int key = dsa_radix_key(row[i]);
+            live = dsa_radix_match(key, prefix, pass);
+            digit = dsa_radix_digit(key, pass);
+        }
+        const unsigned int active = __ballot_sync(0xffffffffu, live);
+        if (live) {
+            // 2026-10-06: One shared atomic per distinct bin in the warp (thousands of
+            // -FLT_MAX ties fall in one bin).
+            const unsigned int peers = __match_any_sync(active, digit);
+            if (lane == (unsigned int)(__ffs(peers) - 1))
+                atomicAdd(&sh[digit], (unsigned int)__popc(peers));
+        }
+    }
+    __syncthreads();
+
+    if (pass < 2u) {
+        unsigned int* g = w + pass * DSA_RADIX_BINS;
+        for (unsigned int b = tid; b < DSA_RADIX_BINS; b += blockDim.x)
+            if (sh[b] != 0u) atomicAdd(&g[b], sh[b]);
+    } else {
+        // 2026-10-06: Every chunk, empty or not, stores all its bins.
+        unsigned int* g = w + c * DSA_RADIX_BINS_LAST;
+        for (unsigned int b = tid; b < DSA_RADIX_BINS_LAST; b += blockDim.x) g[b] = sh[b];
+    }
+}
+
+// 2026-10-06: Count of bin `b` in `pass`: the global histogram, or (pass 2) the per-chunk
+// histograms summed over the `chunks` chunks.
+__device__ __forceinline__ unsigned int dsa_radix_bin_count(const unsigned int* w,
+                                                            unsigned int pass, unsigned int b,
+                                                            unsigned int chunks) {
+    if (pass < 2u) return w[pass * DSA_RADIX_BINS + b];
+    unsigned int s = 0u;
+    for (unsigned int c = 0; c < chunks; ++c) s += w[c * DSA_RADIX_BINS_LAST + b];
+    return s;
+}
+
+// 2026-10-06: Find pass `pass` for row blockIdx.x: the bin where the count from the top reaches
+// `need`. Thread t owns bins [nbins - (t + 1) * per, nbins - t * per), walked from the top, so
+// the exclusive scan over t is the count above its bins. Exactly one thread has
+// excl < need <= excl + local (need >= 1 and the bins hold at least `need` keys); it extends the
+// prefix and, after pass 2, writes n_gt and the per-chunk tie bases. `chunks` is the grid x of
+// the hist launches.
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_find(
+    unsigned int* __restrict__ work,
+    unsigned int select_k,
+    unsigned int kcap,
+    unsigned int pass,
+    unsigned int chunks,
+    const int* __restrict__ geom
+) {
+    if (geom) select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    if (select_k == 0u) return;
+    // 2026-10-06: The bin split assumes DSA_RADIX_THREADS threads (16 bins, then 1, each).
+    if (blockDim.x != DSA_RADIX_THREADS || chunks > DSA_RADIX_MAX_CHUNKS) __trap();
+    __shared__ unsigned int ws[32];
+    const unsigned int tid = threadIdx.x;
+    unsigned int* w = dsa_radix_row(work, blockIdx.x, kcap);
+    const unsigned int nbins = (pass == 2u) ? DSA_RADIX_BINS_LAST : DSA_RADIX_BINS;
+    const unsigned int per = nbins / blockDim.x;
+    const unsigned int need = (pass == 0u) ? select_k : w[DSA_RADIX_STATE + DSA_RS_NEED];
+    const unsigned int prefix = (pass == 0u) ? 0u : w[DSA_RADIX_STATE + DSA_RS_PREFIX];
+    const unsigned int top = nbins - 1u - tid * per;
+    unsigned int local = 0u;
+    for (unsigned int j = 0; j < per; ++j) local += dsa_radix_bin_count(w, pass, top - j, chunks);
+    unsigned int total;
+    const unsigned int excl = dsa_radix_excl_scan(local, ws, &total);
+    // 2026-10-06: The scan's barriers order every read of the state above before the write
+    // below.
+    if (excl < need && need <= excl + local) {
+        unsigned int cum = excl;
+        unsigned int b = top;
+        for (unsigned int j = 0; j < per; ++j) {
+            b = top - j;
+            const unsigned int h = dsa_radix_bin_count(w, pass, b, chunks);
+            if (cum + h >= need) break;
+            cum += h;
+        }
+        const unsigned int shift = (pass == 0u) ? 20u : ((pass == 1u) ? 8u : 0u);
+        const unsigned int left = need - cum;
+        w[DSA_RADIX_STATE + DSA_RS_PREFIX] = prefix | (b << shift);
+        w[DSA_RADIX_STATE + DSA_RS_NEED] = left;
+        if (pass == 2u) {
+            w[DSA_RADIX_STATE + DSA_RS_NGT] = select_k - left;
+            unsigned int run = 0u;
+            for (unsigned int c = 0; c < chunks; ++c) {
+                w[DSA_RADIX_TIE + c] = run;
+                run += w[c * DSA_RADIX_BINS_LAST + b];
+            }
+        }
+    }
+}
+
+// 2026-10-06: Gather the select_k candidates of chunk blockIdx.x of row blockIdx.y (see 3b).
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_gather(
+    const float* __restrict__ scores,
+    unsigned int* __restrict__ work,
+    unsigned int P,
+    unsigned int select_k,
+    unsigned int kcap,
+    const int* __restrict__ geom
+) {
+    if (geom) {
+        P = (unsigned int)geom[DSA_GEOM_NPOOLS];
+        select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    }
+    if (select_k == 0u) return;
+    __shared__ unsigned int ws[32];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int c = blockIdx.x;
+    const unsigned int r = blockIdx.y;
+    unsigned int* w = dsa_radix_row(work, r, kcap);
+    const unsigned int tau = w[DSA_RADIX_STATE + DSA_RS_PREFIX];
+    const unsigned int m = w[DSA_RADIX_STATE + DSA_RS_NEED];
+    const unsigned int ngt = w[DSA_RADIX_STATE + DSA_RS_NGT];
+    unsigned int* cand_key = w + DSA_RADIX_CAND;
+    unsigned int* cand_idx = w + DSA_RADIX_CAND + kcap;
+
+    const unsigned int chunk = (P + gridDim.x - 1u) / gridDim.x;
+    const unsigned int lo = min(c * chunk, P);
+    const unsigned int hi = min(lo + chunk, P);
+    const float* row = scores + (size_t)r * P;
+    // 2026-10-06: Ties at tau in chunks before this one; the loop adds this chunk's in index
+    // order.
+    unsigned int run = w[DSA_RADIX_TIE + c];
+    for (unsigned int base = lo; base < hi; base += blockDim.x) {
+        const unsigned int i = base + tid;
+        const bool live = i < hi;
+        const unsigned int key = live ? dsa_radix_key(row[i]) : 0u;
+        if (live && key > tau) {
+            const unsigned int slot = atomicAdd(&w[DSA_RADIX_STATE + DSA_RS_GT_CNT], 1u);
+            if (slot < ngt) {
+                cand_key[slot] = key;
+                cand_idx[slot] = i;
+            }
+        }
+        const unsigned int tie = (live && key == tau) ? 1u : 0u;
+        unsigned int total;
+        const unsigned int rank = run + dsa_radix_excl_scan(tie, ws, &total);
+        if (tie != 0u && rank < m) {
+            cand_key[ngt + rank] = key;
+            cand_idx[ngt + rank] = i;
+        }
+        run += total;
+    }
+}
+
+// 2026-10-06: Sort row blockIdx.x's select_k candidates (key descending, then index ascending)
+// and write their pool indices.
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_sort(
+    const unsigned int* __restrict__ work,
+    int* __restrict__ selected,
+    unsigned int select_k,
+    unsigned int kcap,
+    const int* __restrict__ geom
+) {
+    if (geom) select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    if (select_k == 0u) return;
+    __shared__ unsigned int sk[DSA_RADIX_SORT_MAX];
+    __shared__ int si[DSA_RADIX_SORT_MAX];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int r = blockIdx.x;
+    const unsigned int* w = work + (size_t)r * (DSA_RADIX_CAND + 2u * kcap);
+    const unsigned int* cand_key = w + DSA_RADIX_CAND;
+    const unsigned int* cand_idx = w + DSA_RADIX_CAND + kcap;
+    unsigned int n2 = 2u;
+    while (n2 < select_k) n2 <<= 1;
+    // 2026-10-06: Padding sorts last on both keys (key 0 is below every finite score's key).
+    for (unsigned int i = tid; i < n2; i += blockDim.x) {
+        sk[i] = (i < select_k) ? cand_key[i] : 0u;
+        si[i] = (i < select_k) ? (int)cand_idx[i] : INT_MAX;
+    }
+    __syncthreads();
+
+#define DSA_RADIX_GT(a, b) ((sk[(a)] > sk[(b)]) || (sk[(a)] == sk[(b)] && si[(a)] < si[(b)]))
+    for (unsigned int k = 2; k <= n2; k <<= 1) {
+        for (unsigned int j = k >> 1; j > 0; j >>= 1) {
+            for (unsigned int i = tid; i < n2; i += blockDim.x) {
+                const unsigned int l = i ^ j;
+                if (l > i) {
+                    const bool gt = DSA_RADIX_GT(i, l);
+                    const bool want_desc = ((i & k) == 0);
+                    if (want_desc != gt) {
+                        const unsigned int tk = sk[i]; sk[i] = sk[l]; sk[l] = tk;
+                        const int ti = si[i]; si[i] = si[l]; si[l] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+#undef DSA_RADIX_GT
+
+    for (unsigned int i = tid; i < select_k; i += blockDim.x)
+        selected[(size_t)r * select_k + i] = si[i];
 }
 
 // 2026-09-25: 4. Expand the selected pools into raw token ids, one block per query, into a

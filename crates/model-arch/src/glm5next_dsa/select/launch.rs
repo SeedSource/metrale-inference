@@ -184,20 +184,45 @@ pub fn select_tokens(
         let scores = if tc { scores.arg_u32(tc_mode) } else { scores };
         scores.launch(stream)?;
 
-        // 2026-09-25: `np2_a` is at most `topk_tile()`, so the request is at most
-        // `topk_smem_for_tile(topk_tile())`, within `TOPK_SMEM_CEILING`.
-        KernelLaunch::new(gpu, kernels.topk_pools)
-            .grid([geom.q_rows as u32, 1, 1])
-            .block([ROW_BLOCK, 1, 1])
-            .shared_mem(topk_smem_for_tile(np2_a) as u32)
-            .arg_ptr(scratch.scores)
-            .arg_ptr(scratch.selected)
-            .arg_u32(geom.q_rows as u32)
-            .arg_u32(npools_a as u32)
-            .arg_u32(np2_a as u32)
-            .arg_u32(selk_a as u32)
-            .arg_ptr(gd)
-            .launch(stream)?;
+        // 2026-10-06: `METRALE_GLM_DSA_TOPK_RADIX=1` swaps in the exact radix select (same
+        // `selected` bytes) when the pool count this launch dispatches on, `npools_a` (the
+        // ceiling under a ceiling launch, so a graph never changes path), exceeds one top-k
+        // tile; see `radix::radix_mode`. The scratch must hold its rows' work buffers.
+        let mode = radix::radix_mode(
+            radix::dsa_topk_radix(),
+            radix::radix_resolved(kernels),
+            scratch.capacity[6] >= radix::radix_work_bytes(cfg, geom.q_rows),
+            npools_a,
+        );
+        radix::log_radix_mode(mode);
+        if mode == radix::RadixMode::Engaged {
+            let t = radix::RadixTopk {
+                scores: scratch.scores,
+                selected: scratch.selected,
+                work: scratch.radix,
+                q_rows: geom.q_rows,
+                n_pools: npools_a,
+                select_k: selk_a,
+                kcap: radix::radix_kcap(cfg),
+                geom_dev: gd,
+            };
+            radix::launch_topk_radix(gpu, kernels, &t, stream)?;
+        } else {
+            // 2026-09-25: `np2_a` is at most `topk_tile()`, so the request is at most
+            // `topk_smem_for_tile(topk_tile())`, within `TOPK_SMEM_CEILING`.
+            KernelLaunch::new(gpu, kernels.topk_pools)
+                .grid([geom.q_rows as u32, 1, 1])
+                .block([ROW_BLOCK, 1, 1])
+                .shared_mem(topk_smem_for_tile(np2_a) as u32)
+                .arg_ptr(scratch.scores)
+                .arg_ptr(scratch.selected)
+                .arg_u32(geom.q_rows as u32)
+                .arg_u32(npools_a as u32)
+                .arg_u32(np2_a as u32)
+                .arg_u32(selk_a as u32)
+                .arg_ptr(gd)
+                .launch(stream)?;
+        }
     }
 
     KernelLaunch::new(gpu, kernels.expand_selection)

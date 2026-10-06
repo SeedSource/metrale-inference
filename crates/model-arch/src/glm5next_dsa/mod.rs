@@ -77,6 +77,7 @@ pub const KERNEL_MAX_KPOOL: usize = 8;
 /// entry point fails `resolve`; those two use `try_kernel` and may be `KernelHandle(0)`.
 /// 2026-10-01: So do `index_scores_tiled` and `index_scores_tc`.
 /// 2026-10-05: So does `grid_stride_marker`.
+/// 2026-10-06: So do the five `topk_radix_*` handles.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
@@ -103,6 +104,16 @@ pub struct Glm5NextDsaKernels {
     /// MODEL.toml `[expected_absent]`, as for `index_scores_tiled`.
     pub grid_stride_marker: KernelHandle,
     pub topk_pools: KernelHandle,
+    /// 2026-10-06: `dsa_topk_radix_{init,hist,find,gather,sort}`: the exact radix top-k that
+    /// `select_tokens` launches instead of `topk_pools` under `METRALE_GLM_DSA_TOPK_RADIX=1`
+    /// above one top-k tile of pools (`select::radix`). `KernelHandle(0)` when the target's
+    /// module lacks them (the b300 copy of `dsa_indexer.cu`); the lever is then ignored, with
+    /// one warning, and `topk_pools` runs.
+    pub topk_radix_init: KernelHandle,
+    pub topk_radix_hist: KernelHandle,
+    pub topk_radix_find: KernelHandle,
+    pub topk_radix_gather: KernelHandle,
+    pub topk_radix_sort: KernelHandle,
     pub expand_selection: KernelHandle,
     /// 2026-09-25: `indexer.k_norm`, a LayerNorm with a bias: `nllb_layernorm_bf16`, in place,
     /// taking `(x, weight, bias, rows, dim, eps)`. An RMSNorm kernel would drop both the mean
@@ -152,6 +163,31 @@ impl Glm5NextDsaKernels {
                 "dsa_indexer_grid_stride_v1",
             ),
             topk_pools: gpu.kernel(DSA_MODULE, "dsa_topk_pools")?,
+            topk_radix_init: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_init",
+            ),
+            topk_radix_hist: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_hist",
+            ),
+            topk_radix_find: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_find",
+            ),
+            topk_radix_gather: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_gather",
+            ),
+            topk_radix_sort: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_sort",
+            ),
             expand_selection: gpu.kernel(DSA_MODULE, "dsa_expand_selection")?,
             k_norm: gpu.kernel(LAYERNORM_MODULE, "nllb_layernorm_bf16")?,
             write_geom: metrale_model_layers::layers::try_kernel(gpu, DSA_MODULE, "dsa_write_geom"),

@@ -93,7 +93,15 @@ name = "dense_gemv_bf16_tc_oracle"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dsa_depth_decode_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_grid_stride_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "dsa_topk_radix_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

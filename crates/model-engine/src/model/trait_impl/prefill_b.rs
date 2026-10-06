@@ -176,11 +176,12 @@ impl TransformerModel {
         if seq.prefix_grid_refs
             && let Some(g) = self.prefix_grid_active_bs(kv_cache.block_size())
             && chunk_len
-                > crate::prefill_plan::grid_chunk_len_c(
+                > crate::prefill_plan::grid_chunk_len_cs(
                     chunk_start,
                     total,
                     g,
                     crate::prefill_plan::grid_chunk_lever(g),
+                    crate::prefill_plan::grid_split_deepest(),
                 )
         {
             static W: std::sync::Once = std::sync::Once::new();

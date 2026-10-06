@@ -16,6 +16,8 @@
 //!   (`prefill_plan::grid_chunk_len_c`); snapshots, restores and the insert stay on `G`. A hit
 //!   then runs from `k*G` in chunks a cold prefill does not run, so it is NOT identical to cold
 //!   (accepted on quality, not identity). Unset, `C = G` and everything below holds as written.
+//!   With `METRALE_GLM_SSM_INPASS_CAPTURE=1` the deepest `G` point is not split off but
+//!   captured inside the pass that crosses it (`inpass_capture.rs`, `prefill_plan::grid_inpass_cut`).
 //! - Snapshots: one at the end of every non-last chunk (`save_checkpoint`: SSM/KDA h and conv
 //!   state plus the DSA indexer aux blob, the plain end-of-pass state), and no others: no
 //!   prompt-end leaf (`finalize_last`), no decode checkpoints, no finish leaf (`cache_sequence`

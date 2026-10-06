@@ -199,16 +199,45 @@ pub fn grid_chunk_lever(g: usize) -> usize {
 /// `g`, `D` or `total`. `c == g` is `grid_chunk_len` exactly (the first multiple of `g` above
 /// `offset` is never past `D`).
 pub fn grid_chunk_len_c(offset: usize, total: usize, g: usize, c: usize) -> usize {
+    grid_chunk_len_cs(offset, total, g, c, true)
+}
+
+/// 2026-10-06: [`grid_chunk_len_c`], with the split at the deepest snapshot point only when
+/// `split_deepest`. Without it the chunks are the plain `c` grid, and the snapshot at `D` comes
+/// from the in-pass capture instead ([`grid_inpass_cut`], `METRALE_GLM_SSM_INPASS_CAPTURE=1`),
+/// so a cold prefill runs exactly the passes of the `c`-token grid.
+pub fn grid_chunk_len_cs(
+    offset: usize,
+    total: usize,
+    g: usize,
+    c: usize,
+    split_deepest: bool,
+) -> usize {
     if g == 0 || offset >= total {
         return 0;
     }
     let c = if c >= g && c.is_multiple_of(g) { c } else { g };
     let mut end = ((offset / c + 1) * c).min(total);
     let d = grid_insert_len(total, g);
-    if offset < d && d < end {
+    if split_deepest && offset < d && d < end {
         end = d;
     }
     end - offset
+}
+
+/// 2026-10-06: The in-pass capture point under a chunk grid `c > g`: the prompt's deepest
+/// snapshot point `D = grid_insert_len(total, g)` when it is not itself a chunk end (a multiple
+/// of `c`, saved by `save_checkpoint`); `None` otherwise, or for `c <= g` (the plain grid, which
+/// has no in-pass snapshot).
+pub fn grid_inpass_cut(total: usize, g: usize, c: usize) -> Option<usize> {
+    let d = grid_insert_len(total, g);
+    (g > 0 && c > g && c.is_multiple_of(g) && d > 0 && !d.is_multiple_of(c)).then_some(d)
+}
+
+/// 2026-10-06: Whether the chunk planner splits at the deepest snapshot point: yes unless the
+/// in-pass capture (`METRALE_GLM_SSM_INPASS_CAPTURE=1`) takes that snapshot inside the pass.
+pub fn grid_split_deepest() -> bool {
+    !inpass_capture_lever()
 }
 
 /// 2026-10-03: `plan_chunk_len`, or [`grid_chunk_len_c`] (2026-10-06: with the chunk grid
@@ -224,7 +253,9 @@ pub fn plan_chunk_len_grid(
     grid: Option<usize>,
 ) -> usize {
     match grid {
-        Some(g) if proposed > 0 && g > 0 => grid_chunk_len_c(offset, total, g, grid_chunk_lever(g)),
+        Some(g) if proposed > 0 && g > 0 => {
+            grid_chunk_len_cs(offset, total, g, grid_chunk_lever(g), grid_split_deepest())
+        }
         _ => plan_chunk_len(offset, total, proposed, block_size, split),
     }
 }

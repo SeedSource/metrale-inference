@@ -152,8 +152,11 @@ gdn_prefill_tc = false
 
 ssm_ba_gates_hopper = true
 # 2026-09-25: Selects `per_token_group_quant_fp8_hopper` (kernels/hopper/common/fp8_act_quant_hopper.cu) over
-# `per_token_group_quant_fp8`. That source is not in this tree, so its handle is 0 and the gb10 quantizer runs
-# (model-layers ops/fp8_act_quant.rs). `METRALE_FP8_ACT_QUANT_HOPPER` overrides.
+# `per_token_group_quant_fp8`. 2026-10-05: The twin is now staged for gb10/glm-5.3-flash/nvfp4 (that target's
+# KERNEL.toml `[sources] use`), so its handle resolves there and `METRALE_FP8_ACT_QUANT_HOPPER=1` opts in. Other
+# gb10 targets do not ship the source: handle 0, the gb10 quantizer runs (model-layers ops/fp8_act_quant.rs).
+# Default stays OFF until a GB10 A/B (native_fp8_act_quant_hopper_microtest + end-to-end) is recorded.
+# `METRALE_FP8_ACT_QUANT_HOPPER` overrides.
 
 
 

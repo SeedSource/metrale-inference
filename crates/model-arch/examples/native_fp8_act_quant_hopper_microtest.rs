@@ -26,8 +26,10 @@
 //!
 //! Each arm's time is also reported as GB/s of compulsory traffic,
 //! `M*K*(2 read + 1 write) + M*(K/128)*4` bytes, and as a share of `HBM_GBPS`.
-//! An image without the twin (any build other than `kernels/hopper`) fails at
-//! start with that message.
+//! An image without the twin (a build other than `kernels/hopper` or
+//! `kernels/gb10/glm-5.3-flash`, which stages it through `[sources] use`) fails at
+//! start with that message. `HBM_GBPS` is the Hopper figure: on gb10 (273 GB/s) read the
+//! GB/s column, not the share.
 //!
 //! Run: `cargo run -p metrale-model-arch --features cuda,gpu-examples \
 //!        --example native_fp8_act_quant_hopper_microtest`
@@ -340,7 +342,7 @@ fn main() -> Result<()> {
     anyhow::ensure!(
         resolved.hopper.0 != 0,
         "`fp8_act_quant_hopper::per_token_group_quant_fp8_hopper` is not in this image — \
-         this microtest is for a build of `kernels/hopper`"
+         this microtest is for a build of `kernels/hopper` or gb10 glm-5.3-flash"
     );
     let shared = ops::Fp8ActQuant::shared_only(resolved.shared);
     let hopper = ops::Fp8ActQuant {

@@ -20,3 +20,14 @@
 
 
 extra_nvcc_flags = ["--fmad=false"]
+
+# 2026-10-05: Files this directory compiles from elsewhere in kernels/ (paths relative to
+# kernels/gb10). fp8_act_quant_hopper.cu is the Hopper per-token FP8 quantizer twin, plain CUDA
+# (uint4 loads, __shfl_xor_sync, __nv_cvt_float_to_fp8; no wgmma, no TMA) and byte-identical to
+# gb10/common/per_token_group_quant_fp8.cu (native_fp8_act_quant_hopper_microtest). It adds the
+# module `fp8_act_quant_hopper`. HARDWARE.toml keeps `fp8_act_quant_hopper = false`; the twin runs
+# only with METRALE_FP8_ACT_QUANT_HOPPER=1.
+[sources]
+use = [
+  "../hopper/common/fp8_act_quant_hopper.cu",
+]

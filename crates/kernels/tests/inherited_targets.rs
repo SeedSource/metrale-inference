@@ -348,3 +348,30 @@ fn inherited_redirects_resolve_only_to_the_declared_same_hardware_source() {
         }
     }
 }
+
+/// 2026-10-05: gb10's glm-5.3-flash target compiles the Hopper FP8 activation-quantizer
+/// twin through `[sources] use` in its KERNEL.toml, beside the shared quantizer it is
+/// byte-identical to. No other gb10 target stages it, so their `fp8_act_quant_hopper`
+/// handle stays 0.
+#[test]
+fn gb10_glm53_stages_the_fp8_act_quant_twin_and_other_gb10_targets_do_not() {
+    let twin = resolve("gb10", "glm-5.3-flash", "nvfp4");
+    let modules = twin.modules();
+    let find = |m: &[(String, &metrale_closure::layout::Entry)], stem: &str| {
+        m.iter().find(|(s, _)| s == stem).map(|(_, e)| e.source.clone())
+    };
+    let src = find(&modules, "fp8_act_quant_hopper").expect("glm-5.3-flash stages the twin");
+    assert_eq!(
+        src,
+        workspace_root().join("kernels/hopper/common/fp8_act_quant_hopper.cu")
+    );
+    assert!(twin.sources().contains(&src), "the build compiles it");
+    assert!(
+        find(&modules, "per_token_group_quant_fp8").is_some(),
+        "the shared quantizer it is compared against stays"
+    );
+    let other = resolve("gb10", "qwen3.6-27b", "nvfp4");
+    assert!(find(&other.modules(), "fp8_act_quant_hopper").is_none());
+    let hopper = resolve("hopper", "qwen3.8-27b", "nvfp4");
+    assert!(find(&hopper.modules(), "fp8_act_quant_hopper").is_some());
+}

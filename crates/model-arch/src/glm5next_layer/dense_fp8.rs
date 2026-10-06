@@ -75,7 +75,7 @@
 //!   MTP block's `kv_a_proj`, indexer, router and head, and any DFlash drafter. Together they are < 0.4 GB/rank of decode reads.
 //! - 2026-10-05: `METRALE_GLM_DENSE_FP8_W8A8=1` (inert, warned once, without
 //!   `METRALE_GLM_DENSE_FP8=1`): [`route`] on a registered weight with more than
-//!   `DENSE_GEMV_FP8W_BATCHM_MAX_M` rows, at least [`W8A8_MIN_ROWS`], `k % 128 == 0`,
+//!   `DENSE_GEMV_FP8W_BATCHM_MAX_M` rows, at least [`w8a8_min_rows`], `k % 128 == 0`,
 //!   `n % 64 == 0`, a 4-byte-aligned `c`, the caller's GEMV handle the BF16-out
 //!   `dense_gemv_bf16` (so its output is BF16) and an activation that fits the W8A8 scratch
 //!   (`m * k` FP8 bytes, `m * k / 128` scales) quantizes `a` (`per_token_group_quant_fp8`, per
@@ -159,10 +159,11 @@ pub fn dense_fp8_w8a8() -> bool {
             return false;
         }
         tracing::warn!(
-            "METRALE_GLM_DENSE_FP8_W8A8=1 - GLM-5.3 prefill GEMMs of >= {W8A8_MIN_ROWS} rows on \
+            "METRALE_GLM_DENSE_FP8_W8A8=1 - GLM-5.3 prefill GEMMs of >= {} rows on \
              FP8 dense weight copies quantize the activations to FP8 E4M3 (per token, per 128-K \
              group) and run the W8A8 fp8_gemm_rowscale_pipe_128x64 instead of dequant + cuBLASLt \
-             BF16; NOT byte-identical"
+             BF16; NOT byte-identical",
+            w8a8_min_rows()
         );
         true
     })
@@ -294,9 +295,11 @@ pub fn dense_nvfp4() -> Nvfp4Classes {
 /// the FP8 path.
 pub const NV4_MAX_M: usize = 16;
 
-/// 2026-10-05: Fewest rows a W8A8 GEMM takes; narrower calls keep the dequant path.
-/// PROVISIONAL: not swept; the 128-row tile wastes most of its MMAs below it.
-pub const W8A8_MIN_ROWS: usize = 64;
+/// 2026-10-05: Fewest rows a W8A8 GEMM takes by default; narrower calls keep the dequant path.
+/// PROVISIONAL: not swept; the 128-row tile wastes most of its MMAs below it. 2026-10-06:
+/// `METRALE_GLM_DENSE_FP8_W8A8_MIN_ROWS` moves it ([`w8a8_min_rows`]).
+pub const W8A8_MIN_ROWS: usize = super::dense_fp8_min_rows::DEFAULT_MIN_ROWS;
+pub use super::dense_fp8_min_rows::w8a8_min_rows;
 
 /// 2026-10-05: Rows the W8A8 activation scratch holds at the widest registered `k`:
 /// `METRALE_GLM_DENSE_FP8_W8A8_ROWS` (an integer >= 1), else [`w8a8_workspace_rows`]. Read once.
@@ -1021,7 +1024,7 @@ fn w8a8_kernels(gpu: &dyn GpuBackend) -> Option<W8a8Kernels> {
 fn w8a8_skip(why: W8a8Skip, m: usize, n: usize, k: usize) -> Result<bool> {
     if !W8A8_SKIP_LOGGED[why as usize].swap(true, Ordering::Relaxed) {
         let text = match why {
-            W8a8Skip::FewRows => format!("fewer than {W8A8_MIN_ROWS} rows"),
+            W8a8Skip::FewRows => format!("fewer than {} rows", w8a8_min_rows()),
             W8a8Skip::Shape => {
                 "k not a multiple of 128, n not a multiple of 64, or c not 4-byte aligned".into()
             }
@@ -1070,7 +1073,7 @@ fn w8a8(
     if !bf16_out {
         return w8a8_skip(W8a8Skip::NotBf16Out, m, n, k);
     }
-    if m < W8A8_MIN_ROWS {
+    if m < w8a8_min_rows() {
         return w8a8_skip(W8a8Skip::FewRows, m, n, k);
     }
     if !k.is_multiple_of(ops::FP8_GEMM_PIPE_KGROUP as usize)

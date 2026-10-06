@@ -63,10 +63,22 @@ use metrale_model_arch::glm5next_mlp::forward_prefill_gemm::cutlass_w4a4::{
 use metrale_model_arch::glm5next_mlp::weights::Nvfp4Proj;
 
 const H: usize = 4096;
-const MI: usize = 2048;
 const E: usize = 288;
 const TOP_K: usize = 8;
-const LOCAL: usize = 144;
+/// 2026-10-05: `moe_intermediate` per expert slice and local expert count, `GLM_MT_MI` /
+/// `GLM_MT_LOCAL` (defaults 2048 / 144 = EP=2). Expert-TP sizing (race-decode) runs 1024 / 288:
+/// every expert local at half the intermediate width, the same weight bytes and FLOPs per rank.
+fn mt_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+fn mi() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| mt_env_usize("GLM_MT_MI", 2048))
+}
+fn n_local() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| mt_env_usize("GLM_MT_LOCAL", 144))
+}
 const LIMIT: f32 = 10.0;
 const TOKEN_WINDOWS: [usize; 3] = [256, 2048, 8192];
 const COS_MIN: f64 = 0.98;
@@ -181,7 +193,7 @@ fn build_table(
 ) -> Result<Table> {
     let tpl: Vec<Tpl> = (0..TEMPLATES).map(|_| make_tpl(r, n, k)).collect();
     let (mut pp, mut sp, mut s2) = (vec![0u64; E], vec![0u64; E], vec![0f32; E]);
-    for e in 0..LOCAL {
+    for e in 0..n_local() {
         let t = &tpl[e % TEMPLATES];
         let (p, s) = (up(g, &t.packed)?, up(g, &t.scale)?);
         owned.extend([p, s]);
@@ -243,7 +255,7 @@ fn round_bf16(v: f32) -> f32 {
     bf16::from_f32(v).to_f32()
 }
 
-/// 2026-10-03: FP32 reference for one sorted row: (act `[MI]`, out `[H]`).
+/// 2026-10-03: FP32 reference for one sorted row: (act `[mi()]`, out `[H]`).
 fn reference_row(
     x: &[f32],
     e: usize,
@@ -253,7 +265,7 @@ fn reference_row(
 ) -> (Vec<f32>, Vec<f32>) {
     let t = e % TEMPLATES;
     let (gd, ud, dd) = (&gate.tpl[t].deq, &upt.tpl[t].deq, &down.tpl[t].deq);
-    let mut act = vec![0f32; MI];
+    let mut act = vec![0f32; mi()];
     for (n, a) in act.iter_mut().enumerate() {
         let (mut sg, mut su) = (0f64, 0f64);
         let (gr, ur) = (&gd[n * H..(n + 1) * H], &ud[n * H..(n + 1) * H]);
@@ -267,9 +279,9 @@ fn reference_row(
     }
     let mut out = vec![0f32; H];
     for (n, o) in out.iter_mut().enumerate() {
-        let dr = &dd[n * MI..(n + 1) * MI];
+        let dr = &dd[n * mi()..(n + 1) * mi()];
         let mut s = 0f64;
-        for k in 0..MI {
+        for k in 0..mi() {
             s += (act[k] * dr[k]) as f64;
         }
         *o = s as f32 * down.s2_host[e];
@@ -349,7 +361,7 @@ fn nvfp4_fake_quant(v: &[f32], gs: f32) -> Vec<f32> {
     out
 }
 
-/// 2026-10-03: Arm (d), emulated W4A4 FP32 reference for one sorted row: (act `[MI]`, out `[H]`).
+/// 2026-10-03: Arm (d), emulated W4A4 FP32 reference for one sorted row: (act `[mi()]`, out `[H]`).
 /// As [`reference_row`], but `x` and the BF16-rounded SwiGLU output are NVFP4-quantized (global
 /// scales `gu_gs` for gate/up, `dn_gs` for down) before their dot products with the dequantized
 /// NVFP4 weights.
@@ -365,7 +377,7 @@ fn reference_row_emu(
     let t = e % TEMPLATES;
     let (gd, ud, dd) = (&gate.tpl[t].deq, &upt.tpl[t].deq, &down.tpl[t].deq);
     let xq = nvfp4_fake_quant(x, gu_gs);
-    let mut act = vec![0f32; MI];
+    let mut act = vec![0f32; mi()];
     for (n, a) in act.iter_mut().enumerate() {
         let (mut sg, mut su) = (0f64, 0f64);
         let (gr, ur) = (&gd[n * H..(n + 1) * H], &ud[n * H..(n + 1) * H]);
@@ -380,9 +392,9 @@ fn reference_row_emu(
     let aq = nvfp4_fake_quant(&act, dn_gs);
     let mut out = vec![0f32; H];
     for (n, o) in out.iter_mut().enumerate() {
-        let dr = &dd[n * MI..(n + 1) * MI];
+        let dr = &dd[n * mi()..(n + 1) * mi()];
         let mut s = 0f64;
-        for k in 0..MI {
+        for k in 0..mi() {
             s += (aq[k] * dr[k]) as f64;
         }
         *o = s as f32 * down.s2_host[e];
@@ -519,17 +531,18 @@ fn main() -> Result<()> {
 
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
     let mut owned = Vec::new();
-    let gate = build_table(g, &mut r, MI, H, &mut owned)?;
-    let upt = build_table(g, &mut r, MI, H, &mut owned)?;
-    let down = build_table(g, &mut r, H, MI, &mut owned)?;
+    let gate = build_table(g, &mut r, mi(), H, &mut owned)?;
+    let upt = build_table(g, &mut r, mi(), H, &mut owned)?;
+    let down = build_table(g, &mut r, H, mi(), &mut owned)?;
 
     // 2026-10-03: The production SFB cache, filled once (one layer), timed separately.
-    let cache = SfbCache::new(g, LOCAL, H, MI)?;
-    let fill = || cache.fill(gate.scale, upt.scale, down.scale, 0, LOCAL, 0);
+    let cache = SfbCache::new(g, n_local(), H, mi())?;
+    let fill = || cache.fill(gate.scale, upt.scale, down.scale, 0, n_local(), 0);
     let t_swizzle = time_ms(g, iters, fill)?;
     println!(
-        "SFB cache {:.1} MB for {LOCAL} experts, swizzle_ms_per_layer={t_swizzle:.3}",
-        SfbCache::bytes(LOCAL, H, MI) as f64 / 1e6
+        "SFB cache {:.1} MB for {} experts, swizzle_ms_per_layer={t_swizzle:.3}",
+        SfbCache::bytes(n_local(), H, mi()) as f64 / 1e6,
+        n_local()
     );
     let experts_for = |gu_is: f32, dn_is: f32| -> Vec<Glm5NextExpertWeights> {
         let p = |t: &Table, e: usize, is: f32| Nvfp4Proj {
@@ -538,7 +551,7 @@ fn main() -> Result<()> {
             scale_2: t.s2_host[e],
             input_scale: is,
         };
-        (0..LOCAL)
+        (0..n_local())
             .map(|e| Glm5NextExpertWeights {
                 gate_proj: p(&gate, e, gu_is),
                 up_proj: p(&upt, e, gu_is),
@@ -591,20 +604,20 @@ fn main() -> Result<()> {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
             .collect();
-        let local: Vec<(usize, usize)> = (0..LOCAL).map(|e| (off[e], off[e + 1])).collect();
+        let local: Vec<(usize, usize)> = (0..n_local()).map(|e| (off[e], off[e + 1])).collect();
         let r_local: usize = local.iter().map(|(a, b)| b - a).sum();
-        let busiest = (0..LOCAL).map(|e| off[e + 1] - off[e]).max().unwrap_or(0);
-        let flop = 6.0 * r_local as f64 * (MI * H) as f64;
+        let busiest = (0..n_local()).map(|e| off[e + 1] - off[e]).max().unwrap_or(0);
+        let flop = 6.0 * r_local as f64 * (mi() * H) as f64;
         println!(
             "tokens={tokens} te={te} local_rows={r_local} busiest_local_expert_rows={busiest} \
              empty_local_experts={}",
             local.iter().filter(|(a, b)| a == b).count()
         );
 
-        let a_gate = g.alloc(te * MI * 2)?;
-        let a_up = g.alloc(te * MI * 2)?;
-        let act_a = g.alloc(te * MI * 2)?;
-        let act_b = g.alloc(te * MI * 2)?;
+        let a_gate = g.alloc(te * mi() * 2)?;
+        let a_up = g.alloc(te * mi() * 2)?;
+        let act_a = g.alloc(te * mi() * 2)?;
+        let act_b = g.alloc(te * mi() * 2)?;
         let out_a = g.alloc(te * H * 2)?;
         let out_b = g.alloc(te * H * 2)?;
         let out_c = g.alloc(te * H * 2)?;
@@ -612,15 +625,15 @@ fn main() -> Result<()> {
         // 2026-10-03: Arm (a): the production W4A16 prefill path at the VA2 tile.
         let m_tiles = busiest.div_ceil(128).max(1) as u32;
         let arm_a = || -> Result<()> {
-            va2(g, k_va2, d_x, &gate, a_gate, d_off, d_stid, MI, H, m_tiles)?;
-            va2(g, k_va2, d_x, &upt, a_up, d_off, d_stid, MI, H, m_tiles)?;
+            va2(g, k_va2, d_x, &gate, a_gate, d_off, d_stid, mi(), H, m_tiles)?;
+            va2(g, k_va2, d_x, &upt, a_up, d_off, d_stid, mi(), H, m_tiles)?;
             KernelLaunch::new(g, k_swiglu)
-                .grid([((te * MI) as u32).div_ceil(256), 1, 1])
+                .grid([((te * mi()) as u32).div_ceil(256), 1, 1])
                 .block([256, 1, 1])
                 .arg_ptr(a_gate)
                 .arg_ptr(a_up)
                 .arg_ptr(act_a)
-                .arg_u32((te * MI) as u32)
+                .arg_u32((te * mi()) as u32)
                 .arg_f32(LIMIT)
                 .launch(0)?;
             va2(
@@ -632,14 +645,14 @@ fn main() -> Result<()> {
                 d_off,
                 DevicePtr(0),
                 H,
-                MI,
+                mi(),
                 m_tiles,
             )
         };
         g.memset_async(out_a, 0, te * H * 2, 0)?;
         arm_a()?;
         g.synchronize(0)?;
-        let got_act_a = dn(g, act_a, te * MI * 2)?;
+        let got_act_a = dn(g, act_a, te * mi() * 2)?;
         let got_out_a = dn(g, out_a, te * H * 2)?;
         let t_a = time_ms(g, iters, arm_a)?;
         println!(
@@ -648,7 +661,7 @@ fn main() -> Result<()> {
         );
 
         // 2026-10-03: Sampled local sorted rows (evenly spaced) and their FP32 reference.
-        let local_sorted: Vec<(usize, usize)> = (0..LOCAL)
+        let local_sorted: Vec<(usize, usize)> = (0..n_local())
             .flat_map(|e| (off[e]..off[e + 1]).map(move |i| (i, e)))
             .collect();
         let n_ref = ref_rows.min(local_sorted.len());
@@ -679,7 +692,7 @@ fn main() -> Result<()> {
         let stats_vs = |refs: &[(Vec<f32>, Vec<f32>)], act: &[u8], out: &[u8]| -> (Stats, Stats) {
             let (mut sa, mut so) = (Stats::default(), Stats::default());
             for ((i, _), (ra, ro)) in picks.iter().zip(refs) {
-                sa.add(ra, (0..MI).map(|c| bf(act, i * MI + c)));
+                sa.add(ra, (0..mi()).map(|c| bf(act, i * mi() + c)));
                 so.add(ro, (0..H).map(|c| bf(out, i * H + c)));
             }
             (sa, so)
@@ -695,7 +708,7 @@ fn main() -> Result<()> {
         // 2026-10-03: Arm (b): static scale = amax / (6 * 448) of this window's x (gate/up) and
         // of arm (a)'s activation over the local rows (down); then the dynamic fallback.
         let x_amax = x_f.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let act_amax = amax_rows(&got_act_a, &local, MI);
+        let act_amax = amax_rows(&got_act_a, &local, mi());
         let gu_static = x_amax / FP4_GS_DEN;
         let dn_static = act_amax / FP4_GS_DEN;
         // 2026-10-03: The dynamic arm's gate/up amax: x over every routed local row, as
@@ -714,7 +727,7 @@ fn main() -> Result<()> {
             // 2026-10-04: The dynamic mode goes through the `METRALE_GLM_MOE_W4A4_DYNAMIC_SCALE`
             // table path (`dynamic_scale = true`), whose result `experts_for(0, 0)` already gives.
             let tables =
-                MoeTables::build(E, 0..LOCAL, &experts, &cache.layout(), mode == "dynamic");
+                MoeTables::build(E, 0..n_local(), &experts, &cache.layout(), mode == "dynamic");
             let args = RunArgs {
                 swiglu: k_swiglu,
                 x: d_x,
@@ -725,13 +738,13 @@ fn main() -> Result<()> {
                 expert_out: out_b,
                 te,
                 hidden: H,
-                moe_intermediate: MI,
+                moe_intermediate: mi(),
                 swiglu_limit: LIMIT,
                 offsets: &off_i32,
                 tables: &tables,
                 skip_down: false,
             };
-            g.memset_async(act_b, 0, te * MI * 2, 0)?;
+            g.memset_async(act_b, 0, te * mi() * 2, 0)?;
             g.memset_async(out_b, 0, te * H * 2, 0)?;
             if let Err(e) = run(g, &args, 0).and_then(|_| g.synchronize(0)) {
                 problems.push(format!(
@@ -740,7 +753,7 @@ fn main() -> Result<()> {
                 println!("  tokens={tokens} b_{mode} run error: {e:#}");
                 continue;
             }
-            let got_act_b = dn(g, act_b, te * MI * 2)?;
+            let got_act_b = dn(g, act_b, te * mi() * 2)?;
             let got_out_b = dn(g, out_b, te * H * 2)?;
             let (sa, so) = stats(&got_act_b, &got_out_b);
             let (_, so_ab) = {
@@ -749,14 +762,14 @@ fn main() -> Result<()> {
                     .iter()
                     .map(|&(i, _)| {
                         (
-                            (0..MI).map(|c| bf(&got_act_a, i * MI + c)).collect(),
+                            (0..mi()).map(|c| bf(&got_act_a, i * mi() + c)).collect(),
                             (0..H).map(|c| bf(&got_out_a, i * H + c)).collect(),
                         )
                     })
                     .collect();
                 let (mut x1, mut x2) = (Stats::default(), Stats::default());
                 for ((i, _), (wa, wo)) in picks.iter().zip(&want) {
-                    x1.add(wa, (0..MI).map(|c| bf(&got_act_b, i * MI + c)));
+                    x1.add(wa, (0..mi()).map(|c| bf(&got_act_b, i * mi() + c)));
                     x2.add(wo, (0..H).map(|c| bf(&got_out_b, i * H + c)));
                 }
                 (x1, x2)
@@ -764,7 +777,7 @@ fn main() -> Result<()> {
             // 2026-10-03: Arm (d) for this mode: the device's resolved global scales, then the
             // emulated W4A4 reference rows (same sampled rows as (c)).
             let gu_gs = resolve_gs(gu_is, gu_dyn_amax);
-            let dn_gs = resolve_gs(dn_is, amax_rows(&got_act_b, &local, MI));
+            let dn_gs = resolve_gs(dn_is, amax_rows(&got_act_b, &local, mi()));
             let emu: Vec<(Vec<f32>, Vec<f32>)> = std::thread::scope(|s| {
                 let chunk = picks.len().div_ceil(threads).max(1);
                 let handles: Vec<_> = picks
@@ -876,7 +889,7 @@ fn main() -> Result<()> {
                     d_off,
                     DevicePtr(0),
                     H,
-                    MI,
+                    mi(),
                     m_tiles,
                 )
             };
@@ -884,7 +897,7 @@ fn main() -> Result<()> {
             match arm_e().and_then(|_| g.synchronize(0)) {
                 Err(e) => println!("  tokens={tokens} e_{mode} run error: {e:#}"),
                 Ok(()) => {
-                    let got_act_e = dn(g, act_b, te * MI * 2)?;
+                    let got_act_e = dn(g, act_b, te * mi() * 2)?;
                     let got_out_e = dn(g, out_c, te * H * 2)?;
                     let (sa_e2, so_e2) = stats(&got_act_e, &got_out_e);
                     println!(

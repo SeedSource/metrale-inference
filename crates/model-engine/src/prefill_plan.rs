@@ -156,7 +156,63 @@ pub fn grid_chunk_len(offset: usize, total: usize, g: usize) -> usize {
     next.min(total) - offset
 }
 
-/// 2026-10-03: `plan_chunk_len`, or [`grid_chunk_len`] when `grid` is `Some(G)`: the grid
+/// 2026-10-06: The chunk grid `C` for a `METRALE_PREFIX_GRID_CHUNK_TOKENS` value under snapshot
+/// grid `g`: a positive multiple of `g`, else `g` (unset, empty, unparsable, below `g` or not a
+/// multiple of it), which is the plain grid.
+pub fn grid_chunk_tokens_from(v: Option<&str>, g: usize) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&c| g > 0 && c >= g && c.is_multiple_of(g))
+        .unwrap_or(g)
+}
+
+/// 2026-10-06: `METRALE_PREFIX_GRID_CHUNK_TOKENS` (race #68) for snapshot grid `g`: the value is
+/// read once per process (and logged once); the result is [`grid_chunk_tokens_from`] for this
+/// `g`. Unset: `g`.
+pub fn grid_chunk_lever(g: usize) -> usize {
+    static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static LOG: std::sync::Once = std::sync::Once::new();
+    let raw = RAW.get_or_init(|| std::env::var("METRALE_PREFIX_GRID_CHUNK_TOKENS").ok());
+    let c = grid_chunk_tokens_from(raw.as_deref(), g);
+    LOG.call_once(|| {
+        if c != g {
+            tracing::warn!(
+                "METRALE_PREFIX_GRID_CHUNK_TOKENS={c} - prefill chunks end on the {c}-token grid; \
+                 SSM snapshots and restores stay on the {g}-token grid, and the chunk holding a \
+                 prompt's deepest {g}-token point ends there. A hit no longer runs the chunks a \
+                 cold prefill runs (NOT identical to cold)"
+            );
+        } else if raw.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            tracing::warn!(
+                "METRALE_PREFIX_GRID_CHUNK_TOKENS={} ignored: not a multiple of the {g}-token \
+                 grid - chunks stay on the snapshot grid",
+                raw.as_deref().unwrap_or("")
+            );
+        }
+    });
+    c
+}
+
+/// 2026-10-06: [`grid_chunk_len`] with a chunk grid `c` (a multiple of `g`; anything else is
+/// taken as `g`): up to the next multiple of `c` above `offset` or to `total`, except that a
+/// chunk strictly spanning the prompt's deepest snapshot point `D = grid_insert_len(total, g)`
+/// ends at `D`, so the snapshot a later turn restores is saved. Every chunk end is a multiple of
+/// `g`, `D` or `total`. `c == g` is `grid_chunk_len` exactly (the first multiple of `g` above
+/// `offset` is never past `D`).
+pub fn grid_chunk_len_c(offset: usize, total: usize, g: usize, c: usize) -> usize {
+    if g == 0 || offset >= total {
+        return 0;
+    }
+    let c = if c >= g && c.is_multiple_of(g) { c } else { g };
+    let mut end = ((offset / c + 1) * c).min(total);
+    let d = grid_insert_len(total, g);
+    if offset < d && d < end {
+        end = d;
+    }
+    end - offset
+}
+
+/// 2026-10-03: `plan_chunk_len`, or [`grid_chunk_len_c`] (2026-10-06: with the chunk grid
+/// [`grid_chunk_lever`]) when `grid` is `Some(G)`: the grid
 /// replaces the budget-derived length (`proposed`), the block alignment and the tail split. An
 /// empty proposal stays empty. With `grid == None` this is `plan_chunk_len` exactly.
 pub fn plan_chunk_len_grid(
@@ -168,7 +224,7 @@ pub fn plan_chunk_len_grid(
     grid: Option<usize>,
 ) -> usize {
     match grid {
-        Some(g) if proposed > 0 && g > 0 => grid_chunk_len(offset, total, g),
+        Some(g) if proposed > 0 && g > 0 => grid_chunk_len_c(offset, total, g, grid_chunk_lever(g)),
         _ => plan_chunk_len(offset, total, proposed, block_size, split),
     }
 }

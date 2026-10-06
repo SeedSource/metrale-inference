@@ -120,7 +120,7 @@ impl Dev {
         compress: KernelHandle,
         scores: KernelHandle,
     ) -> Result<Self> {
-        let mut rng = Lcg(0x5EED_D5A);
+        let mut rng = Lcg(0x05EE_DD5A);
         let k_host = rng.bf16_bytes(MAX_TOKENS * D, -1.0, 1.0);
         let gate = rng.bf16_bytes(MAX_TOKENS * D, -2.0, 2.0);
         // 2026-10-05: Every 23rd token invalid, so pools are partly or wholly invalid.

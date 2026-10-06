@@ -101,6 +101,10 @@ name = "dsa_grid_stride_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dsa_topk_radix_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_indexer_microtest"
 required-features = ["cuda", "gpu-examples"]
 

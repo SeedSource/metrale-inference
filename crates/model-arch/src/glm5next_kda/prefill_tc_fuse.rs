@@ -88,6 +88,18 @@ pub(super) fn kda_front_fuse_fallback(why: &str) {
     });
 }
 
+/// 2026-10-10: The one warning when `METRALE_GLM_KDA_FRONT_FUSE=1` meets an in-pass capture that
+/// splits the scan at a chunk boundary: that capture's conv-state tail reads `ws.qkv_proj`, which
+/// the fused front never writes, so the call runs the unfused front.
+pub(super) fn kda_front_fuse_split_capture() {
+    static W: std::sync::Once = std::sync::Once::new();
+    W.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_KDA_FRONT_FUSE=1: an in-pass capture inside the call needs the unfused              KDA chunked-TC front; those calls run unfused"
+        )
+    });
+}
+
 impl Glm5NextKdaLayer {
     /// 2026-10-07: `stateful_chunked_tc` with the fused front: over rows `0..k`, reading the
     /// three projections in `ws.qkv_parts` (part `i` at `i * k * qkv` elements, as

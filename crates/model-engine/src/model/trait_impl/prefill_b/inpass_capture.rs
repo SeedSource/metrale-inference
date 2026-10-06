@@ -17,6 +17,9 @@
 //!      whose call covers the cut copies its recurrent and conv state as of the cut into the
 //!      slot (GLM-5.3 KDA: `Glm5NextKdaLayer::decode_k_capture`, which splits the token loop's
 //!      two launches at that row; bit-identical to the uncaptured pass) and counts itself.
+//!      2026-10-06: Under `METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1`, `prefill_chunked_tc` splits
+//!      its scan at the cut instead when the cut is a 16-row chunk boundary of the call (or its
+//!      end); a cut inside a chunk takes no copy, so the count falls short and step 3 frees it.
 //!   3. [`TransformerModel::finalize_inpass_capture`], after the pass: when every SSM layer
 //!      captured, attach the aux blobs as of the cut (`LayerAuxState::snapshot_aux_prefix`; the
 //!      DSA indexer rows `[0, cut)`) and register the slot exactly as `save_checkpoint` registers

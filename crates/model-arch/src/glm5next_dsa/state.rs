@@ -325,6 +325,20 @@ impl LayerState for Glm5NextDsaState {
         }
         self.map_rows(end.saturating_add(self.lookahead))
     }
+
+    /// 2026-10-05: `map_rows_through(end)` maps `min(end + lookahead, capacity)` rows, so it is a
+    /// no-op for every `end` up to `mapped_rows - lookahead`, and for any `end` once the whole
+    /// capacity is backed. Eager or released: `None` (nothing is ever mapped).
+    fn rows_backed_through(&self) -> Option<usize> {
+        if self.released {
+            return None;
+        }
+        let mapped = self.mapped_rows()?;
+        if mapped >= self.capacity {
+            return Some(usize::MAX);
+        }
+        Some(mapped.saturating_sub(self.lookahead))
+    }
 }
 
 #[cfg(test)]

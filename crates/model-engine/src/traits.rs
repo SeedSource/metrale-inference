@@ -161,6 +161,12 @@ pub struct SequenceState {
     /// (`check_safe_to_evict`). `TransformerModel::alloc_sequence` sizes it to the attention-layer
     /// count whether or not `--high-speed-swap` is on.
     pub disk_last_offloaded_per_layer: Vec<u32>,
+    /// 2026-10-05: Positions `[0, lazy_rows_agreed)` whose lazily mapped state every rank has
+    /// backed, by a rank-agreed vote (`trait_impl/decode_lazy_agree.rs`). A decode or verify step
+    /// whose map end passes it votes before its first collective; one below it maps nothing on
+    /// any rank. Equal on every rank: it changes only at a vote, from the gathered values.
+    /// `0` at allocation and after `free_sequence`.
+    pub lazy_rows_agreed: usize,
     /// 2026-09-25: `Some(k)` makes prefill score every prompt position with its top-`k`
     /// alternatives (`/v1/completions` with `echo` and `logprobs`). Set by the scheduler before
     /// prefill. Such a request bypasses the prefix cache, so every position has a hidden row.
@@ -226,6 +232,7 @@ impl SequenceState {
             prompt_len: 0,
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: Vec::new(),
+            lazy_rows_agreed: 0,
             collect_prompt_logprobs: None,
             prompt_logprobs: Vec::new(),
             adapter_slot: -1,

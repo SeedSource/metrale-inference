@@ -18,7 +18,8 @@
 //!   (`rank_agree`), so EP ranks map, charge and refuse identically.
 //!   2026-10-05: Except the VMM lazy-map floor, which reads each rank's own free device memory
 //!   (A168): a prefill chunk's admission is therefore voted on by every rank before its first
-//!   collective (model-engine `prefill_b/lazy_agree.rs`). Decode-time maps are not voted yet.
+//!   collective (model-engine `prefill_b/lazy_agree.rs`), and so is each decode or verify step
+//!   that maps past the rank-agreed extent (model-engine `trait_impl/decode_lazy_agree.rs`).
 //!
 //! The `valid` byte array stays eagerly allocated: one 2 MiB granule holds 2 M of its rows,
 //! so mapping it lazily would round 131 KB up to 2 MiB per layer.

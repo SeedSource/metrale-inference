@@ -34,6 +34,10 @@ mod decode_a_diag;
 mod decode_b;
 mod decode_b2;
 pub(in crate::model) mod decode_checkpoint;
+// 2026-10-05: The rank-agreed lazy-map admission of decode and verify steps (A168).
+mod decode_lazy_agree;
+#[cfg(test)]
+mod decode_lazy_agree_tests;
 mod decode_graph_key;
 mod decode_multi_seq_gate;
 mod drafter_prefill;

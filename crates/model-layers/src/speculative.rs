@@ -42,6 +42,13 @@ pub trait ProposerState: Send + Sync {
         let _ = end;
         Ok(())
     }
+
+    /// 2026-10-05: [`crate::layer::LayerState::rows_backed_through`] for a proposer, in the
+    /// same `end` units as its `map_rows_through` (its look-ahead already subtracted).
+    /// Default: `None`.
+    fn rows_backed_through(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// 2026-09-25: A draft-token proposer. The model calls `propose` for draft

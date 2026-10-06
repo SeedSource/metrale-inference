@@ -35,7 +35,8 @@ mod forward_layers;
 mod grid_restore;
 mod h_state_ptrs;
 mod inpass_capture;
-mod lazy_agree;
+// 2026-10-05: Also the verdict of the decode-time vote (`decode_lazy_agree.rs`).
+pub(in crate::model) mod lazy_agree;
 #[cfg(test)]
 mod lazy_agree_tests;
 mod midchunk_capture;
@@ -45,8 +46,9 @@ mod proc_range;
 mod prompt_logprobs;
 mod save_checkpoint;
 mod snap_agree;
+// 2026-10-05: Its two-rank gather harness also serves `decode_lazy_agree_tests.rs`.
 #[cfg(test)]
-mod snap_agree_tests;
+pub(in crate::model) mod snap_agree_tests;
 mod stage_batched;
 mod upload_meta;
 mod upload_paged;

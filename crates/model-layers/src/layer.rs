@@ -35,6 +35,15 @@ pub trait LayerState: Send + Sync {
         let _ = end;
         Ok(())
     }
+
+    /// 2026-10-05: The largest `end` for which `map_rows_through(end)` maps nothing new on this
+    /// rank (`usize::MAX` once fully backed), from what is mapped now. `None`: the state maps
+    /// nothing lazily. The rank-agreed decode admission (model-engine
+    /// `trait_impl/decode_lazy_agree.rs`) takes the minimum over states and ranks. Default:
+    /// `None`.
+    fn rows_backed_through(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// 2026-09-25: State of a layer that keeps nothing per sequence.

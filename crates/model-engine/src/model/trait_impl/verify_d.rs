@@ -69,6 +69,9 @@ impl TransformerModel {
         }
 
         let bs = kv_cache.block_size();
+        // 2026-10-05: Rank-agreed lazy-map admission (A168), before the step's first collective
+        // and any capture or replay (`decode_lazy_agree.rs`).
+        self.agree_decode_lazy_maps(seq, (seq.seq_len + k).saturating_sub(1) / bs, bs)?;
         for t in 0..k {
             let pos = seq.seq_len + t;
             let blocks_needed = (pos / bs) + 1;

@@ -85,6 +85,11 @@ impl ProposerState for Glm5NextMtpProposerState {
     fn map_rows_through(&self, end: usize) -> Result<()> {
         metrale_model_layers::layer::LayerState::map_rows_through(&self.dsa, end)
     }
+
+    /// 2026-10-05: The drafter's DSA indexer cache, net of its look-ahead.
+    fn rows_backed_through(&self) -> Option<usize> {
+        metrale_model_layers::layer::LayerState::rows_backed_through(&self.dsa)
+    }
 }
 
 pub struct Glm5NextMtpHead {

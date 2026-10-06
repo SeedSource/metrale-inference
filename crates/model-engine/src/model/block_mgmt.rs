@@ -295,7 +295,12 @@ pub(crate) fn ensure_blocks_through_decode(
 /// extents depend only on token positions, so EP ranks map identically. A full indexer pool
 /// fails with "KV cache exhausted", which the scheduler's decode path answers by preempting a
 /// sequence. Lever off: returns at once.
-fn map_lazy_rows_through(
+/// 2026-10-05: The VMM lazy-map floor reads this rank's free memory, so the outcome can differ
+/// by rank (A168): on a multi-rank world the shared decode and verify steps first map through
+/// `TransformerModel::agree_decode_lazy_maps` (`trait_impl/decode_lazy_agree.rs`), which votes,
+/// and the call here then maps nothing. No collective here: the head-only `ReserveKv` path
+/// (`reserve_decode_block_dispatch`) also comes through.
+pub(crate) fn map_lazy_rows_through(
     seq: &SequenceState,
     abs_block_idx: usize,
     block_size: usize,
@@ -303,7 +308,19 @@ fn map_lazy_rows_through(
     if !metrale_model_arch::glm5next_dsa::lazy::dsa_indexer_lazy() {
         return Ok(());
     }
-    let end = abs_block_idx.saturating_add(1).saturating_mul(block_size);
+    map_lazy_states_through(seq, lazy_map_end(abs_block_idx, block_size))
+}
+
+/// 2026-10-05: The position `map_lazy_rows_through` maps through for a step whose last KV
+/// block is `abs_block_idx`: every position of that block.
+pub(crate) fn lazy_map_end(abs_block_idx: usize, block_size: usize) -> usize {
+    abs_block_idx.saturating_add(1).saturating_mul(block_size)
+}
+
+/// 2026-10-05: `map_rows_through(end)` on every layer state and the proposer state, whatever
+/// the lever (states that map nothing lazily return at once). Split out of
+/// `map_lazy_rows_through` for the rank-agreed decode admission (`decode_lazy_agree.rs`).
+pub(crate) fn map_lazy_states_through(seq: &SequenceState, end: usize) -> Result<()> {
     for st in &seq.layer_states {
         st.map_rows_through(end)?;
     }

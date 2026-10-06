@@ -57,11 +57,11 @@ __device__ __forceinline__ float dsa_block_sum(float v, float* smem, unsigned ti
 // are used as passed. Pool-indexed blocks past the live pool count return at once, so a
 // ceiling launch can fix the grid at the context ceiling. Slots: S (tokens in the cache),
 // pools including the trailing partial one, complete pools, select_k, top-k tile width.
-
-
-
-
-
+// 2026-10-05: dsa_kpool_compress and dsa_index_scores walk the live pools with a grid
+// stride (block b takes pools b, b + gridDim.x, ... below the live count), so a ceiling
+// launch need not be one block per ceiling pool: the host launches a few waves of blocks
+// and a graph replay pays for those, not for the context ceiling. With
+// METRALE_GLM_DSA_GRID_STRIDE=0 the host launches the ceiling grid again.
 
 #define DSA_GEOM_S        0
 #define DSA_GEOM_NPOOLS_F 1
@@ -129,51 +129,58 @@ extern "C" __global__ void dsa_kpool_compress(
     int first_key,
     const int* __restrict__ geom
 ) {
-    const unsigned int p = blockIdx.x;
     const unsigned int tid = threadIdx.x;
+    // 2026-10-05: Grid-stride walk over the live pools: block b takes pools b, b + gridDim.x,
+    // ... below `live`, so any grid of one block or more covers every live pool exactly once,
+    // each by one block running the per-pool code below unchanged (same thread mapping, same
+    // reduction order), and a grid of `live` blocks or more is one pool per block, this
+    // kernel's earlier form. `live` counts the pools including the trailing partial one: geom's
+    // under a ceiling launch, whose grid the host sets (METRALE_GLM_DSA_GRID_STRIDE), else the
+    // grid itself (an exact launch has one block per pool).
+    unsigned int live = gridDim.x;
     if (geom) {
         S = (unsigned int)geom[DSA_GEOM_S];
-        // 2026-09-25: Under a ceiling launch this pool may not be live yet.
-        if (p >= (unsigned int)geom[DSA_GEOM_NPOOLS_F]) return;
+        live = (unsigned int)geom[DSA_GEOM_NPOOLS_F];
     }
-
-    // 2026-09-25: Slot bookkeeping is the same for every channel, so thread 0 writes it.
-    bool all_valid = true;
-    for (unsigned int s = 0; s < KP; ++s) {
-        long long raw = (long long)first_key + (long long)p * KP + s;
-        bool in_range = raw >= 0 && raw < (long long)S;
-        bool ok = in_range && valid[in_range ? (unsigned)raw : 0] != 0;
-        all_valid &= ok;
-        if (tid == 0) pool_indices[p * KP + s] = ok ? (int)raw : DSA_INVALID;
-    }
-    if (tid == 0) pool_valid[p] = all_valid ? 1 : 0;
-
-    for (unsigned int d = tid; d < D; d += blockDim.x) {
-        float mx = -CUDART_INF_F;
-        float lg[8];
-        for (unsigned int s = 0; s < KP && s < 8; ++s) {
+    for (unsigned int p = blockIdx.x; p < live; p += gridDim.x) {
+        // 2026-09-25: Slot bookkeeping is the same for every channel, so thread 0 writes it.
+        bool all_valid = true;
+        for (unsigned int s = 0; s < KP; ++s) {
             long long raw = (long long)first_key + (long long)p * KP + s;
             bool in_range = raw >= 0 && raw < (long long)S;
             bool ok = in_range && valid[in_range ? (unsigned)raw : 0] != 0;
-            lg[s] = ok ? (__bfloat162float(gate[(size_t)raw * D + d]) + ape[s * D + d])
-                       : -CUDART_INF_F;
-            mx = fmaxf(mx, lg[s]);
+            all_valid &= ok;
+            if (tid == 0) pool_indices[p * KP + s] = ok ? (int)raw : DSA_INVALID;
         }
-        float sum = 0.0f;
-        for (unsigned int s = 0; s < KP && s < 8; ++s) {
-            lg[s] = (lg[s] == -CUDART_INF_F) ? 0.0f : __expf(lg[s] - mx);
-            sum += lg[s];
+        if (tid == 0) pool_valid[p] = all_valid ? 1 : 0;
+
+        for (unsigned int d = tid; d < D; d += blockDim.x) {
+            float mx = -CUDART_INF_F;
+            float lg[8];
+            for (unsigned int s = 0; s < KP && s < 8; ++s) {
+                long long raw = (long long)first_key + (long long)p * KP + s;
+                bool in_range = raw >= 0 && raw < (long long)S;
+                bool ok = in_range && valid[in_range ? (unsigned)raw : 0] != 0;
+                lg[s] = ok ? (__bfloat162float(gate[(size_t)raw * D + d]) + ape[s * D + d])
+                           : -CUDART_INF_F;
+                mx = fmaxf(mx, lg[s]);
+            }
+            float sum = 0.0f;
+            for (unsigned int s = 0; s < KP && s < 8; ++s) {
+                lg[s] = (lg[s] == -CUDART_INF_F) ? 0.0f : __expf(lg[s] - mx);
+                sum += lg[s];
+            }
+            // 2026-09-25: A pool with no valid slot has sum 0, so its weights and key are 0.
+            float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+            float acc = 0.0f;
+            for (unsigned int s = 0; s < KP && s < 8; ++s) {
+                long long raw = (long long)first_key + (long long)p * KP + s;
+                bool in_range = raw >= 0 && raw < (long long)S;
+                bool ok = in_range && valid[in_range ? (unsigned)raw : 0] != 0;
+                if (ok) acc += lg[s] * inv * __bfloat162float(k[(size_t)raw * D + d]);
+            }
+            pool_keys[p * D + d] = acc;
         }
-        // 2026-09-25: A pool with no valid slot has sum 0, so its weights and key are 0.
-        float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-        float acc = 0.0f;
-        for (unsigned int s = 0; s < KP && s < 8; ++s) {
-            long long raw = (long long)first_key + (long long)p * KP + s;
-            bool in_range = raw >= 0 && raw < (long long)S;
-            bool ok = in_range && valid[in_range ? (unsigned)raw : 0] != 0;
-            if (ok) acc += lg[s] * inv * __bfloat162float(k[(size_t)raw * D + d]);
-        }
-        pool_keys[p * D + d] = acc;
     }
 }
 
@@ -200,67 +207,60 @@ extern "C" __global__ void dsa_index_scores(
     float scale,
     const int* __restrict__ geom
 ) {
-    const unsigned int p = blockIdx.x;
     const unsigned int r = blockIdx.y;
     const unsigned int tid = threadIdx.x;
     extern __shared__ float sh[];
+    // 2026-10-05: Grid-stride walk over the live pools, as in dsa_kpool_compress: block (b, r)
+    // takes pools b, b + gridDim.x, ... below `live`, each computed exactly as the
+    // one-pool-per-block form computed it, and a grid of `live` blocks or more is that form.
+    // `live` is geom's complete-pool count under a ceiling launch, else the grid width (an
+    // exact launch has one block per pool and no early exit).
+    unsigned int live = gridDim.x;
     if (geom) {
         S = (unsigned int)geom[DSA_GEOM_S];
         P = (unsigned int)geom[DSA_GEOM_NPOOLS];
         // 2026-09-25: `P` is also the row stride of out / valid_cand, so it may vary with geom
         // only because the device-geometry path is decode-only (Q == 1, every r * P is 0).
         // The launcher refuses a ceiling launch with Q > 1.
-        if (p >= P) return;
+        live = P;
     }
+    for (unsigned int p = blockIdx.x; p < live; p += gridDim.x) {
+        // 2026-09-25: A pool is a candidate only when it is complete and its last token, clamped
+        // to [0, S-1], is at or before this query's position and valid. Others score -FLT_MAX.
+        int end = pool_indices[p * KP + KP - 1];
+        int end_c = end < 0 ? 0 : (end >= (int)S ? (int)S - 1 : end);
+        bool vis = (end_c <= q_pos[r]) && (valid_keys[end_c] != 0);
+        bool cand = (pool_valid[p] != 0) && vis;
+        if (tid == 0) valid_cand[(size_t)r * P + p] = cand ? 1 : 0;
+        if (!cand) {
+            if (tid == 0) out[(size_t)r * P + p] = -FLT_MAX;
+            continue;
+        }
 
-    // 2026-09-25: A pool is a candidate only when it is complete and its last token, clamped
-    // to [0, S-1], is at or before this query's position and valid. Others score -FLT_MAX.
-    int end = pool_indices[p * KP + KP - 1];
-    int end_c = end < 0 ? 0 : (end >= (int)S ? (int)S - 1 : end);
-    bool vis = (end_c <= q_pos[r]) && (valid_keys[end_c] != 0);
-    bool cand = (pool_valid[p] != 0) && vis;
-    if (tid == 0) valid_cand[(size_t)r * P + p] = cand ? 1 : 0;
-    if (!cand) {
-        if (tid == 0) out[(size_t)r * P + p] = -FLT_MAX;
-        return;
-    }
-
-    // 2026-09-25: One warp per head: each lane accumulates every 32nd product, a shuffle tree
-    // reduces them, and the head's term lands in sh[h]. Thread 0 then sums sh[0..H) in head
-    // order. sh must hold H floats: the host requests max(SCORES_BLOCK, 4 * H) bytes.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5;
-    const unsigned int nwarps = (blockDim.x + 31u) / 32u;
-    const float* __restrict__ pk = pool_keys + (size_t)p * D;
-    for (unsigned int h = warp; h < H; h += nwarps) {
-        const float* __restrict__ qh = q + ((size_t)r * H + h) * D;
-        float dot = 0.0f;
-        for (unsigned int d = lane; d < D; d += 32u) dot += qh[d] * pk[d];
-        for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
-        if (lane == 0) sh[h] = weights[(size_t)r * H + h] * fmaxf(scale * dot, 0.0f);
-    }
-    __syncthreads();
-    if (tid == 0) {
-        float acc = 0.0f;
-        for (unsigned int h = 0; h < H; ++h) acc += sh[h];
-        out[(size_t)r * P + p] = acc;
+        // 2026-09-25: One warp per head: each lane accumulates every 32nd product, a shuffle tree
+        // reduces them, and the head's term lands in sh[h]. Thread 0 then sums sh[0..H) in head
+        // order. sh must hold H floats: the host requests max(SCORES_BLOCK, 4 * H) bytes.
+        const unsigned int lane = tid & 31u;
+        const unsigned int warp = tid >> 5;
+        const unsigned int nwarps = (blockDim.x + 31u) / 32u;
+        const float* __restrict__ pk = pool_keys + (size_t)p * D;
+        for (unsigned int h = warp; h < H; h += nwarps) {
+            const float* __restrict__ qh = q + ((size_t)r * H + h) * D;
+            float dot = 0.0f;
+            for (unsigned int d = lane; d < D; d += 32u) dot += qh[d] * pk[d];
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+            if (lane == 0) sh[h] = weights[(size_t)r * H + h] * fmaxf(scale * dot, 0.0f);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float acc = 0.0f;
+            for (unsigned int h = 0; h < H; ++h) acc += sh[h];
+            out[(size_t)r * P + p] = acc;
+        }
+        // 2026-10-05: This block's next pool rewrites sh[0..H): every thread waits here until
+        // thread 0 has summed it. All threads reach this barrier or none do (cand depends on
+        // the pool and the row only), so it is safe inside the loop.
+        __syncthreads();
     }
 }
 

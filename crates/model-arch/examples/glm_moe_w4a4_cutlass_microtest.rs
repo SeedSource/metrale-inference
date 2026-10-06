@@ -761,7 +761,7 @@ fn main() -> Result<()> {
             // local experts' rows only (activation pre-filled with a 0x5A sentinel) must give a
             // byte-identical expert_out (whole buffer) and local activation rows; the known-bad
             // span one row short must change expert_out.
-            let full_span = swiglu_span(&off_i32, 0..LOCAL, te, true);
+            let full_span = swiglu_span(&off_i32, 0..n_local(), te, true);
             for (leg, span) in [
                 ("local", full_span.clone()),
                 ("short", full_span.start..full_span.end.saturating_sub(1)),
@@ -776,24 +776,24 @@ fn main() -> Result<()> {
                     expert_out: out_b,
                     te,
                     hidden: H,
-                    moe_intermediate: MI,
+                    moe_intermediate: mi(),
                     swiglu_limit: LIMIT,
                     offsets: &off_i32,
                     tables: &tables,
                     skip_down: false,
                     swiglu_rows: span.clone(),
                 };
-                g.memset_async(act_b, 0x5A, te * MI * 2, 0)?;
+                g.memset_async(act_b, 0x5A, te * mi() * 2, 0)?;
                 g.memset_async(out_b, 0, te * H * 2, 0)?;
                 run(g, &largs, 0).and_then(|_| g.synchronize(0))?;
-                let got_act_l = dn(g, act_b, te * MI * 2)?;
+                let got_act_l = dn(g, act_b, te * mi() * 2)?;
                 let got_out_l = dn(g, out_b, te * H * 2)?;
                 let out_diff = got_out_l
                     .iter()
                     .zip(&got_out_b)
                     .filter(|(x, y)| x != y)
                     .count();
-                let (lo, hi) = (full_span.start * MI * 2, full_span.end * MI * 2);
+                let (lo, hi) = (full_span.start * mi() * 2, full_span.end * mi() * 2);
                 let act_diff = got_act_l[lo..hi]
                     .iter()
                     .zip(&got_act_b[lo..hi])

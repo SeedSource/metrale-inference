@@ -31,7 +31,7 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use super::profile;
 use crate::glm5next_mhc::{
     Glm5NextMhcKernels, Glm5NextMhcSiteWeights, glm_hc_expand, glm_hc_post, glm_hc_post_mix,
-    glm_hc_pre_part, glm_hc_pre_part_premixed, hc_head_mean, mix_hc,
+    glm_hc_post_mix_finish, glm_hc_pre_part, glm_hc_pre_part_premixed, hc_head_mean, mix_hc,
 };
 
 /// 2026-10-01: A row range, `(first row, rows)`.
@@ -165,6 +165,14 @@ pub struct SpSite<'a> {
     /// 2026-10-06: The front finds its mix rows already in `weights.mix` at the chunk positions
     /// (the previous pass's `post_mix`) and runs `hc_finish` only.
     pub premixed: bool,
+    /// 2026-10-06: `METRALE_GLM_MHC_POST_MIX_FINISH`, with `post_mix`: the back's fused launch
+    /// also runs the `post_mix` site's `hc_finish` (`glm_hc_post_mix_finish`), writing that
+    /// site's `y` into the rows' `hidden`, and its `post` / `comb` into the rows' slots.
+    pub post_finish: bool,
+    /// 2026-10-06: The previous pass's back ran this site's `hc_finish` too (`post_finish`):
+    /// `hidden`, `post` and `comb` of the rows already hold this site's pre outputs, so the
+    /// front runs the norm only. Never with `expand`.
+    pub prefinished: bool,
 }
 
 impl SpRows<'_> {
@@ -188,10 +196,17 @@ impl SpRows<'_> {
         let x = hidden.offset(t * h * 2);
         let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
         let t_mhc = profile::start();
+        ensure!(
+            !(site.prefinished && site.expand),
+            "sequence-parallel front: a prefinished site cannot expand the highway"
+        );
         if site.expand {
             glm_hc_expand(gpu, self.mhc.hc_expand, x, streams, kt, ht, hct, stream)?;
         }
-        if site.premixed {
+        if site.prefinished {
+            // 2026-10-06: The previous back wrote this site's `y`, `post` and `comb` for these
+            // rows (`glm_hc_post_mix_finish`); nothing to launch.
+        } else if site.premixed {
             // 2026-10-06: Rows `[t, t + k)` of the mix sit at rows `t..` of the scratch.
             let mut w = *site.weights;
             w.mix = w.mix.offset(t * mix_hc(hc) * 4);
@@ -239,6 +254,9 @@ impl SpRows<'_> {
 
     /// 2026-10-04: The back of rows `[t, t + k)`: `hc_post` of the reduced partial in its
     /// `hidden` rows into the highway, then (`last`) `hc_head_mean` into the same rows.
+    /// 2026-10-06: With `post_mix` and `finish` (`SpSite::post_finish`), one launch also runs
+    /// the next site's `hc_finish` into the rows' `hidden`, `post` and `comb`.
+    #[allow(clippy::too_many_arguments)]
     pub fn back(
         &self,
         gpu: &dyn GpuBackend,
@@ -246,6 +264,7 @@ impl SpRows<'_> {
         (t, k): Span,
         last: bool,
         post_mix: Option<&Glm5NextMhcSiteWeights>,
+        finish: bool,
         stream: u64,
     ) -> Result<()> {
         let (h, hc) = (self.hidden, self.hc_mult);
@@ -255,7 +274,43 @@ impl SpRows<'_> {
         let x = hidden.offset(t * h * 2);
         let (kt, ht, hct) = (k as u32, h as u32, hc as u32);
         let t_post = profile::start();
-        if let Some(next) = post_mix {
+        ensure!(
+            !(finish && (last || post_mix.is_none())),
+            "sequence-parallel back: post+mix+finish needs a next site and a non-last pass"
+        );
+        if let (Some(next), true) = (post_mix, finish) {
+            static ENGAGED: std::sync::Once = std::sync::Once::new();
+            ENGAGED.call_once(|| {
+                tracing::warn!(
+                    "METRALE_GLM_MHC_POST_MIX_FINISH: ENGAGED (glm5next_hc_post_mix_finish_bf16, \
+                     first back of {k} rows; the next front launches no hc_finish)"
+                );
+            });
+            // 2026-10-06: The next site's mix rows go to rows `t..` of its scratch; its `y`,
+            // `post` and `comb` to the rows the front would write (`x`, `post`, `comb`).
+            let mix_out = next.mix.offset(t * mix_hc(hc) * 4);
+            glm_hc_post_mix_finish(
+                gpu,
+                self.mhc,
+                x,
+                streams,
+                post,
+                comb,
+                streams,
+                next,
+                mix_out,
+                x,
+                post,
+                comb,
+                kt,
+                ht,
+                hct,
+                self.sinkhorn_iters,
+                self.rms_eps,
+                self.hc_eps,
+                stream,
+            )?;
+        } else if let Some(next) = post_mix {
             // 2026-10-06: The next site's mix rows go to rows `t..` of its scratch.
             let mix_out = next.mix.offset(t * mix_hc(hc) * 4);
             glm_hc_post_mix(
@@ -352,7 +407,8 @@ pub fn sp_pass(
     }
     for &c in calls {
         for s in plan.spans(rank, c) {
-            rows.back(gpu, hidden, s, site.last, site.post_mix, stream)?;
+            let fin = site.post_finish;
+            rows.back(gpu, hidden, s, site.last, site.post_mix, fin, stream)?;
         }
     }
     Ok(())

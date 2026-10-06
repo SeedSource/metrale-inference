@@ -185,13 +185,35 @@ impl Glm5NextLayer {
             )
         };
         let post_mix = post_mix_on && usable(&mhc.ffn);
+        // 2026-10-06: `METRALE_GLM_MHC_POST_MIX_FINISH=1`: where a back fuses post with the next
+        // site's mix, the same launch runs that site's `hc_finish` (`glm_hc_post_mix_finish`)
+        // and the next front runs the norm only. Within the layer the FFN front reads exactly
+        // the rows the attention back wrote (the argument above). Across layers the FFN back
+        // records it in the ticket (`finished`), and the next attention front skips `hc_finish`
+        // only when it takes that ticket; a front that does not take it recomputes `y`, `post`
+        // and `comb` from the highway, overwriting the same rows (`hidden`, `post` and `comb`
+        // are scratch between a back and the next front).
+        let finish_on = post_mix_on && crate::glm5next_mhc::mhc_post_mix_finish();
+        let finish_usable = |site: &crate::glm5next_mhc::Glm5NextMhcSiteWeights| {
+            finish_on
+                && crate::glm5next_mhc::post_mix_finish_usable(
+                    &mhc.kernels,
+                    site,
+                    self.hidden as u32,
+                    mhc.hc_mult as u32,
+                )
+        };
+        let attn_finish = post_mix && finish_usable(&mhc.ffn);
         let ticket = |layer: usize| crate::glm5next_layer::seq_parallel::PremixTicket {
             layer,
             seq_len_start,
             total: num_tokens,
             hidden: hidden.0,
+            finished: false,
         };
-        let attn_premixed = self.premix.take_matches(ticket(self.layer_idx));
+        let handoff = self.premix.take_handoff(ticket(self.layer_idx));
+        let attn_premixed = handoff.is_some();
+        let attn_prefinished = handoff == Some(true);
         if attn_premixed {
             static ENGAGED: std::sync::Once = std::sync::Once::new();
             ENGAGED.call_once(|| {
@@ -216,6 +238,8 @@ impl Glm5NextLayer {
             attn: true,
             post_mix: post_mix.then_some(&mhc.ffn),
             premixed: attn_premixed,
+            post_finish: attn_finish,
+            prefinished: attn_prefinished,
         };
         let mixer = |(t, k): (usize, usize), x: DevicePtr| {
             self.attn_mixer(
@@ -241,6 +265,7 @@ impl Glm5NextLayer {
 
         // 2026-10-01: FFN pass, over the windows `prefill_staged_run` uses.
         let ffn_out = ctx.buffers.moe_output();
+        let ffn_finish = next_attn.is_some_and(finish_usable);
         let wins = ffn_windows(subs, rows_ffn, prefill_tail_merge(), |k| self.ffn_mergeable(k));
         let ffn = SpSite {
             weights: &mhc.ffn,
@@ -251,6 +276,8 @@ impl Glm5NextLayer {
             attn: false,
             post_mix: next_attn,
             premixed: post_mix,
+            post_finish: ffn_finish,
+            prefinished: attn_finish,
         };
         let mlp = |(_, k): (usize, usize), x: DevicePtr| {
             // 2026-10-04: Full width: the window's dense GEMMs in one slice, as
@@ -261,7 +288,10 @@ impl Glm5NextLayer {
         };
         sp_pass(gpu, comm, add_k, plan, &lanes, hidden, &wins, ffn, mlp, stream)?;
         if next_attn.is_some() {
-            self.premix.issue(ticket(self.layer_idx + 1));
+            self.premix.issue(crate::glm5next_layer::seq_parallel::PremixTicket {
+                finished: ffn_finish,
+                ..ticket(self.layer_idx + 1)
+            });
         }
         if self.is_last {
             // 2026-10-01: Both ranks leave with every final row, as `prefill_staged_run` does.

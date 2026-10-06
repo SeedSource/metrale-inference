@@ -40,7 +40,8 @@ fn plan_bytes_is_the_per_region_max() {
     let long = DsaSelectGeometry::plan(&c, 16_384, 1).unwrap();
     let wide = DsaSelectGeometry::plan(&c, 4_096, 64).unwrap();
     let (one, t1) = DsaSelectScratch::plan_bytes(&c, &[long]);
-    assert_eq!(one, long.scratch_bytes());
+    // 2026-10-06: Regions 0 to 5; region 6 (radix top-k) follows the lever, off here.
+    assert_eq!(&one[..6], &long.scratch_bytes()[..]);
     assert_eq!(t1, c.out_width() * 4);
     let (both, tb) = DsaSelectScratch::plan_bytes(&c, &[long, wide]);
     for i in 0..6 {

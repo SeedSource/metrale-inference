@@ -64,7 +64,9 @@ static SHARED: Mutex<Option<DsaSelectScratch>> = Mutex::new(None);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedPlan {
     /// 2026-10-05: Region and `tokens` bytes of the one shared scratch.
-    pub plan: ([usize; 6], usize),
+    /// 2026-10-06: Seven regions; the seventh is the radix top-k work buffer (0 with
+    /// `METRALE_GLM_DSA_TOPK_RADIX` off).
+    pub plan: ([usize; 7], usize),
     /// 2026-10-05: Bytes one text-layer workspace allocates on its own.
     pub layer_bytes: usize,
     /// 2026-10-05: Bytes the MTP head's workspace allocates on its own.

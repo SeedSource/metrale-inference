@@ -32,6 +32,9 @@
 //! against `kept_pools` in `tests`), so the launcher uses the full arrays in place and
 //! `dsa_compact_pools` is not launched. A left-padded batch would need the compaction;
 //! [`DsaSelectGeometry::plan`] handles contiguous caches only.
+//!
+//! 2026-10-06: Scratch region 6 is the radix top-k work buffer ([`radix`],
+//! `METRALE_GLM_DSA_TOPK_RADIX=1`), planned only with the lever on: lever-off sizes are unchanged.
 
 use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
@@ -349,7 +352,9 @@ pub struct DsaSelectScratch {
     /// 2026-09-25: `[q_rows, out_width]` i32 token ids, `-1` where nothing was selected. The
     /// result of the pass; `dsa_expand_selection` writes every slot of each row.
     tokens: DevicePtr,
-    capacity: [usize; 6],
+    /// 2026-10-06: Radix top-k work buffer (region 6), NULL when none was planned.
+    radix: DevicePtr,
+    capacity: [usize; 7],
     tokens_bytes: usize,
 }
 
@@ -368,11 +373,20 @@ impl DsaSelectScratch {
     /// `geoms`: the per-region maximum. For one geometry, exactly what [`Self::alloc`] has
     /// always reserved. `METRALE_GLM_DSA_SELECT_SCRATCH_SHARED` (`shared.rs`) sizes the one
     /// scratch every DSA workspace shares with it.
-    pub fn plan_bytes(cfg: &Glm5NextDsaConfig, geoms: &[DsaSelectGeometry]) -> ([usize; 6], usize) {
-        let mut capacity = [0usize; 6];
+    pub fn plan_bytes(cfg: &Glm5NextDsaConfig, geoms: &[DsaSelectGeometry]) -> ([usize; 7], usize) {
+        Self::plan_bytes_for(cfg, geoms, radix::dsa_topk_radix())
+    }
+
+    /// 2026-10-06: [`Self::plan_bytes`] for an explicit `METRALE_GLM_DSA_TOPK_RADIX` state.
+    pub fn plan_bytes_for(
+        cfg: &Glm5NextDsaConfig,
+        geoms: &[DsaSelectGeometry],
+        lever: bool,
+    ) -> ([usize; 7], usize) {
+        let mut capacity = [0usize; 7];
         let mut tokens_bytes = 0;
         for g in geoms {
-            for (c, w) in capacity.iter_mut().zip(g.scratch_bytes()) {
+            for (c, w) in capacity.iter_mut().zip(radix::regions(g, cfg, lever)) {
                 *c = (*c).max(w);
             }
             tokens_bytes = tokens_bytes.max(g.q_rows * cfg.out_width() * 4);
@@ -381,12 +395,12 @@ impl DsaSelectScratch {
     }
 
     /// 2026-10-05: Total bytes of a scratch planned by [`Self::plan_bytes`].
-    pub fn planned_total(plan: &([usize; 6], usize)) -> usize {
+    pub fn planned_total(plan: &([usize; 7], usize)) -> usize {
         plan.0.iter().sum::<usize>() + plan.1
     }
 
     /// 2026-10-05: Allocate `plan` (from [`Self::plan_bytes`]), in field order.
-    pub fn alloc_sized(gpu: &dyn GpuBackend, plan: ([usize; 6], usize)) -> Result<Self> {
+    pub fn alloc_sized(gpu: &dyn GpuBackend, plan: ([usize; 7], usize)) -> Result<Self> {
         let (capacity, tokens_bytes) = plan;
         Ok(Self {
             pool_keys: gpu.alloc(capacity[0])?,
@@ -396,6 +410,7 @@ impl DsaSelectScratch {
             valid_cand: gpu.alloc(capacity[4])?,
             selected: gpu.alloc(capacity[5])?,
             tokens: gpu.alloc(tokens_bytes)?,
+            radix: radix::alloc_region(gpu, capacity[6])?,
             capacity,
             tokens_bytes,
         })
@@ -427,7 +442,7 @@ impl DsaSelectScratch {
     /// 2026-09-25: Whether `geom` fits what was allocated. `select_tokens` checks it on every
     /// pass, so a pass larger than the allocation is an error rather than an overrun.
     pub fn fits(&self, cfg: &Glm5NextDsaConfig, geom: &DsaSelectGeometry) -> Result<()> {
-        let want = geom.scratch_bytes();
+        let want = radix::regions(geom, cfg, radix::dsa_topk_radix());
         for (i, (w, c)) in want.iter().zip(self.capacity.iter()).enumerate() {
             if w > c {
                 bail!(
@@ -459,6 +474,7 @@ impl DsaSelectScratch {
             self.valid_cand,
             self.selected,
             self.tokens,
+            self.radix,
         ] {
             gpu.free(p)?;
         }
@@ -469,6 +485,7 @@ impl DsaSelectScratch {
 mod launch;
 pub use launch::select_tokens;
 pub mod grid_stride;
+pub mod radix;
 pub mod shared;
 pub mod split;
 

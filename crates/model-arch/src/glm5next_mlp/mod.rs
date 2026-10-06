@@ -37,6 +37,9 @@ use metrale_config::{Glm5NextRouterMode, ModelConfig};
 use metrale_gpu_runtime::gpu::{GpuBackend, KernelHandle};
 
 pub mod build;
+pub mod expert_tp;
+#[cfg(test)]
+mod expert_tp_tests;
 pub mod forward;
 pub mod forward_prefill_gemm;
 pub mod weights;
@@ -58,6 +61,11 @@ pub const W4A16_GEMV_MODULE: &str = "w4a16_gemv";
 pub const MOE_MODULE: &str = "moe";
 /// 2026-09-25: `[modules]`: `moe_w4a16_grouped_gemm = "moe_w4a16"`, the tensor-core grouped W4A16 GEMM.
 pub const MOE_GROUPED_MODULE: &str = "moe_w4a16";
+
+/// 2026-10-05: Under expert-TP (`METRALE_GLM_EXPERT_TP`), the half width `moe_intermediate_size
+/// / 2` must be a multiple of this: the CUTLASS W4A4 prefill tile's K and N (128), which also
+/// covers the W4A16 MMA prefill (64) and the NVFP4 scale group (16).
+pub const EXPERT_TP_WIDTH_ALIGN: usize = 128;
 
 /// 2026-09-25: The most experts `glm5next_router_topk` can select per token: its per-token
 /// selection lives in the shared arrays `sel_id[16]` and `sel_w[16]`.
@@ -276,6 +284,7 @@ pub struct Glm5NextMlpConfig {
     pub local_dense_intermediate: usize,
     /// 2026-09-25: `moe_intermediate_size`, one routed expert's width. Not divided by TP: an
     /// expert is owned whole by one EP rank.
+    /// 2026-10-05: Under expert-TP, `moe_intermediate_size / 2`: this rank's slice of I.
     pub moe_intermediate: usize,
     /// 2026-09-25: `shared_expert_intermediate_size / tp_world_size`: this rank's share of the
     /// shared expert.
@@ -284,6 +293,8 @@ pub struct Glm5NextMlpConfig {
     pub num_experts: usize,
     /// 2026-09-25: `num_experts / ep_world_size`; this rank owns ids
     /// `[ep_rank * local_experts, (ep_rank + 1) * local_experts)`.
+    /// 2026-10-05: Under expert-TP, `num_experts` (ids `0..num_experts`, see
+    /// [`Self::local_expert_range`]).
     pub local_experts: usize,
     pub ep_rank: usize,
     pub top_k: usize,
@@ -310,7 +321,18 @@ impl Glm5NextMlpConfig {
     /// 2026-09-25: Divides the global widths by TP and the expert set by EP (a world size of 0
     /// counts as 1), then runs [`Self::validate`]. Errors when a width or the expert count does
     /// not divide evenly.
+    /// 2026-10-05: [`Self::from_config_with`] at the process's `METRALE_GLM_EXPERT_TP` setting.
     pub fn from_config(config: &ModelConfig) -> Result<Self> {
+        Self::from_config_with(config, metrale_config::glm_expert_tp())
+    }
+
+    /// 2026-10-05: [`Self::from_config`] with the expert layout given: `expert_tp = false` is the
+    /// EP split; `true` is expert-TP (`METRALE_GLM_EXPERT_TP`): this rank owns every routed
+    /// expert (`local_experts = num_experts`, range `0..num_experts`) at width
+    /// `moe_intermediate_size / 2`, its slice of I. Expert-TP is refused unless
+    /// `tp_world_size == ep_world_size == 2` on the same ranks (`tp_rank == ep_rank`) and
+    /// `moe_intermediate_size / 2` is a multiple of [`EXPERT_TP_WIDTH_ALIGN`].
+    pub fn from_config_with(config: &ModelConfig, expert_tp: bool) -> Result<Self> {
         let tp = config.tp_world_size.max(1);
         let ep = config.ep_world_size.max(1);
         if !config.intermediate_size.is_multiple_of(tp) {
@@ -333,7 +355,7 @@ impl Glm5NextMlpConfig {
                 config.num_experts
             );
         }
-        let c = Self {
+        let mut c = Self {
             hidden: config.hidden_size,
             local_dense_intermediate: config.intermediate_size / tp,
             moe_intermediate: config.moe_intermediate_size,
@@ -349,13 +371,46 @@ impl Glm5NextMlpConfig {
             tp_world_size: tp,
             ep_world_size: ep,
         };
+        if expert_tp {
+            if tp != 2 || ep != 2 || config.tp_rank != config.ep_rank {
+                bail!(
+                    "METRALE_GLM_EXPERT_TP=1 needs TP2/EP2 on the same two ranks \
+                     (tp_world_size 2, ep_world_size 2, tp_rank == ep_rank); this rank has \
+                     tp_world_size {tp} (rank {}), ep_world_size {ep} (rank {}). Unset the lever \
+                     or serve at --tp-size 2 --ep-size 2",
+                    config.tp_rank,
+                    config.ep_rank
+                );
+            }
+            let full = config.moe_intermediate_size;
+            if !full.is_multiple_of(2) || !(full / 2).is_multiple_of(EXPERT_TP_WIDTH_ALIGN) {
+                bail!(
+                    "METRALE_GLM_EXPERT_TP=1: moe_intermediate_size {full} does not halve to a \
+                     multiple of {EXPERT_TP_WIDTH_ALIGN} (the CUTLASS W4A4 tile; the W4A16 MMA \
+                     needs 64), so not every routed-MoE path can run the slice"
+                );
+            }
+            c.moe_intermediate = full / 2;
+            c.local_experts = config.num_experts;
+        }
         c.validate()?;
         Ok(c)
     }
 
+    /// 2026-10-05: Whether this rank runs expert-TP (`METRALE_GLM_EXPERT_TP`): split over EP
+    /// ranks yet owning every routed expert, each at its slice of I.
+    pub fn is_expert_tp(&self) -> bool {
+        self.ep_world_size > 1 && self.local_experts == self.num_experts
+    }
+
     /// 2026-09-25: The half-open global expert-id range this rank owns.
+    /// 2026-10-05: `0..num_experts` when the rank owns every expert (EP 1, or expert-TP).
     pub fn local_expert_range(&self) -> std::ops::Range<usize> {
-        let start = self.ep_rank * self.local_experts;
+        let start = if self.local_experts == self.num_experts {
+            0
+        } else {
+            self.ep_rank * self.local_experts
+        };
         start..start + self.local_experts
     }
 

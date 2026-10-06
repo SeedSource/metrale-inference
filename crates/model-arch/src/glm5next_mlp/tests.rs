@@ -133,3 +133,73 @@ fn the_router_ladder_comes_from_the_config() {
             .router_bf16_ladder
     );
 }
+
+/// 2026-10-05: Expert-TP (`METRALE_GLM_EXPERT_TP`) at TP2/EP2: each rank owns all 288 experts
+/// (range `0..288`, every id a local slot equal to the id) at width 1024, the dense and shared
+/// widths are the EP2 ones, and the site still needs the all-reduce.
+#[test]
+fn expert_tp_owns_every_expert_at_half_width() {
+    let mut base = glm_config();
+    base.tp_world_size = 2;
+    base.ep_world_size = 2;
+    for rank in 0..2 {
+        let mut m = base.clone();
+        m.tp_rank = rank;
+        m.ep_rank = rank;
+        let ep = Glm5NextMlpConfig::from_config_with(&m, false).unwrap();
+        let c = Glm5NextMlpConfig::from_config_with(&m, true).unwrap();
+        assert!(!ep.is_expert_tp());
+        assert!(c.is_expert_tp(), "rank {rank}");
+        assert_eq!(c.moe_intermediate, 1024);
+        assert_eq!(c.local_experts, 288);
+        assert_eq!(c.local_expert_range(), 0..288);
+        assert_eq!(c.local_slot(200), Some(200));
+        assert_eq!(c.ep_rank, rank);
+        assert_eq!(c.local_dense_intermediate, ep.local_dense_intermediate);
+        assert_eq!(c.local_shared_intermediate, ep.local_shared_intermediate);
+        assert!(c.needs_all_reduce());
+        // 2026-10-05: The same routed-expert bytes per rank as EP2: 288 halves = 144 wholes.
+        assert_eq!(
+            c.local_experts * c.moe_intermediate,
+            ep.local_experts * ep.moe_intermediate
+        );
+    }
+    // 2026-10-05: The EP2 ranges are unchanged by the expert-TP rule.
+    let mut m = base.clone();
+    m.ep_rank = 1;
+    m.tp_rank = 1;
+    let ep1 = Glm5NextMlpConfig::from_config_with(&m, false).unwrap();
+    assert_eq!(ep1.local_expert_range(), 144..288);
+}
+
+/// 2026-10-05: Expert-TP is refused off TP2/EP2-on-the-same-ranks and for a width whose half is
+/// not a multiple of 128.
+#[test]
+fn expert_tp_is_refused_off_tp2_ep2() {
+    let world_one = glm_config();
+    assert!(Glm5NextMlpConfig::from_config_with(&world_one, true).is_err());
+
+    let mut tp_only = glm_config();
+    tp_only.tp_world_size = 2;
+    assert!(Glm5NextMlpConfig::from_config_with(&tp_only, true).is_err());
+
+    let mut crossed = glm_config();
+    crossed.tp_world_size = 2;
+    crossed.ep_world_size = 2;
+    crossed.tp_rank = 1;
+    crossed.ep_rank = 0;
+    assert!(Glm5NextMlpConfig::from_config_with(&crossed, true).is_err());
+
+    let mut narrow = glm_config();
+    narrow.tp_world_size = 2;
+    narrow.ep_world_size = 2;
+    narrow.moe_intermediate_size = 192;
+    assert!(Glm5NextMlpConfig::from_config_with(&narrow, true).is_err());
+    narrow.moe_intermediate_size = 256;
+    assert_eq!(
+        Glm5NextMlpConfig::from_config_with(&narrow, true)
+            .unwrap()
+            .moe_intermediate,
+        128
+    );
+}

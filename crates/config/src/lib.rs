@@ -238,6 +238,39 @@ pub fn glm_moe_w4a4_down_w4a16_from(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// 2026-10-05: Whether GLM-5.3 runs its routed experts tensor-parallel over the intermediate
+/// dimension instead of expert-parallel (`METRALE_GLM_EXPERT_TP`, see [`glm_expert_tp_from`]);
+/// off by default. Read once per process.
+///
+/// Four places read it and must agree: the server's topology check and weight-store EP view
+/// (`serve_phases`), `Glm5NextWeightLoader`'s defer predicate, and
+/// `Glm5NextMlpConfig::from_config` (which the text and MTP loaders both call, so the two never
+/// mix layouts).
+pub fn glm_expert_tp() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| glm_expert_tp_from(std::env::var("METRALE_GLM_EXPERT_TP").ok().as_deref()))
+}
+
+/// 2026-10-05: The policy half of [`glm_expert_tp`]: only `1` (trimmed) turns it on.
+pub fn glm_expert_tp_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+#[cfg(test)]
+mod glm_expert_tp_gate_tests {
+    use super::glm_expert_tp_from as on;
+
+    #[test]
+    fn only_one_turns_expert_tp_on() {
+        for off in [None, Some(""), Some("0"), Some("true"), Some("on"), Some("11")] {
+            assert!(!on(off), "{off:?} must leave the lever off");
+        }
+        for v in ["1", " 1", "1\n"] {
+            assert!(on(Some(v)), "{v:?} must turn the lever on");
+        }
+    }
+}
+
 #[cfg(test)]
 mod glm_moe_w4a4_fix_lever_tests {
     use super::{glm_moe_w4a4_down_w4a16_from, glm_moe_w4a4_dynamic_scale_from};

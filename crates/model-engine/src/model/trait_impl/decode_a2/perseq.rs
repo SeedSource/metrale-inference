@@ -5,6 +5,11 @@
 //!
 //! Owner: model-engine (decode).
 //! Invariants: `suppress_graphs` holds its previous value again when this returns.
+//! Known gap (2026-10-05, A168 review): each row's lazy-map vote runs inside its own `decode()`,
+//! so a refusal at row i > 0 comes after rows 0..i-1 advanced on both ranks, and the scheduler's
+//! preempt-and-relaunch decodes those rows again (a duplicated token). The same holds for a KV
+//! exhaustion mid-loop before the vote. The GLM ship envs set `METRALE_GLM_DECODE_MULTI_SEQ=1`,
+//! whose batched path votes every row before any advances (`decode_a2.rs`).
 
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::DevicePtr;

@@ -156,7 +156,8 @@ impl TransformerModel {
             self.kv_cache.lock().free_blocks(&seq.block_table);
             seq.block_table.clear();
         }
-        // 2026-10-05: The lazily mapped states are released below; a reused struct votes afresh.
+        // 2026-10-05: The layer states were released above (the proposer below); a reused struct
+        // votes afresh.
         seq.lazy_rows_agreed = 0;
 
         // 2026-09-25: `--high-speed-swap`: drop one disk ref per disk block id. An id

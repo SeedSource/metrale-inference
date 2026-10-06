@@ -237,7 +237,8 @@ impl CommBackend for PairComm {
 }
 
 /// 2026-09-25: Run the real gather on two threads; returns what each rank observed.
-fn gather_two(vals: [u32; 2]) -> [Vec<u32>; 2] {
+/// 2026-10-05: Also the two-rank harness of `lazy_agree_tests`.
+pub(super) fn gather_two(vals: [u32; 2]) -> [Vec<u32>; 2] {
     let link = Arc::new(Link {
         slot: Mutex::new(None),
         cv: Condvar::new(),

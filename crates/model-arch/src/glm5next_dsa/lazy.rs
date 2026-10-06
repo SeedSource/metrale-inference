@@ -16,6 +16,9 @@
 //! - Every mapping decision depends only on token positions (the KV block grid and the row a
 //!   write path is about to write), and the pool limit is checked equal on every rank
 //!   (`rank_agree`), so EP ranks map, charge and refuse identically.
+//!   2026-10-05: Except the VMM lazy-map floor, which reads each rank's own free device memory
+//!   (A168): a prefill chunk's admission is therefore voted on by every rank before its first
+//!   collective (model-engine `prefill_b/lazy_agree.rs`). Decode-time maps are not voted yet.
 //!
 //! The `valid` byte array stays eagerly allocated: one 2 MiB granule holds 2 M of its rows,
 //! so mapping it lazily would round 131 KB up to 2 MiB per layer.

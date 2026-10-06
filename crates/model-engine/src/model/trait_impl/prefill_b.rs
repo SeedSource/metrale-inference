@@ -35,6 +35,9 @@ mod forward_layers;
 mod grid_restore;
 mod h_state_ptrs;
 mod inpass_capture;
+mod lazy_agree;
+#[cfg(test)]
+mod lazy_agree_tests;
 mod midchunk_capture;
 mod prefix_lookup;
 mod prefix_reserve;
@@ -193,7 +196,7 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         let end_pos = chunk_start + chunk_len;
         let blocks_needed = (end_pos - 1) / bs + 1;
-        super::super::block_mgmt::ensure_blocks_through_prefill(
+        let admitted = super::super::block_mgmt::ensure_blocks_through_prefill(
             seq,
             blocks_needed - 1,
             &mut kv_cache,
@@ -201,6 +204,15 @@ impl TransformerModel {
             self.gpu.as_ref(),
             stream,
             self.levers.kv_poison,
+        );
+        // 2026-10-05: Rank-agreed admission (race-memory #79, A168): the KV blocks and the
+        // lazily mapped DSA indexer rows are admitted per rank (the lazy-map floor reads this
+        // rank's free memory), so every rank votes before the chunk's first forward
+        // collective, and a refusal on any rank fails the chunk on all of them. One
+        // `ep_gather_u32` per chunk; single-rank returns `admitted` unchanged.
+        self.agree_admission(
+            admitted,
+            &format!("prefill chunk [{chunk_start}, +{chunk_len}) of {total}"),
         )?;
 
         // 2026-09-25: Processing range for this chunk; a fully cached chunk

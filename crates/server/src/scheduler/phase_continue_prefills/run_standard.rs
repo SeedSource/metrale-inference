@@ -238,18 +238,7 @@ pub(super) fn run_standard_chunk_loop(
 
     // 2026-09-25: Plain prefill chunk; decode runs separately. Under EP the
     // chunk is first broadcast to the worker.
-    let ep_ok = (|| -> Result<()> {
-        model.ep_broadcast_cmd_for_seq(p.seq.slot_idx as u32, 0xFFFFFFF0)?;
-        model.ep_broadcast_cmd(chunk_len as u32)?;
-        model.ep_broadcast_cmd(p.chunk_offset as u32)?;
-        model.ep_broadcast_cmd(p.prompt_tokens.len() as u32)?;
-        model.ep_broadcast_tokens(&p.prompt_tokens)?;
-        // 2026-09-25: Every `0xFFFFFFF0` broadcast must be followed by this
-        // call: the worker runs the matching collective in its `0xFFFFFFF0`
-        // handler (`Model::ep_sync_vision_embeds`).
-        model.ep_sync_vision_embeds(&p.prompt_tokens)?;
-        Ok(())
-    })();
+    let ep_ok = broadcast_chunk(model, p, chunk_len);
     if let Err(e) = ep_ok {
         tracing::error!("EP broadcast chunk: {e:#}");
         completed_indices.push((idx, Err(format!("prefill failed: {e:#}"))));
@@ -295,6 +284,15 @@ pub(super) fn run_standard_chunk_loop(
             &mut victim,
             "preempted: KV cache exhausted (a prefill needed its blocks)",
         );
+        // 2026-10-05: Under EP the worker refused the same chunk (the admission is
+        // rank-agreed, `prefill_b/lazy_agree.rs`) and is waiting for its next command, so
+        // the retry is announced to it like the first attempt; without this the head's
+        // retry would run its collectives alone. A no-op on a single rank.
+        if let Err(e) = broadcast_chunk(model, p, chunk_len) {
+            tracing::error!("EP broadcast chunk (retry): {e:#}");
+            completed_indices.push((idx, Err(format!("prefill failed: {e:#}"))));
+            return;
+        }
         chunk_res = model.prefill_chunk(
             &p.prompt_tokens,
             &mut p.seq,
@@ -357,4 +355,19 @@ pub(super) fn run_standard_chunk_loop(
             completed_indices.push((idx, Err(format!("prefill failed: {e:#}"))));
         }
     }
+}
+
+/// 2026-10-05: Announce one plain prefill chunk to EP workers (`0xFFFFFFF0`, the chunk
+/// bounds, the prompt, then the vision sync). No-op without the multi-rank protocol.
+fn broadcast_chunk(model: &dyn Model, p: &PrefillInProgress, chunk_len: usize) -> Result<()> {
+    model.ep_broadcast_cmd_for_seq(p.seq.slot_idx as u32, 0xFFFFFFF0)?;
+    model.ep_broadcast_cmd(chunk_len as u32)?;
+    model.ep_broadcast_cmd(p.chunk_offset as u32)?;
+    model.ep_broadcast_cmd(p.prompt_tokens.len() as u32)?;
+    model.ep_broadcast_tokens(&p.prompt_tokens)?;
+    // 2026-09-25: Every `0xFFFFFFF0` broadcast must be followed by this
+    // call: the worker runs the matching collective in its `0xFFFFFFF0`
+    // handler (`Model::ep_sync_vision_embeds`).
+    model.ep_sync_vision_embeds(&p.prompt_tokens)?;
+    Ok(())
 }

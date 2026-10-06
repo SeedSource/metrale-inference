@@ -334,6 +334,10 @@ __device__ __forceinline__ unsigned int q_smem_slot(int g, unsigned int lane, in
 
 // 2026-10-01: One warp's slice [j, j_end) for G heads. SAME_KV is the kernel above's
 // `same_kv` branch, hoisted out of the loop.
+// 2026-10-05: `key_stride` walks the keys j, j + key_stride, j + 2 * key_stride, ... below
+// j_end: lane k of a window resolves key j0 + k * key_stride. The head-grouped kernels pass 1,
+// which is the contiguous walk exactly (integer index math only; every float operation and its
+// order are unchanged). The split kernel passes num_splits * NUM_WARPS (see dsa_mla_decode_hg).
 template <int G, bool Q_SMEM, bool SAME_KV>
 __device__ __forceinline__ void dsa_hg_slice(
     const float (&q_reg)[G][VEC_BF16],
@@ -357,12 +361,14 @@ __device__ __forceinline__ void dsa_hg_slice(
     const float k_scale,
     const float v_scale,
     const unsigned long long cache_stride_bytes,
-    const bool aligned
+    const bool aligned,
+    const unsigned int key_stride
 ) {
-    for (unsigned int j0 = j; j0 < j_end; j0 += WARP_SIZE) {
+    for (unsigned int j0 = j; j0 < j_end; j0 += WARP_SIZE * key_stride) {
         // 2026-10-01: Lane k resolves key j0 + k: the same validity test, block-table read and
         // byte offset the kernel above computes per key.
-        const unsigned int jl = j0 + lane_id;
+        // 2026-10-05: Key j0 + k * key_stride (j0 + k at key_stride 1).
+        const unsigned int jl = j0 + lane_id * key_stride;
         unsigned long long tok_off = 0ull;
         bool ok = false;
         if (jl < j_end) {
@@ -450,7 +456,29 @@ __device__ __forceinline__ void dsa_hg_slice(
     }
 }
 
-template <int G, bool Q_SMEM>
+// 2026-10-05: SPLIT (entry `glm5next_dsa_mla_decode_fp8_hg8_split`, opt-in through
+// METRALE_GLM_DSA_MLA_SPLIT, glm5next_dsa/attend.rs) is the same block with the row's
+// selection shared by num_splits blocks along grid z, grid [num_q_heads / G, rows, num_splits].
+// The grid of the plain kernel is [num_q_heads / 8, rows] = 12 blocks at 32 heads and 3 verify
+// rows on a 48-SM GB10, and each warp walks up to ceil(sel_width / 8) keys one after another,
+// so the launch is bound by that serial chain, not by bandwidth.
+//   * Keys: the T = num_splits * NUM_WARPS warps of a (head group, row) take the selection
+//     interleaved, warp t = split * NUM_WARPS + warp_id owning j = t, t + T, t + 2T, ... The
+//     selection is `-1`-padded past the row's valid prefix (dsa_expand_selection), so a
+//     contiguous split would leave the valid keys on the first blocks; interleaved, every warp
+//     gets about valid / T of them wherever they sit.
+//   * Each block runs the same per-warp online softmax and the same cross-warp tree, then
+//     writes, per head, its UNNORMALISED partial instead of O: o[512] and (m, l), FP32, to
+//     `partials`. Layout, P = rows * num_q_heads * num_splits partials, partial
+//     p = (row * num_q_heads + head) * num_splits + split:
+//       o  at partials[p * 512 .. p * 512 + 512)
+//       ml at partials[P * 512 + 2p], [P * 512 + 2p + 1]   (m, l)
+//     A block whose keys are all invalid writes l = 0 (and o = 0); the merge skips it.
+//   * glm5next_dsa_mla_split_merge (below) combines a (row, head)'s num_splits partials with
+//     the log-sum-exp rescale and writes BF16 O under this file's launch contract.
+// Not byte-identical to the plain kernel: the keys reach the softmax in another order and the
+// partials merge in another tree. FP32 throughout, --fmad=false as for the whole module.
+template <int G, bool Q_SMEM, bool SPLIT>
 __device__ __forceinline__ void dsa_mla_decode_hg(
     const __nv_bfloat16* __restrict__ Q,
     const unsigned char* __restrict__ K_cache,
@@ -468,7 +496,9 @@ __device__ __forceinline__ void dsa_mla_decode_hg(
     const float inv_sqrt_d,
     const float k_scale,
     const float v_scale,
-    const unsigned long long cache_stride_bytes
+    const unsigned long long cache_stride_bytes,
+    float* __restrict__ partials,
+    const unsigned int num_splits
 ) {
     // 2026-10-01: Q_SMEM keeps G * 512 floats of q in smem_o, which holds NUM_WARPS * 512.
     static_assert(G >= 1 && G <= NUM_WARPS, "q for G heads must fit smem_o");
@@ -531,10 +561,19 @@ __device__ __forceinline__ void dsa_mla_decode_hg(
     }
 
     // 2026-10-01: The kernel above's split, unchanged.
-    const unsigned int chunk = (sel_width + NUM_WARPS - 1) / NUM_WARPS;
-    const unsigned int j     = warp_id * chunk;
-    unsigned int j_end = j + chunk;
-    if (j_end > sel_width) j_end = sel_width;
+    // 2026-10-05: SPLIT: this warp's interleaved keys (see above the template).
+    unsigned int j, j_end, key_stride;
+    if constexpr (SPLIT) {
+        key_stride = num_splits * NUM_WARPS;
+        j      = blockIdx.z * NUM_WARPS + warp_id;
+        j_end  = sel_width;
+    } else {
+        const unsigned int chunk = (sel_width + NUM_WARPS - 1) / NUM_WARPS;
+        j      = warp_id * chunk;
+        j_end  = j + chunk;
+        if (j_end > sel_width) j_end = sel_width;
+        key_stride = 1u;
+    }
 
     float m[G];
     float l[G];
@@ -558,11 +597,11 @@ __device__ __forceinline__ void dsa_mla_decode_hg(
     if (same_kv) {
         dsa_hg_slice<G, Q_SMEM, true>(q_reg, q_s, m, l, o_reg, K_cache, V_cache, my_block_table,
             my_sel, j, j_end, seq_len, block_size, token_stride, kv_lora_dim, lane_id,
-            lane_offset, inv_sqrt_d, k_scale, v_scale, cache_stride_bytes, aligned);
+            lane_offset, inv_sqrt_d, k_scale, v_scale, cache_stride_bytes, aligned, key_stride);
     } else {
         dsa_hg_slice<G, Q_SMEM, false>(q_reg, q_s, m, l, o_reg, K_cache, V_cache, my_block_table,
             my_sel, j, j_end, seq_len, block_size, token_stride, kv_lora_dim, lane_id,
-            lane_offset, inv_sqrt_d, k_scale, v_scale, cache_stride_bytes, aligned);
+            lane_offset, inv_sqrt_d, k_scale, v_scale, cache_stride_bytes, aligned, key_stride);
     }
 
     // 2026-10-01: Per head, the kernel above's cross-warp merge and store on one 16 KB
@@ -613,24 +652,45 @@ __device__ __forceinline__ void dsa_mla_decode_hg(
             __syncthreads();
         }
 
-        if (warp_id == 0) {
-            const float final_l = smem_l[0];
-            const float inv_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
-            unsigned int* o32 = (unsigned int*)(
-                O + row_off + (unsigned long long)(head0 + g) * kv_lora_dim + lane_offset);
-            #pragma unroll
-            for (int i = 0; i < VEC_U32; i++) {
-                const float v0 = smem_o[0][lane_offset + 2*i]     * inv_l;
-                const float v1 = smem_o[0][lane_offset + 2*i + 1] * inv_l;
-                const unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
-                const unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
-                o32[i] = lo | (hi << 16);
+        if constexpr (SPLIT) {
+            // 2026-10-05: This block's partial for head head0 + g, unnormalised (layout above
+            // the template). The barrier at the top of the next head orders warp 0's reads of
+            // smem_o[0] before the next head overwrites it, as for the store below.
+            if (warp_id == 0) {
+                const unsigned long long n_part =
+                    (unsigned long long)gridDim.y * num_q_heads * num_splits;
+                const unsigned long long p =
+                    ((unsigned long long)seq_idx * num_q_heads + head0 + g) * num_splits
+                    + blockIdx.z;
+                float4* po =
+                    reinterpret_cast<float4*>(partials + p * GLM_KV_LORA_DIM + lane_offset);
+                #pragma unroll
+                for (int c = 0; c < 4; c++) po[c] = o_s4[lane_id * 4 + c];
+                if (lane_id == 0)
+                    reinterpret_cast<float2*>(partials + n_part * GLM_KV_LORA_DIM)[p] =
+                        make_float2(smem_m[0], smem_l[0]);
+            }
+        } else {
+            if (warp_id == 0) {
+                const float final_l = smem_l[0];
+                const float inv_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
+                unsigned int* o32 = (unsigned int*)(
+                    O + row_off + (unsigned long long)(head0 + g) * kv_lora_dim + lane_offset);
+                #pragma unroll
+                for (int i = 0; i < VEC_U32; i++) {
+                    const float v0 = smem_o[0][lane_offset + 2*i]     * inv_l;
+                    const float v1 = smem_o[0][lane_offset + 2*i + 1] * inv_l;
+                    const unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
+                    const unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+                    o32[i] = lo | (hi << 16);
+                }
             }
         }
     }
 }
 
 // 2026-10-01: The entry points, one per G, with the kernel above's argument list.
+// 2026-10-05: SPLIT false: no partials, num_splits 1 (both unread).
 #define DSA_MLA_HG_ENTRY(NAME, G, Q_SMEM, MIN_BLOCKS)                                         \
     extern "C" __global__ void __launch_bounds__(NUM_WARPS * WARP_SIZE, MIN_BLOCKS) NAME(     \
         const __nv_bfloat16* __restrict__ Q, const unsigned char* __restrict__ K_cache,      \
@@ -641,12 +701,112 @@ __device__ __forceinline__ void dsa_mla_decode_hg(
         const unsigned int num_kv_heads, const unsigned int kv_lora_dim,                     \
         const unsigned int block_size, const float inv_sqrt_d, const float k_scale,          \
         const float v_scale, const unsigned long long cache_stride_bytes) {                  \
-        dsa_mla_decode_hg<G, Q_SMEM>(Q, K_cache, V_cache, O, block_tables, seq_lens,          \
+        dsa_mla_decode_hg<G, Q_SMEM, false>(Q, K_cache, V_cache, O, block_tables, seq_lens,   \
             sel_indices, sel_width, max_blocks_per_seq, num_q_heads, num_kv_heads,           \
-            kv_lora_dim, block_size, inv_sqrt_d, k_scale, v_scale, cache_stride_bytes);      \
+            kv_lora_dim, block_size, inv_sqrt_d, k_scale, v_scale, cache_stride_bytes,       \
+            nullptr, 1u);                                                                     \
     }
 
 // 2026-10-01: G = 2 is capped at 128 registers for two blocks per SM; G = 4 and 8 take one.
 DSA_MLA_HG_ENTRY(glm5next_dsa_mla_decode_fp8_hg2, 2, false, 2)
 DSA_MLA_HG_ENTRY(glm5next_dsa_mla_decode_fp8_hg4, 4, false, 1)
 DSA_MLA_HG_ENTRY(glm5next_dsa_mla_decode_fp8_hg8, 8, true, 1)
+
+// 2026-10-05: The split entry (METRALE_GLM_DSA_MLA_SPLIT): G = 8 with q in shared memory, as
+// `_hg8`, one block per (8 heads, row, split), grid [num_q_heads / 8, rows, num_splits]. The
+// head-grouped argument list with O replaced by `partials` and `num_splits` appended; the host
+// sizes `partials` for rows * num_q_heads * num_splits * (512 + 2) floats.
+extern "C" __global__ void __launch_bounds__(NUM_WARPS * WARP_SIZE, 1)
+glm5next_dsa_mla_decode_fp8_hg8_split(
+    const __nv_bfloat16* __restrict__ Q,
+    const unsigned char* __restrict__ K_cache,
+    const unsigned char* __restrict__ V_cache,
+    float* __restrict__ partials,                  // 2026-10-05: layout above dsa_mla_decode_hg
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ sel_indices,
+    const unsigned int sel_width,
+    const unsigned int max_blocks_per_seq,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int kv_lora_dim,
+    const unsigned int block_size,
+    const float inv_sqrt_d,
+    const float k_scale,
+    const float v_scale,
+    const unsigned long long cache_stride_bytes,
+    const unsigned int num_splits                  // 2026-10-05: == gridDim.z
+) {
+    dsa_mla_decode_hg<8, true, true>(Q, K_cache, V_cache, nullptr, block_tables, seq_lens,
+        sel_indices, sel_width, max_blocks_per_seq, num_q_heads, num_kv_heads, kv_lora_dim,
+        block_size, inv_sqrt_d, k_scale, v_scale, cache_stride_bytes, partials, num_splits);
+}
+
+// 2026-10-05: Threads of the merge: four latent dims each.
+#define SPLIT_MERGE_THREADS (GLM_KV_LORA_DIM / 4)
+
+// 2026-10-05: Merge of the split partials: one block per (head, row), grid
+// [num_q_heads, rows], blockDim SPLIT_MERGE_THREADS (128), launched on the split launch's
+// stream right after it with the same rows, heads and num_splits (the partial layout depends on
+// all three). For one (row, head), over the partials s with l_s > 0:
+//   M = max m_s,  L = sum l_s * exp(m_s - M),  o = sum o_s * exp(m_s - M),  O = bf16(o * (1 / L))
+// with __expf, and 1 / L applied as the plain kernel applies 1 / final_l. The launch contract:
+//   * seq_len 0: the split blocks wrote nothing and this writes nothing to O;
+//   * no valid index in the row: every l_s is 0, so L = 0, 1 / L is taken as 0 and o stays
+//     0.0f, and the row is written as +0.0 bf16, the bits the plain kernel writes;
+//   * skipped and duplicated indices were handled by the split blocks exactly as by the plain
+//     kernel (dsa_hg_slice).
+extern "C" __global__ void __launch_bounds__(SPLIT_MERGE_THREADS)
+glm5next_dsa_mla_split_merge(
+    const float* __restrict__ partials,
+    __nv_bfloat16* __restrict__ O,                 // 2026-10-05: [rows, num_q_heads, kv_lora_dim] bf16
+    const int* __restrict__ seq_lens,              // 2026-10-05: [rows]
+    const unsigned int num_q_heads,
+    const unsigned int kv_lora_dim,
+    const unsigned int num_splits
+) {
+    const unsigned int head    = blockIdx.x;
+    const unsigned int seq_idx = blockIdx.y;
+    const unsigned int tid     = threadIdx.x;
+
+    if (head >= num_q_heads) return;
+    if (seq_lens[seq_idx] == 0) return;
+
+    const unsigned long long n_part = (unsigned long long)gridDim.y * num_q_heads * num_splits;
+    const unsigned long long p0 = ((unsigned long long)seq_idx * num_q_heads + head) * num_splits;
+    const float2* ml = reinterpret_cast<const float2*>(partials + n_part * GLM_KV_LORA_DIM);
+
+    float m_max = -1e30f;
+    for (unsigned int s = 0; s < num_splits; s++) {
+        const float2 v = ml[p0 + s];
+        if (v.y > 0.0f) m_max = fmaxf(m_max, v.x);
+    }
+
+    float L = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (unsigned int s = 0; s < num_splits; s++) {
+        const float2 v = ml[p0 + s];
+        if (!(v.y > 0.0f)) continue;
+        const float w = __expf(v.x - m_max);
+        L = L + v.y * w;
+        const float4 o =
+            reinterpret_cast<const float4*>(partials + (p0 + s) * GLM_KV_LORA_DIM)[tid];
+        acc[0] = acc[0] + o.x * w;
+        acc[1] = acc[1] + o.y * w;
+        acc[2] = acc[2] + o.z * w;
+        acc[3] = acc[3] + o.w * w;
+    }
+
+    const float inv_l = (L > 0.0f) ? (1.0f / L) : 0.0f;
+    unsigned int* o32 = (unsigned int*)(
+        O + (unsigned long long)seq_idx * num_q_heads * kv_lora_dim
+          + (unsigned long long)head * kv_lora_dim + 4u * tid);
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const unsigned int lo =
+            (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[2*i] * inv_l));
+        const unsigned int hi =
+            (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[2*i + 1] * inv_l));
+        o32[i] = lo | (hi << 16);
+    }
+}

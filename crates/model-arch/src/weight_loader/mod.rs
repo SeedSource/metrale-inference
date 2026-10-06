@@ -59,7 +59,7 @@ use anyhow::Result;
 use metrale_cache::kv_cache::KvCacheDtype;
 use metrale_config::ModelConfig;
 use metrale_gpu_runtime::gpu::GpuBackend;
-use metrale_model_weights::weights::{DeferHook, WeightStore};
+use metrale_model_weights::weights::{ArenaHook, DeferHook, WeightStore};
 
 use metrale_model_layers::layer::TransformerLayer;
 use metrale_model_layers::layers::VisionTower;
@@ -336,6 +336,17 @@ pub trait ModelWeightLoader {
     /// `WeightStore::deferred`, and the loader that asked reads it. See
     /// [`metrale_model_weights::weights::DeferHook`] for the contract.
     fn defer_predicate(&self, _config: &ModelConfig) -> Option<DeferHook> {
+        None
+    }
+
+    /// 2026-10-06: Which checkpoint tensors may the fast loader place in the store's weight
+    /// arena (one large allocation, sub-allocated) instead of one allocation each?
+    ///
+    /// Default `None`: every tensor is allocated alone. A loader returns a predicate only for
+    /// tensors it keeps until teardown and never frees by name (`WeightStore::free_matching`
+    /// cannot free an arena tensor; it reports and keeps it). `serve_phases/weights.rs` asks
+    /// once, before the load. See [`metrale_model_weights::weights::WeightArena`].
+    fn arena_predicate(&self, _config: &ModelConfig) -> Option<ArenaHook> {
         None
     }
 

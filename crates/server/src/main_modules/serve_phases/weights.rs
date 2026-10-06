@@ -17,6 +17,10 @@ use crate::cli;
 #[cfg(test)]
 #[path = "weights_allowlist_tests.rs"]
 mod weights_allowlist_tests;
+// 2026-10-06: `METRALE_GLM_WEIGHT_ARENA`'s fast-loader hook, in its own file (size cap).
+#[path = "weights_arena.rs"]
+mod weights_arena;
+use weights_arena::arena_hook;
 
 /// 2026-09-26: The load pre-flight's peak-memory multiplier for this model;
 /// `None` leaves the loader's own (1.3x, or 1.5x with FP8 tensors).
@@ -135,6 +139,7 @@ pub(crate) fn load_weight_store(
                 );
             }
             loader.defer = defer_hook(config);
+            loader.arena = arena_hook(config);
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("METRALE_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()

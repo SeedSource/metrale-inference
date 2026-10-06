@@ -446,6 +446,8 @@ pub(crate) fn default_conv_kernel() -> usize {
 mod dispatch;
 mod factory;
 mod gguf;
+// 2026-10-06: `METRALE_GLM_WEIGHT_ARENA`, in its own file (this one is over the size cap).
+mod glm_weight_arena;
 mod kv_completeness;
 #[cfg(test)]
 mod kv_completeness_tests;
@@ -458,6 +460,7 @@ mod tests;
 
 pub use dispatch::parse_config;
 pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
+pub use glm_weight_arena::{glm_weight_arena, glm_weight_arena_from};
 pub use model_config::ModelConfig;
 pub use parsers::{
     PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, allow_partial_targets,

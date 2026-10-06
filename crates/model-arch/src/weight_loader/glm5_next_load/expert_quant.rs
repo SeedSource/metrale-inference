@@ -89,6 +89,14 @@ fn quantize_and_upload(
 const QUANTIZED_EXPERT_LABEL: &str = "glm5_next routed expert, NVFP4 at load";
 
 fn upload_bytes(gpu: &dyn GpuBackend, store: &WeightStore, b: &[u8]) -> Result<DevicePtr> {
+    // 2026-10-06: Into the derived weight arena when this layer planned it
+    // (`METRALE_GLM_WEIGHT_ARENA=1`, `expert_arena::plan_expert_layer`); else one allocation.
+    if let Some(p) = store
+        .derived()
+        .upload_in_arena(gpu, QUANTIZED_EXPERT_LABEL, b)?
+    {
+        return Ok(p);
+    }
     let p = gpu.alloc(b.len().max(1))?;
     gpu.copy_h2d(b, p)?;
     store.derived().adopt(QUANTIZED_EXPERT_LABEL, p, b.len());

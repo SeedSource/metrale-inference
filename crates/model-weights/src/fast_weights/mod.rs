@@ -27,6 +27,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 
+mod arena_plan;
 mod direct_io;
 mod header;
 
@@ -97,6 +98,11 @@ pub struct FastSafetensorsLoader {
     /// model that does not opt in. See [`crate::weights::DeferHook`] for the
     /// contract — including the half that says the pre-flight must agree.
     pub defer: Option<crate::weights::DeferHook>,
+    /// 2026-10-06: Tensors the MODEL's weight loader keeps until teardown and never frees
+    /// alone, so they are uploaded into one [`crate::weights::WeightArena`] instead of one
+    /// allocation each (`ModelWeightLoader::arena_predicate`, `METRALE_GLM_WEIGHT_ARENA=1`).
+    /// `None` (the default) uploads every tensor as before.
+    pub arena: Option<crate::weights::ArenaHook>,
 }
 
 /// Is this tensor part of a multimodal checkpoint's vision tower?
@@ -139,6 +145,7 @@ impl FastSafetensorsLoader {
             prefetch_shards: false,
             skip_vision: false,
             defer: None,
+            arena: None,
         }
     }
 
@@ -156,6 +163,7 @@ impl FastSafetensorsLoader {
             prefetch_shards: false,
             skip_vision: false,
             defer: None,
+            arena: None,
         }
     }
 }
@@ -182,6 +190,7 @@ fn load_shard_fast(
     out: &mut HashMap<String, WeightTensor>,
     deferred_out: &mut HashMap<String, crate::weights::DeferredTensor>,
     offload_logged: &mut bool,
+    arena: arena_plan::ArenaSel<'_>,
 ) -> Result<()> {
     // Header parsing uses a buffered fd — header is a few KB, cache pollution
     // is negligible and buffered I/O handles short reads cleanly.
@@ -300,6 +309,8 @@ fn load_shard_fast(
     };
 
     let _ = file_size; // retained for future use (tail-fragment buffered read)
+    // 2026-10-06: Plan the weight arena for this shard's claimed tensors (all false without one).
+    let in_arena = arena_plan::plan_shard(arena, &tensors);
     let reader_handle = std::thread::spawn(move || {
         for (idx, (abs_offset, len)) in tensors_for_reader.iter().enumerate() {
             let msg = direct_io::read_tensor_aligned(raw_fd, *abs_offset, *len, using_direct)
@@ -325,7 +336,10 @@ fn load_shard_fast(
             raw
         };
 
-        let ptr = match gpu.alloc(meta.len) {
+        // 2026-10-06: An arena tensor's bytes go into its arena slot; every other tensor (and
+        // every tensor without an arena) is allocated alone, as before.
+        let from_arena = arena_plan::alloc(arena, in_arena[idx], gpu, meta.len)?;
+        let ptr = match from_arena.map_or_else(|| gpu.alloc(meta.len), Ok) {
             Ok(p) => {
                 gpu.copy_h2d(src, p)?;
                 p

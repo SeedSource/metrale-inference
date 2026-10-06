@@ -72,6 +72,14 @@ impl WeightLoader for FastSafetensorsLoader {
         let total_shards = shard_files.len();
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;
+        // 2026-10-06: The weight arena for the tensors the model's arena hook claims; with no
+        // hook it is never planned and every tensor is allocated alone, as before.
+        let arena = crate::weights::WeightArena::default();
+        let arena_pick = |name: &str, dtype: crate::weights::WeightDtype| {
+            self.arena.as_ref().is_some_and(|h| h(name, dtype))
+        };
+        let pick: &dyn Fn(&str, crate::weights::WeightDtype) -> bool = &arena_pick;
+        let arena_sel: arena_plan::ArenaSel<'_> = self.arena.as_ref().map(|_| (&arena, pick));
 
         for (i, shard_path) in shard_files.iter().enumerate() {
             // When an index is present, only load the tensors it routes here;
@@ -111,6 +119,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &mut weights,
                 &mut deferred,
                 &mut offload_logged,
+                arena_sel,
             )?;
 
             let free_now = gpu.free_memory().unwrap_or(0);
@@ -156,6 +165,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &mut weights,
                 &mut deferred,
                 &mut extra_offload,
+                None,
             )?;
         }
 
@@ -164,6 +174,8 @@ impl WeightLoader for FastSafetensorsLoader {
         for (name, d) in deferred {
             store.defer(name, d);
         }
+        arena.log_summary();
+        store.set_arena(arena);
         Ok(store)
     }
 }

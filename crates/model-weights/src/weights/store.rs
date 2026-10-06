@@ -13,6 +13,7 @@ impl WeightStore {
             prepartitioned_tp: None,
             deferred: HashMap::new(),
             derived: DerivedStore::default(),
+            arena: WeightArena::default(),
         }
     }
 
@@ -45,6 +46,7 @@ impl WeightStore {
             prepartitioned_tp: None,
             deferred: HashMap::new(),
             derived: DerivedStore::default(),
+            arena: WeightArena::default(),
         }
     }
 
@@ -96,7 +98,9 @@ impl WeightStore {
     ///
     /// Per-entry free is sound for the same reason `release` gives below: the
     /// loaders allocate one `gpu.alloc` per tensor, and no loader inserts an
-    /// `.offset()` view of a shared block into this map.
+    /// `.offset()` view of a shared block into this map — except the weight
+    /// arena's sub-allocations (2026-10-06), which are recognised by
+    /// `WeightArena::contains` and never freed here.
     pub fn free_matching(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -104,18 +108,44 @@ impl WeightStore {
     ) -> Result<(usize, usize)> {
         let doomed: Vec<String> = self.weights.keys().filter(|n| pred(n)).cloned().collect();
         let (mut count, mut bytes) = (0usize, 0usize);
+        let (mut kept, mut kept_bytes) = (0usize, 0usize);
         for name in doomed {
             // `remove` before `free`: the map must never hold a pointer to
             // memory that is gone, even if the free below fails.
             let Some(t) = self.weights.remove(&name) else {
                 continue;
             };
+            // 2026-10-06: An arena tensor cannot be freed alone; its bytes stay until the
+            // arena is released at teardown. Not counted as freed, and reported below.
+            if self.arena.contains(t.ptr) {
+                kept += 1;
+                kept_bytes += t.byte_size();
+                continue;
+            }
             bytes += t.byte_size();
             gpu.free(t.ptr)
                 .map_err(|e| e.context(format!("freeing weight {name}")))?;
             count += 1;
         }
+        if kept > 0 {
+            tracing::warn!(
+                "weight arena: {kept} tensor(s) ({:.1} MiB) were released by name but live in the \
+                 weight arena, so their memory stays resident until teardown; the model's arena \
+                 predicate claims a tensor its loader frees",
+                kept_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
         Ok((count, bytes))
+    }
+
+    /// 2026-10-06: Install the arena the fast loader filled (replacing the empty default).
+    pub fn set_arena(&mut self, arena: WeightArena) {
+        self.arena = arena;
+    }
+
+    /// 2026-10-06: The arena holding the tensors an [`ArenaHook`] claimed at load.
+    pub fn arena(&self) -> &WeightArena {
+        &self.arena
     }
 
     /// The owner for buffers a loader derives from these tensors.

@@ -78,7 +78,10 @@ pub fn load_glm5next_mtp_module(
         weights: build_dsa_weights(gpu, &dsa_cfg, &dsa_plan, &load)?,
         kernels: dsa_layer_kernels,
         select_kernels: dsa_kernels,
-        decode_kernel: crate::glm5next_dsa::attend::Glm5NextDsaDecodeKernel::resolve(gpu)?,
+        // 2026-10-05: With the text layers' shared split scratch under
+        // `METRALE_GLM_DSA_MLA_SPLIT` (`attend::split`).
+        decode_kernel:
+            crate::glm5next_dsa::attend::Glm5NextDsaDecodeKernel::resolve_for(gpu, &dsa_cfg)?,
         // 2026-09-25: Single-row workspace: the drafter runs this layer one row at a time.
         // 2026-10-05: Its select scratch is the text layers' shared one under
         // `METRALE_GLM_DSA_SELECT_SCRATCH_SHARED=1` (`select::shared::for_mtp`), else its own.

@@ -552,8 +552,13 @@ impl Glm5NextWeightLoader {
                         weights: w,
                         kernels: dsa_layer_kernels,
                         select_kernels: dsa_kernels,
+                        // 2026-10-05: `resolve_for` also attaches the shared split scratch
+                        // under `METRALE_GLM_DSA_MLA_SPLIT` (allocated here, at load).
                         decode_kernel:
-                            crate::glm5next_dsa::attend::Glm5NextDsaDecodeKernel::resolve(gpu)?,
+                            crate::glm5next_dsa::attend::Glm5NextDsaDecodeKernel::resolve_for(
+                                gpu,
+                                &dsa_cfg,
+                            )?,
                         workspace: {
                             let ws =
                                 crate::glm5next_dsa::layer::Glm5NextDsaWorkspace::new_with_select(

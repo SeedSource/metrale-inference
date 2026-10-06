@@ -22,7 +22,9 @@ use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::GpuBackend;
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
-use super::{DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, decode_attention, mla_scale};
+use super::{
+    DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, decode_attention_with, mla_scale,
+};
 use crate::glm5next_dsa::{Glm5NextDsaConfig, KERNEL_KV_LORA_DIM, select::DsaSelectGeometry};
 
 /// 2026-10-01: Module of the tensor-core prefill kernel (the `.cu` file stem).
@@ -110,8 +112,9 @@ pub(crate) fn prefill_tc_refusal(
 
 /// 2026-10-01: The DSA MLA attention of `paging.num_seqs` query rows: the tensor-core kernel when
 /// `is_prefill`, `METRALE_GLM_MLA_PREFILL_TC=1` and `prefill_tc_refusal` passes, else
-/// [`decode_attention`] (which follows `METRALE_GLM_DSA_MLA_HEADGROUP`). Engagement and the first
-/// fallback are logged once.
+/// [`super::decode_attention`] (which follows `METRALE_GLM_DSA_MLA_HEADGROUP`). Engagement and the
+/// first fallback are logged once. 2026-10-05: The fallback runs with the split-key path
+/// (`METRALE_GLM_DSA_MLA_SPLIT`) allowed only when `is_prefill` is false.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     gpu: &dyn GpuBackend,
@@ -148,7 +151,8 @@ pub fn attention(
             }
         }
     }
-    decode_attention(gpu, kernel, cfg, geom, paging, inputs, stream)
+    // 2026-10-05: `METRALE_GLM_DSA_MLA_SPLIT` applies to decode and verify rows only.
+    decode_attention_with(gpu, kernel, cfg, geom, paging, inputs, !is_prefill, stream)
 }
 
 /// 2026-10-01: Launch `glm5next_dsa_mla_prefill_tc_fp8` over `paging.num_seqs` rows, grid

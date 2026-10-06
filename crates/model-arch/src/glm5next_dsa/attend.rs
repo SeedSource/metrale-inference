@@ -37,6 +37,12 @@ pub use prefill_tc::{
     MLA_PREFILL_TC_ENTRY, MLA_PREFILL_TC_HEADS, MLA_PREFILL_TC_MAX_SEL, MLA_PREFILL_TC_MODULE,
     MLA_PREFILL_TC_SMEM_BYTES, attention, prefill_attention_tc,
 };
+pub mod split;
+pub use split::{
+    DSA_MLA_SPLIT_ENTRY, DSA_MLA_SPLIT_HEADGROUP, DSA_MLA_SPLIT_MAX, DSA_MLA_SPLIT_MAX_ROWS,
+    DSA_MLA_SPLIT_MERGE_ENTRY, DSA_MLA_SPLIT_MIN_KEYS, DSA_MLA_SPLIT_PARTIAL_FLOATS, MlaSplit,
+    decode_attention_split, mla_split, split_count, split_scratch_bytes,
+};
 
 /// 2026-09-25: Module name the DSA decode kernel resolves from. An unlisted `.cu`
 /// takes its file stem, and this one lives in the `glm-5.3-flash` target.
@@ -128,11 +134,22 @@ pub(crate) fn headgroup_for(requested: usize, num_q_heads: usize, resolved: bool
 /// 2026-10-01: With the head-grouped variants, `KernelHandle(0)` where one did not resolve.
 /// 2026-10-01: And the tensor-core prefill kernel (`METRALE_GLM_MLA_PREFILL_TC`, see
 /// [`prefill_tc`]), `KernelHandle(0)` when it did not resolve.
+/// 2026-10-05: And the split-key decode (`METRALE_GLM_DSA_MLA_SPLIT`, see [`split`]): its two
+/// entry points (`KernelHandle(0)` when absent), the device's SM count the split rule reads,
+/// and the partials scratch the launch writes (NULL, 0 partials, unless [`Self::resolve_for`]
+/// installed it with the lever on or [`Self::with_split_scratch`] attached one).
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaDecodeKernel {
     base: KernelHandle,
     headgroup: [KernelHandle; DSA_MLA_HEADGROUPS.len()],
     prefill_tc: KernelHandle,
+    split: KernelHandle,
+    split_merge: KernelHandle,
+    sm_count: u32,
+    split_scratch: DevicePtr,
+    /// 2026-10-05: Capacity of `split_scratch` in partials of
+    /// [`DSA_MLA_SPLIT_PARTIAL_FLOATS`] floats each (rows x heads x splits).
+    split_partials: usize,
 }
 
 impl Glm5NextDsaDecodeKernel {
@@ -154,11 +171,65 @@ impl Glm5NextDsaDecodeKernel {
             MLA_PREFILL_TC_MODULE,
             MLA_PREFILL_TC_ENTRY,
         );
+        // 2026-10-05: The split pair is optional too; `sm_count` is read once here, as
+        // `GpuBackend::sm_count` asks (the CUDA backend asks the driver, the mock says 48).
+        let split =
+            metrale_model_layers::layers::try_kernel(gpu, DSA_DECODE_MODULE, DSA_MLA_SPLIT_ENTRY);
+        let split_merge = metrale_model_layers::layers::try_kernel(
+            gpu,
+            DSA_DECODE_MODULE,
+            DSA_MLA_SPLIT_MERGE_ENTRY,
+        );
+        let sm_count = gpu.sm_count().unwrap_or(split::FALLBACK_SM_COUNT);
         Ok(Self {
             base,
             headgroup,
             prefill_tc,
+            split,
+            split_merge,
+            sm_count,
+            split_scratch: DevicePtr(0),
+            split_partials: 0,
         })
+    }
+
+    /// 2026-10-05: [`Self::resolve`] for a layer of `cfg`; with `METRALE_GLM_DSA_MLA_SPLIT` on
+    /// (and both split entry points resolved) it also attaches the rank's one shared split
+    /// scratch (`split::shared_scratch`), sized for `cfg.local_heads` and allocated by the
+    /// first layer that asks, at load. Lever off: exactly `resolve`, no allocation.
+    pub fn resolve_for(gpu: &dyn GpuBackend, cfg: &Glm5NextDsaConfig) -> Result<Self> {
+        let mut k = Self::resolve(gpu)?;
+        if mla_split() != MlaSplit::Off && k.has_split_kernels() {
+            let (ptr, partials) = split::shared_scratch(gpu, cfg.local_heads)?;
+            k.split_scratch = ptr;
+            k.split_partials = partials;
+        }
+        Ok(k)
+    }
+
+    /// 2026-10-05: This kernel with a split scratch of its own, sized for
+    /// [`DSA_MLA_SPLIT_MAX_ROWS`] rows of `num_q_heads` heads at [`DSA_MLA_SPLIT_MAX`] splits
+    /// ([`split_scratch_bytes`]), whatever the lever says. For the microtest, which runs the
+    /// split arm directly; the caller owns (and may free) the returned pointer.
+    pub fn with_split_scratch(
+        mut self,
+        gpu: &dyn GpuBackend,
+        num_q_heads: usize,
+    ) -> Result<(Self, DevicePtr)> {
+        let p = gpu.alloc(split_scratch_bytes(num_q_heads))?;
+        self.split_scratch = p;
+        self.split_partials = split::scratch_partials(num_q_heads);
+        Ok((self, p))
+    }
+
+    /// 2026-10-05: Whether both split entry points resolved.
+    pub fn has_split_kernels(&self) -> bool {
+        self.split.0 != 0 && self.split_merge.0 != 0
+    }
+
+    /// 2026-10-05: Whether a split launch can run: both entry points and a scratch.
+    pub fn has_split(&self) -> bool {
+        self.has_split_kernels() && self.split_scratch.0 != 0 && self.split_partials != 0
     }
 
     /// 2026-10-01: Whether `glm5next_dsa_mla_prefill_tc_fp8` resolved.
@@ -259,6 +330,10 @@ impl DsaDecodePaging {
 /// 2026-10-01: The kernel is the per-head one unless `METRALE_GLM_DSA_MLA_HEADGROUP` selects a
 /// head group that divides `num_q_heads` and resolved; otherwise the per-head kernel runs and
 /// the fallback is logged once.
+///
+/// 2026-10-05: When that is head group 8, `METRALE_GLM_DSA_MLA_SPLIT` may take the split-key
+/// pair instead (`split::split_for`). [`attention`] reaches it only for decode and verify
+/// rows (`is_prefill` false, `decode_attention_with`).
 pub fn decode_attention(
     gpu: &dyn GpuBackend,
     kernel: Glm5NextDsaDecodeKernel,
@@ -266,6 +341,25 @@ pub fn decode_attention(
     geom: &DsaSelectGeometry,
     paging: &DsaDecodePaging,
     inputs: &DsaDecodeInputs,
+    stream: u64,
+) -> Result<()> {
+    decode_attention_with(gpu, kernel, cfg, geom, paging, inputs, true, stream)
+}
+
+/// 2026-10-05: [`decode_attention`], with `allow_split` false keeping the split-key path off
+/// for this launch whatever `METRALE_GLM_DSA_MLA_SPLIT` says. [`attention`] passes
+/// `!is_prefill`: prefill rows keep the head-grouped kernel, so the rank's one shared split
+/// scratch is only ever written by the decode / verify / draft stream (a single-rank serve may
+/// run a prefill on a second stream; see [`split`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_attention_with(
+    gpu: &dyn GpuBackend,
+    kernel: Glm5NextDsaDecodeKernel,
+    cfg: &Glm5NextDsaConfig,
+    geom: &DsaSelectGeometry,
+    paging: &DsaDecodePaging,
+    inputs: &DsaDecodeInputs,
+    allow_split: bool,
     stream: u64,
 ) -> Result<()> {
     let requested = mla_headgroup();
@@ -285,6 +379,15 @@ pub fn decode_attention(
                 }
             );
         });
+    }
+    // 2026-10-05: `METRALE_GLM_DSA_MLA_SPLIT` (off by default) on the head-group-8 path only.
+    let splits = if allow_split && g == DSA_MLA_SPLIT_HEADGROUP {
+        split::split_for(&kernel, paging, geom)
+    } else {
+        None
+    };
+    if let Some(s) = splits {
+        return decode_attention_split(gpu, kernel, s, cfg, geom, paging, inputs, stream);
     }
     decode_attention_headgroup(gpu, kernel, g, cfg, geom, paging, inputs, stream)
 }

@@ -276,3 +276,59 @@ fn prefill_tc_names_and_mirrors_are_consistent() {
     const _: () = assert!(MLA_PREFILL_TC_SMEM_BYTES <= 101_376);
     const _: () = assert!(MLA_PREFILL_TC_HEADS == 32);
 }
+
+/// 2026-10-05: `METRALE_GLM_DSA_MLA_SPLIT`: `1` is auto, an integer of 2 or more forces S (at
+/// most 16), anything else is off.
+#[test]
+fn split_lever_parses_auto_forced_and_off() {
+    assert_eq!(split::parse_mla_split(None), MlaSplit::Off);
+    for v in ["", "0", " 0 ", "auto", "-3", "2x"] {
+        assert_eq!(split::parse_mla_split(Some(v)), MlaSplit::Off, "{v:?}");
+    }
+    assert_eq!(split::parse_mla_split(Some("1")), MlaSplit::Auto);
+    assert_eq!(split::parse_mla_split(Some(" 1 ")), MlaSplit::Auto);
+    for (v, s) in [("2", 2), ("8", 8), ("16", 16), ("40", DSA_MLA_SPLIT_MAX)] {
+        assert_eq!(split::parse_mla_split(Some(v)), MlaSplit::Fixed(s), "{v:?}");
+    }
+}
+
+/// 2026-10-05: `split::split_count` on 48 SMs.
+fn split_s(mode: MlaSplit, rows: usize, heads: usize, width: usize, cap: usize) -> usize {
+    split::split_count(mode, rows, heads, width, 48, cap)
+}
+
+/// 2026-10-05: A scratch for 32 heads, in partials.
+const CAP32: usize = DSA_MLA_SPLIT_MAX_ROWS * 32 * DSA_MLA_SPLIT_MAX;
+
+/// 2026-10-05: The auto rule at GLM-5.3 TP2 shapes (32 heads, width 2051, 48 SMs), forced S,
+/// and the caps (16, the scratch, 64 slots per block).
+#[test]
+fn split_count_follows_the_documented_rule() {
+    let auto = MlaSplit::Auto;
+    assert_eq!(split_s(auto, 1, 32, 2051, CAP32), 16);
+    assert_eq!(split_s(auto, 3, 32, 2051, CAP32), 8);
+    assert_eq!(split_s(auto, 12, 32, 2051, CAP32), 2);
+    assert_eq!(split_s(auto, 16, 32, 2051, CAP32), 2);
+    assert_eq!(split_s(auto, 3, 32, 600, CAP32), 8);
+    // 2026-10-05: Fewer than two 64-slot blocks stays unsplit.
+    assert_eq!(split_s(auto, 3, 32, 127, CAP32), 1);
+    assert_eq!(split_s(auto, 3, 32, 128, CAP32), 2);
+    assert_eq!(split_s(auto, 3, 32, 1, CAP32), 1);
+    assert_eq!(split_s(MlaSplit::Fixed(5), 3, 32, 2051, CAP32), 5);
+    assert_eq!(split_s(MlaSplit::Fixed(16), 16, 32, 2051, CAP32), 16);
+    // 2026-10-05: A 32-head scratch holds 8 splits of 16 rows x 64 heads.
+    assert_eq!(split_s(MlaSplit::Fixed(16), 16, 64, 2051, CAP32), 8);
+    assert_eq!(split_s(MlaSplit::Off, 3, 32, 2051, CAP32), 1);
+    assert_eq!(split_s(auto, 3, 32, 2051, 0), 1);
+}
+
+/// 2026-10-05: The documented scratch size: 16 rows x heads x 16 splits x (512 + 2) FP32,
+/// 16.8 MB at 32 heads per rank.
+#[test]
+fn split_scratch_is_sixteen_rows_by_heads_by_sixteen_splits() {
+    assert_eq!(DSA_MLA_SPLIT_PARTIAL_FLOATS, 514);
+    assert_eq!(split_scratch_bytes(32), 16_842_752);
+    assert_eq!(split_scratch_bytes(64), 33_685_504);
+    assert_eq!(DSA_MLA_SPLIT_ENTRY, "glm5next_dsa_mla_decode_fp8_hg8_split");
+    assert_eq!(DSA_MLA_SPLIT_HEADGROUP, 8);
+}

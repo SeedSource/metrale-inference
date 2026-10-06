@@ -48,8 +48,7 @@ use metrale_model_arch::weight_loader::glm5_next_load::expert_arena::{
 };
 use metrale_model_weights::fast_weights::FastSafetensorsLoader;
 use metrale_model_weights::weights::{
-    ArenaHook, DeferredTensor, WEIGHT_ARENA_ALIGN, WeightArena, WeightDtype, WeightLoader,
-    WeightStore,
+    ArenaHook, DeferredTensor, WEIGHT_ARENA_ALIGN, WeightArena, WeightLoader, WeightStore,
 };
 
 const H: usize = 4096;
@@ -145,7 +144,7 @@ fn arena_checks(
 
 /// Bind `layers` x the local experts of `cfg` from `store`, planning the arena when `arena`.
 fn bind(
-    g: &dyn GpuBackend,
+    g: &(dyn GpuBackend + 'static),
     store: &WeightStore,
     layers: usize,
     cfg: &Glm5NextMlpConfig,
@@ -163,7 +162,7 @@ fn bind(
 
 /// A derived-arena part (etp, quant): bind off then on, compare every projection, check.
 fn derived_part(
-    g: &dyn GpuBackend,
+    g: &(dyn GpuBackend + 'static),
     part: &str,
     src: &[(usize, String, String, DeferredTensor)],
     layers: usize,
@@ -226,7 +225,7 @@ fn derived_part(
 }
 
 /// The fast-loader part: load the same file with and without the GLM arena hook.
-fn fast_part(g: &dyn GpuBackend, dir: &Path, ck: &mut Checks) -> Result<()> {
+fn fast_part(g: &(dyn GpuBackend + 'static), dir: &Path, ck: &mut Checks) -> Result<()> {
     let load = |hook: Option<ArenaHook>| -> Result<WeightStore> {
         let mut l = FastSafetensorsLoader::new();
         l.arena = hook;
@@ -287,7 +286,7 @@ fn mlp_cfg(num_experts: usize, local: usize, width: usize) -> Glm5NextMlpConfig 
     }
 }
 
-fn run(g: &dyn GpuBackend, dir: &Path, layers: usize, ck: &mut Checks) -> Result<()> {
+fn run(g: &(dyn GpuBackend + 'static), dir: &Path, layers: usize, ck: &mut Checks) -> Result<()> {
     let base = g.live_alloc_count();
     println!("SETUP writing sources under {}", dir.display());
     let etp_src = write_source(dir.join("etp.bin"), 0..288, false)?;
@@ -326,7 +325,7 @@ fn main() -> Result<()> {
         .join("glm5next_weight_arena");
     std::fs::create_dir_all(&dir)?;
     let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
-    let g: &dyn GpuBackend = &backend;
+    let g: &(dyn GpuBackend + 'static) = &backend;
     let mut ck = Checks(Vec::new());
     let r = run(g, &dir, layers, &mut ck);
     let _ = std::fs::remove_dir_all(&dir);

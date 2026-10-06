@@ -5,7 +5,7 @@
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants: none beyond the types.
 
-use super::grid_stride::{ceiling_grids, device_sms, dsa_grid_stride, log_grid_stride};
+use super::grid_stride::ceiling_launch_grids;
 use super::*;
 
 /// 2026-09-25: Run the selection kernels, leaving `[q_rows, out_width]` token ids in
@@ -74,21 +74,17 @@ pub fn select_tokens(
     let has_pools = geom.n_pools > 0 || ceiling.is_some();
 
     // 2026-10-05: Grid x of the two pool-indexed kernels. An exact launch is one block per pool.
-    // A ceiling launch makes the kernels walk the live pools with a grid stride, so under
+    // A ceiling launch can make the kernels walk the live pools with a grid stride, so under
     // `METRALE_GLM_DSA_GRID_STRIDE` (default on) its grid is a few waves of blocks
     // (`grid_stride::stride_blocks`), not one per ceiling pool: a graph replay pays for the
-    // grid, and every block past the live pool count was a block that did nothing. With the
-    // lever off it is the ceiling grid, `m + 1` blocks for compress (the trailing partial
-    // pool's slot) and `m` for the scores.
+    // grid, and every block past the live pool count was a block that did nothing. Only a
+    // kernel module that defines `dsa_indexer_grid_stride_v1` has the loop
+    // (`kernels.grid_stride_marker`); without it, or with the lever off, the grid is the
+    // ceiling grid, `m + 1` blocks for compress (the trailing partial pool's slot) and `m`
+    // for the scores.
     let (compress_x, scores_x) = match ceiling {
         None => (geom.n_pools_full, geom.n_pools),
-        Some(m) => {
-            let stride = dsa_grid_stride();
-            let sms = if stride { device_sms(gpu) } else { 0 };
-            let grids = ceiling_grids(m, sms, stride);
-            log_grid_stride(stride, sms, m, grids.0, grids.1);
-            grids
-        }
+        Some(m) => ceiling_launch_grids(gpu, kernels.grid_stride_marker.0 != 0, m),
     };
 
     // 2026-09-25: Pool compression over the full pool count; the trailing partial pool is

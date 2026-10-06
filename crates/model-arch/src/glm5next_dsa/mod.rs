@@ -76,6 +76,7 @@ pub const KERNEL_MAX_KPOOL: usize = 8;
 /// All but `write_geom` and `indexer_store` are resolved with `kernel()`, so a missing
 /// entry point fails `resolve`; those two use `try_kernel` and may be `KernelHandle(0)`.
 /// 2026-10-01: So do `index_scores_tiled` and `index_scores_tc`.
+/// 2026-10-05: So does `grid_stride_marker`.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
@@ -91,6 +92,16 @@ pub struct Glm5NextDsaKernels {
     /// launches it under `METRALE_GLM_DSA_SCORES_TC` (`select::scores_tc_for`);
     /// `KernelHandle(0)` when the target lacks it, and the FP32 scorer runs.
     pub index_scores_tc: KernelHandle,
+    /// 2026-10-05: `dsa_indexer_grid_stride_v1`, a no-op kernel that `dsa_indexer.cu` defines
+    /// iff `dsa_kpool_compress` and `dsa_index_scores` both walk the live pools with a grid
+    /// stride. A ceiling `select_tokens` launches the capped stride grid only when this
+    /// resolved (`select::grid_stride::stride_mode`); `KernelHandle(0)` when the target's
+    /// module lacks it (a copy of the file without the loop, such as the b300 fork), and the
+    /// one-block-per-ceiling-pool grids run. Resolved here, at load, not at the first launch:
+    /// a failed lookup after the boot audit seals aborts the process
+    /// (`metrale_telemetry::kernel_audit`), and one before it is judged by the target's
+    /// MODEL.toml `[expected_absent]`, as for `index_scores_tiled`.
+    pub grid_stride_marker: KernelHandle,
     pub topk_pools: KernelHandle,
     pub expand_selection: KernelHandle,
     /// 2026-09-25: `indexer.k_norm`, a LayerNorm with a bias: `nllb_layernorm_bf16`, in place,
@@ -134,6 +145,11 @@ impl Glm5NextDsaKernels {
                 gpu,
                 DSA_MODULE,
                 "dsa_index_scores_tc",
+            ),
+            grid_stride_marker: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_indexer_grid_stride_v1",
             ),
             topk_pools: gpu.kernel(DSA_MODULE, "dsa_topk_pools")?,
             expand_selection: gpu.kernel(DSA_MODULE, "dsa_expand_selection")?,

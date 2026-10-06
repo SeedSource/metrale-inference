@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! 2026-10-05: Host tests of `METRALE_GLM_DSA_GRID_STRIDE`: the switch and its table entry,
-//! the stride-grid arithmetic, a host replay of the kernels' grid-stride walk, and the grids
-//! `select_tokens` gives the pool-indexed kernels on the mock backend, for a ceiling and for
-//! an exact launch.
+//! the stride-grid arithmetic, a host replay of the kernels' grid-stride walk, the marker gate
+//! (`dsa_indexer_grid_stride_v1`: which kernel files define it, when it is looked up, the mode
+//! and its log line), and the grids `select_tokens` gives the pool-indexed kernels on the mock
+//! backend, for a ceiling launch with and without the marker and for an exact launch.
 //!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants: none beyond the types.
@@ -14,7 +15,7 @@ use super::super::{
 };
 use super::*;
 use crate::glm5next_dsa::state::max_dsa_context;
-use crate::glm5next_dsa::{Glm5NextDsaConfig, Glm5NextDsaKernels};
+use crate::glm5next_dsa::{DSA_MODULE, Glm5NextDsaConfig, Glm5NextDsaKernels};
 use metrale_gpu_runtime::gpu::DevicePtr;
 use metrale_gpu_runtime::gpu::mock::{MockArg, MockGpuBackend, MockLaunch};
 
@@ -67,8 +68,17 @@ fn inputs(geom_dev: DevicePtr) -> DsaSelectInputs {
 /// order)`. Each pass is compress, scores, top-k, expand. `None` is a ceiling launch over the
 /// pools of `max_context` tokens (planned at that context, as `Glm5NextDsaWorkspace` does,
 /// with a non-null `geom_dev`); `Some(seq)` is an exact launch over `seq` tokens with none.
-fn run(max_context: usize, exact_seq: Option<usize>) -> (DsaSelectGeometry, Vec<MockLaunch>) {
+/// `marker` is whether the kernel module defines `dsa_indexer_grid_stride_v1`: `false` denies
+/// that lookup, as a module without the stride loop would.
+fn run(
+    max_context: usize,
+    exact_seq: Option<usize>,
+    marker: bool,
+) -> (DsaSelectGeometry, Vec<MockLaunch>) {
     let gpu = MockGpuBackend::new();
+    if !marker {
+        gpu.deny_kernel(DSA_MODULE, GRID_STRIDE_MARKER);
+    }
     let c = cfg(max_context);
     let biggest = DsaSelectGeometry::plan(&c, max_dsa_context(&c), 1).unwrap();
     let scratch = DsaSelectScratch::alloc(&gpu, &c, &biggest).unwrap();
@@ -188,15 +198,15 @@ fn a_stride_grid_covers_every_live_pool_exactly_once() {
     }
 }
 
-/// 2026-10-05: A ceiling launch gives compress and the scores the grids `ceiling_grids` names
-/// for the lever's state, and changes nothing else: block sizes, shared memory, the scalar
-/// arguments (set from the ceiling, so every capture passes the same ones), and the top-k and
-/// expand launches.
+/// 2026-10-05: With the marker resolved, a ceiling launch gives compress and the scores the
+/// grids `ceiling_grids` names for the lever's state, and changes nothing else: block sizes,
+/// shared memory, the scalar arguments (set from the ceiling, so every capture passes the same
+/// ones), and the top-k and expand launches.
 #[test]
 fn a_ceiling_launch_gets_the_stride_grid_and_nothing_else_changes() {
     let stride = dsa_grid_stride();
     for max_context in [65_536usize, 1_024] {
-        let (geom, l) = run(max_context, None);
+        let (geom, l) = run(max_context, None, true);
         let c = cfg(max_context);
         let m = contiguous_pool_count(c.index_kpool, max_dsa_context(&c));
         assert_eq!(m, geom.n_pools);
@@ -220,9 +230,36 @@ fn a_ceiling_launch_gets_the_stride_grid_and_nothing_else_changes() {
         assert_eq!(l[1].args[14], u32_arg(m * kp));
     }
     if stride {
-        let (_, l) = run(65_536, None);
+        let (_, l) = run(65_536, None, true);
         assert_eq!(l[0].grid, [384, 1, 1], "8 blocks x 48 SMs, not 16,385");
         assert_eq!(l[1].grid, [384, 1, 1], "8 blocks x 48 SMs, not 16,384");
+    }
+}
+
+/// 2026-10-05: A module without `dsa_indexer_grid_stride_v1` has kernels that are one block per
+/// pool, so a ceiling launch gets the ceiling grids (`m + 1` for compress, `m` for the scores)
+/// with the lever on or off, and everything else about the launches is as with the marker.
+#[test]
+fn a_ceiling_launch_without_the_marker_gets_the_ceiling_grids() {
+    for max_context in [65_536usize, 1_024] {
+        let c = cfg(max_context);
+        let m = contiguous_pool_count(c.index_kpool, max_dsa_context(&c));
+        let (_, l) = run(max_context, None, false);
+        let (_, with_marker) = run(max_context, None, true);
+        assert_eq!(l.len(), 4, "compress, scores, top-k, expand");
+        assert_eq!(l[0].grid, [(m + 1) as u32, 1, 1], "compress, m {m}");
+        assert_eq!(l[1].grid, [m as u32, 1, 1], "scores, m {m}");
+        for (i, (a, b)) in l.iter().zip(&with_marker).enumerate() {
+            assert_eq!(
+                (a.block, a.shared_mem),
+                (b.block, b.shared_mem),
+                "launch {i}"
+            );
+            assert_eq!(a.args, b.args, "launch {i}");
+            if i >= 2 {
+                assert_eq!(a.grid, b.grid, "launch {i}");
+            }
+        }
     }
 }
 
@@ -231,10 +268,209 @@ fn a_ceiling_launch_gets_the_stride_grid_and_nothing_else_changes() {
 #[test]
 fn an_exact_launch_keeps_one_block_per_pool() {
     for (seq, full, whole) in [(1_000usize, 250usize, 250usize), (1_002, 251, 250)] {
-        let (geom, l) = run(65_536, Some(seq));
-        assert_eq!((geom.n_pools_full, geom.n_pools), (full, whole));
-        assert_eq!(l.len(), 4);
-        assert_eq!(l[0].grid, [full as u32, 1, 1], "seq {seq}");
-        assert_eq!(l[1].grid, [whole as u32, 1, 1], "seq {seq}");
+        for marker in [true, false] {
+            let (geom, l) = run(65_536, Some(seq), marker);
+            assert_eq!((geom.n_pools_full, geom.n_pools), (full, whole));
+            assert_eq!(l.len(), 4);
+            assert_eq!(l[0].grid, [full as u32, 1, 1], "seq {seq}, marker {marker}");
+            assert_eq!(
+                l[1].grid,
+                [whole as u32, 1, 1],
+                "seq {seq}, marker {marker}"
+            );
+        }
+    }
+}
+
+/// 2026-10-05: The stride grid needs the lever AND the marker; any other state is the
+/// one-block-per-ceiling-pool grids. Each lever state is passed in, since the process's own
+/// is read once from the environment.
+#[test]
+fn the_stride_grid_needs_the_lever_and_the_marker() {
+    let gpu = MockGpuBackend::new();
+    let g = stride_blocks(MOCK_SMS);
+    for m in [16_384usize, 196_608] {
+        for (lever, marker, want) in [
+            (true, true, (g, g)),
+            (true, false, (m + 1, m)),
+            (false, true, (m + 1, m)),
+            (false, false, (m + 1, m)),
+        ] {
+            assert_eq!(
+                ceiling_launch_grids_for(lever, &gpu, marker, m),
+                want,
+                "lever {lever}, marker {marker}, m {m}"
+            );
+        }
+    }
+}
+
+/// 2026-10-05: The mode, and the one line logged for it on the first ceiling launch.
+#[test]
+fn the_mode_and_the_log_line_follow_the_lever_and_the_marker() {
+    let g = stride_blocks(MOCK_SMS);
+    assert_eq!(stride_mode(true, true), StrideMode::Engaged);
+    assert_eq!(stride_mode(true, false), StrideMode::MarkerMissing);
+    assert_eq!(stride_mode(false, true), StrideMode::LeverOff);
+    assert_eq!(stride_mode(false, false), StrideMode::LeverOff);
+    assert!(StrideMode::Engaged.engaged());
+    assert!(!StrideMode::LeverOff.engaged() && !StrideMode::MarkerMissing.engaged());
+    let line = |lever, marker| grid_stride_log_line(stride_mode(lever, marker), g);
+    assert_eq!(line(true, true), "GRID_STRIDE: ENGAGED (G=384)");
+    assert_eq!(line(false, true), "GRID_STRIDE: OFF (lever=0)");
+    assert_eq!(line(false, false), "GRID_STRIDE: OFF (lever=0)");
+    assert_eq!(
+        line(true, false),
+        "GRID_STRIDE: OFF (kernel module lacks dsa_indexer_grid_stride_v1)"
+    );
+}
+
+/// 2026-10-05: The marker is looked up when the kernels are resolved, not at the first
+/// launch: a lookup that fails after the boot audit seals aborts the process. It is optional:
+/// a module without it still resolves, with a zero handle.
+#[test]
+fn the_marker_is_resolved_with_the_kernels_and_is_optional() {
+    let gpu = MockGpuBackend::new();
+    let k = Glm5NextDsaKernels::resolve(&gpu).unwrap();
+    assert_ne!(k.grid_stride_marker.0, 0);
+    let want = (DSA_MODULE.to_string(), GRID_STRIDE_MARKER.to_string());
+    assert!(gpu.kernel_lookups_snapshot().contains(&want));
+
+    let gpu = MockGpuBackend::new();
+    gpu.deny_kernel(DSA_MODULE, GRID_STRIDE_MARKER);
+    let k = Glm5NextDsaKernels::resolve(&gpu).expect("a module without the marker resolves");
+    assert_eq!(k.grid_stride_marker.0, 0);
+    assert_ne!(k.kpool_compress.0, 0);
+    assert_ne!(k.index_scores.0, 0);
+}
+
+/// 2026-10-05: `.cu` text with `//` comments removed and whitespace runs collapsed to one
+/// space, so prose that names a kernel or the loop is not read as code.
+fn code_of(src: &str) -> String {
+    src.lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("for(", "for (")
+}
+
+/// 2026-10-05: Whether `body` holds a `for` whose index starts at `blockIdx.x` and steps by
+/// `gridDim.x`: the walk over the live pools.
+fn has_stride_loop(body: &str) -> bool {
+    body.split("for (").skip(1).any(|rest| {
+        let mut parts = rest.splitn(3, ';');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(init), Some(_), Some(step)) => {
+                init.contains("= blockIdx.x")
+                    && step
+                        .split(')')
+                        .next()
+                        .is_some_and(|s| s.contains("+= gridDim.x"))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// 2026-10-05: What a `dsa_indexer.cu` declares: `(dsa_kpool_compress has the stride loop,
+/// dsa_index_scores has it, the marker is defined)`. A kernel's text runs to the next entry
+/// point. Panics on a missing kernel, so a rename fails the scan.
+fn stride_facts(src: &str) -> (bool, bool, bool) {
+    let code = code_of(src);
+    let has_loop = |kernel: &str| {
+        let head = format!("__global__ void {kernel}(");
+        let at = code.find(&head).unwrap_or_else(|| panic!("no `{head}`"));
+        let rest = &code[at + head.len()..];
+        has_stride_loop(rest.split("__global__").next().unwrap_or(rest))
+    };
+    (
+        has_loop("dsa_kpool_compress"),
+        has_loop("dsa_index_scores"),
+        code.contains(&format!("__global__ void {GRID_STRIDE_MARKER}(")),
+    )
+}
+
+/// 2026-10-05: The host launches the capped stride grid when the module defines the marker, so
+/// a `dsa_indexer.cu` defines it iff `dsa_kpool_compress` and `dsa_index_scores` both carry the
+/// loop. A copy without the loop that defined it would run on a grid that covers the first
+/// few pools only; one with both loops that did not would never get the stride grid. Every
+/// hardware tree's copy is read: b300 forks the file and has neither today.
+#[test]
+fn every_dsa_indexer_defines_the_marker_iff_both_kernels_carry_the_loop() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels");
+    let mut seen = Vec::new();
+    for hw in std::fs::read_dir(&root).expect("kernels/ readable") {
+        let hw = hw.expect("a kernels/ entry").path();
+        let cu = hw.join("common/dsa_indexer.cu");
+        if !cu.is_file() {
+            continue;
+        }
+        let src = std::fs::read_to_string(&cu).unwrap_or_else(|e| panic!("{cu:?}: {e}"));
+        let (compress, scores, marker) = stride_facts(&src);
+        assert_eq!(
+            marker,
+            compress && scores,
+            "{cu:?}: marker defined {marker}, stride loop in dsa_kpool_compress {compress}, \
+             in dsa_index_scores {scores}"
+        );
+        seen.push((
+            hw.file_name().unwrap().to_string_lossy().into_owned(),
+            marker,
+        ));
+    }
+    // 2026-10-05: gb10 is the origin and carries the loops; a scan that missed it, or found
+    // its marker gone, would leave the stride grid off everywhere without failing.
+    assert!(
+        seen.contains(&("gb10".to_string(), true)),
+        "gb10's dsa_indexer.cu must carry both loops and the marker: {seen:?}"
+    );
+}
+
+/// 2026-10-05: A `.cu` text with the two kernels, each with or without the loop, and the
+/// marker or not. Without the loop, the loop is still written in a comment, and the marker is
+/// written in a comment either way; neither may count.
+fn synthetic_cu(compress_loop: bool, scores_loop: bool, marker: bool) -> String {
+    let body = |stride: bool| {
+        if stride {
+            "for (unsigned int p = blockIdx.x; p < live; p += gridDim.x) { work(p); }"
+        } else {
+            "unsigned int p = blockIdx.x; // for (unsigned int p = blockIdx.x; p < n; p += \
+             gridDim.x)\n work(p);"
+        }
+    };
+    let define = if marker {
+        format!("extern \"C\" __global__ void {GRID_STRIDE_MARKER}() {{}}")
+    } else {
+        String::new()
+    };
+    format!(
+        "// extern \"C\" __global__ void {GRID_STRIDE_MARKER}() {{}}\n\
+         extern \"C\" __global__ void dsa_kpool_compress(int a) {{ {} }}\n\
+         extern \"C\" __global__ void dsa_index_scores(int a) {{ {} }}\n{define}\n",
+        body(compress_loop),
+        body(scores_loop),
+    )
+}
+
+/// 2026-10-05: The scan has teeth: each of the eight loop / marker combinations is read back as
+/// written (so a loop in the second kernel is not credited to the first), and the rule rejects
+/// exactly the four that break it.
+#[test]
+fn the_marker_rule_tells_a_consistent_file_from_a_broken_one() {
+    let broken = [
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+        (false, true, true),
+    ];
+    for bits in 0..8u8 {
+        let (c, s, m) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+        assert_eq!(
+            stride_facts(&synthetic_cu(c, s, m)),
+            (c, s, m),
+            "bits {bits}"
+        );
+        assert_eq!(m != (c && s), broken.contains(&(c, s, m)), "bits {bits}");
     }
 }

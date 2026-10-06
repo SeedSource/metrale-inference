@@ -711,10 +711,12 @@ extern "C" int metrale_cutlass_pack_weight_sfb(
 // 2026-10-06: `METRALE_CUTLASS_W4A4_AMAX_DEDUP=1` computes the W4A4 dynamic activation amax with
 // act_amax_mark_tokens + act_amax_flagged (gathered A) or act_amax_rows_flat (row-ordered A)
 // instead of act_amax_grouped: the same value, read once per distinct row. Read once.
+// 2026-10-06: Default on (exact: microtest bitwise + C=1 panel 6/6 identical, race-pf-amaxpanel-L34);
+// `0` turns it off.
 static bool amax_dedup_lever() {
   static const bool on = [] {
     const char* v = std::getenv("METRALE_CUTLASS_W4A4_AMAX_DEDUP");
-    return v != nullptr && v[0] == '1' && v[1] == '\0';
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
   }();
   return on;
 }

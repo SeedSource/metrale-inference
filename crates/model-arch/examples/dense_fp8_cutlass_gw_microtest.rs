@@ -383,9 +383,8 @@ fn kern(g: &dyn GpuBackend) -> Result<Kern> {
     })
 }
 
-/// 2026-10-06: `--phase route` (a child with the levers on): one weight through
-/// `dense_fp8::convert_weight_nvfp4` + `finish_load` is block-scaled; `route` at M 257 returns
-/// `Done` with bits equal to a direct quant + `dense_fp8_gw::gemm`; M 1 takes the NVFP4 GEMV.
+/// 2026-10-06: `--phase route` (levers on, scratch 8192 rows): a converted weight is block-scaled;
+/// `route` at M 257 is `Done`, bits = direct quant + gw::gemm; M 1 takes the NVFP4 GEMV.
 fn phase_route() -> Result<bool> {
     use metrale_model_arch::glm5next_layer::dense_fp8::{self as df, LayerFp8, Route};
     let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
@@ -447,6 +446,7 @@ fn main() -> Result<()> {
             ("METRALE_GLM_DENSE_FP8_W8A8", "1"),
             ("METRALE_GLM_DENSE_NVFP4", "kda"),
             ("METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW", "1"),
+            ("METRALE_GLM_DENSE_FP8_W8A8_ROWS", "8192"),
         ])
         .status()?
         .success();

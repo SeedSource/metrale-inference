@@ -61,6 +61,7 @@ fn inputs(geom_dev: DevicePtr) -> DsaSelectInputs {
         q_mask: p(8),
         first_key: 0,
         geom_dev,
+        pool_cache: None,
     }
 }
 

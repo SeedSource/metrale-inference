@@ -3,8 +3,8 @@
 //! 2026-10-06: Tests of the DSA pool cache (`METRALE_GLM_DSA_POOL_CACHE`), stages 1-3: the
 //! lever entry, the ring bookkeeping and its three release-mode checks on both sides of each
 //! bound, the state layout on the mock backend (ring offsets, allocation equal to the reserve,
-//! lazy mapping, release), the replay pre-check, the aux refusal, the kernel file's entry
-//! points, and the reserve and pool sizing.
+//! lazy mapping, release), the replay pre-check, the aux refusal, the reserve and pool sizing,
+//! and the launches `select_tokens` makes with the cache set.
 //!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants: none beyond the types.
@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use metrale_gpu_runtime::gpu::GpuBackend;
-use metrale_gpu_runtime::gpu::mock::MockGpuBackend;
+use metrale_gpu_runtime::gpu::mock::{MockArg, MockGpuBackend};
+use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::lazy_buffer::{DEFAULT_GRANULE, MapBudget};
 use metrale_model_layers::layer::LayerState;
 
@@ -311,6 +311,95 @@ fn aux_snapshot_and_restore_are_refused_with_the_cache() {
     assert!(e.contains("pool cache: aux v2 not implemented"), "{e}");
     assert_eq!(st.len(), 8, "nothing moved");
     st.free(&gpu).unwrap();
+}
+
+/// 2026-10-06: `select_tokens` with the cache set: the incremental compress from the
+/// watermark, then scores, top-k and expand on the persistent arrays (the scratch's pool
+/// regions untouched).
+#[test]
+fn select_tokens_compresses_from_the_watermark_into_the_persistent_arrays() {
+    use crate::glm5next_dsa::Glm5NextDsaKernels;
+    use crate::glm5next_dsa::select::{
+        DsaSelectGeometry, DsaSelectInputs, DsaSelectLaunch, DsaSelectScratch, select_tokens,
+    };
+    let gpu = MockGpuBackend::new();
+    let c = cfg(16_384);
+    let big = DsaSelectGeometry::plan(&c, max_dsa_context(&c), 1).unwrap();
+    let scratch = DsaSelectScratch::alloc(&gpu, &c, &big).unwrap();
+    let mut kernels = Glm5NextDsaKernels::resolve(&gpu).unwrap();
+    let incr = KernelHandle(0xBEEF);
+    kernels.kpool_compress_incr = incr;
+    let pc = DsaPoolCacheArgs {
+        pk: DevicePtr(0xA000),
+        pidx: DevicePtr(0xB000),
+        pvalid: DevicePtr(0xC000),
+        pk_len_dev: DevicePtr(0xD000),
+        pk_start: 2_000,
+        ring_rows: R,
+    };
+    let p = |n: u64| DevicePtr(0x1000 * n);
+    let inputs = DsaSelectInputs {
+        k_normed: p(1),
+        gate: p(2),
+        valid: p(3),
+        ape: p(4),
+        q: p(5),
+        weights: p(6),
+        q_pos: p(7),
+        q_mask: p(8),
+        first_key: 0,
+        geom_dev: DevicePtr::NULL,
+        pool_cache: Some(pc),
+    };
+    let geom = DsaSelectGeometry::plan(&c, 8_006, 1).unwrap();
+    let exact = DsaSelectLaunch::Exact;
+    select_tokens(&gpu, &kernels, &c, &geom, &inputs, &scratch, exact, 0).unwrap();
+    let l = gpu.launches_snapshot();
+    assert_eq!(l.len(), 4, "compress, scores, top-k, expand");
+    assert_eq!(l[0].func, incr.0);
+    // 2026-10-06: Pools [2000, 2002): 8,006 rows are 2,001 complete pools plus a partial one.
+    assert_eq!(l[0].grid, [2, 1, 1]);
+    let u = |v: u32| MockArg::Bytes(v.to_le_bytes().to_vec());
+    assert_eq!(l[0].args[4], MockArg::Buffer(pc.pk));
+    assert_eq!(l[0].args[5], MockArg::Buffer(pc.pidx));
+    assert_eq!(l[0].args[6], MockArg::Buffer(pc.pvalid));
+    assert_eq!(l[0].args[7], u(8_006));
+    assert_eq!(l[0].args[11], u(R as u32));
+    assert_eq!(l[0].args[12], u(2_000));
+    assert_eq!(l[0].args[13], MockArg::Buffer(pc.pk_len_dev));
+    // 2026-10-06: Scores read the persistent keys, ids and validity; expand the ids.
+    assert_eq!(l[1].args[1], MockArg::Buffer(pc.pk));
+    assert_eq!(l[1].args[3], MockArg::Buffer(pc.pidx));
+    assert_eq!(l[1].args[4], MockArg::Buffer(pc.pvalid));
+    assert_eq!(l[3].args[1], MockArg::Buffer(pc.pidx));
+
+    // 2026-10-06: Nothing due (watermark at the last complete pool, length on a pool
+    // boundary): still one block, which publishes the device watermark.
+    let at = DsaPoolCacheArgs {
+        pk_start: 2_000,
+        ..pc
+    };
+    let geom = DsaSelectGeometry::plan(&c, 8_000, 1).unwrap();
+    let inputs = DsaSelectInputs {
+        pool_cache: Some(at),
+        ..inputs
+    };
+    select_tokens(&gpu, &kernels, &c, &geom, &inputs, &scratch, exact, 0).unwrap();
+    assert_eq!(gpu.launches_snapshot()[4].grid, [1, 1, 1]);
+
+    // 2026-10-06: Refused before any launch: the kernel absent, or a nonzero first key.
+    let n = gpu.launches_snapshot().len();
+    let mut no_incr = kernels;
+    no_incr.kpool_compress_incr = KernelHandle(0);
+    let r = select_tokens(&gpu, &no_incr, &c, &geom, &inputs, &scratch, exact, 0);
+    assert!(r.is_err());
+    let shifted = DsaSelectInputs {
+        first_key: 1,
+        ..inputs
+    };
+    let r = select_tokens(&gpu, &kernels, &c, &geom, &shifted, &scratch, exact, 0);
+    assert!(r.is_err());
+    assert_eq!(gpu.launches_snapshot().len(), n);
 }
 
 /// 2026-10-06: The kernel file defines every pool-cache entry point the host resolves, and the

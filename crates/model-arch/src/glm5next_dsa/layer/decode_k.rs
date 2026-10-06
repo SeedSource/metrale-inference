@@ -8,6 +8,8 @@
 //! Invariants:
 //! - The lockstep check (`check_lockstep`) and the `k` and metadata checks run before the
 //!   first launch.
+//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` the replay-safe path fills the geometry
+//!   with `dsa_write_geom_pk` (six slots; the workspace allocates six), never `dsa_write_geom`.
 
 use anyhow::{Result, bail};
 use metrale_cache::kv_cache::PagedKvCache;
@@ -387,7 +389,31 @@ impl Glm5NextDsaLayer {
                 block_size,
                 cache_stride_bytes: (block_size * self.cfg.kv_lora_rank) as u64,
             };
-            if replay_safe {
+            if replay_safe && st.is_pool_cache() {
+                // 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: `dsa_write_geom_pk` fills the same
+                // five slots and `DSA_GEOM_PK_START = min(pk_len_dev, (S - 1) / kpool)`, the
+                // first pool this row's compress recomputes (its own row's pool at most), so a
+                // replay after a rejected draft never starts past a rewritten pool.
+                let wg = self.select_kernels.write_geom_pk;
+                let pk_len_dev = st.pool_cache().map_or(DevicePtr::NULL, |p| p.pk_len_dev);
+                if wg.0 == 0 {
+                    bail!(
+                        "DSA layer {}: METRALE_GLM_DSA_POOL_CACHE=1 needs dsa_write_geom_pk on \
+                         the replay-safe path",
+                        self.layer_idx
+                    );
+                }
+                KernelLaunch::new(gpu, wg)
+                    .grid([1, 1, 1])
+                    .block([1, 1, 1])
+                    .arg_ptr(d_sl)
+                    .arg_ptr(w.geom_dev)
+                    .arg_u32(self.cfg.index_kpool as u32)
+                    .arg_u32(self.cfg.index_topk as u32)
+                    .arg_u32(super::super::select::topk_tile() as u32)
+                    .arg_ptr(pk_len_dev)
+                    .launch(stream)?;
+            } else if replay_safe {
                 // 2026-09-25: `dsa_write_geom` reads S from `d_sl`, this row's `seq_len` entry
                 // in the metadata.
                 KernelLaunch::new(gpu, self.select_kernels.write_geom)

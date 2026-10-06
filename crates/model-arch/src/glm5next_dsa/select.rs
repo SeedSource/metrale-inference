@@ -8,6 +8,8 @@
 //! - [`DsaSelectGeometry::plan`] returns `Ok` only when `select_k <= topk_np2`.
 //! - `select_tokens` checks [`DsaSelectScratch::fits`] before its first launch and fails
 //!   when the pass needs more scratch than was allocated.
+//! - 2026-10-06: With `DsaSelectInputs::pool_cache` set, `select_tokens` fails before any
+//!   launch when `dsa_kpool_compress_incr` is unresolved or `first_key` is not 0.
 //!
 //! ```text
 //! k_normed, gate, valid, ape  -> dsa_kpool_compress   -> pool keys / indices / valid
@@ -313,6 +315,12 @@ pub struct DsaSelectInputs {
     /// `select_k` grow with the context; the kernels read them from here when it is non-null.
     /// Only with `q_rows == 1`: `select_tokens` refuses a ceiling launch otherwise.
     pub geom_dev: DevicePtr,
+    /// 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: the state's persistent pool arrays. Set,
+    /// `select_tokens` compresses only pools from the watermark (`dsa_kpool_compress_incr`,
+    /// `k_normed`/`gate` then being rings) into them, and the scores, top-k and expand kernels
+    /// read them instead of the scratch's pool regions. `None`: today's full compress into the
+    /// scratch.
+    pub pool_cache: Option<super::pool_cache::DsaPoolCacheArgs>,
 }
 
 /// 2026-09-25: How a pass is launched: exactly, or at the context ceiling so one graph serves

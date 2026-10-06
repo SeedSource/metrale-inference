@@ -232,6 +232,7 @@ fn main() -> Result<()> {
         q_mask,
         first_key: 0,
         geom_dev: DevicePtr::NULL,
+        pool_cache: None,
     };
     let ctrl_inputs = DsaSelectInputs {
         weights: weights_ctrl,

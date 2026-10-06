@@ -102,6 +102,9 @@ impl Glm5NextDsaLayer {
         }
         let d = self.cfg.index_head_dim;
         let pos = state.len();
+        // 2026-10-06: Pool cache on, `off` is the ring slot and the device `pk_len` is clamped
+        // first after a rewind.
+        self.pool_clamp_before_write(gpu, state, pos, stream)?;
         let off = state.row_offset(pos);
         let (src_k, src_g) = (
             pre.k_normed.offset(row * d * 2),

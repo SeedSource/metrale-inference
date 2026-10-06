@@ -9,6 +9,8 @@
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants:
 //! - `write_kv_row` writes no KV latent when the indexer cache is behind `seq_len`.
+//! - 2026-10-06: Every selection here passes the state's pool cache (`pool_select_args`,
+//!   which range-checks the compress) and records the compress (`note_selected`) after it.
 
 use anyhow::{Result, bail};
 use metrale_cache::kv_cache::PagedKvCache;
@@ -39,7 +41,7 @@ impl Glm5NextDsaLayer {
         &self,
         gpu: &dyn GpuBackend,
         row: usize,
-        state: &Glm5NextDsaState,
+        state: &mut Glm5NextDsaState,
         q_pos_dev: DevicePtr,
         replay_safe: bool,
         q_resid_row: DevicePtr,
@@ -89,6 +91,10 @@ impl Glm5NextDsaLayer {
             } else {
                 DevicePtr::NULL
             },
+            // 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: the state's pool arrays, after the
+            // release-mode read check; on the replay-safe path the start comes from the geom
+            // slot `dsa_write_geom_pk` filled (`decode_k_rows`).
+            pool_cache: state.pool_select_args()?,
         };
         // 2026-09-25: On the replay-safe path the grid and the shared-memory request are set
         // at the context ceiling and the live extents come from `geom_dev`, so one graph
@@ -117,6 +123,7 @@ impl Glm5NextDsaLayer {
             launch,
             stream,
         )?;
+        state.note_selected();
         use crate::glm5next_layer::profile;
         profile::end(profile::DSA_SELECT, t, gpu, stream);
         Ok(())
@@ -125,6 +132,8 @@ impl Glm5NextDsaLayer {
     /// 2026-09-26: `indexer_forward`'s last step: places the projected `k_normed` and `gate`
     /// at row `pos` (through `dsa_indexer_store` at `pos_dev` when given), marks the row
     /// valid, and advances `state` by one row.
+    /// 2026-10-06: Pool cache on, the device-position store is `dsa_indexer_store_ring` (ring
+    /// slot `pos % ring`, and the device `pk_len` clamped to the row's pool).
     pub(super) fn store_indexer_row(
         &self,
         gpu: &dyn GpuBackend,
@@ -138,6 +147,35 @@ impl Glm5NextDsaLayer {
         match pos_dev {
             // 2026-09-25: Placement and the validity mark both use the device-side position;
             // a memset at `valid.offset(pos)` would fix a host address in a captured graph.
+            Some(pd) if state.is_pool_cache() => {
+                let (pk_len_dev, ring) = match state.pool_cache() {
+                    Some(p) => (p.pk_len_dev, p.book.ring_rows()),
+                    None => (DevicePtr::NULL, 1),
+                };
+                let kernel = self.select_kernels.indexer_store_ring;
+                if kernel.0 == 0 {
+                    bail!(
+                        "DSA layer {}: METRALE_GLM_DSA_POOL_CACHE=1 needs dsa_indexer_store_ring \
+                         for a captured indexer write",
+                        self.layer_idx
+                    );
+                }
+                KernelLaunch::new(gpu, kernel)
+                    .grid([1, 1, 1])
+                    .block([d.min(1024) as u32, 1, 1])
+                    .arg_ptr(w.stage_k)
+                    .arg_ptr(w.stage_gate)
+                    .arg_ptr(pd)
+                    .arg_ptr(state.k_normed)
+                    .arg_ptr(state.gate)
+                    .arg_ptr(state.valid)
+                    .arg_u32(d as u32)
+                    .arg_u32(ring as u32)
+                    .arg_u32(self.cfg.index_kpool as u32)
+                    .arg_ptr(pk_len_dev)
+                    .launch(stream)?;
+                state.note_device_store(pos);
+            }
             Some(pd) => {
                 KernelLaunch::new(gpu, self.select_kernels.indexer_store)
                     .grid([1, 1, 1])
@@ -154,6 +192,36 @@ impl Glm5NextDsaLayer {
             None => gpu.memset_async(state.valid.offset(pos), 1, 1, stream)?,
         }
         state.advance(1)
+    }
+
+    /// 2026-10-06: Before a host-path indexer write from row `pos0` with the pool cache on:
+    /// clamp the device `pk_len` to `pos0 / kpool` on `stream` when it may be above it (after a
+    /// rewind), so a later graph replay never starts its compress past a rewritten pool. No-op
+    /// with the lever off and in the common append.
+    pub(super) fn pool_clamp_before_write(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut Glm5NextDsaState,
+        pos0: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let Some((pk_len_dev, pools)) = state.take_dev_clamp(pos0) else {
+            return Ok(());
+        };
+        let kernel = self.select_kernels.pk_len_clamp;
+        if kernel.0 == 0 {
+            bail!(
+                "DSA layer {}: METRALE_GLM_DSA_POOL_CACHE=1 needs dsa_pk_len_clamp",
+                self.layer_idx
+            );
+        }
+        KernelLaunch::new(gpu, kernel)
+            .grid([1, 1, 1])
+            .block([1, 1, 1])
+            .arg_ptr(pk_len_dev)
+            .arg_i32(pools as i32)
+            .launch(stream)?;
+        Ok(())
     }
 
     /// 2026-09-25: The selection for all `k` rows in one pass (`q_rows = k`), used when
@@ -176,7 +244,7 @@ impl Glm5NextDsaLayer {
         &self,
         gpu: &dyn GpuBackend,
         k: usize,
-        state: &Glm5NextDsaState,
+        state: &mut Glm5NextDsaState,
         q_pos_host: &[i32],
         row_batch: Option<&DsaRowBatch>,
         split: Option<(RowSplit, &dyn metrale_comm::CommBackend)>,
@@ -244,6 +312,8 @@ impl Glm5NextDsaLayer {
             // 2026-09-25: Host geometry only: `select_tokens` refuses the device-geometry
             // (ceiling) launch at `q_rows > 1`.
             geom_dev: DevicePtr::NULL,
+            // 2026-10-06: One compress for all `k` rows, as without the cache.
+            pool_cache: state.pool_select_args()?,
         };
         let t = crate::glm5next_layer::profile::start();
         // 2026-09-25: The base of the `[max_rows, out_width]` output, not a row slice: the
@@ -272,6 +342,7 @@ impl Glm5NextDsaLayer {
                 stream,
             )?,
         }
+        state.note_selected();
         crate::glm5next_layer::profile::end(
             crate::glm5next_layer::profile::DSA_SELECT,
             t,

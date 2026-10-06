@@ -127,6 +127,17 @@ pub struct Glm5NextDsaKernels {
     /// 2026-09-25: Copies the staged indexer row to a device-side position and marks it
     /// valid.
     pub indexer_store: KernelHandle,
+    /// 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1` kernels (`pool_cache.rs`), resolved only
+    /// with the lever on (`KernelHandle(0)` otherwise, so the lever-off load is unchanged):
+    /// `dsa_kpool_compress_incr` (compress pools `[pk_start, live)` from the raw-row ring into
+    /// the persistent arrays, then set the device `pk_len`), `dsa_write_geom_pk`
+    /// (`dsa_write_geom` plus the `DSA_GEOM_PK_START` slot), `dsa_indexer_store_ring`
+    /// (`dsa_indexer_store` at ring slot `pos % ring`, clamping the device `pk_len`) and
+    /// `dsa_pk_len_clamp` (the host-path clamp after a rewind).
+    pub kpool_compress_incr: KernelHandle,
+    pub write_geom_pk: KernelHandle,
+    pub indexer_store_ring: KernelHandle,
+    pub pk_len_clamp: KernelHandle,
     /// 2026-09-25: Oracle only; no code under `src/` launches it. See [`MASKED_ATTN_MAX_KEYS`].
     pub topk_to_mask: KernelHandle,
     /// 2026-09-25: Oracle only; no code under `src/` launches it. See [`MASKED_ATTN_MAX_KEYS`].
@@ -197,9 +208,23 @@ impl Glm5NextDsaKernels {
                 DSA_MODULE,
                 "dsa_indexer_store",
             ),
+            kpool_compress_incr: pool_cache_kernel(gpu, "dsa_kpool_compress_incr"),
+            write_geom_pk: pool_cache_kernel(gpu, "dsa_write_geom_pk"),
+            indexer_store_ring: pool_cache_kernel(gpu, "dsa_indexer_store_ring"),
+            pk_len_clamp: pool_cache_kernel(gpu, "dsa_pk_len_clamp"),
             topk_to_mask: gpu.kernel(DSA_MODULE, "dsa_topk_to_mask")?,
             mla_masked_attn: gpu.kernel(DSA_MODULE, "dsa_mla_masked_attn")?,
         })
+    }
+}
+
+/// 2026-10-06: A pool-cache kernel of [`DSA_MODULE`], looked up only with
+/// `METRALE_GLM_DSA_POOL_CACHE=1`; `KernelHandle(0)` otherwise or when absent.
+fn pool_cache_kernel(gpu: &dyn GpuBackend, name: &str) -> KernelHandle {
+    if pool_cache::dsa_pool_cache() {
+        metrale_model_layers::layers::try_kernel(gpu, DSA_MODULE, name)
+    } else {
+        KernelHandle(0)
     }
 }
 

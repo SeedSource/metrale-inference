@@ -49,6 +49,16 @@ pub(crate) fn dsa_select_rows_enabled() -> bool {
     std::env::var("METRALE_DSA_SELECT_ROWS").as_deref() != Ok("0")
 }
 
+/// 2026-10-06: i32 slots of the workspace's device geometry: 5 (`dsa_write_geom`), or 6 with
+/// `METRALE_GLM_DSA_POOL_CACHE=1` (`dsa_write_geom_pk` adds `DSA_GEOM_PK_START`).
+pub(crate) fn geom_slots() -> usize {
+    if super::super::pool_cache::dsa_pool_cache() {
+        6
+    } else {
+        5
+    }
+}
+
 /// 2026-09-25: Scratch reused across `decode_k` calls; each layer owns one.
 pub struct Glm5NextDsaWorkspace {
     pub(super) q_a: DevicePtr,
@@ -84,7 +94,8 @@ pub struct Glm5NextDsaWorkspace {
     pub(super) stage_k: DevicePtr,
     pub(super) stage_gate: DevicePtr,
     /// 2026-09-25: `[5]` i32 selector geometry, written on the device by `dsa_write_geom`
-    /// for each row on the replay-safe path.
+    /// for each row on the replay-safe path. 2026-10-06: `[6]` with the pool cache
+    /// (`geom_slots`, `dsa_write_geom_pk`).
     pub(super) geom_dev: DevicePtr,
     pub(super) select: DsaSelectScratch,
     /// 2026-10-01: `METRALE_GLM_DSA_ROW_BATCH` staging (`row_batch.rs`); `None` unless the
@@ -189,7 +200,8 @@ impl Glm5NextDsaWorkspace {
             max_rows: rows,
             stage_k: gpu.alloc(cfg.index_head_dim * 2)?,
             stage_gate: gpu.alloc(cfg.index_head_dim * 2)?,
-            geom_dev: gpu.alloc(5 * 4)?,
+            // 2026-10-06: A sixth slot (`DSA_GEOM_PK_START`) with `METRALE_GLM_DSA_POOL_CACHE=1`.
+            geom_dev: gpu.alloc(geom_slots() * 4)?,
             select: match select {
                 Some(s) => {
                     s.fits(cfg, &geom)?;

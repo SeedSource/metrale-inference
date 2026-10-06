@@ -267,6 +267,7 @@ impl Fixture {
             q_mask: self.q_mask.offset(r),
             first_key: 0,
             geom_dev: row.geom,
+            pool_cache: None,
         };
         select_tokens(
             g,

@@ -464,7 +464,7 @@ impl LayerGraphHooks for Glm5NextLayer {
                         self.layer_idx
                     )
                 })?
-                .ensure_room_through(seq_len + k)
+                .replay_room(seq_len, k)
                 // 2026-09-25: `ensure_room_through` raises the same error for every caller;
                 // the context names this route.
                 .with_context(|| {

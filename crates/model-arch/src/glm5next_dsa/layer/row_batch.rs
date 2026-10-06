@@ -374,28 +374,36 @@ impl Glm5NextDsaLayer {
         let d = self.cfg.index_head_dim;
         let h = self.cfg.hidden;
         let pos0 = st.len();
-        let off = st.row_offset(pos0);
         let bm = self.kernels.gemv_batchm;
-        let k_rows = st.k_normed.offset(off);
         let w_wk = self.weights.wk;
-        batchm_rows(gpu, bm, 2, hidden, w_wk, k_rows, k, d, h, stream)?;
-        // 2026-10-01: `nllb_layernorm_bf16` normalises row `blockIdx.x` of `x` in place and
-        // returns for `row >= rows`; every block does the same arithmetic on its own row at
-        // any `rows`, so `k` blocks equal `k` one-block launches.
-        KernelLaunch::new(gpu, self.select_kernels.k_norm)
-            .grid([k as u32, 1, 1])
-            .block([d.min(1024) as u32, 1, 1])
-            .shared_mem((d.min(1024) * 4) as u32)
-            .arg_ptr(k_rows)
-            .arg_ptr(self.weights.k_norm_weight)
-            .arg_ptr(self.weights.k_norm_bias)
-            .arg_u32(k as u32)
-            .arg_u32(d as u32)
-            .arg_f32(self.rms_eps)
-            .launch(stream)?;
-        let gate = st.gate.offset(off);
         let w_gate = self.weights.compress_gate;
-        batchm_rows(gpu, bm, 2, hidden, w_gate, gate, k, d, h, stream)?;
+        // 2026-10-06: Pool cache on, the rows go to ring slots: one run per contiguous stretch
+        // (two when the ring wraps inside the write). The batched GEMV and the LayerNorm are
+        // per-row bit-identical at any row count, so a split run writes the same bytes. Lever
+        // off: one run, `(0, k)`, the launches as before.
+        self.pool_clamp_before_write(gpu, st, pos0, stream)?;
+        for (r0, n) in st.ring_runs(pos0, k) {
+            let off = st.row_offset(pos0 + r0);
+            let x = hidden.offset(r0 * h * 2);
+            let k_rows = st.k_normed.offset(off);
+            batchm_rows(gpu, bm, 2, x, w_wk, k_rows, n, d, h, stream)?;
+            // 2026-10-01: `nllb_layernorm_bf16` normalises row `blockIdx.x` of `x` in place and
+            // returns for `row >= rows`; every block does the same arithmetic on its own row at
+            // any `rows`, so `k` blocks equal `k` one-block launches.
+            KernelLaunch::new(gpu, self.select_kernels.k_norm)
+                .grid([n as u32, 1, 1])
+                .block([d.min(1024) as u32, 1, 1])
+                .shared_mem((d.min(1024) * 4) as u32)
+                .arg_ptr(k_rows)
+                .arg_ptr(self.weights.k_norm_weight)
+                .arg_ptr(self.weights.k_norm_bias)
+                .arg_u32(n as u32)
+                .arg_u32(d as u32)
+                .arg_f32(self.rms_eps)
+                .launch(stream)?;
+            let gate = st.gate.offset(off);
+            batchm_rows(gpu, bm, 2, x, w_gate, gate, n, d, h, stream)?;
+        }
         let heads = self.cfg.index_heads;
         let (r0, rows) = split.map_or((0, k), |s| (s.r0, s.rows));
         let hw = self.workspace.head_weights_rows.offset(r0 * heads * 4);

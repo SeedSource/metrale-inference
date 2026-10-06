@@ -32,6 +32,8 @@ fn glm53(capacity: usize, proposer: bool) -> LazyShape {
         proposer,
         index_head_dim: 128,
         capacity,
+        pool_cache: false,
+        index_kpool: 4,
     }
 }
 

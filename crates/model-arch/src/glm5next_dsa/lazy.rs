@@ -91,6 +91,12 @@ pub struct LazyShape {
     pub index_head_dim: usize,
     /// 2026-10-03: Rows each buffer can hold (`dsa_capacity`).
     pub capacity: usize,
+    /// 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: the two lazily mapped buffers per indexer
+    /// cache are the pool keys `[pools, d]` f32 and pool ids `[pools, kpool]` i32
+    /// (`pool_cache.rs`), not `k_normed`/`gate`.
+    pub pool_cache: bool,
+    /// 2026-10-06: Tokens per pool; read only with `pool_cache`.
+    pub index_kpool: usize,
 }
 
 impl LazyShape {
@@ -102,6 +108,9 @@ impl LazyShape {
     /// 2026-10-03: Mapped bytes one sequence of `tokens` tokens needs, granule rounding and the
     /// proposer's look-ahead included.
     pub fn seq_mapped_bytes(&self, tokens: usize, granule: usize) -> usize {
+        if self.pool_cache {
+            return self.pool_cache_mapped_bytes(tokens, granule);
+        }
         let t = tokens.min(self.capacity);
         let target = 2 * self.dsa_layers * mapped_bytes_for_rows(t, self.index_head_dim, granule);
         let proposer = if self.proposer {
@@ -122,13 +131,81 @@ impl LazyShape {
 
     /// 2026-10-03: Tokens a new sequence is certain to get from `available` pool bytes: whole
     /// granule sets (one granule in every buffer), each worth `granule / row_bytes` tokens.
+    ///
+    /// 2026-10-06: With `pool_cache`, tokens are counted in whole pool-key granules
+    /// (`granule / (4 d)` pools each), each set of them needing a pool-id granule per cache
+    /// every `granule / 4` pools ([`Self::pool_cache_free_tokens`]).
     pub fn free_tokens(&self, available: usize, granule: usize) -> usize {
+        if self.pool_cache {
+            return self.pool_cache_free_tokens(available, granule);
+        }
         let set = self.bufs_per_seq() * granule;
         let rows_per_granule = granule / row_bytes(self.index_head_dim).max(1);
         if set == 0 {
             return usize::MAX;
         }
         (available / set) * rows_per_granule
+    }
+}
+
+impl LazyShape {
+    /// 2026-10-06: Indexer caches per sequence (text DSA layers and the proposer's).
+    fn caches(&self) -> usize {
+        self.dsa_layers + usize::from(self.proposer)
+    }
+
+    /// 2026-10-06: Mapped bytes of one cache's `pk` and `pidx` at `rows` rows, as
+    /// `PoolCache::map_rows` maps them (whole pools, then whole granules).
+    fn pool_cache_cache_bytes(&self, rows: usize, granule: usize) -> usize {
+        let kp = self.index_kpool.max(1);
+        let pools = rows.min(self.capacity).div_ceil(kp);
+        round_up_to_granule(pools * self.index_head_dim * 4, granule)
+            + round_up_to_granule(pools * kp * 4, granule)
+    }
+
+    /// 2026-10-06: `seq_mapped_bytes` with the pool cache.
+    fn pool_cache_mapped_bytes(&self, tokens: usize, granule: usize) -> usize {
+        let t = tokens.min(self.capacity);
+        let target = self.dsa_layers * self.pool_cache_cache_bytes(t, granule);
+        let proposer = if self.proposer {
+            let p = (t + PROPOSER_LOOKAHEAD_ROWS).min(self.capacity);
+            self.pool_cache_cache_bytes(p, granule)
+        } else {
+            0
+        };
+        target + proposer
+    }
+
+    /// 2026-10-06: `free_tokens` with the pool cache: the most tokens `n` whole pool-key
+    /// granules cover (`n * rows_pk`, `rows_pk = granule / (4 d) * kpool`) such that every cache
+    /// can map them and the `ceil(n * rows_pk / rows_id)` pool-id granules they need
+    /// (`rows_id = granule / 4`, at kpool 4 and d 128 one id granule per 32 key granules) out
+    /// of `available`.
+    fn pool_cache_free_tokens(&self, available: usize, granule: usize) -> usize {
+        let caches = self.caches();
+        let kp = self.index_kpool.max(1);
+        let pk_pools = granule / (self.index_head_dim * 4).max(1);
+        let id_pools = granule / (kp * 4);
+        if caches == 0 || granule == 0 {
+            return usize::MAX;
+        }
+        if pk_pools == 0 || id_pools == 0 {
+            return 0;
+        }
+        // 2026-10-06: Granules each cache may map, then the most key granules `n` with
+        // `n + ceil(n * pk_pools / id_pools) <= budget`.
+        let budget = (available / granule / caches) as u128;
+        let (a, b) = (pk_pools as u128, id_pools as u128);
+        let cost = |n: u128| n + (n * a).div_ceil(b);
+        let mut n = budget * b / (a + b);
+        while n > 0 && cost(n) > budget {
+            n -= 1;
+        }
+        while cost(n + 1) <= budget {
+            n += 1;
+        }
+        let tokens = n * a * kp as u128;
+        usize::try_from(tokens).unwrap_or(usize::MAX)
     }
 }
 

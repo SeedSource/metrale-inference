@@ -48,6 +48,7 @@ pub mod binding;
 pub mod build;
 pub mod layer;
 pub mod lazy;
+pub mod pool_cache;
 pub mod select;
 pub mod state;
 pub mod tp;

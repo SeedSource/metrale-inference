@@ -11,6 +11,9 @@
 //!   leaves `len` unchanged.
 //! - A blob is `HEADER_BYTES + len * (4 * index_head_dim + 1)` bytes: it
 //!   carries `len` rows, not `capacity`.
+//! - 2026-10-06: A state allocated with `METRALE_GLM_DSA_POOL_CACHE=1` is
+//!   neither snapshotted nor restored: both return `Err` ("pool cache: aux v2
+//!   not implemented") before any copy (stage 4 of the pool-cache design).
 //!
 //! # Why a blob and not a rewind
 //!
@@ -74,6 +77,13 @@ impl Glm5NextDsaState {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<u8>> {
+        // 2026-10-06: TODO(pool-cache stage 4): aux blob v2. The v1 layout copies `k_normed`
+        // and `gate` from row 0, which with `METRALE_GLM_DSA_POOL_CACHE=1` are a ring.
+        ensure!(
+            !self.is_pool_cache(),
+            "pool cache: aux v2 not implemented (METRALE_GLM_DSA_POOL_CACHE=1 has no DSA \
+             prefix-cache snapshot yet)"
+        );
         ensure!(
             rows <= self.len(),
             "DSA aux prefix of {rows} rows past the {} rows this state holds",
@@ -103,6 +113,12 @@ impl Glm5NextDsaState {
     /// model-engine's `apply_aux_states` propagates it with `?`, so the
     /// prefix-cache hit fails.
     pub fn restore_blob(&mut self, blob: &[u8], gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+        // 2026-10-06: TODO(pool-cache stage 4): aux blob v2; see `snapshot_blob_prefix`.
+        ensure!(
+            !self.is_pool_cache(),
+            "pool cache: aux v2 not implemented (METRALE_GLM_DSA_POOL_CACHE=1 cannot restore a \
+             DSA prefix-cache blob yet)"
+        );
         ensure!(
             blob.len() >= HEADER_BYTES,
             "DSA aux blob truncated: {} bytes, need at least {HEADER_BYTES} for the header",

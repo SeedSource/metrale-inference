@@ -69,6 +69,20 @@ pub(crate) fn load_weight_store(
             .context("Failed to load rank-local K3 weights");
     }
     let mult = quant_multiplier(config);
+    // 2026-10-05: GLM-5.3 expert-TP (`METRALE_GLM_EXPERT_TP=1`) owns every routed expert on every
+    // rank, each at half width, so the store must see all of them: it loads at EP 1 (no remote
+    // expert skip) and the model's defer rule keeps every routed-expert tensor off the device
+    // until `Glm5NextWeightLoader` reads back this rank's slice. `resolve_topology` has already
+    // refused the lever off GLM-5.3 TP2/EP2.
+    let (ep_rank, ep_size) = if expert_tp_store(config) {
+        tracing::info!(
+            "METRALE_GLM_EXPERT_TP=1: loading the weight store at EP 1 (rank {ep_rank} of \
+             {ep_size} keeps every routed expert, deferred, and binds its half of each)"
+        );
+        (0, 1)
+    } else {
+        (ep_rank, ep_size)
+    };
 
     // 2026-09-26: Any `.gguf` file in the directory selects `GgufLoader`.
     if metrale_model_weights::weights::find_gguf(model_dir).is_some() {
@@ -486,6 +500,13 @@ fn skip_activation_scales_for(model_type: &str, glm_cutlass_w4a4: bool) -> bool 
         "glm5_next" => !glm_cutlass_w4a4,
         _ => false,
     }
+}
+
+/// 2026-10-05: Whether the weight store loads at EP 1 for GLM-5.3 expert-TP
+/// (`METRALE_GLM_EXPERT_TP=1`); false for every other model and with the lever off.
+fn expert_tp_store(config: &ModelConfig) -> bool {
+    matches!(config.model_type.as_str(), "glm5_next" | "glm5_next_text")
+        && metrale_config::glm_expert_tp()
 }
 
 /// 2026-09-26: Whether `mtp.*` is left unloaded: `qwen4_exp`, whose

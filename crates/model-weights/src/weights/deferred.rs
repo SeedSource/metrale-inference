@@ -125,6 +125,47 @@ impl DeferredTensor {
         })?;
         Ok(buf)
     }
+
+    /// 2026-10-05: Read bytes `[start, start + len)` of the tensor into host memory, then drop
+    /// that range from the page cache (Linux): a loader that keeps only a slice of a deferred
+    /// tensor (GLM-5.3 expert-TP keeps half the rows of gate_proj/up_proj) reads only that
+    /// slice, and on a unified-memory box the cache copy would be held from the same pool the
+    /// device uses. Errors when the range is outside the tensor or the shard is short.
+    pub fn read_host_range(&self, start: usize, len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let n = self.byte_size();
+        let end = start.checked_add(len).filter(|&e| e <= n).with_context(|| {
+            format!(
+                "deferred tensor: range {start}+{len} is outside the {n}-byte tensor in {}",
+                self.path.display()
+            )
+        })?;
+        let at = self.offset + start as u64;
+        let mut f = std::fs::File::open(&self.path)
+            .with_context(|| format!("deferred tensor: opening {}", self.path.display()))?;
+        f.seek(SeekFrom::Start(at))?;
+        let mut buf = vec![0u8; end - start];
+        f.read_exact(&mut buf).with_context(|| {
+            format!(
+                "deferred tensor: reading {len} B at offset {at} of {}",
+                self.path.display()
+            )
+        })?;
+        #[cfg(target_os = "linux")]
+        if len > 0 {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: an advisory call on an open descriptor; the kernel checks the range.
+            unsafe {
+                libc::posix_fadvise(
+                    f.as_raw_fd(),
+                    at as libc::off_t,
+                    len as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+        Ok(buf)
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +202,27 @@ mod tests {
             dtype: WeightDtype::BF16,
         };
         assert_eq!(d.read_host_bytes().unwrap(), payload);
+    }
+
+    /// 2026-10-05: A range read returns exactly those bytes of the tensor, never the header's,
+    /// and a range past the tensor's end is refused even when the shard holds more bytes.
+    #[test]
+    fn host_range_read_returns_exactly_that_slice_of_the_tensor() {
+        let payload: Vec<u8> = (0u8..32).collect();
+        let (_d, path) =
+            write_shard(&[vec![0xFFu8; 8], payload.clone(), vec![0xEEu8; 8]].concat());
+        let d = DeferredTensor {
+            path,
+            offset: 8,
+            shape: vec![4, 4],
+            dtype: WeightDtype::BF16,
+        };
+        assert_eq!(d.read_host_range(0, 32).unwrap(), payload);
+        assert_eq!(d.read_host_range(16, 16).unwrap(), payload[16..].to_vec());
+        assert_eq!(d.read_host_range(5, 3).unwrap(), payload[5..8].to_vec());
+        assert!(d.read_host_range(0, 0).unwrap().is_empty());
+        assert!(d.read_host_range(16, 17).is_err());
+        assert!(d.read_host_range(usize::MAX, 2).is_err());
     }
 
     /// Write a one-tensor-per-entry safetensors file and return its path.

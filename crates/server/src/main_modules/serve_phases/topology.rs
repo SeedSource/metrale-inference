@@ -73,6 +73,26 @@ pub(crate) fn resolve_topology(
     config.serve_max_seq_len = args.max_seq_len;
     config.ep_rank = ep_rank;
     config.ep_world_size = ep_size;
+    // 2026-10-05: GLM-5.3 expert-TP (`METRALE_GLM_EXPERT_TP=1`) is defined only for the 2-rank
+    // TP2/EP2 serve on overlapping groups; refused here, before the weight store loads.
+    if metrale_config::glm_expert_tp() {
+        anyhow::ensure!(
+            matches!(config.model_type.as_str(), "glm5_next" | "glm5_next_text")
+                && tp_size == 2
+                && ep_size == 2
+                && world_size == 2
+                && tp_rank == ep_rank,
+            "METRALE_GLM_EXPERT_TP=1 needs a GLM-5.3 model_type (glm5_next) at --tp-size 2 --ep-size 2 \
+             --world-size 2 (this serve: model_type {}, tp {tp_size}, ep {ep_size}, world \
+             {world_size}). Unset the lever",
+            config.model_type
+        );
+        tracing::info!(
+            "METRALE_GLM_EXPERT_TP=1: routed experts run expert-TP (every rank owns all {} \
+             experts at half width); the EP expert range logged below does not apply to them",
+            config.num_experts
+        );
+    }
     if tp_size > 1 {
         let loader = metrale_model_engine::factory::loader_for_config(config)?;
         if !loader.supports_tp() {

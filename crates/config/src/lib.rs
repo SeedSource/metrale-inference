@@ -259,6 +259,48 @@ pub fn glm_moe_swiglu_local_rows_from(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// 2026-10-06: Whether the CUTLASS W4A4 routed-MoE prefill quantizes each token row of the
+/// gate/up input once and copies it to every routed copy (`METRALE_CUTLASS_W4A4_PACK_ONCE`, see
+/// [`cutlass_w4a4_pack_once_from`]) instead of quantizing every routed copy. Exact (the C side
+/// engages it only when every expert of the call has the same global scale). Off by default,
+/// and only meaningful with `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1`. Read once per process.
+pub fn cutlass_w4a4_pack_once() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        cutlass_w4a4_pack_once_from(
+            std::env::var("METRALE_CUTLASS_W4A4_PACK_ONCE")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-06: The policy half of [`cutlass_w4a4_pack_once`]: only `1` (trimmed) turns it on.
+pub fn cutlass_w4a4_pack_once_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// 2026-10-06: Whether the CUTLASS W4A4 routed-MoE prefill's clamped SwiGLU also computes the
+/// down projection's dynamic activation amax as it writes `a_act`
+/// (`METRALE_GLM_MOE_SWIGLU_AMAX`, see [`glm_moe_swiglu_amax_from`]), so the down call skips its
+/// own amax pass. Exact (the C side uses it only when the rows match). Off by default, and only
+/// meaningful with `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1`. Read once per process.
+pub fn glm_moe_swiglu_amax() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        glm_moe_swiglu_amax_from(
+            std::env::var("METRALE_GLM_MOE_SWIGLU_AMAX")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-06: The policy half of [`glm_moe_swiglu_amax`]: only `1` (trimmed) turns it on.
+pub fn glm_moe_swiglu_amax_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// 2026-10-04: Whether the CUTLASS W4A4 routed-MoE prefill runs its DOWN projection as the
 /// W4A16 grouped GEMM (BF16 activations) instead of W4A4 (`METRALE_GLM_MOE_W4A4_DOWN_W4A16`, see
 /// [`glm_moe_w4a4_down_w4a16_from`]); gate/up stay W4A4. Off by default, and only meaningful with
@@ -315,7 +357,8 @@ mod glm_expert_tp_gate_tests {
 #[cfg(test)]
 mod glm_moe_w4a4_fix_lever_tests {
     use super::{
-        glm_moe_combine_local_from, glm_moe_swiglu_local_rows_from, glm_moe_w4a4_down_w4a16_from,
+        cutlass_w4a4_pack_once_from, glm_moe_combine_local_from, glm_moe_swiglu_amax_from,
+        glm_moe_swiglu_local_rows_from, glm_moe_w4a4_down_w4a16_from,
         glm_moe_w4a4_dynamic_scale_from,
     };
 
@@ -326,6 +369,8 @@ mod glm_moe_w4a4_fix_lever_tests {
             glm_moe_w4a4_down_w4a16_from,
             glm_moe_swiglu_local_rows_from,
             glm_moe_combine_local_from,
+            cutlass_w4a4_pack_once_from,
+            glm_moe_swiglu_amax_from,
         ] {
             for off in [
                 None,

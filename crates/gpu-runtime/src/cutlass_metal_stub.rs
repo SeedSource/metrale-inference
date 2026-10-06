@@ -188,3 +188,67 @@ pub fn nvfp4_grouped_down_w4a4(
 pub fn set_w4a4_amax_dedup_override(_force: Option<bool>) {
     unreachable!("cutlass::set_w4a4_amax_dedup_override is cuda-only (not built for metal)")
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_gate_up_w4a4_ex(
+    _a: u64,
+    _sorted_token_ids: u64,
+    _gate_packed_ptrs: &[u64],
+    _gate_sfb_ptrs: &[u64],
+    _gate_scale2_vals: &[f32],
+    _up_packed_ptrs: &[u64],
+    _up_sfb_ptrs: &[u64],
+    _up_scale2_vals: &[f32],
+    _act_gscale_vals: &[f32],
+    _c_gate: u64,
+    _c_up: u64,
+    _expert_offsets_host: &[i32],
+    _n: u32,
+    _k: u32,
+    _num_tokens: usize,
+    _pack_once: bool,
+    _stream: u64,
+) -> Result<bool> {
+    unreachable!("cutlass::nvfp4_grouped_gate_up_w4a4_ex is cuda-only (not built for metal)")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_down_w4a4_ex(
+    _a: u64,
+    _packed_ptrs: &[u64],
+    _sfb_ptrs: &[u64],
+    _scale2_vals: &[f32],
+    _act_gscale_vals: &[f32],
+    _c: u64,
+    _expert_offsets_host: &[i32],
+    _n: u32,
+    _k: u32,
+    _pre_amax: Option<(u64, std::ops::Range<usize>)>,
+    _stream: u64,
+) -> Result<bool> {
+    unreachable!("cutlass::nvfp4_grouped_down_w4a4_ex is cuda-only (not built for metal)")
+}
+
+pub fn set_w4a4_pack_once_fault(_on: bool) {
+    unreachable!("cutlass::set_w4a4_pack_once_fault is cuda-only (not built for metal)")
+}
+
+/// 2026-10-06: Mirrors the cuda build's `W4a4LastPrep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct W4a4LastPrep {
+    pub ws_base: u64,
+    pub sfa_off: u64,
+    pub sfa_bytes: u64,
+    pub gs_off: u64,
+    pub groups: u64,
+    pub pack_once: bool,
+    pub pre_amax: bool,
+}
+
+pub fn w4a4_last_prep() -> Option<W4a4LastPrep> {
+    None
+}
+
+pub fn workspace() -> Result<(u64, usize)> {
+    unreachable!("cutlass::workspace is cuda-only (not built for metal)")
+}

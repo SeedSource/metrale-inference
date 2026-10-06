@@ -61,7 +61,9 @@ __device__ __forceinline__ float dsa_block_sum(float v, float* smem, unsigned ti
 // stride (block b takes pools b, b + gridDim.x, ... below the live count), so a ceiling
 // launch need not be one block per ceiling pool: the host launches a few waves of blocks
 // and a graph replay pays for those, not for the context ceiling. With
-// METRALE_GLM_DSA_GRID_STRIDE=0 the host launches the ceiling grid again.
+// METRALE_GLM_DSA_GRID_STRIDE=0 the host launches the ceiling grid again. It does so too when
+// the module lacks the marker kernel dsa_indexer_grid_stride_v1 (defined below
+// dsa_index_scores), so a copy of this file without the loop must not define it.
 
 #define DSA_GEOM_S        0
 #define DSA_GEOM_NPOOLS_F 1
@@ -263,6 +265,9 @@ extern "C" __global__ void dsa_index_scores(
         __syncthreads();
     }
 }
+
+// 2026-10-05: No-op marker: it exists iff both kernels above carry the grid-stride loop.
+extern "C" __global__ void dsa_indexer_grid_stride_v1() {}
 
 // 2026-10-01: 2b. dsa_index_scores_tiled: the same scores and candidacy as dsa_index_scores,
 // byte-identical by construction, with one block per DSA_TILE_ROWS x DSA_TILE_POOLS tile

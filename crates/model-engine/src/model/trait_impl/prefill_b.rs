@@ -175,7 +175,13 @@ impl TransformerModel {
         // a grid point is off the plan.
         if seq.prefix_grid_refs
             && let Some(g) = self.prefix_grid_active_bs(kv_cache.block_size())
-            && chunk_len > crate::prefill_plan::grid_chunk_len(chunk_start, total, g)
+            && chunk_len
+                > crate::prefill_plan::grid_chunk_len_c(
+                    chunk_start,
+                    total,
+                    g,
+                    crate::prefill_plan::grid_chunk_lever(g),
+                )
         {
             static W: std::sync::Once = std::sync::Once::new();
             W.call_once(|| {

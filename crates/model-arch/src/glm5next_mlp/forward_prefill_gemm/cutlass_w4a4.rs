@@ -84,6 +84,28 @@ pub fn down_w4a16_on() -> bool {
     metrale_config::glm_moe_w4a4_down_w4a16()
 }
 
+/// 2026-10-06: `METRALE_GLM_MOE_SWIGLU_LOCAL_ROWS=1` (read once, `metrale_config`).
+pub fn swiglu_local_rows_on() -> bool {
+    metrale_config::glm_moe_swiglu_local_rows()
+}
+
+/// 2026-10-06: The sorted rows the SwiGLU must cover: the local experts' span
+/// `offsets[local.start] .. offsets[local.end]` when `local_only`, else every routed row `0..te`.
+/// Rows are sorted by global expert id, so the local experts' rows are contiguous.
+pub fn swiglu_span(
+    offsets: &[i32],
+    local: std::ops::Range<usize>,
+    te: usize,
+    local_only: bool,
+) -> std::ops::Range<usize> {
+    if !local_only {
+        return 0..te;
+    }
+    let at = |e: usize| offsets.get(e).map_or(te, |&o| (o.max(0) as usize).min(te));
+    let (lo, hi) = (at(local.start), at(local.end));
+    lo..hi.max(lo)
+}
+
 /// 2026-10-03: The CUTLASS tile's K and the TMA row alignment: both GEMM dims a multiple of
 /// 128 (GLM-5.3: hidden 4096, moe_intermediate 2048), at least one local expert, and at most
 /// 65535 of them (the batched swizzle's grid.y). `Err` carries the refusal reason.
@@ -405,6 +427,8 @@ pub struct RunArgs<'a> {
     /// 2026-10-04: Stop after the SwiGLU: the caller runs the down projection on W4A16
     /// (`METRALE_GLM_MOE_W4A4_DOWN_W4A16=1`).
     pub skip_down: bool,
+    /// 2026-10-06: Sorted rows the SwiGLU covers ([`swiglu_span`]); `0..te` writes every row.
+    pub swiglu_rows: std::ops::Range<usize>,
 }
 
 /// 2026-10-03: CUTLASS W4A4 gate/up, the clamped SwiGLU, CUTLASS W4A4 down, all on `stream`.
@@ -430,16 +454,20 @@ pub fn run(gpu: &dyn GpuBackend, a: &RunArgs<'_>, stream: u64) -> Result<()> {
         h,
         stream,
     )?;
-    super::super::forward::swiglu_rows(
-        gpu,
-        a.swiglu,
-        a.a_gate,
-        a.a_up,
-        a.a_act,
-        a.te * a.moe_intermediate,
-        a.swiglu_limit,
-        stream,
-    )?;
+    // 2026-10-06: Elementwise over `swiglu_rows` only (BF16 `[te, moe_intermediate]` buffers).
+    let (r, row_bytes) = (&a.swiglu_rows, a.moe_intermediate * 2);
+    if !r.is_empty() {
+        super::super::forward::swiglu_rows(
+            gpu,
+            a.swiglu,
+            a.a_gate.offset(r.start * row_bytes),
+            a.a_up.offset(r.start * row_bytes),
+            a.a_act.offset(r.start * row_bytes),
+            r.len() * a.moe_intermediate,
+            a.swiglu_limit,
+            stream,
+        )?;
+    }
     if a.skip_down {
         return Ok(());
     }
@@ -642,7 +670,26 @@ pub(crate) fn forward(
         offsets: &offsets,
         tables: &tables,
         skip_down: down_w4a16_on(),
+        swiglu_rows: swiglu_span(
+            &offsets,
+            cfg.local_expert_range(),
+            te,
+            swiglu_local_rows_on(),
+        ),
     };
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if swiglu_local_rows_on() {
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    "GLM routed-MoE prefill CUTLASS W4A4: SwiGLU over local rows only \
+                     (METRALE_GLM_MOE_SWIGLU_LOCAL_ROWS=1): first layer {}..{} of {te} routed rows",
+                    args.swiglu_rows.start,
+                    args.swiglu_rows.end
+                );
+            });
+        }
+    }
     match run(gpu, &args, stream) {
         Ok(()) if args.skip_down => Ok(Outcome::DownPending),
         Ok(()) => Ok(Outcome::Done),
@@ -653,6 +700,19 @@ pub(crate) fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swiglu_span_covers_local_experts_or_everything() {
+        // 4 experts, 2 per rank: rows 0..3 e0, 3..3 e1, 3..7 e2, 7..10 e3.
+        let off = [0, 3, 3, 7, 10];
+        assert_eq!(swiglu_span(&off, 0..2, 10, false), 0..10);
+        assert_eq!(swiglu_span(&off, 0..2, 10, true), 0..3);
+        assert_eq!(swiglu_span(&off, 2..4, 10, true), 3..10);
+        assert_eq!(swiglu_span(&off, 1..2, 10, true), 3..3);
+        // A short or bad table never reaches past `te` or runs backwards.
+        assert_eq!(swiglu_span(&off[..3], 2..4, 10, true), 3..10);
+        assert_eq!(swiglu_span(&[0, 9, 4], 1..2, 10, true), 9..9);
+    }
     use crate::glm5next_mlp::weights::Nvfp4Proj;
 
     fn proj(packed: u64, s2: f32, is: f32) -> Nvfp4Proj {

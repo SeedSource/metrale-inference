@@ -218,6 +218,27 @@ pub fn glm_moe_w4a4_dynamic_scale_from(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// 2026-10-06: Whether the CUTLASS W4A4 routed-MoE prefill runs the clamped SwiGLU over the
+/// local experts' sorted rows only (`METRALE_GLM_MOE_SWIGLU_LOCAL_ROWS`, see
+/// [`glm_moe_swiglu_local_rows_from`]) instead of every routed row; rows of experts another EP rank
+/// owns are never read by the down projection. Off by default, and only meaningful with
+/// `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1`. Read once per process.
+pub fn glm_moe_swiglu_local_rows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        glm_moe_swiglu_local_rows_from(
+            std::env::var("METRALE_GLM_MOE_SWIGLU_LOCAL_ROWS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-06: The policy half of [`glm_moe_swiglu_local_rows`]: only `1` (trimmed) turns it on.
+pub fn glm_moe_swiglu_local_rows_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// 2026-10-04: Whether the CUTLASS W4A4 routed-MoE prefill runs its DOWN projection as the
 /// W4A16 grouped GEMM (BF16 activations) instead of W4A4 (`METRALE_GLM_MOE_W4A4_DOWN_W4A16`, see
 /// [`glm_moe_w4a4_down_w4a16_from`]); gate/up stay W4A4. Off by default, and only meaningful with
@@ -273,13 +294,17 @@ mod glm_expert_tp_gate_tests {
 
 #[cfg(test)]
 mod glm_moe_w4a4_fix_lever_tests {
-    use super::{glm_moe_w4a4_down_w4a16_from, glm_moe_w4a4_dynamic_scale_from};
+    use super::{
+        glm_moe_swiglu_local_rows_from, glm_moe_w4a4_down_w4a16_from,
+        glm_moe_w4a4_dynamic_scale_from,
+    };
 
     #[test]
     fn only_one_turns_either_fix_lever_on() {
         for f in [
             glm_moe_w4a4_dynamic_scale_from,
             glm_moe_w4a4_down_w4a16_from,
+            glm_moe_swiglu_local_rows_from,
         ] {
             for off in [
                 None,

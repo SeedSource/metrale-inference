@@ -59,7 +59,7 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_arch::glm5next_mlp::Glm5NextExpertWeights;
 use metrale_model_arch::glm5next_mlp::forward_prefill_gemm::cutlass_w4a4::{
-    MoeTables, RunArgs, SfbCache, run,
+    MoeTables, RunArgs, SfbCache, run, swiglu_span,
 };
 use metrale_model_arch::glm5next_mlp::weights::Nvfp4Proj;
 
@@ -744,6 +744,7 @@ fn main() -> Result<()> {
                 offsets: &off_i32,
                 tables: &tables,
                 skip_down: false,
+                swiglu_rows: 0..te,
             };
             g.memset_async(act_b, 0, te * mi() * 2, 0)?;
             g.memset_async(out_b, 0, te * H * 2, 0)?;
@@ -756,6 +757,67 @@ fn main() -> Result<()> {
             }
             let got_act_b = dn(g, act_b, te * mi() * 2)?;
             let got_out_b = dn(g, out_b, te * H * 2)?;
+            // 2026-10-06: Arm (b-local), `METRALE_GLM_MOE_SWIGLU_LOCAL_ROWS`: the SwiGLU over the
+            // local experts' rows only (activation pre-filled with a 0x5A sentinel) must give a
+            // byte-identical expert_out (whole buffer) and local activation rows; the known-bad
+            // span one row short must change expert_out.
+            let full_span = swiglu_span(&off_i32, 0..LOCAL, te, true);
+            for (leg, span) in [
+                ("local", full_span.clone()),
+                ("short", full_span.start..full_span.end.saturating_sub(1)),
+            ] {
+                let largs = RunArgs {
+                    swiglu: k_swiglu,
+                    x: d_x,
+                    sorted_token_ids: d_stid,
+                    a_gate,
+                    a_up,
+                    a_act: act_b,
+                    expert_out: out_b,
+                    te,
+                    hidden: H,
+                    moe_intermediate: MI,
+                    swiglu_limit: LIMIT,
+                    offsets: &off_i32,
+                    tables: &tables,
+                    skip_down: false,
+                    swiglu_rows: span.clone(),
+                };
+                g.memset_async(act_b, 0x5A, te * MI * 2, 0)?;
+                g.memset_async(out_b, 0, te * H * 2, 0)?;
+                run(g, &largs, 0).and_then(|_| g.synchronize(0))?;
+                let got_act_l = dn(g, act_b, te * MI * 2)?;
+                let got_out_l = dn(g, out_b, te * H * 2)?;
+                let out_diff = got_out_l
+                    .iter()
+                    .zip(&got_out_b)
+                    .filter(|(x, y)| x != y)
+                    .count();
+                let (lo, hi) = (full_span.start * MI * 2, full_span.end * MI * 2);
+                let act_diff = got_act_l[lo..hi]
+                    .iter()
+                    .zip(&got_act_b[lo..hi])
+                    .filter(|(x, y)| x != y)
+                    .count();
+                println!(
+                    "  tokens={tokens} {mode} swiglu_{leg} rows {}..{} of {te}: expert_out {out_diff} \
+                     differing bytes of {}, local act {act_diff} differing bytes of {}",
+                    span.start,
+                    span.end,
+                    got_out_l.len(),
+                    hi - lo
+                );
+                match leg {
+                    "local" if out_diff != 0 || act_diff != 0 => problems.push(format!(
+                        "tokens={tokens} {mode}: SwiGLU local rows not byte-identical \
+                         (out {out_diff}, act {act_diff})"
+                    )),
+                    "short" if out_diff == 0 && span.end > span.start => problems.push(format!(
+                        "tokens={tokens} {mode}: known-bad short SwiGLU span not detected"
+                    )),
+                    _ => {}
+                }
+            }
             let (sa, so) = stats(&got_act_b, &got_out_b);
             let (_, so_ab) = {
                 // 2026-10-03: (b) vs (a) over the same sampled rows, for context.
@@ -932,6 +994,7 @@ fn main() -> Result<()> {
             // (`skip_down`), then the REAL W4A16 down (the arm-(a) `va2` kernel) over `act_b`.
             let args_e = RunArgs {
                 skip_down: true,
+                swiglu_rows: 0..te,
                 ..args
             };
             let arm_e = || -> Result<()> {

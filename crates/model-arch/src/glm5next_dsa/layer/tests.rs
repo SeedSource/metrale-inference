@@ -339,6 +339,8 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
     let module = concat!(
         include_str!("../../glm5next_layer/comm_overlap.rs"),
         include_str!("../../glm5next_layer/dense_fp8.rs"),
+        include_str!("../../glm5next_layer/dense_fp8_gw.rs"),
+        include_str!("../../glm5next_layer/dense_fp8_min_rows.rs"),
         include_str!("../../glm5next_layer/mod.rs"),
         include_str!("../../glm5next_layer/levers.rs"),
         include_str!("../../glm5next_layer/levers_comm.rs"),
@@ -346,6 +348,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
         include_str!("../../glm5next_layer/profile.rs"),
         include_str!("../../glm5next_layer/scratch_union.rs"),
         include_str!("../../glm5next_layer/seq_parallel.rs"),
+        include_str!("../../glm5next_layer/seq_parallel/premix.rs"),
         include_str!("../../glm5next_layer/state.rs"),
         include_str!("../../glm5next_layer/steps.rs"),
         include_str!("../../glm5next_layer/steps/drafter.rs"),
@@ -363,6 +366,8 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
         [
             "comm_overlap.rs",
             "dense_fp8.rs",
+            "dense_fp8_gw.rs",
+            "dense_fp8_min_rows.rs",
             "levers.rs",
             "levers_comm.rs",
             "mod.rs",
@@ -371,6 +376,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
             "scratch_union.rs",
             "scratch_union_tests.rs",
             "seq_parallel.rs",
+            "seq_parallel/premix.rs",
             "seq_parallel/tests.rs",
             "state.rs",
             "steps.rs",

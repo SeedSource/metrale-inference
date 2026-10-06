@@ -185,7 +185,12 @@ fn gemm(
 
 fn main() -> Result<()> {
     let gpu = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
-    let quant = gpu.kernel("per_token_group_quant_fp8", "per_token_group_quant_fp8")?;
+    // 2026-10-06: `per_token_group_quant_fp8` takes an `Fp8ActQuant` now. Only the shared kernel,
+    // as before (no Hopper twin), so this example's numbers are unchanged.
+    let quant = ops::Fp8ActQuant {
+        shared: gpu.kernel("per_token_group_quant_fp8", "per_token_group_quant_fp8")?,
+        ..Default::default()
+    };
     let kmajor = gpu.kernel("fp8_scale_transpose", "fp8_act_scale_to_kmajor")?;
     let silu = gpu.kernel("moe_silu_mul", "moe_silu_mul")?;
     let silu_strided = gpu.kernel("silu_mul_strided", "silu_mul_strided")?;

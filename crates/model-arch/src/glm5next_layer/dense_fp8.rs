@@ -1073,7 +1073,9 @@ fn w8a8(
     if !bf16_out {
         return w8a8_skip(W8a8Skip::NotBf16Out, m, n, k);
     }
-    if m < w8a8_min_rows() {
+    // 2026-10-06: A block-scaled weight (`METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW`) keeps the
+    // default 64-row floor: its CUTLASS GEMM is gated from 64 rows only.
+    if m < w8a8_min_rows() || (e.bs && m < W8A8_MIN_ROWS) {
         return w8a8_skip(W8a8Skip::FewRows, m, n, k);
     }
     if !k.is_multiple_of(ops::FP8_GEMM_PIPE_KGROUP as usize)

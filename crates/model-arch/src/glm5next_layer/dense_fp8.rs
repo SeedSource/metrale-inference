@@ -109,6 +109,13 @@
 //!   `front_end_with` (q/k/v/g_a over `hidden`), DSA `decode_k` / `decode_k_wide` (q_a and
 //!   kv_a over `hidden`, kv_a issued right after q_a), MLP `forward_dense_sliced` (gate/up
 //!   over each row slice).
+//! - 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW=1` ([`super::dense_fp8_gw`]; inert
+//!   without W8A8, refused without CUTLASS): [`register`] quantizes a weight that also gets an
+//!   NVFP4 decode copy (N, K multiples of 128) to 128x128 block-scaled FP8 instead of per-row
+//!   (the entry's `bs`; its `w.row_scale` then holds `[N/128, K/128]` block scales). Such an
+//!   entry never takes the per-row decode GEMVs (its 1..=16-row calls go to the NVFP4 GEMV or
+//!   the dequant), its W8A8 GEMM runs `dense_fp8_gw::gemm` (CUTLASS Sm120 FP8 blockwise) and
+//!   its dequant `dequant_fp8_blockscaled_bf16`. Off, no entry has `bs` and nothing changes.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -346,6 +353,9 @@ struct Entry {
     off: usize,
     /// 2026-10-05: The NVFP4 decode copy (`METRALE_GLM_DENSE_NVFP4`), if this weight has one.
     nv: Option<QuantizedWeight>,
+    /// 2026-10-06: `w` is 128x128 block-scaled (`METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW`):
+    /// `w.row_scale` holds `[N/128, K/128]` block scales, not per-row ones.
+    bs: bool,
 }
 
 /// 2026-10-05: The `METRALE_GLM_DENSE_NVFP4` kernels: the load-time quantizer and the decode
@@ -400,6 +410,9 @@ static DEQUANTS: AtomicU64 = AtomicU64::new(0);
 static FIRST_HIT: AtomicBool = AtomicBool::new(false);
 static FIRST_DEQUANT: AtomicBool = AtomicBool::new(false);
 static HANDLE_MISMATCH: AtomicBool = AtomicBool::new(false);
+/// 2026-10-06: Block-scaled weights (`METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW`) and their scale bytes.
+static GW_WEIGHTS: AtomicUsize = AtomicUsize::new(0);
+static GW_SCALE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 const ARENA_ALIGN: usize = 256;
 
@@ -624,14 +637,25 @@ fn register(
         bail!("METRALE_GLM_DENSE_FP8: {bf16} is already an FP8 copy; registered twice");
     }
     let s = gpu.default_stream();
-    let w = metrale_model_layers::weight_map::quantize_to_fp8(
-        &DenseWeight { weight: bf16 },
-        n,
-        k,
-        gpu,
-        kk.quant,
-        s,
-    )?;
+    // 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW`: a weight that gets an NVFP4 decode
+    // copy below is quantized block-scaled (module doc); every other weight as before.
+    let bs = super::dense_fp8_gw::cutlass_gw()
+        && super::dense_fp8_gw::eligible_for(true, nv4 && nv4_kernels(gpu).is_some(), n, k);
+    let w = if bs {
+        let w = super::dense_fp8_gw::quantize_block_scaled(gpu, bf16, n, k, s)?;
+        GW_WEIGHTS.fetch_add(1, Ordering::Relaxed);
+        GW_SCALE_BYTES.fetch_add(n.div_ceil(128) * k.div_ceil(128) * 4, Ordering::Relaxed);
+        w
+    } else {
+        metrale_model_layers::weight_map::quantize_to_fp8(
+            &DenseWeight { weight: bf16 },
+            n,
+            k,
+            gpu,
+            kk.quant,
+            s,
+        )?
+    };
     // 2026-10-05: The NVFP4 decode copy, from the BF16 original (not from the FP8 copy, which
     // would quantize twice); `quantize_to_nvfp4` synchronizes `s` too.
     let nv = if nv4
@@ -662,7 +686,7 @@ fn register(
     map()
         .write()
         .unwrap()
-        .insert(w.weight.0, Entry { w, n, k, off, nv });
+        .insert(w.weight.0, Entry { w, n, k, off, nv, bs });
     Ok(Some(w))
 }
 
@@ -715,12 +739,24 @@ pub fn ensure_bf16(b: DevicePtr, n: usize, k: usize, site: &str) -> Result<()> {
 }
 
 /// 2026-10-03: The FP8 copy registered under key `ptr` with shape `[n, k]`, if any.
+/// 2026-10-06: Under `METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW` a weight with an NVFP4 copy may be
+/// block-scaled: its `row_scale` then holds `[N/128, K/128]` block scales ([`is_block_scaled`]).
 pub fn lookup(ptr: DevicePtr, n: usize, k: usize) -> Option<Fp8DenseWeight> {
     if !dense_fp8() {
         return None;
     }
     let m = map().read().unwrap();
     m.get(&ptr.0).filter(|e| e.n == n && e.k == k).map(|e| e.w)
+}
+
+/// 2026-10-06: Whether the copy under key `ptr` (`[n, k]`) is 128x128 block-scaled
+/// (`METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW`); false when unregistered or per-row.
+pub fn is_block_scaled(ptr: DevicePtr, n: usize, k: usize) -> bool {
+    if !dense_fp8() {
+        return false;
+    }
+    let m = map().read().unwrap();
+    m.get(&ptr.0).is_some_and(|e| e.n == n && e.k == k && e.bs)
 }
 
 /// 2026-10-04: `dense_gemv_bf16` (module `gemv`), the BF16-out GEMV handle the three GLM
@@ -769,6 +805,8 @@ pub fn route(
         && gemv.0 == bf16_gemv_handle(gpu).0
     {
         let done = match if dense_fp8() { find(b, n, k)? } else { None } {
+            // 2026-10-06: a block-scaled weight has no per-row GEMV; it falls through.
+            Some(e) if e.bs => false,
             Some(e) => ops::dense_gemv_tcm::try_fp8(
                 gpu, a, &e.w, c, m as u32, n as u32, k as u32, n as u32, stream,
             )?,
@@ -800,7 +838,8 @@ pub fn route(
     let Some(kk) = kernels(gpu) else {
         bail!("METRALE_GLM_DENSE_FP8: weight {b} is registered but the kernels are missing");
     };
-    if m <= ops::DENSE_GEMV_FP8W_BATCHM_MAX_M as usize {
+    // 2026-10-06: a block-scaled weight (`e.bs`) has no per-row GEMV; it takes the dequant.
+    if m <= ops::DENSE_GEMV_FP8W_BATCHM_MAX_M as usize && !e.bs {
         if gemv.0 == kk.bf16_gemv.0 {
             if m == 1 {
                 ops::dense_gemv_fp8w(gpu, kk.gemv1, a, &e.w, c, n as u32, k as u32, stream)?;
@@ -1088,20 +1127,25 @@ fn w8a8(
         )?;
         st.held = want;
     }
-    ops::fp8_gemm_t_rowscale(
-        gpu,
-        kk.gemm,
-        s.a_fp8,
-        s.a_scale,
-        s.ones,
-        e.w.weight,
-        e.w.row_scale,
-        c,
-        m as u32,
-        n as u32,
-        k as u32,
-        stream,
-    )?;
+    if e.bs {
+        // 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW` (module doc).
+        super::dense_fp8_gw::gemm(gpu, s.a_fp8, s.a_scale, &e.w, c, m, n, k, stream)?;
+    } else {
+        ops::fp8_gemm_t_rowscale(
+            gpu,
+            kk.gemm,
+            s.a_fp8,
+            s.a_scale,
+            s.ones,
+            e.w.weight,
+            e.w.row_scale,
+            c,
+            m as u32,
+            n as u32,
+            k as u32,
+            stream,
+        )?;
+    }
     W8A8_GEMMS.fetch_add(1, Ordering::Relaxed);
     if !W8A8_FIRST.swap(true, Ordering::Relaxed) {
         tracing::info!(
@@ -1215,7 +1259,11 @@ fn dequant(
     }
     let dst = base.offset(e.off);
     let launch = |s: u64| {
-        ops::dequant_fp8_rowscale_bf16(gpu, kk.dequant, &e.w, dst, e.n as u32, e.k as u32, s)
+        if e.bs {
+            super::dense_fp8_gw::dequant_block_scaled(gpu, &e.w, dst, e.n, e.k, s)
+        } else {
+            ops::dequant_fp8_rowscale_bf16(gpu, kk.dequant, &e.w, dst, e.n as u32, e.k as u32, s)
+        }
     };
     let mut c = CACHE.lock().unwrap();
     if gpu.stream_is_capturing(stream) {
@@ -1480,6 +1528,8 @@ pub fn finish_load(gpu: &dyn GpuBackend) -> Result<usize> {
     // 2026-10-05: Resolve the W8A8 lever here, at load, so `METRALE_GLM_DENSE_FP8_W8A8=1`
     // without `METRALE_GLM_DENSE_FP8=1` is warned about (nothing else reads it then).
     let _ = dense_fp8_w8a8();
+    // 2026-10-06: Likewise `METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW` (REFUSED / NOT engaged logs).
+    let _ = super::dense_fp8_gw::cutlass_gw();
     if !dense_fp8() {
         return Ok(0);
     }
@@ -1489,6 +1539,12 @@ pub fn finish_load(gpu: &dyn GpuBackend) -> Result<usize> {
     }
     let arena = alloc_arena(gpu, need)?;
     finish_load_w8a8(gpu)?;
+    // 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW`: warm the CUTLASS workspace (before the
+    // KV pool is sized) and log ENGAGED / NOT engaged.
+    super::dense_fp8_gw::finish_load(
+        GW_WEIGHTS.load(Ordering::Relaxed),
+        GW_SCALE_BYTES.load(Ordering::Relaxed),
+    )?;
     if dense_nvfp4().any() {
         tracing::info!(
             "METRALE_GLM_DENSE_NVFP4: {} NVFP4 decode copies, {:.2} GB/rank (on top of the FP8 \

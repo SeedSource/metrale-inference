@@ -2,8 +2,9 @@
 
 //! 2026-09-25: Host-side FFI to the CUTLASS GEMM wrappers in `cuda/cutlass_*.cu`:
 //! the shared `extern` block and workspace here; dense BF16 and NVFP4 GEMMs in
-//! `gemm`, grouped per-expert NVFP4 MoE GEMMs in `grouped`, and NVFP4 weight
-//! pack, SFB swizzle and transpose in `pack`.
+//! `gemm`, grouped per-expert NVFP4 MoE GEMMs in `grouped`, NVFP4 weight
+//! pack, SFB swizzle and transpose in `pack`, and (2026-10-06) the FP8
+//! blockwise-scaled W8A8 GEMM in `fp8_blockwise`.
 //!
 //! Owner: gpu-runtime.
 //! Invariants:
@@ -20,10 +21,15 @@ use std::ffi::c_void;
 #[cfg(metrale_cutlass)]
 use std::sync::OnceLock;
 
+mod fp8_blockwise;
 mod gemm;
 mod grouped;
 mod pack;
 
+pub use fp8_blockwise::{
+    FP8_BLOCKWISE_BLOCK, Fp8BlockwiseSchedule, fp8_blockwise_gemm_bf16, fp8_blockwise_scale_k_major,
+    fp8_blockwise_shape_ok,
+};
 pub use gemm::{bf16_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t};
 pub use grouped::{
     nvfp4_grouped_down, nvfp4_grouped_down_w4a4, nvfp4_grouped_gate_up,
@@ -83,6 +89,22 @@ unsafe extern "C" {
         workspace_size: usize,
         stream: *mut c_void,
     ) -> i32;
+    // 2026-10-06: `cuda/cutlass_fp8_blockwise_gemm.cu` (`fp8_blockwise`).
+    pub(crate) fn metrale_cutlass_fp8_blockwise_gemm_bf16(
+        a_fp8: *const c_void,
+        a_scale: *const c_void,
+        b_fp8: *const c_void,
+        b_scale: *const c_void,
+        out: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        schedule: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn metrale_cutlass_fp8_blockwise_scale_k_major() -> i32;
     pub(crate) fn metrale_cutlass_pack_bf16_weight_to_nvfp4_t(
         weight_bf16: *const c_void,
         packed_t: *mut c_void,

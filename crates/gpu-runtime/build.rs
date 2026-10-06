@@ -255,6 +255,8 @@ fn build_cutlass_object(cutlass_home: std::path::PathBuf, arch: &str) {
         std::path::PathBuf::from("cuda/cutlass_bf16_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_gemm.cu"),
         std::path::PathBuf::from("cuda/cutlass_nvfp4_grouped_gemm.cu"),
+        // 2026-10-06: FP8 blockwise W8A8 GEMM (METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW).
+        std::path::PathBuf::from("cuda/cutlass_fp8_blockwise_gemm.cu"),
     ];
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());

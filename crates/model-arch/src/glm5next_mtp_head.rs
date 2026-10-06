@@ -4,7 +4,8 @@
 //!
 //! Owner: model-arch (GLM-5.3 MTP drafter).
 //! Invariants:
-//! - The FP8 copy of the draft head is read only on the vocab-sharded sweep; every other
+//! - The FP8 copy of the draft head (or, under `METRALE_GLM_MTP_HEAD_NVFP4=1`, the NVFP4 copy
+//!   that replaces it, `head_nv4.rs`) is read only on the vocab-sharded sweep; every other
 //!   sweep reads the BF16 `lm_head`.
 //!
 //! ```text
@@ -41,6 +42,7 @@ use metrale_model_layers::speculative::{DraftProposer, ProposerState};
 use metrale_model_layers::weight_map::DenseWeight;
 
 mod batch;
+mod head_nv4;
 mod init;
 mod proposer;
 
@@ -114,10 +116,14 @@ pub struct Glm5NextMtpHead {
     /// 2026-09-25: FP8 E4M3 copy of this rank's vocab shard of `lm_head`, for drafting only.
     /// The target verifies every draft with its own head, so this copy can change the
     /// acceptance rate but not an emitted token. `None` when `METRALE_GLM_MTP_HEAD_FP8=0`,
-    /// when the `gemv_fp8w` kernel is absent, or when quantisation fails.
+    /// when the `gemv_fp8w` kernel is absent, when quantisation fails, or (2026-10-06) when
+    /// the NVFP4 copy `head_nv4` replaces it.
     /// Measured 2026-08-29 (nsys): 2.66 ms -> ~1.33 ms per draft sweep.
     head_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
     gemv_fp8w_k: KernelHandle,
+    /// 2026-10-06: NVFP4 copy of the same shard (`METRALE_GLM_MTP_HEAD_NVFP4=1`, `head_nv4.rs`);
+    /// when `Some`, `head_fp8` is `None` and the sharded sweep reads this instead.
+    head_nv4: Option<metrale_model_layers::weight_map::QuantizedWeight>,
     /// 2026-10-04: `kv_lora_rank` of the block, the head dim of a per-sequence pool.
     kv_lora_rank: usize,
     /// 2026-10-04: `METRALE_GLM_MTP_SEQ_KV` (or `METRALE_GLM_MTP_BATCH_DRAFT`) at construction:
@@ -331,28 +337,31 @@ impl Glm5NextMtpHead {
             (self.lm_head, self.vocab, 0)
         };
         // 2026-09-25: The FP8 copy covers only `[head_v0, head_v0 + head_n)`, so it serves the
-        // sharded sweep alone; an unsharded sweep reads the BF16 head.
-        match self.head_fp8.filter(|_| sharded && n == self.head_n) {
-            Some(q) => ops::dense_gemv_fp8w(
-                gpu,
-                self.gemv_fp8w_k,
-                st.x,
-                &q,
-                st.logits,
-                n as u32,
-                h as u32,
-                stream,
-            )?,
-            None => ops::dense_gemv(
-                gpu,
-                self.gemv_k,
-                st.x,
-                &w,
-                st.logits,
-                n as u32,
-                h as u32,
-                stream,
-            )?,
+        // sharded sweep alone; an unsharded sweep reads the BF16 head. 2026-10-06: the NVFP4
+        // copy (`METRALE_GLM_MTP_HEAD_NVFP4=1`) covers the same rows and goes first.
+        if !self.head_sweep_nv4(gpu, st.x, st.logits, 1, sharded, n, stream)? {
+            match self.head_fp8.filter(|_| sharded && n == self.head_n) {
+                Some(q) => ops::dense_gemv_fp8w(
+                    gpu,
+                    self.gemv_fp8w_k,
+                    st.x,
+                    &q,
+                    st.logits,
+                    n as u32,
+                    h as u32,
+                    stream,
+                )?,
+                None => ops::dense_gemv(
+                    gpu,
+                    self.gemv_k,
+                    st.x,
+                    &w,
+                    st.logits,
+                    n as u32,
+                    h as u32,
+                    stream,
+                )?,
+            }
         }
         ops::argmax_bf16(gpu, self.argmax_k, st.logits, st.arg, n as u32, stream)?;
         let mut out = [0u8; 4];

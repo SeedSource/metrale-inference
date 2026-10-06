@@ -401,32 +401,35 @@ impl Glm5NextMtpHead {
                 st.seq_len += 1;
             }
             self.norm_rows(gpu, sc.x, self.module.final_norm, sc.x, n, stream)?;
-            match fp8 {
-                Some(q) => ops::dense_gemv_fp8w_batchm(
-                    gpu,
-                    sc.gemv_fp8w_batchm,
-                    sc.x,
-                    &q,
-                    sc.logits,
-                    n as u32,
-                    1,
-                    nv as u32,
-                    h as u32,
-                    nv as u32,
-                    stream,
-                )?,
-                None => ops::dense_gemv_batchm(
-                    gpu,
-                    sc.gemv_batchm,
-                    sc.x,
-                    &w,
-                    sc.logits,
-                    n as u32,
-                    nv as u32,
-                    h as u32,
-                    nv as u32,
-                    stream,
-                )?,
+            // 2026-10-06: The NVFP4 copy first (`head_nv4.rs`; rows equal `forward_one`'s).
+            if !self.head_sweep_nv4(gpu, sc.x, sc.logits, n, sharded, nv, stream)? {
+                match fp8 {
+                    Some(q) => ops::dense_gemv_fp8w_batchm(
+                        gpu,
+                        sc.gemv_fp8w_batchm,
+                        sc.x,
+                        &q,
+                        sc.logits,
+                        n as u32,
+                        1,
+                        nv as u32,
+                        h as u32,
+                        nv as u32,
+                        stream,
+                    )?,
+                    None => ops::dense_gemv_batchm(
+                        gpu,
+                        sc.gemv_batchm,
+                        sc.x,
+                        &w,
+                        sc.logits,
+                        n as u32,
+                        nv as u32,
+                        h as u32,
+                        nv as u32,
+                        stream,
+                    )?,
+                }
             }
             ops::argmax_bf16_batch(
                 gpu,

@@ -58,12 +58,25 @@ impl Glm5NextMtpHead {
         } else {
             config.vocab_size
         };
+        // 2026-10-06: `METRALE_GLM_MTP_HEAD_NVFP4=1` (`head_nv4.rs`): an NVFP4 copy of the same
+        // shard, from the BF16 rows. When it is built the FP8 copy below is not: its only two
+        // readers (`forward_one`, `propose_batch_impl`, 1..=16 rows) read the NVFP4 copy instead.
+        let head_nv4 = head_nv4::build(
+            gpu,
+            lm_head
+                .weight
+                .offset(head_rank * head_n * config.hidden_size * 2),
+            head_n,
+            config.vocab_size,
+            config.hidden_size,
+        );
         // 2026-09-25: Quantise only the rows this rank sweeps: `head_n * hidden` bytes, not
         // the whole vocab. A failure here is not fatal; the head falls back to the BF16 sweep.
         let gemv_fp8w_k =
             metrale_model_layers::layers::try_kernel(gpu, "gemv_fp8w", "dense_gemv_fp8w");
         let head_fp8 = if std::env::var("METRALE_GLM_MTP_HEAD_FP8").as_deref() == Ok("0")
             || gemv_fp8w_k.0 == 0
+            || head_nv4.is_some()
         {
             None
         } else {
@@ -139,6 +152,7 @@ impl Glm5NextMtpHead {
             head_n,
             head_fp8,
             gemv_fp8w_k,
+            head_nv4,
             kv_lora_rank,
             seq_kv,
             batch,

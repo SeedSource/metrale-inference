@@ -852,6 +852,35 @@ pub fn nv4_gemv(
     k: usize,
     stream: u64,
 ) -> Result<()> {
+    nv4_gemv_uncounted(gpu, a, q, c, m, n, k, stream)?;
+    NV4_HITS.fetch_add(1, Ordering::Relaxed);
+    if !NV4_FIRST_HIT.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "METRALE_GLM_DENSE_NVFP4: first NVFP4 GEMV routed ({m} rows, {n}x{k}); {} NVFP4 copies \
+             ({:.2} GB)",
+            NV4_WEIGHTS.load(Ordering::Relaxed),
+            NV4_BYTES.load(Ordering::Relaxed) as f64 / 1e9
+        );
+    }
+    Ok(())
+}
+
+/// 2026-10-06: [`nv4_gemv`] without the dense lever's hit counter and first-hit log, for an
+/// NVFP4 copy that is not in the dense registry (the MTP draft head,
+/// `METRALE_GLM_MTP_HEAD_NVFP4`). Same tiers, grid ceil(n / 4) (one block per 4 outputs; the
+/// dense microtest's `N % 4 = 1` shape covers a partial last block), block 256, no allocation
+/// or sync, so it is capture-safe. Each row's bits equal the M = 1 launch on that row.
+#[allow(clippy::too_many_arguments)]
+pub fn nv4_gemv_uncounted(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
     let Some(kk) = nv4_kernels(gpu) else {
         bail!("METRALE_GLM_DENSE_NVFP4: a weight has an NVFP4 copy but the kernels are missing");
     };
@@ -874,17 +903,38 @@ pub fn nv4_gemv(
     if takes_m {
         l = l.arg_u32(m as u32);
     }
-    l.arg_u32(n as u32).arg_u32(k as u32).launch(stream)?;
-    NV4_HITS.fetch_add(1, Ordering::Relaxed);
-    if !NV4_FIRST_HIT.swap(true, Ordering::Relaxed) {
-        tracing::info!(
-            "METRALE_GLM_DENSE_NVFP4: first NVFP4 GEMV routed ({m} rows, {n}x{k}); {} NVFP4 copies \
-             ({:.2} GB)",
-            NV4_WEIGHTS.load(Ordering::Relaxed),
-            NV4_BYTES.load(Ordering::Relaxed) as f64 / 1e9
-        );
+    l.arg_u32(n as u32).arg_u32(k as u32).launch(stream)
+}
+
+/// 2026-10-06: An NVFP4 copy of the BF16 `[n, k]` weight at `bf16`, made by the quantizer the
+/// dense lever uses ([`register`]: `quantize_to_nvfp4` with `quantize_bf16_to_nvfp4_mse`;
+/// packed E2M1 `[n, k/2]`, one E4M3 scale per 16 K, FP32 tensor scale), in the layout
+/// [`nv4_gemv_uncounted`] reads. Outside the registry: nothing is registered, freed or
+/// counted, and the BF16 original is untouched. `Ok(None)` when the NVFP4 kernels are missing
+/// (logged once) or the shape is empty or `k % 16 != 0`. Synchronizes `stream`.
+pub fn quantize_nvfp4_copy(
+    gpu: &dyn GpuBackend,
+    bf16: DevicePtr,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<Option<QuantizedWeight>> {
+    if n == 0 || k == 0 || !k.is_multiple_of(16) || bf16.is_null() {
+        return Ok(None);
     }
-    Ok(())
+    let Some(q) = nv4_kernels(gpu) else {
+        return Ok(None);
+    };
+    metrale_model_layers::weight_map::quantize_to_nvfp4(
+        &DenseWeight { weight: bf16 },
+        n,
+        k,
+        gpu,
+        q.absmax,
+        q.quant,
+        stream,
+    )
+    .map(Some)
 }
 
 /// 2026-10-05: NVFP4 GEMVs [`route`] launched so far (host-side; graph replays not counted).

@@ -98,7 +98,10 @@ pub fn load_glm5next_mtp_module(
         kv_scale: 1.0,
     }));
 
-    let expert = |id: usize| super::glm5_next_load::bind_expert_at(gpu, store, idx, id);
+    // 2026-10-05: `mlp_cfg` is the text layers' layout (`Glm5NextMlpConfig::from_config`), so
+    // under `METRALE_GLM_EXPERT_TP=1` the MTP experts are sliced the same way.
+    let expert =
+        |id: usize| super::glm5_next_load::bind_expert_cfg(gpu, store, idx, id, &mlp_cfg);
     let mlp = Glm5NextMlpSite::Moe(Box::new(mlp_build::build_moe(
         gpu,
         &mlp_cfg,

@@ -41,6 +41,9 @@ use metrale_model_layers::weight_map::DenseWeight;
 #[cfg(test)]
 mod defer_hook_tests;
 mod expert_quant;
+mod expert_tp_bind;
+#[cfg(test)]
+mod expert_tp_bind_tests;
 #[cfg(test)]
 mod export_layout_tests;
 mod loader;
@@ -133,6 +136,45 @@ fn defer_rule(
 ) -> bool {
     is_full_width_mtp_expert(name, dtype, num_layers)
         || (defer_activation_scales && is_activation_scale(name))
+}
+
+/// 2026-10-05: Whether a store tensor belongs to a routed expert of any layer, the MTP layer
+/// included (`model.language_model.layers.{L}.mlp.experts.{id}.*`: weight, block scale, global
+/// scale, activation scale). Under `METRALE_GLM_EXPERT_TP=1`
+/// [`Glm5NextWeightLoader::defer_predicate`] defers every one of them, and
+/// `expert_tp_bind::bind_expert_tp` reads back only this rank's slice of each.
+fn is_routed_expert_tensor(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("model.language_model.layers.") else {
+        return false;
+    };
+    let Some((idx, rel)) = rest.split_once('.') else {
+        return false;
+    };
+    let Some(tail) = rel.strip_prefix("mlp.experts.") else {
+        return false;
+    };
+    let Some((id, _)) = tail.split_once('.') else {
+        return false;
+    };
+    idx.parse::<usize>().is_ok() && id.parse::<usize>().is_ok()
+}
+
+/// 2026-10-05: [`bind_expert`], or under expert-TP (`cfg.is_expert_tp()`) this rank's slice of
+/// the expert (`expert_tp_bind::bind_expert_tp`). The text and MTP loaders both bind through
+/// here with the same `cfg` layout, so the two never mix layouts. Lever off, exactly
+/// [`bind_expert`].
+pub(super) fn bind_expert_cfg(
+    gpu: &dyn GpuBackend,
+    store: &WeightStore,
+    layer: usize,
+    id: usize,
+    cfg: &Glm5NextMlpConfig,
+) -> Result<Glm5NextExpertWeights> {
+    if cfg.is_expert_tp() {
+        expert_tp_bind::bind_expert_tp(gpu, store, layer, id, cfg)
+    } else {
+        bind_expert(gpu, store, layer, id)
+    }
 }
 
 /// 2026-10-03: The value of an activation-scale tensor's bytes: one F32 (any shape with one
@@ -460,16 +502,6 @@ pub(super) fn layer_source(
     layer: usize,
 ) -> Result<LayerSource> {
     LayerSource::collect(gpu, store, layer)
-}
-
-/// 2026-09-25: [`bind_expert`], for the MTP loader.
-pub(super) fn bind_expert_at(
-    gpu: &dyn GpuBackend,
-    store: &WeightStore,
-    layer: usize,
-    id: usize,
-) -> Result<Glm5NextExpertWeights> {
-    bind_expert(gpu, store, layer, id)
 }
 
 /// 2026-09-25: `upload_f32_as_bf16`, for the MTP loader.

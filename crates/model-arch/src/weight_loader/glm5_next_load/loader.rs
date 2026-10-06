@@ -34,14 +34,20 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
     /// 2026-10-03: Under `METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1` also every `*.input_scale`
     /// (`defer_rule`); `bind_expert` reads the routed experts' from disk. Off, the rule is the
     /// one above.
+    /// 2026-10-05: Under `METRALE_GLM_EXPERT_TP=1` also every routed-expert tensor of every
+    /// layer (`is_routed_expert_tensor`): the server loads the store at EP 1 so every expert is
+    /// visible, and `bind_expert_cfg` reads back only this rank's slice of each, so the whole
+    /// expert set never reaches the device. Off, the rule is the ones above.
     fn defer_predicate(
         &self,
         config: &ModelConfig,
     ) -> Option<metrale_model_weights::weights::DeferHook> {
         let num_layers = config.num_hidden_layers;
         let defer_scales = metrale_config::glm_moe_prefill_cutlass_w4a4();
+        let expert_tp = metrale_config::glm_expert_tp();
         Some(std::sync::Arc::new(move |name: &str, dtype: WeightDtype| {
             defer_rule(name, dtype, num_layers, defer_scales)
+                || (expert_tp && is_routed_expert_tensor(name))
         }))
     }
 
@@ -590,7 +596,7 @@ impl Glm5NextWeightLoader {
                     &load,
                 )?),
                 Mlp::RoutedMoe => {
-                    let expert = |id: usize| bind_expert(gpu, store, idx, id);
+                    let expert = |id: usize| bind_expert_cfg(gpu, store, idx, id, &mlp_cfg);
                     Glm5NextMlpSite::Moe(Box::new(mlp_build::build_moe(
                         gpu,
                         &mlp_cfg,

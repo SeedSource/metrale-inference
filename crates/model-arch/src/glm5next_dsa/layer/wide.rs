@@ -31,10 +31,8 @@
 //!   blocking copies, ordered only against the default stream, as in the row loop).
 //! - The lockstep check, `ensure_room(k)` and the block-table checks run before the first
 //!   launch; the indexer cache ends at `seq_len + k`, as after `k` rows of `decode_k`.
-//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1`, `ensure_room(k)` includes the ring bound
-//!   for the whole window (at most 8,192 rows written before the first sub-chunk selects,
-//!   within the 8,448-row ring), and each sub-chunk's selection compresses only the pools
-//!   completed since the previous one.
+//! - 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: `ensure_room(k)` bounds the whole window by
+//!   the ring; ring writes are `wide_ring.rs`; each sub-chunk compresses only new pools.
 
 use std::sync::Arc;
 
@@ -387,23 +385,10 @@ impl Glm5NextDsaLayer {
         // cache rows `[len, len + k)` (validity and length follow per sub-chunk below), the
         // head weights and the selector queries into the arena.
         let t = profile::start();
-        // 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: the window's rows go to ring slots
-        // (`ensure_room(k)` above checked the ring holds them with every row the next compress
-        // needs). When the ring wraps inside the window the keys and gates are produced into
-        // `arena.q_idx` (free until `wq_b` writes it below, on the same stream) and copied to
-        // their two ring runs, so the GEMM runs at the same M and its bytes do not change.
-        // Lever off: no clamp, no staging, the cache rows as before.
-        let pos0 = st.len();
-        self.pool_clamp_before_write(gpu, st, pos0, stream)?;
-        st.note_ring_write(pos0 + k);
-        let runs = st.ring_runs(pos0, k);
-        let staged = runs.len() > 1;
-        let off = st.row_offset(pos0);
-        let (k_rows, gate_rows) = if staged {
-            (arena.q_idx, arena.q_idx.offset(k * d * 2))
-        } else {
-            (st.k_normed.offset(off), st.gate.offset(off))
-        };
+        // 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: ring slots, staged through `arena.q_idx`
+        // when the ring wraps inside the window (`wide_ring.rs`). Lever off: the cache rows.
+        let win = self.pool_window_begin(gpu, st, arena.q_idx, k, stream)?;
+        let (k_rows, gate_rows) = (win.k_rows, win.gate_rows);
         let w_wk = self.weights.wk;
         gemm(gpu, g, gv, bm, hidden, w_wk, k_rows, k, d, h, stream)?;
         // 2026-10-01: `nllb_layernorm_bf16` normalises row `blockIdx.x` in place, as in
@@ -421,14 +406,7 @@ impl Glm5NextDsaLayer {
             .launch(stream)?;
         let w_gate = self.weights.compress_gate;
         gemm(gpu, g, gv, bm, hidden, w_gate, gate_rows, k, d, h, stream)?;
-        if staged {
-            for (r0, n) in runs {
-                let dst = st.row_offset(pos0 + r0);
-                let (src_k, src_g) = (k_rows.offset(r0 * d * 2), gate_rows.offset(r0 * d * 2));
-                gpu.copy_d2d_async(src_k, st.k_normed.offset(dst), n * d * 2, stream)?;
-                gpu.copy_d2d_async(src_g, st.gate.offset(dst), n * d * 2, stream)?;
-            }
-        }
+        win.scatter(gpu, st, d, stream)?;
         let w_wp = self.weights.weights_proj;
         self.gemm_f32_rows(gpu, hidden, w_wp, arena.head_weights, k, heads, h, stream)?;
         let (w_qb, qr, qi) = (self.weights.wq_b, arena.q_resid, arena.q_idx);
@@ -456,8 +434,7 @@ impl Glm5NextDsaLayer {
                 first_key: 0,
                 // 2026-10-01: Host geometry, as `select_rows_batched` passes.
                 geom_dev: DevicePtr::NULL,
-                // 2026-10-06: Pool cache on: compress the pools completed since the last
-                // sub-chunk only.
+                // 2026-10-06: Pool cache on: only the pools completed since the last sub-chunk.
                 pool_cache: st.pool_select_args()?,
             };
             let t = profile::start();

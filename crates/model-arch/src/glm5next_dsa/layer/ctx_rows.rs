@@ -12,8 +12,9 @@
 //! - No collective is issued, as in `write_kv_row`.
 //! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` the indexer rows go to ring slots, split
 //!   at the ring's end; `ensure_room(k)` refuses a write the ring cannot hold. Context rows are
-//!   written without a selection, so nothing advances the pool watermark here (see the
-//!   pool-cache open question on drafter context rows).
+//!   written without a selection, so each call ends with a compress-only pass
+//!   (`pool_compress_written`) that advances the pool watermark, and a call longer than
+//!   `ring_rows - kpool` rows runs as several (`write_kv_row` compresses per completed pool).
 //! - Not written: the selector head weights (`weights_proj`). `write_kv_row` leaves them in
 //!   workspace scratch that a context row never reads, so no carried state differs.
 
@@ -68,6 +69,35 @@ impl Glm5NextDsaLayer {
                 st.len()
             ),
             std::cmp::Ordering::Equal => {}
+        }
+        // 2026-10-06: Pool cache: after a compress the ring holds at most
+        // `ring_rows - len % kpool` new rows, so a longer call runs as calls of at most
+        // `ring_rows - kpool` rows, each compressed before the next (the drafter's tiles are
+        // `CTX_TILE` = 256 rows and never split).
+        let chunk = st
+            .pool_cache()
+            .map(|pc| pc.book.ring_rows() - pc.book.kpool())
+            .filter(|&c| k > c);
+        if let Some(chunk) = chunk {
+            let (h, kvr) = (self.cfg.hidden, self.cfg.kv_lora_rank);
+            let mut r0 = 0;
+            while r0 < k {
+                let n = chunk.min(k - r0);
+                self.write_kv_rows(
+                    gpu,
+                    hidden.offset(r0 * h * 2),
+                    n,
+                    kv_a.offset(r0 * kvr * 2),
+                    slots.offset(r0 * 8),
+                    state,
+                    kv_cache,
+                    seq_len + r0,
+                    block_table,
+                    stream,
+                )?;
+                r0 += n;
+            }
+            return Ok(());
         }
         // Checked before any write, as `indexer_forward`'s `ensure_room(1)` is per row.
         st.ensure_room(k)?;
@@ -141,6 +171,8 @@ impl Glm5NextDsaLayer {
             batchm_rows(gpu, bm, 2, x, w_gate, gate, n, d, h, stream)?;
         }
         gpu.memset_async(st.valid.offset(pos0), 1, k, stream)?;
-        st.advance(k)
+        st.advance(k)?;
+        // 2026-10-06: Pool cache: no selection follows a context write, so compress here.
+        self.pool_compress_written(gpu, st, stream)
     }
 }

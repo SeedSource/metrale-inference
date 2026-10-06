@@ -3,8 +3,9 @@
 //! 2026-10-06: Tests of the DSA pool cache (`METRALE_GLM_DSA_POOL_CACHE`), stages 1-3: the
 //! lever entry, the ring bookkeeping and its three release-mode checks on both sides of each
 //! bound, the state layout on the mock backend (ring offsets, allocation equal to the reserve,
-//! lazy mapping, release), the replay pre-check, the aux refusal, the reserve and pool sizing,
-//! and the launches `select_tokens` makes with the cache set.
+//! lazy mapping, release), the replay pre-check, the reserve and pool sizing, and the launches
+//! `select_tokens` makes with the cache set. Stage 4 (aux v2) and the lead-review items are in
+//! `pool_cache_more_tests.rs`.
 //!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants: none beyond the types.
@@ -293,23 +294,6 @@ fn the_replay_pre_check_and_sync_follow_the_ring() {
     // one row past one.)
     assert!(st.replay_room(20_004 - R - 5, 1).is_err());
     st.replay_room(20_004 - R - 4, 1).unwrap();
-    st.free(&gpu).unwrap();
-}
-
-/// 2026-10-06: Stage 4 is not here: a pool-cache state refuses DSA prefix-cache snapshots and
-/// restores before any copy.
-#[test]
-fn aux_snapshot_and_restore_are_refused_with_the_cache() {
-    let gpu = MockGpuBackend::new();
-    let c = cfg(16_384);
-    let mut st = Glm5NextDsaState::alloc_pool_cache(&gpu, &c, 0, None).unwrap();
-    st.advance(8).unwrap();
-    let e = st.snapshot_blob(&gpu, 0).unwrap_err().to_string();
-    assert!(e.contains("pool cache: aux v2 not implemented"), "{e}");
-    let blob = vec![0u8; 16];
-    let e = st.restore_blob(&blob, &gpu, 0).unwrap_err().to_string();
-    assert!(e.contains("pool cache: aux v2 not implemented"), "{e}");
-    assert_eq!(st.len(), 8, "nothing moved");
     st.free(&gpu).unwrap();
 }
 

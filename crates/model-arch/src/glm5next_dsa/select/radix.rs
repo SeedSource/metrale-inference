@@ -142,12 +142,15 @@ pub fn radix_region_bytes(geom: &DsaSelectGeometry, cfg: &Glm5NextDsaConfig, lev
 
 /// 2026-10-06: All seven select scratch regions of `geom`, in `DsaSelectScratch` field order:
 /// `scratch_bytes` (regions 0 to 5), then [`radix_region_bytes`].
+/// 2026-10-06: `pool_cache` (`METRALE_GLM_DSA_POOL_CACHE=1`) plans regions 0 to 2 (pool keys,
+/// indices, validity) at 0 bytes (`scratch_bytes_with`); region 6 does not depend on it.
 pub(super) fn regions(
     geom: &DsaSelectGeometry,
     cfg: &Glm5NextDsaConfig,
     lever: bool,
+    pool_cache: bool,
 ) -> [usize; 7] {
-    let b = geom.scratch_bytes();
+    let b = geom.scratch_bytes_with(pool_cache);
     [
         b[0],
         b[1],

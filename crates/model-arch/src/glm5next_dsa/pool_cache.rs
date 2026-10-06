@@ -29,9 +29,9 @@
 //! `pvalid` is allocated eagerly, like `valid` (`lazy.rs`): at a quarter byte per token one
 //! 2 MiB granule would hold 8 M tokens, so mapping it lazily would round it up to a granule.
 //!
-//! TODO(pool-cache stage 4): prefix-cache aux blob v2 (`aux_state.rs` refuses with the lever
-//! on). TODO(pool-cache stage 5): GPU parity microtest (cached pools and selections against the
-//! full recompute) before the lever is advertised.
+//! 2026-10-06: Stage 4 (prefix-cache aux blob v2) is `aux_state.rs`; stage 5 (the GPU parity
+//! microtest) is `examples/dsa_pool_cache_parity_microtest.rs`, which must pass on a GB10 before
+//! the lever is advertised.
 
 use std::sync::{Arc, OnceLock};
 
@@ -221,6 +221,17 @@ impl RingBook {
         Ok(())
     }
 
+    /// 2026-10-06: The book of a state just restored from an aux blob v2 carrying `pk` final
+    /// pools: the tail rows from `kpool * pk` sit in the ring, and the restore wrote `pk` to the
+    /// device copy.
+    pub fn restored(ring_rows: usize, kpool: usize, pk: usize) -> Self {
+        let mut b = Self::new(ring_rows, kpool);
+        b.pk_len = pk;
+        b.ring_lo = b.kpool * pk;
+        b.dev_hi = pk;
+        b
+    }
+
     /// 2026-10-06: Record a compress over `len` rows: pools `[0, len / kpool)` are final, and
     /// the kernel set the device copy to the same value.
     pub fn note_compressed(&mut self, len: usize) {
@@ -392,6 +403,9 @@ impl PoolCache {
     }
 }
 
+#[cfg(test)]
+#[path = "pool_cache_more_tests.rs"]
+mod more_tests;
 #[cfg(test)]
 #[path = "pool_cache_tests.rs"]
 mod tests;

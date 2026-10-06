@@ -28,7 +28,7 @@ pub fn select_tokens(
     launch: DsaSelectLaunch,
     stream: u64,
 ) -> Result<()> {
-    scratch.fits(cfg, geom)?;
+    scratch.fits_with(cfg, geom, inputs.pool_cache.is_some())?;
 
     let d = geom.index_head_dim;
     let kp = geom.index_kpool;
@@ -283,19 +283,7 @@ fn launch_compress_incr(
     compress_x: usize,
     stream: u64,
 ) -> Result<()> {
-    if kernels.kpool_compress_incr.0 == 0 {
-        bail!(
-            "DSA select: METRALE_GLM_DSA_POOL_CACHE=1 needs dsa_kpool_compress_incr, which this \
-             kernel module does not define"
-        );
-    }
-    if inputs.first_key != 0 {
-        bail!(
-            "DSA select: the pool cache counts pools from row 0; first_key {} is not supported",
-            inputs.first_key
-        );
-    }
-    let (d, kp) = (geom.index_head_dim, geom.index_kpool);
+    let kp = geom.index_kpool;
     let (seq_a, grid_x, start) = match ceiling {
         Some(m) => (m * kp, compress_x, 0),
         None => {
@@ -303,24 +291,100 @@ fn launch_compress_incr(
             (geom.seq, (geom.n_pools_full - start).max(1), start)
         }
     };
+    let rows = PoolRows {
+        k_normed: inputs.k_normed,
+        gate: inputs.gate,
+        valid: inputs.valid,
+        ape: inputs.ape,
+        first_key: inputs.first_key,
+    };
+    let dims = (geom.index_head_dim, kp);
+    let grid = (seq_a, grid_x, start);
+    launch_incr_raw(gpu, kernels, &rows, pc, dims, grid, inputs.geom_dev, stream)
+}
+
+/// 2026-10-06: The per-key inputs of a pool compress.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolRows {
+    /// 2026-10-06: The `k_normed` ring.
+    pub k_normed: DevicePtr,
+    /// 2026-10-06: The `gate` ring.
+    pub gate: DevicePtr,
+    /// 2026-10-06: `[seq]` u8 per-key validity (absolute rows).
+    pub valid: DevicePtr,
+    /// 2026-10-06: `[index_kpool, index_head_dim]` f32 APE table.
+    pub ape: DevicePtr,
+    /// 2026-10-06: Must be 0 (the cache counts pools from row 0).
+    pub first_key: i32,
+}
+
+/// 2026-10-06: A compress-only pass with the pool cache (`METRALE_GLM_DSA_POOL_CACHE=1`):
+/// pools `[pc.pk_start, ceil(seq / kpool))` into the persistent arrays with no scores, top-k
+/// or expand, as an exact launch of `dsa_kpool_compress_incr` (the very launch
+/// `select_tokens` makes for the same `seq` and `pk_start`). It advances the pool watermark
+/// for rows written without a selection (MTP drafter context rows), so later writes stay
+/// within the ring. The caller records it with `Glm5NextDsaState::note_selected`.
+#[allow(clippy::too_many_arguments)]
+pub fn compress_pools_only(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextDsaKernels,
+    cfg: &Glm5NextDsaConfig,
+    rows: &PoolRows,
+    pc: &super::super::pool_cache::DsaPoolCacheArgs,
+    seq: usize,
+    stream: u64,
+) -> Result<()> {
+    let kp = cfg.index_kpool.max(1);
+    let n_full = seq.div_ceil(kp);
+    let start = pc.pk_start.min(n_full);
+    let grid_x = (n_full - start).max(1);
+    let dims = (cfg.index_head_dim, kp);
+    let grid = (seq, grid_x, start);
+    launch_incr_raw(gpu, kernels, rows, pc, dims, grid, DevicePtr(0), stream)
+}
+
+/// 2026-10-06: One `dsa_kpool_compress_incr` launch (15 arguments, kernel order).
+#[allow(clippy::too_many_arguments)]
+fn launch_incr_raw(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextDsaKernels,
+    rows: &PoolRows,
+    pc: &super::super::pool_cache::DsaPoolCacheArgs,
+    (d, kp): (usize, usize),
+    (seq_a, grid_x, start): (usize, usize, usize),
+    geom_dev: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    if kernels.kpool_compress_incr.0 == 0 {
+        bail!(
+            "DSA select: METRALE_GLM_DSA_POOL_CACHE=1 needs dsa_kpool_compress_incr, which this \
+             kernel module does not define"
+        );
+    }
+    if rows.first_key != 0 {
+        bail!(
+            "DSA select: the pool cache counts pools from row 0; first_key {} is not supported",
+            rows.first_key
+        );
+    }
     KernelLaunch::new(gpu, kernels.kpool_compress_incr)
         .grid([grid_x as u32, 1, 1])
         .block([d.min(1024) as u32, 1, 1])
-        .arg_ptr(inputs.k_normed)
-        .arg_ptr(inputs.gate)
-        .arg_ptr(inputs.valid)
-        .arg_ptr(inputs.ape)
+        .arg_ptr(rows.k_normed)
+        .arg_ptr(rows.gate)
+        .arg_ptr(rows.valid)
+        .arg_ptr(rows.ape)
         .arg_ptr(pc.pk)
         .arg_ptr(pc.pidx)
         .arg_ptr(pc.pvalid)
         .arg_u32(seq_a as u32)
         .arg_u32(d as u32)
         .arg_u32(kp as u32)
-        .arg_i32(inputs.first_key)
+        .arg_i32(rows.first_key)
         .arg_u32(pc.ring_rows as u32)
         .arg_u32(start as u32)
         .arg_ptr(pc.pk_len_dev)
-        .arg_ptr(inputs.geom_dev)
+        .arg_ptr(geom_dev)
         .launch(stream)?;
     Ok(())
 }

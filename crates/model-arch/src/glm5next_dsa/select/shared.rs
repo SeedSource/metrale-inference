@@ -32,6 +32,8 @@
 //! - Lever off: [`install`] is not called and [`for_mtp`] returns `None`, so every workspace
 //!   allocates its own scratch exactly as before.
 //! - Lever on: one allocation, held here for the life of the process, handed out by copy.
+//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` the shared plan (like every
+//!   per-workspace one) has no pool key/index/validity regions.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -76,18 +78,27 @@ pub struct SharedPlan {
 impl SharedPlan {
     /// 2026-10-05: Plan for text layers at `layer_rows` rows and the MTP head at [`MTP_ROWS`],
     /// each at `max_dsa_context(cfg)` tokens, as `Glm5NextDsaWorkspace::new` plans them.
+    /// 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` neither the shared nor the per-workspace
+    /// plans carry the pool regions ([`Self::new_with`]).
     pub fn new(cfg: &Glm5NextDsaConfig, layer_rows: usize) -> Result<Self> {
+        let pool_cache = crate::glm5next_dsa::pool_cache::dsa_pool_cache();
+        Self::new_with(cfg, layer_rows, pool_cache)
+    }
+
+    /// 2026-10-06: [`Self::new`] with the pool-cache lever given. Pure, for tests.
+    pub fn new_with(cfg: &Glm5NextDsaConfig, layer_rows: usize, pool_cache: bool) -> Result<Self> {
         let seq = max_dsa_context(cfg);
         let layer = DsaSelectGeometry::plan(cfg, seq, layer_rows.max(1))?;
         let mtp = DsaSelectGeometry::plan(cfg, seq, MTP_ROWS)?;
         let one = |g: &DsaSelectGeometry| {
-            DsaSelectScratch::planned_total(&DsaSelectScratch::plan_bytes(
+            DsaSelectScratch::planned_total(&DsaSelectScratch::plan_bytes_with(
                 cfg,
                 std::slice::from_ref(g),
+                pool_cache,
             ))
         };
         Ok(Self {
-            plan: DsaSelectScratch::plan_bytes(cfg, &[layer, mtp]),
+            plan: DsaSelectScratch::plan_bytes_with(cfg, &[layer, mtp], pool_cache),
             layer_bytes: one(&layer),
             mtp_bytes: one(&mtp),
         })
@@ -121,13 +132,18 @@ pub fn install(
     tracing::info!(
         "GLM DSA select scratch SHARED (METRALE_GLM_DSA_SELECT_SCRATCH_SHARED): 1 x {:.1} MB at \
          {} tokens for {layers} DSA layers ({layer_rows} rows, {:.1} MB each) and the MTP head \
-         ({MTP_ROWS} row, {:.1} MB); saves {:.1} MB ({:.1} MB without an MTP head)",
+         ({MTP_ROWS} row, {:.1} MB); saves {:.1} MB ({:.1} MB without an MTP head){}",
         mb(p.shared_bytes()),
         max_dsa_context(cfg),
         mb(p.layer_bytes),
         mb(p.mtp_bytes),
         mb(p.saved_bytes(layers, true)),
         mb(p.saved_bytes(layers, false)),
+        if crate::glm5next_dsa::pool_cache::dsa_pool_cache() {
+            "; pool regions not allocated (METRALE_GLM_DSA_POOL_CACHE)"
+        } else {
+            ""
+        },
     );
     *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(scratch);
     Ok(scratch)

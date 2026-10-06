@@ -224,6 +224,69 @@ impl Glm5NextDsaLayer {
         Ok(())
     }
 
+    /// 2026-10-06: The replay-safe geometry write with the pool cache: `dsa_write_geom_pk` fills
+    /// `dsa_write_geom`'s five slots from `d_sl` plus `DSA_GEOM_PK_START = min(pk_len_dev,
+    /// (S - 1) / kpool)`, the first pool this row's compress recomputes (its own row's pool at
+    /// most), so a replay after a rejected draft never starts past a rewritten pool.
+    pub(super) fn pool_write_geom_pk(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &Glm5NextDsaState,
+        d_sl: DevicePtr,
+        geom_dev: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let wg = self.select_kernels.write_geom_pk;
+        let pk_len_dev = state.pool_cache().map_or(DevicePtr::NULL, |p| p.pk_len_dev);
+        if wg.0 == 0 {
+            bail!(
+                "DSA layer {}: METRALE_GLM_DSA_POOL_CACHE=1 needs dsa_write_geom_pk on the \
+                 replay-safe path",
+                self.layer_idx
+            );
+        }
+        KernelLaunch::new(gpu, wg)
+            .grid([1, 1, 1])
+            .block([1, 1, 1])
+            .arg_ptr(d_sl)
+            .arg_ptr(geom_dev)
+            .arg_u32(self.cfg.index_kpool as u32)
+            .arg_u32(self.cfg.index_topk as u32)
+            .arg_u32(super::super::select::topk_tile() as u32)
+            .arg_ptr(pk_len_dev)
+            .launch(stream)?;
+        Ok(())
+    }
+
+    /// 2026-10-06: After rows written without a selection (MTP drafter context rows) with the
+    /// pool cache on: compress the pools they completed (`select::compress_pools_only`, an
+    /// exact `dsa_kpool_compress_incr`) and record it, so the watermark follows `len` and the
+    /// next write stays within the ring. No-op with the lever off or when no pool completed.
+    pub(super) fn pool_compress_written(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut Glm5NextDsaState,
+        stream: u64,
+    ) -> Result<()> {
+        if !state.pool_compress_due() {
+            return Ok(());
+        }
+        let Some(pc) = state.pool_select_args()? else {
+            return Ok(());
+        };
+        let rows = super::super::select::PoolRows {
+            k_normed: state.k_normed,
+            gate: state.gate,
+            valid: state.valid,
+            ape: self.weights.ape,
+            first_key: 0,
+        };
+        let (cfg, k) = (&self.cfg, &self.select_kernels);
+        super::super::select::compress_pools_only(gpu, k, cfg, &rows, &pc, state.len(), stream)?;
+        state.note_selected();
+        Ok(())
+    }
+
     /// 2026-09-25: The selection for all `k` rows in one pass (`q_rows = k`), used when
     /// [`batch_select_enabled`](super::batch_select_enabled) holds; see there for why it
     /// selects what per-row passes do.
@@ -423,6 +486,8 @@ impl Glm5NextDsaLayer {
             .arg_f32(self.rms_eps)
             .arg_f32(1.0 / self.kv_scale)
             .launch(stream)?;
-        self.indexer_forward(gpu, hidden, st, None, stream)
+        self.indexer_forward(gpu, hidden, st, None, stream)?;
+        // 2026-10-06: Pool cache: a context row has no selection, so compress here.
+        self.pool_compress_written(gpu, st, stream)
     }
 }

@@ -55,6 +55,7 @@ mod row_batch;
 mod row_src;
 mod rows;
 mod wide;
+mod wide_ring;
 mod workspace;
 mod xseq;
 

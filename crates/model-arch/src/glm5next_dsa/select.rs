@@ -10,6 +10,9 @@
 //!   when the pass needs more scratch than was allocated.
 //! - 2026-10-06: With `DsaSelectInputs::pool_cache` set, `select_tokens` fails before any
 //!   launch when `dsa_kpool_compress_incr` is unresolved or `first_key` is not 0.
+//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` the scratch plans and allocates no pool
+//!   key/index/validity regions (null pointers), and `fits_with` refuses a pass without
+//!   `pool_cache` on such a scratch. Lever off: the same regions and bytes as before.
 //!
 //! ```text
 //! k_normed, gate, valid, ape  -> dsa_kpool_compress   -> pool keys / indices / valid
@@ -272,11 +275,21 @@ impl DsaSelectGeometry {
     /// 2026-09-25: Bytes of each scratch region this pass writes, in [`DsaSelectScratch`]
     /// field order: pool keys (f32), pool indices (i32), pool validity (u8), scores (f32),
     /// candidacy (u8), selected pools (i32).
+    /// 2026-10-06: Test-only since production plans through [`Self::scratch_bytes_with`].
+    #[cfg(test)]
     fn scratch_bytes(&self) -> [usize; 6] {
+        self.scratch_bytes_with(false)
+    }
+
+    /// 2026-10-06: [`Self::scratch_bytes`], with the three pool regions 0 when `pool_cache`
+    /// (`METRALE_GLM_DSA_POOL_CACHE=1`): the pass then compresses into the state's persistent
+    /// pool arrays and never touches the scratch's.
+    fn scratch_bytes_with(&self, pool_cache: bool) -> [usize; 6] {
+        let pools = if pool_cache { 0 } else { self.n_pools_full };
         [
-            self.n_pools_full * self.index_head_dim * 4,
-            self.n_pools_full * self.index_kpool * 4,
-            self.n_pools_full,
+            pools * self.index_head_dim * 4,
+            pools * self.index_kpool * 4,
+            pools,
             self.q_rows * self.n_pools * 4,
             self.q_rows * self.n_pools,
             self.q_rows * self.select_k * 4,
@@ -366,132 +379,9 @@ pub struct DsaSelectScratch {
     tokens_bytes: usize,
 }
 
-impl DsaSelectScratch {
-    /// 2026-09-25: Allocate for `geom`, the largest pass the caller will run
-    /// (`Glm5NextDsaWorkspace::new` plans it at `max_dsa_context`).
-    pub fn alloc(
-        gpu: &dyn GpuBackend,
-        cfg: &Glm5NextDsaConfig,
-        geom: &DsaSelectGeometry,
-    ) -> Result<Self> {
-        Self::alloc_sized(gpu, Self::plan_bytes(cfg, std::slice::from_ref(geom)))
-    }
-
-    /// 2026-10-05: Region bytes (field order) and `tokens` bytes that cover every pass in
-    /// `geoms`: the per-region maximum. For one geometry, exactly what [`Self::alloc`] has
-    /// always reserved. `METRALE_GLM_DSA_SELECT_SCRATCH_SHARED` (`shared.rs`) sizes the one
-    /// scratch every DSA workspace shares with it.
-    pub fn plan_bytes(cfg: &Glm5NextDsaConfig, geoms: &[DsaSelectGeometry]) -> ([usize; 7], usize) {
-        Self::plan_bytes_for(cfg, geoms, radix::dsa_topk_radix())
-    }
-
-    /// 2026-10-06: [`Self::plan_bytes`] for an explicit `METRALE_GLM_DSA_TOPK_RADIX` state.
-    pub fn plan_bytes_for(
-        cfg: &Glm5NextDsaConfig,
-        geoms: &[DsaSelectGeometry],
-        lever: bool,
-    ) -> ([usize; 7], usize) {
-        let mut capacity = [0usize; 7];
-        let mut tokens_bytes = 0;
-        for g in geoms {
-            for (c, w) in capacity.iter_mut().zip(radix::regions(g, cfg, lever)) {
-                *c = (*c).max(w);
-            }
-            tokens_bytes = tokens_bytes.max(g.q_rows * cfg.out_width() * 4);
-        }
-        (capacity, tokens_bytes)
-    }
-
-    /// 2026-10-05: Total bytes of a scratch planned by [`Self::plan_bytes`].
-    pub fn planned_total(plan: &([usize; 7], usize)) -> usize {
-        plan.0.iter().sum::<usize>() + plan.1
-    }
-
-    /// 2026-10-05: Allocate `plan` (from [`Self::plan_bytes`]), in field order.
-    pub fn alloc_sized(gpu: &dyn GpuBackend, plan: ([usize; 7], usize)) -> Result<Self> {
-        let (capacity, tokens_bytes) = plan;
-        Ok(Self {
-            pool_keys: gpu.alloc(capacity[0])?,
-            pool_indices: gpu.alloc(capacity[1])?,
-            pool_valid: gpu.alloc(capacity[2])?,
-            scores: gpu.alloc(capacity[3])?,
-            valid_cand: gpu.alloc(capacity[4])?,
-            selected: gpu.alloc(capacity[5])?,
-            tokens: gpu.alloc(tokens_bytes)?,
-            radix: radix::alloc_region(gpu, capacity[6])?,
-            capacity,
-            tokens_bytes,
-        })
-    }
-
-    /// 2026-10-05: Bytes this scratch reserved, all regions and `tokens`.
-    pub fn bytes(&self) -> usize {
-        Self::planned_total(&(self.capacity, self.tokens_bytes))
-    }
-
-    /// 2026-09-25: `[q_rows, out_width]` i32 selection produced by the last pass.
-    pub fn tokens(&self) -> DevicePtr {
-        self.tokens
-    }
-
-    /// 2026-09-25: The same scratch with `tokens` pointing at row `row`.
-    ///
-    /// The per-row selector (`q_rows == 1`) writes each row's result into its own slot of
-    /// the `[max_rows, out_width]` output, which the attention reads in one launch. The
-    /// other regions are temporaries of one pass and are shared.
-    pub fn row(&self, row: usize, cfg: &Glm5NextDsaConfig) -> Self {
-        Self {
-            tokens: self.tokens.offset(row * cfg.out_width() * 4),
-            tokens_bytes: self.tokens_bytes - row * cfg.out_width() * 4,
-            ..*self
-        }
-    }
-
-    /// 2026-09-25: Whether `geom` fits what was allocated. `select_tokens` checks it on every
-    /// pass, so a pass larger than the allocation is an error rather than an overrun.
-    pub fn fits(&self, cfg: &Glm5NextDsaConfig, geom: &DsaSelectGeometry) -> Result<()> {
-        let want = radix::regions(geom, cfg, radix::dsa_topk_radix());
-        for (i, (w, c)) in want.iter().zip(self.capacity.iter()).enumerate() {
-            if w > c {
-                bail!(
-                    "DSA select: scratch region {i} needs {w} B but only {c} B was \
-                     reserved ({} tokens, {} pools, {} query rows)",
-                    geom.seq,
-                    geom.n_pools,
-                    geom.q_rows
-                );
-            }
-        }
-        let want_tokens = geom.q_rows * cfg.out_width() * 4;
-        if want_tokens > self.tokens_bytes {
-            bail!(
-                "DSA select: selection output needs {want_tokens} B but only {} B was \
-                 reserved",
-                self.tokens_bytes
-            );
-        }
-        Ok(())
-    }
-
-    pub fn free(self, gpu: &dyn GpuBackend) -> Result<()> {
-        for p in [
-            self.pool_keys,
-            self.pool_indices,
-            self.pool_valid,
-            self.scores,
-            self.valid_cand,
-            self.selected,
-            self.tokens,
-            self.radix,
-        ] {
-            gpu.free(p)?;
-        }
-        Ok(())
-    }
-}
-
 mod launch;
-pub use launch::select_tokens;
+mod scratch;
+pub use launch::{PoolRows, compress_pools_only, select_tokens};
 pub mod grid_stride;
 pub mod radix;
 pub mod shared;

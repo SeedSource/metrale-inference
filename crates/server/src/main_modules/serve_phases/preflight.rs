@@ -177,8 +177,11 @@ pub(crate) fn preflight_reserve(
     // sequence (`decode_ring::slot_bytes`).
     let per_seq_blob = config.num_ssm_layers() * (h_state_bytes + conv_state_bytes);
     let marconi_bytes = marconi.slots * per_seq_blob;
+    // 2026-10-05: `METRALE_SPEC_CUDA_HEADROOM_MB` overrides the 4 GiB spec-on headroom (race-memory
+    // #79): the constant predates the explicit GLM MTP (A59) and per-sequence reserves, and at a
+    // 532K request the ledger peaked 6.1 GiB under the budget. Unset = 4096, unchanged.
     let cuda_headroom: usize = if spec_on_pool {
-        4 * 1024 * 1024 * 1024
+        spec_cuda_headroom_mb() * 1024 * 1024
     } else {
         512 * 1024 * 1024
     };
@@ -332,5 +335,33 @@ pub(crate) fn spec_reserve_tokens(args: &cli::ServeArgs) -> usize {
         args.resolved_num_drafts() + 2
     } else {
         1
+    }
+}
+
+/// 2026-10-05: The spec-on CUDA headroom in MiB: `METRALE_SPEC_CUDA_HEADROOM_MB` when set to a
+/// positive integer, else 4096 (the previous constant).
+fn spec_cuda_headroom_mb() -> usize {
+    parse_headroom_mb(std::env::var("METRALE_SPEC_CUDA_HEADROOM_MB").ok().as_deref())
+}
+
+/// 2026-10-05: `spec_cuda_headroom_mb` with the env value as a parameter (unit-testable).
+fn parse_headroom_mb(v: Option<&str>) -> usize {
+    v.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(4096)
+}
+
+#[cfg(test)]
+mod spec_headroom_tests {
+    use super::parse_headroom_mb;
+
+    /// 2026-10-05: Unset, empty, zero or garbage keep the 4 GiB default; a positive value wins.
+    #[test]
+    fn headroom_defaults_to_4096_and_takes_a_positive_override() {
+        assert_eq!(parse_headroom_mb(None), 4096);
+        assert_eq!(parse_headroom_mb(Some("")), 4096);
+        assert_eq!(parse_headroom_mb(Some("0")), 4096);
+        assert_eq!(parse_headroom_mb(Some("abc")), 4096);
+        assert_eq!(parse_headroom_mb(Some(" 3400 ")), 3400);
     }
 }

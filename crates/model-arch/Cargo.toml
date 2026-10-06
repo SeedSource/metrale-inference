@@ -413,6 +413,10 @@ name = "kda_front_fuse_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "kda_tc_capture_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "flashkda_prefill_microtest"
 required-features = ["cuda", "gpu-examples"]
 

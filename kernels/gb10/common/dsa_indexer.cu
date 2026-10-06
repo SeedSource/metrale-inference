@@ -16,6 +16,13 @@
 //   an argument, never derived here.
 // - 2026-10-06: dsa_topk_radix_{init,hist,find,gather,sort} (3b, METRALE_GLM_DSA_TOPK_RADIX=1)
 //   write the same `selected` bytes as dsa_topk_pools, for pool counts above one top-k tile.
+// - 2026-10-06: METRALE_GLM_DSA_POOL_CACHE=1 (pool cache, host side in
+//   crates/model-arch/src/glm5next_dsa/pool_cache.rs) replaces the first stage with
+//   dsa_kpool_compress_incr: pools [pk_start, live) only, into persistent per-state arrays,
+//   reading k/gate from a ring at row % ring_rows, each pool by the per-pool body of
+//   dsa_kpool_compress unchanged. The later stages read the persistent arrays. The kernels
+//   above it (dsa_write_geom, dsa_indexer_store, dsa_kpool_compress) are untouched; the
+//   lever-off path launches only them.
 
 
 
@@ -72,6 +79,9 @@ __device__ __forceinline__ float dsa_block_sum(float v, float* smem, unsigned ti
 #define DSA_GEOM_NPOOLS   2
 #define DSA_GEOM_SELECT_K 3
 #define DSA_GEOM_NP2      4
+// 2026-10-06: Pool cache only: first pool the incremental compress recomputes. Written by
+// dsa_write_geom_pk into a 6-slot geom; dsa_write_geom (5 slots) never touches it.
+#define DSA_GEOM_PK_START 5
 
 // 2026-09-25: One thread. Fills the geom slots from seq_len[0]. `tile` is the top-k tile width
 // (a power of two); np2 = min(max(2, next power of two >= complete pools), tile).
@@ -186,6 +196,162 @@ extern "C" __global__ void dsa_kpool_compress(
             pool_keys[p * D + d] = acc;
         }
     }
+}
+
+// 2026-10-06: Pool cache (METRALE_GLM_DSA_POOL_CACHE=1). The device copy of a state's pool
+// watermark, pk_len_dev[0], counts the pools whose keys in the persistent arrays are final.
+// It may only be lowered by a write (a rewritten row's pool must be recomputed) and is set by
+// the compress. Four kernels:
+// - dsa_write_geom_pk: dsa_write_geom's five slots, plus DSA_GEOM_PK_START =
+//   min(pk_len_dev, (S - 1) / KP), the first pool the replayed row's compress recomputes.
+// - dsa_indexer_store_ring: dsa_indexer_store at ring slot pos % ring_rows; valid stays
+//   full length (valid[pos]); thread 0 lowers pk_len_dev to pos / KP.
+// - dsa_pk_len_clamp: the host path's lowering after a rewind (pk_len_dev = min(., pools)).
+// - dsa_kpool_compress_incr: below.
+
+// 2026-10-06: One thread. dsa_write_geom's slots from seq_len[0] (same arithmetic), and the
+// pool-cache start slot. pk_len_dev may be ahead of S after a rejected draft; the store of
+// row S - 1 (dsa_indexer_store_ring) already lowered it, and the min here bounds it again.
+extern "C" __global__ void dsa_write_geom_pk(
+    const int* __restrict__ seq_len,
+    int* __restrict__ geom,
+    unsigned int KP,
+    unsigned int topk,
+    unsigned int tile,
+    const int* __restrict__ pk_len_dev
+) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const int S = seq_len[0];
+    const int np = S / (int)KP;
+    int np2 = 2;
+    while (np2 < np && np2 < (int)tile) np2 <<= 1;
+    const int cap = (int)(topk / KP);
+    geom[DSA_GEOM_S] = S;
+    geom[DSA_GEOM_NPOOLS_F] = (S + (int)KP - 1) / (int)KP;
+    geom[DSA_GEOM_NPOOLS] = np;
+    geom[DSA_GEOM_SELECT_K] = np < cap ? np : cap;
+    geom[DSA_GEOM_NP2] = np2;
+    const int last = S > 0 ? (S - 1) / (int)KP : 0;
+    const int pk = pk_len_dev[0];
+    geom[DSA_GEOM_PK_START] = pk < last ? pk : last;
+}
+
+// 2026-10-06: dsa_indexer_store with the k/gate rows in a ring of ring_rows rows: the staged
+// row lands at slot pos[0] % ring_rows, valid[pos[0]] is set at the absolute position, and the
+// pool watermark drops to the written row's pool.
+extern "C" __global__ void dsa_indexer_store_ring(
+    const __nv_bfloat16* __restrict__ stage_k,
+    const __nv_bfloat16* __restrict__ stage_gate,
+    const int* __restrict__ pos,
+    __nv_bfloat16* __restrict__ k_ring,
+    __nv_bfloat16* __restrict__ gate_ring,
+    unsigned char* __restrict__ valid,
+    unsigned int D,
+    unsigned int ring_rows,
+    unsigned int KP,
+    int* __restrict__ pk_len_dev
+) {
+    const int p = pos[0];
+    const size_t base = (size_t)((unsigned int)p % ring_rows) * D;
+    for (unsigned int d = threadIdx.x; d < D; d += blockDim.x) {
+        k_ring[base + d] = stage_k[d];
+        gate_ring[base + d] = stage_gate[d];
+    }
+    if (threadIdx.x == 0) {
+        valid[p] = 1;
+        const int pool = p / (int)KP;
+        if (pk_len_dev[0] > pool) pk_len_dev[0] = pool;
+    }
+}
+
+// 2026-10-06: One thread. Lowers the pool watermark to `pools` (host-path write after a rewind).
+extern "C" __global__ void dsa_pk_len_clamp(int* __restrict__ pk_len_dev, int pools) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (pk_len_dev[0] > pools) pk_len_dev[0] = pools;
+}
+
+// 2026-10-06: Incremental kpool compression into persistent per-state arrays. Pools
+// [pk_start, live) only, walked with the grid stride of dsa_kpool_compress (block b takes
+// pk_start + b, pk_start + b + gridDim.x, ...). The per-pool body is dsa_kpool_compress's,
+// line for line (same slot loop order, same __expf, same FP32 accumulation order); the one
+// difference is the k/gate index, ring slot raw % ring_rows instead of raw, so each pool key is
+// bit-identical to the full recompute's as long as the ring still holds rows
+// [pk_start * KP, S) (the host checks it before every launch). valid is full length.
+// Exact launch (geom NULL): S, pk_start from the arguments, live = ceil(S / KP). Ceiling launch:
+// S, live and pk_start from geom (dsa_write_geom_pk). Afterwards block 0 sets pk_len_dev to
+// S / KP (complete pools; the trailing partial pool is rewritten and stays invalid until it
+// completes). No block reads pk_len_dev here (the start is the argument or the geom slot), so
+// that store races with nothing.
+extern "C" __global__ void dsa_kpool_compress_incr(
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ gate,
+    const unsigned char* __restrict__ valid,
+    const float* __restrict__ ape,
+    float* __restrict__ pool_keys,
+    int* __restrict__ pool_indices,
+    unsigned char* __restrict__ pool_valid,
+    unsigned int S,
+    unsigned int D,
+    unsigned int KP,
+    int first_key,
+    unsigned int ring_rows,
+    unsigned int pk_start,
+    int* __restrict__ pk_len_dev,
+    const int* __restrict__ geom
+) {
+    const unsigned int tid = threadIdx.x;
+    unsigned int live = (S + KP - 1) / KP;
+    if (geom) {
+        S = (unsigned int)geom[DSA_GEOM_S];
+        live = (unsigned int)geom[DSA_GEOM_NPOOLS_F];
+        pk_start = (unsigned int)geom[DSA_GEOM_PK_START];
+    }
+    for (unsigned int p = pk_start + blockIdx.x; p < live; p += gridDim.x) {
+        // 2026-09-25: Slot bookkeeping is the same for every channel, so thread 0 writes it.
+        bool all_valid = true;
+        for (unsigned int s = 0; s < KP; ++s) {
+            long long raw = (long long)first_key + (long long)p * KP + s;
+            bool in_range = raw >= 0 && raw < (long long)S;
+            bool ok = in_range && valid[in_range ? (unsigned)raw : 0] != 0;
+            all_valid &= ok;
+            if (tid == 0) pool_indices[p * KP + s] = ok ? (int)raw : DSA_INVALID;
+        }
+        if (tid == 0) pool_valid[p] = all_valid ? 1 : 0;
+
+        for (unsigned int d = tid; d < D; d += blockDim.x) {
+            float mx = -CUDART_INF_F;
+            float lg[8];
+            for (unsigned int s = 0; s < KP && s < 8; ++s) {
+                long long raw = (long long)first_key + (long long)p * KP + s;
+                bool in_range = raw >= 0 && raw < (long long)S;
+                bool ok = in_range && valid[in_range ? (unsigned)raw : 0] != 0;
+                // 2026-10-06: Ring slot of row raw (raw >= 0 whenever ok).
+                size_t slot = ok ? (size_t)((unsigned long long)raw % ring_rows) : 0;
+                lg[s] = ok ? (__bfloat162float(gate[slot * D + d]) + ape[s * D + d])
+                           : -CUDART_INF_F;
+                mx = fmaxf(mx, lg[s]);
+            }
+            float sum = 0.0f;
+            for (unsigned int s = 0; s < KP && s < 8; ++s) {
+                lg[s] = (lg[s] == -CUDART_INF_F) ? 0.0f : __expf(lg[s] - mx);
+                sum += lg[s];
+            }
+            // 2026-09-25: A pool with no valid slot has sum 0, so its weights and key are 0.
+            float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+            float acc = 0.0f;
+            for (unsigned int s = 0; s < KP && s < 8; ++s) {
+                long long raw = (long long)first_key + (long long)p * KP + s;
+                bool in_range = raw >= 0 && raw < (long long)S;
+                bool ok = in_range && valid[in_range ? (unsigned)raw : 0] != 0;
+                if (ok) {
+                    size_t slot = (size_t)((unsigned long long)raw % ring_rows);
+                    acc += lg[s] * inv * __bfloat162float(k[slot * D + d]);
+                }
+            }
+            pool_keys[p * D + d] = acc;
+        }
+    }
+    if (blockIdx.x == 0 && tid == 0) pk_len_dev[0] = (int)(S / KP);
 }
 
 // 2026-09-25: 2. Per-(query, pool) index score, one block per (pool, query). `weights` must

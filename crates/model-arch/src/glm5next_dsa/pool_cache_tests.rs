@@ -3,8 +3,8 @@
 //! 2026-10-06: Tests of the DSA pool cache (`METRALE_GLM_DSA_POOL_CACHE`), stages 1-3: the
 //! lever entry, the ring bookkeeping and its three release-mode checks on both sides of each
 //! bound, the state layout on the mock backend (ring offsets, allocation equal to the reserve,
-//! lazy mapping, release), the replay pre-check, the aux refusal, and the reserve and pool
-//! sizing.
+//! lazy mapping, release), the replay pre-check, the aux refusal, the kernel file's entry
+//! points, and the reserve and pool sizing.
 //!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants: none beyond the types.
@@ -311,6 +311,38 @@ fn aux_snapshot_and_restore_are_refused_with_the_cache() {
     assert!(e.contains("pool cache: aux v2 not implemented"), "{e}");
     assert_eq!(st.len(), 8, "nothing moved");
     st.free(&gpu).unwrap();
+}
+
+/// 2026-10-06: The kernel file defines every pool-cache entry point the host resolves, and the
+/// incremental compress keeps `dsa_kpool_compress`'s per-pool arithmetic.
+#[test]
+fn the_kernel_file_defines_the_pool_cache_kernels() {
+    let cu = include_str!("../../../../kernels/gb10/common/dsa_indexer.cu");
+    for k in [
+        "dsa_kpool_compress_incr",
+        "dsa_write_geom_pk",
+        "dsa_indexer_store_ring",
+        "dsa_pk_len_clamp",
+    ] {
+        assert!(cu.contains(&format!("__global__ void {k}(")), "{k}");
+    }
+    let body = |name: &str| {
+        let i = cu.find(&format!("__global__ void {name}(")).unwrap();
+        let j = i + cu[i..].find("pool_keys[p * D + d] = acc;").unwrap();
+        cu[i..j].to_string()
+    };
+    let (full, incr) = (body("dsa_kpool_compress"), body("dsa_kpool_compress_incr"));
+    for line in [
+        "lg[s] = (lg[s] == -CUDART_INF_F) ? 0.0f : __expf(lg[s] - mx);",
+        "float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;",
+        "mx = fmaxf(mx, lg[s]);",
+        "if (tid == 0) pool_indices[p * KP + s] = ok ? (int)raw : DSA_INVALID;",
+        "if (tid == 0) pool_valid[p] = all_valid ? 1 : 0;",
+    ] {
+        assert!(full.contains(line) && incr.contains(line), "{line}");
+    }
+    assert!(incr.contains("raw % ring_rows"));
+    assert!(incr.contains("pk_start + blockIdx.x"));
 }
 
 /// 2026-10-06: The reserve with the cache: per token and layer 133.25 B of pool arrays and

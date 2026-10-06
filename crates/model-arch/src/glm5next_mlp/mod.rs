@@ -479,3 +479,17 @@ impl Glm5NextMlpConfig {
 
 #[cfg(test)]
 mod tests;
+
+/// 2026-10-06: Logs once that `METRALE_GLM_MOE_COMBINE_LOCAL=1` is engaged (the grouped prefill
+/// skips the `expert_out` zeroing and the combine skips slots of experts outside `local`).
+pub(crate) fn log_combine_local(local: &std::ops::Range<usize>, rows: usize) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_MOE_COMBINE_LOCAL=1: ENGAGED - grouped MoE prefill skips the expert_out \
+             zeroing; combine reads local experts {}..{} only (first call: {rows} rows)",
+            local.start,
+            local.end
+        );
+    });
+}

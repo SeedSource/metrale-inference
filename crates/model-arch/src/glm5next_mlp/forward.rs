@@ -472,6 +472,7 @@ pub fn forward_moe_sliced(
     // `glm5next_moe_combine_indexed`, which finds each slot's row through `token_to_perm`.
     if combine_local {
         let local = cfg.local_expert_range();
+        super::log_combine_local(&local, rows);
         KernelLaunch::new(gpu, k.combine_indexed_local)
             .grid([rows as u32, 1, 1])
             .block([ACT_BLOCK, 1, 1])

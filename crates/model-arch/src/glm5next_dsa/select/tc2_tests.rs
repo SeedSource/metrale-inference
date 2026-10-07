@@ -54,7 +54,7 @@ fn dsa_scores_tc2_grid_and_smem() {
     assert_eq!(scores_tc2_grid(128, 32_768), [256, 4, 1]);
     assert_eq!(SCORES_TC2_BLOCK as usize, 8 * 32, "eight warps");
     assert_eq!(SCORES_TC2_POOLS, 8 * 16, "16 pools (two n-tiles) per warp");
-    assert_eq!(scores_tc2_smem(128, 32), 21_504);
+    assert_eq!(scores_tc2_smem(128, 32), 21_632);
     // 2026-10-07: Within the default 48 KiB at the envelope's corner, so no opt-in is needed.
     assert!(scores_tc2_smem(128, SCORES_TC2_MAX_H) <= 49_152);
 }

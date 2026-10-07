@@ -54,7 +54,7 @@ pub fn scores_tc2_grid(q_rows: usize, n_pools: usize) -> [u32; 3] {
 }
 
 /// 2026-10-07: Dynamic shared memory of one block at head dim `d` and `heads` heads: two
-/// `[32][d + 8]` BF16 q buffers, then `[32][heads + 1]` f32 weights (21,504 B at 128 / 32).
+/// `[32][d + 8]` BF16 q buffers, then `[32][heads + 1]` f32 weights (21,632 B at 128 / 32).
 pub fn scores_tc2_smem(d: usize, heads: usize) -> usize {
     2 * SCORES_TC2_ROWS * (d + 8) * 2 + SCORES_TC2_ROWS * (heads + 1) * 4
 }

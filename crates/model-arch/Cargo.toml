@@ -105,6 +105,10 @@ name = "dsa_grid_stride_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dsa_kpool_once_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_topk_radix_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -118,6 +122,10 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "dsa_indexer_tc_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "dsa_indexer_tc2_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

@@ -45,8 +45,11 @@ use metrale_model_layers::layers::ops;
 
 use super::super::Glm5NextDsaConfig;
 use super::super::attend::{DsaDecodeInputs, DsaDecodePaging, attention};
-use super::super::select::split::{row_split_for, select_tokens_split};
-use super::super::select::{DsaSelectInputs, DsaSelectLaunch::Exact, select_tokens};
+use super::super::select::pool_once;
+use super::super::select::split::{row_split_for, select_tokens_split_with};
+use super::super::select::{
+    DsaSelectGeometry, DsaSelectInputs, DsaSelectLaunch::Exact, select_tokens,
+};
 use super::super::state::Glm5NextDsaState;
 use super::decode_k::bt_entries_needed;
 use super::{Glm5NextDsaLayer, gemm};
@@ -417,6 +420,31 @@ impl Glm5NextDsaLayer {
         // the selection plans at the sliced path's length; then the selection and the attend
         // over its rows, inputs at its offset into the arena.
         let pool = kv_cache.k_pool_ptr(self.attn_layer_idx);
+        // 2026-10-07: `METRALE_GLM_DSA_KPOOL_ONCE=1`: mark the whole window's keys valid, then
+        // compress the pools of the window's end length once into the selection scratch; every
+        // sub-chunk below reads its own first `n_pools` of them (`select::pool_once`). Nothing
+        // else writes the scratch's pool regions between here and the last sub-chunk.
+        let once = pool_once::dsa_kpool_once();
+        if once {
+            gpu.memset_async(st.valid.offset(st.len()), 1, k, stream)?;
+            let wg = DsaSelectGeometry::plan(c, st.len() + k, 1)?;
+            let wi = DsaSelectInputs {
+                k_normed: st.k_normed,
+                gate: st.gate,
+                valid: st.valid,
+                ape: self.weights.ape,
+                q: arena.q_idx,
+                weights: arena.head_weights,
+                q_pos: q_pos_dev,
+                q_mask: w.q_mask_rows,
+                first_key: 0,
+                geom_dev: DevicePtr::NULL,
+            };
+            let t = profile::start();
+            let sk = &self.select_kernels;
+            pool_once::compress_window(gpu, sk, c, &wg, &wi, &w.select, stream)?;
+            profile::end(profile::DSA_SELECT, t, gpu, stream);
+        }
         for (t0, n) in crate::glm5next_layer::sub_chunks(k, core) {
             gpu.memset_async(st.valid.offset(st.len()), 1, n, stream)?;
             st.advance(n)?;
@@ -447,7 +475,11 @@ impl Glm5NextDsaLayer {
             let on = crate::glm5next_layer::dsa_index_split_wide();
             match row_split_for(ctx.comm, on, n) {
                 Some((s, comm)) => {
-                    select_tokens_split(gpu, sk, c, &geom, &inputs, sel, s, comm, stream)?
+                    let (g, i) = (&geom, &inputs);
+                    select_tokens_split_with(gpu, sk, c, g, i, sel, s, comm, !once, stream)?
+                }
+                None if once => {
+                    pool_once::select_tokens_pooled(gpu, sk, c, &geom, &inputs, sel, stream)?
                 }
                 None => select_tokens(gpu, sk, c, &geom, &inputs, sel, Exact, stream)?,
             }

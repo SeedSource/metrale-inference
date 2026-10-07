@@ -142,6 +142,27 @@ pub fn select_tokens_split(
     comm: &dyn CommBackend,
     stream: u64,
 ) -> Result<()> {
+    select_tokens_split_with(
+        gpu, kernels, cfg, geom, inputs, scratch, split, comm, true, stream,
+    )
+}
+
+/// 2026-10-07: [`select_tokens_split`] with `compress` as in `select_tokens_with`: `false`
+/// (`METRALE_GLM_DSA_KPOOL_ONCE`, `pool_once`) skips each rank's pool compress because the
+/// window's pools are already in `scratch`; the row split and the exchange are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn select_tokens_split_with(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextDsaKernels,
+    cfg: &Glm5NextDsaConfig,
+    geom: &DsaSelectGeometry,
+    inputs: &DsaSelectInputs,
+    scratch: &DsaSelectScratch,
+    split: RowSplit,
+    comm: &dyn CommBackend,
+    compress: bool,
+    stream: u64,
+) -> Result<()> {
     ensure!(
         geom.q_rows == split.k && inputs.geom_dev.0 == 0,
         "DSA index split: a {}-row split of a {}-row pass (device geometry {}); the split \
@@ -156,7 +177,10 @@ pub fn select_tokens_split(
     };
     let inp = split.inputs(cfg, inputs);
     let out = scratch.row(split.r0, cfg);
-    select_tokens(gpu, kernels, cfg, &mine, &inp, &out, DsaSelectLaunch::Exact, stream)?;
+    let exact = DsaSelectLaunch::Exact;
+    launch::select_tokens_with(
+        gpu, kernels, cfg, &mine, &inp, &out, exact, compress, stream,
+    )?;
     // 2026-10-01: Under `METRALE_GLM_PREFILL_COMM_OVERLAP` a deferred all-reduce may still be
     // in flight on the comm stream. Waiting for both slots first keeps this communicator to
     // one operation in flight at a time, in issue order, on both ranks. A slot with nothing

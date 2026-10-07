@@ -382,10 +382,12 @@ pub struct DsaSelectScratch {
 mod launch;
 mod scratch;
 pub use launch::{PoolRows, compress_pools_only, select_tokens};
+pub mod pool_once;
 pub mod grid_stride;
 pub mod radix;
 pub mod shared;
 pub mod split;
+pub mod tc2;
 
 #[cfg(test)]
 mod tests;

@@ -206,6 +206,7 @@ impl Rig {
             q_mask: self.q_mask,
             first_key: 0,
             geom_dev: DevicePtr::NULL,
+            pool_cache: None,
         }
     }
 }

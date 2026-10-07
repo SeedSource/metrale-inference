@@ -105,6 +105,9 @@ impl Glm5NextKdaLayer {
         let c = &self.cfg;
         let (qkv, cd, d) = (c.qkv_dim(), c.conv_dim(), c.head_dim);
         let nchunks = k.div_ceil(KDA_TC_C);
+        // 2026-10-07: logged once when the fused front first runs (gate scripts grep it).
+        static ENGAGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ENGAGED.get_or_init(|| tracing::warn!("METRALE_GLM_KDA_FRONT_FUSE=1: ENGAGED"));
         let q = ws.qkv_parts;
         let kp = ws.qkv_parts.offset(k * qkv * 2);
         let v = ws.qkv_parts.offset(2 * k * qkv * 2);

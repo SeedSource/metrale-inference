@@ -85,6 +85,9 @@ pub fn w8a8_fused_input(
     let Some(kk) = kernels(gpu) else {
         return Ok(false);
     };
+    // 2026-10-07: logged once when the fused norm + quant first replaces a quant launch.
+    static ENGAGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ENGAGED.get_or_init(|| tracing::warn!("METRALE_GLM_NORM_FP8_QUANT_FUSE=1: ENGAGED"));
     w8a8(
         gpu,
         gemv.0 == kk.bf16_gemv.0,

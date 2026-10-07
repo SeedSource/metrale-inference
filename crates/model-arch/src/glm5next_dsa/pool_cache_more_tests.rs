@@ -377,3 +377,74 @@ fn the_select_scratch_drops_its_pool_regions_with_the_cache() {
     assert_eq!(p_off.layer_bytes - p_on.layer_bytes, pool_bytes);
     assert_eq!(p_off.mtp_bytes - p_on.mtp_bytes, pool_bytes);
 }
+
+/// 2026-10-06 (comb21 port): The pool-cache and radix top-k levers plan the select scratch
+/// independently: the pool cache zeroes regions 0 to 2 only, the radix lever sizes region 6
+/// only, and with both on the scratch allocates scores, candidacy, selected, tokens and the
+/// radix work buffer, and still refuses a pass without the cache's arrays.
+#[test]
+fn the_pool_cache_and_radix_levers_plan_the_scratch_independently() {
+    use crate::glm5next_dsa::select::radix::radix_region_bytes;
+    use crate::glm5next_dsa::select::{DsaSelectGeometry, DsaSelectScratch};
+    let c = cfg(557_056);
+    let g = DsaSelectGeometry::plan(&c, max_dsa_context(&c), 1).unwrap();
+    let radix = radix_region_bytes(&g, &c, true);
+    assert!(radix > 0, "the ceiling pass has more than one top-k tile of pools");
+    let plan = |r: bool, pc: bool| DsaSelectScratch::plan_bytes_levers(&c, &[g], r, pc);
+    let (off, t_off) = plan(false, false);
+    assert_eq!(off[6], 0);
+    for (r, pc) in [(true, false), (false, true), (true, true)] {
+        let (p, t) = plan(r, pc);
+        assert_eq!(t, t_off);
+        assert_eq!(p[3..6], off[3..6], "radix {r} pool cache {pc}");
+        let pools: &[usize] = if pc { &[0, 0, 0] } else { &off[..3] };
+        assert_eq!(&p[..3], pools, "radix {r} pool cache {pc}");
+        assert_eq!(p[6], if r { radix } else { 0 }, "radix {r} pool cache {pc}");
+    }
+    assert_eq!(DsaSelectScratch::plan_bytes_with(&c, &[g], true), plan(false, true));
+    assert_eq!(DsaSelectScratch::plan_bytes_for(&c, &[g], true), plan(true, false));
+
+    let gpu = MockGpuBackend::new();
+    let n0 = gpu.live_alloc_count();
+    let s = DsaSelectScratch::alloc_sized(&gpu, plan(true, true)).unwrap();
+    assert_eq!(
+        gpu.live_alloc_count(),
+        n0 + 5,
+        "scores, candidacy, selected, tokens, radix work"
+    );
+    assert!(s.fits_with(&c, &g, true).is_ok());
+    assert!(s.fits_with(&c, &g, false).is_err());
+    s.free(&gpu).unwrap();
+    assert_eq!(gpu.live_alloc_count(), n0);
+}
+
+/// 2026-10-06 (comb21 port): Source guard. In the select launcher the scratch's pool regions
+/// appear only in the full-compress (`pool_cache: None`) arm; every scores variant (plain,
+/// tiled, tensor-core: one launch with the handle swapped) reads the `pool_keys` /
+/// `pool_indices` / `pool_valid` the cache match chose, and so does the expand; the radix
+/// top-k, the index split and the grid-stride helpers never name a pool region.
+#[test]
+fn every_select_launch_reads_the_pools_the_cache_match_chose() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/glm5next_dsa/select");
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
+    let src = read("launch.rs");
+    let arm = src.find("match inputs.pool_cache {").expect("the cache match");
+    let none = src[arm..].find("None => {").expect("the full-compress arm") + arm;
+    let end = src[none..].find("if has_pools {").expect("the scores block") + none;
+    let hits: Vec<usize> = src.match_indices("scratch.pool_").map(|(i, _)| i).collect();
+    assert_eq!(hits.len(), 6, "three compress outputs and the three returned regions");
+    assert!(hits.iter().all(|&i| none < i && i < end), "a scratch pool region outside the None arm");
+    let scores = &src[end..src[end..].find(".launch(stream)").unwrap() + end];
+    for p in [".arg_ptr(pool_keys)", ".arg_ptr(pool_indices)", ".arg_ptr(pool_valid)"] {
+        assert!(scores.contains(p), "scores launch lacks {p}");
+    }
+    let expand = &src[src.find("kernels.expand_selection").unwrap()..];
+    let expand = &expand[..expand.find(".launch(stream)").unwrap()];
+    assert!(expand.contains(".arg_ptr(pool_indices)"));
+    for f in ["radix.rs", "split.rs", "grid_stride.rs", "shared.rs"] {
+        let s = read(f);
+        for field in [".pool_keys", ".pool_indices", ".pool_valid", "pool_regions("] {
+            assert!(!s.contains(field), "{f} names {field}");
+        }
+    }
+}

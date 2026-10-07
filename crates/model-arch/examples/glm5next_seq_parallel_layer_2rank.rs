@@ -389,6 +389,8 @@ fn row_local_case(
             attn: expand,
             post_mix: None,
             premixed: false,
+            post_finish: false,
+            prefinished: false,
         };
         for &call in cs.iter() {
             for rank in 0..2 {
@@ -414,7 +416,7 @@ fn row_local_case(
         for &call in cs.iter() {
             for rank in 0..2 {
                 for sp in plan.spans(rank, call) {
-                    lanes.back(g, s.hidden, sp, last, None, stream)?;
+                    lanes.back(g, s.hidden, sp, last, None, false, stream)?;
                 }
             }
         }
@@ -572,6 +574,8 @@ fn layer_case(
                 attn: true,
                 post_mix: None,
                 premixed: false,
+                post_finish: false,
+                prefinished: false,
             };
             let mixer =
                 |c: Span, x: DevicePtr| stand_in(g, add, c, x, half, bias, tmp, None, stream);
@@ -596,6 +600,8 @@ fn layer_case(
                 attn: false,
                 post_mix: None,
                 premixed: false,
+                post_finish: false,
+                prefinished: false,
             };
             let o = Some(s.ffn_out);
             let mlp = |c: Span, x: DevicePtr| stand_in(g, add, c, x, 1, bias, tmp, o, stream);

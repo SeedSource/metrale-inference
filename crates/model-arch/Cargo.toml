@@ -394,6 +394,10 @@ name = "hc_post_mix_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "hc_post_mix_finish_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_combine_local_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 

@@ -813,7 +813,7 @@ extern "C" __global__ void __launch_bounds__(DSA_TC_THREADS) dsa_index_scores_tc
 // loaded into registers before this head's MMAs and stored into the other buffer after them,
 // with one __syncthreads per head. The block's weights sit in shared memory as
 // [32][H + 1] floats (rows past Q as 0.0f). Dynamic shared memory: 2 x 32 x (D + 8) x 2 B of
-// q plus 32 x (H + 1) x 4 B of weights (21,504 B at D = 128, H = 32).
+// q plus 32 x (H + 1) x 4 B of weights (21,632 B at D = 128, H = 32).
 //
 // Why the bytes equal 2c mode 1 for every (row r, pool p) it stores:
 // - Operands: q and key elements are __float2bfloat16_rn of the same FP32 values (q rows past

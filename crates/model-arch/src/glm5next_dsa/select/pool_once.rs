@@ -80,6 +80,13 @@ pub fn compress_window(
         bail!("DSA pool compress: the once-per-window compress takes host geometry only");
     }
     scratch.fits(cfg, geom)?;
+    // 2026-10-07: logged once so a serve shows the lever reached the prefill (gate scripts grep it).
+    static ENGAGED: OnceLock<()> = OnceLock::new();
+    ENGAGED.get_or_init(|| {
+        tracing::warn!(
+            "METRALE_GLM_DSA_KPOOL_ONCE=1: ENGAGED - dsa_kpool_compress once per full-width window"
+        );
+    });
     let (d, kp) = (geom.index_head_dim, geom.index_kpool);
     launch_kpool_compress(
         gpu,

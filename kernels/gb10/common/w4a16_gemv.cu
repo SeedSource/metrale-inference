@@ -716,6 +716,181 @@ extern "C" __global__ void w4a16_gemv_batch3(
     w4a16_gemv_batchm_impl<3>(A, B_packed, B_scale, scale2, C, 3u, N, K);
 }
 
+// 2026-10-07: METRALE_GLM_NV4_B3_STAGED. Same arithmetic as w4a16_gemv_batchm_impl<3> (so the
+// same bits as w4a16_gemv_batch3 and, per row, the M = 1 kernel) with two changes that move no
+// FP operation:
+//  (1) The three BF16 activation rows are staged in shared memory once per block, one K window
+//      at a time (NV4B3_WCH k16 chunks = 16 * NV4B3_WCH K), by cooperative uint4 loads. Each
+//      thread then reads its 2 x uint4 per row from shared memory instead of global memory.
+//      The window is a static 12 KiB x (NV4B3_WCH / 128) buffer, so no dynamic-smem opt-in is
+//      needed for any K (K = 16384 is 128 chunks x 8 windows).
+//  (2) The next iteration's 8-byte weight word and scale byte are loaded into registers before
+//      the current iteration's FMAs.
+// Order kept from the base kernel: thread (output, lane) walks chunks kk = lane + 64 * phase +
+// 128 * j ascending, per phase its own accumulators acc[phase][t] (fmaf(scale, part, acc)),
+// the per-chunk `part` chain over 16 elements in index order, then the shfl_xor / s_vl /
+// shfl_down / smem reduction verbatim. NV4B3_WCH must be a multiple of 128 so a window holds
+// whole strides of the chunk walk (a thread's chunk sequence per phase is unchanged).
+// Threads with n >= N take no part in the math but reach every __syncthreads.
+#ifndef NV4B3_WCH
+#define NV4B3_WCH 128
+#endif
+#define NV4B3_JW (NV4B3_WCH / 128)
+
+extern "C" __global__ void w4a16_gemv_batch3_staged(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    static_assert(NV4B3_WCH % 128 == 0, "window must hold whole 128-chunk strides");
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;  // uniform per warp (64 threads share an output)
+
+    __shared__ float s_lut[16];
+    __shared__ uint4 s_a[3][2][NV4B3_WCH];  // [row][lo/hi uint4 of the chunk][chunk in window]
+    __shared__ float s_vl[3][N_PER_BLOCK][2 * WARP_SIZE];
+    __shared__ float smem[3][N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+    const unsigned int nwin = (K16 + NV4B3_WCH - 1) / NV4B3_WCH;
+
+    const unsigned char* wrow = B_packed + (unsigned long long)(valid ? n : 0u) * half_K;
+    const unsigned char* srow = B_scale + (unsigned long long)(valid ? n : 0u) * num_groups;
+
+    // Register-held weight word and scale byte of the current iteration; first = (win 0, ph 0, j 0).
+    unsigned long long cur_w = 0ull;
+    unsigned char cur_s = 0;
+    if (valid && lane < K16) {
+        cur_w = *(const unsigned long long*)(wrow + (unsigned long long)lane * 8);
+        cur_s = srow[lane];
+    }
+
+    float acc[2][3];
+    #pragma unroll
+    for (int p = 0; p < 2; p++) {
+        #pragma unroll
+        for (int t = 0; t < 3; t++) acc[p][t] = 0.0f;
+    }
+
+    #pragma unroll 1
+    for (unsigned int win = 0; win < nwin; win++) {
+        const unsigned int base = win * NV4B3_WCH;
+        const unsigned int cnt = min((unsigned int)NV4B3_WCH, K16 - base);
+        // Cooperative staging: coalesced uint4 loads, 2 uint4 (= 16 BF16) per chunk per row.
+        for (unsigned int u = threadIdx.x; u < cnt * 2u; u += BLOCK_SIZE) {
+            #pragma unroll
+            for (int t = 0; t < 3; t++) {
+                const uint4 v = ((const uint4*)(A + (unsigned long long)t * K))[(unsigned long long)base * 2 + u];
+                s_a[t][u & 1u][u >> 1] = v;
+            }
+        }
+        __syncthreads();  // staged window (and s_lut on the first pass) visible
+
+        if (valid) {
+            #pragma unroll
+            for (int ph = 0; ph < 2; ph++) {
+                #pragma unroll
+                for (int j = 0; j < NV4B3_JW; j++) {
+                    const unsigned int kk = base + lane + ph * threads_per_out + 128u * j;
+                    // Prefetch the next iteration (next slot, or slot 0 of the next window).
+                    const int ns = ph * NV4B3_JW + j + 1;
+                    unsigned int nk;
+                    if (ns < 2 * NV4B3_JW) nk = base + lane + (ns / NV4B3_JW) * threads_per_out + 128u * (ns % NV4B3_JW);
+                    else                   nk = base + NV4B3_WCH + lane;
+                    unsigned long long nxt_w = 0ull;
+                    unsigned char nxt_s = 0;
+                    if (nk < K16) {
+                        nxt_w = *(const unsigned long long*)(wrow + (unsigned long long)nk * 8);
+                        nxt_s = srow[nk];
+                    }
+                    if (kk < K16) {
+                        __nv_fp8_e4m3 fp8;
+                        *(unsigned char*)&fp8 = cur_s;
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+                        float scale = scl_fp8(cur_s) * scale2;
+#else
+                        float scale = (float)fp8 * scale2;
+#endif
+                        float wl[16];
+                        #pragma unroll
+                        for (int b = 0; b < 8; b++) {
+                            unsigned char byte_val = (unsigned char)(cur_w >> (b * 8));
+                            wl[b * 2]     = s_lut[byte_val & 0xF];
+                            wl[b * 2 + 1] = s_lut[byte_val >> 4];
+                        }
+                        const unsigned int c = kk - base;
+                        #pragma unroll
+                        for (int t = 0; t < 3; t++) {
+                            const uint4 a_lo = s_a[t][0][c];
+                            const uint4 a_hi = s_a[t][1][c];
+                            const unsigned int ar[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                                        a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+                            float part = 0.0f;
+                            #pragma unroll
+                            for (int b = 0; b < 8; b++) {
+                                const float ax = __uint_as_float(ar[b] << 16);
+                                const float ay = __uint_as_float(ar[b] & 0xFFFF0000u);
+                                part = fmaf(ax, wl[b * 2], part);
+                                part = fmaf(ay, wl[b * 2 + 1], part);
+                            }
+                            acc[ph][t] = fmaf(scale, part, acc[ph][t]);
+                        }
+                    }
+                    cur_w = nxt_w;
+                    cur_s = nxt_s;
+                }
+            }
+        }
+        __syncthreads();  // window consumed before the next staging overwrites it
+    }
+
+    if (valid) {
+        #pragma unroll
+        for (int ph = 0; ph < 2; ph++) {
+            #pragma unroll
+            for (int t = 0; t < 3; t++) {
+                const float v = acc[ph][t] + __shfl_xor_sync(0xFFFFFFFF, acc[ph][t], 1);
+                if ((lane & 1u) == 0u) {
+                    s_vl[t][local_out][ph * WARP_SIZE + (lane >> 1)] = v;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    const unsigned int warp_in_out = lane / WARP_SIZE;
+    if (valid) {
+        #pragma unroll
+        for (int t = 0; t < 3; t++) {
+            float a = s_vl[t][local_out][lane];
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+            }
+            if (lane % WARP_SIZE == 0) smem[t][local_out * 2 + warp_in_out] = a;
+        }
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < 3; t++) {
+            float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
+            C[(unsigned long long)t * N + n] = __float2bfloat16(r);
+        }
+    }
+}
+
 
 extern "C" __global__ void w4a16_gemv_batch4(
     const __nv_bfloat16* __restrict__ A,

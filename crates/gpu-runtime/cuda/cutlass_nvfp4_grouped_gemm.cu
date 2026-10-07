@@ -13,13 +13,18 @@
 //   METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4) and metrale_cutlass_pack_weight_sfb_batched are
 //   additions; the pre-existing entry points launch exactly what they launched before (the
 //   new prep_grouped_a / launch_projection parameters default to the old behaviour).
+// - 2026-10-06: The `_w4a4_ex` entry points add two opt-in exact paths (PACK_ONCE for gate/up,
+//   an external amax for down; see prep_grouped_a). With them off they launch what the plain
+//   `_w4a4` entries launch, and those entries now call them with both off.
 // - CUTLASS (BSD-3-Clause, NVIDIA) headers only; see THIRD_PARTY_NOTICES.md.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <vector>
 
@@ -564,6 +569,135 @@ __global__ void make_alpha_w4a4(
   }
 }
 
+// 2026-10-06: METRALE_CUTLASS_W4A4_PACK_ONCE (gate/up, gathered A). One 16-value block of
+// pack_act_grouped_gs: the same expressions in the same order (keep the two in step), so the
+// 8 code bytes and the block-scale byte are a pure function of (row values, gs). codes8 gets
+// the 8 bytes pack_act_grouped_gs stores at packed[row * (k/2) + base/2 ..].
+__device__ __forceinline__ void quant16_gs(
+    const __nv_bfloat16* __restrict__ arow,
+    int base,
+    float gs,
+    unsigned char* __restrict__ codes8,
+    unsigned char* __restrict__ sf_out) {
+  const float inv_gs = 1.0f / gs;
+  float v[16];
+  float max_abs = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    v[i] = __bfloat162float(arow[base + i]);
+    max_abs = fmaxf(max_abs, fabsf(v[i]));
+  }
+  float sf_val = fminf((max_abs / 6.0f) * inv_gs, 448.0f);
+  cutlass::float_ue4m3_t sf(sf_val);
+  *sf_out = *reinterpret_cast<unsigned char*>(&sf);
+  float dec = static_cast<float>(sf);
+  float out_scale = dec > 0.0f ? 1.0f / (dec * gs) : 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; i += 2) {
+    codes8[i / 2] = static_cast<unsigned char>(
+        float_to_e2m1_rne(v[i] * out_scale) | (float_to_e2m1_rne(v[i + 1] * out_scale) << 4));
+  }
+}
+
+// 2026-10-06: PACK_ONCE staging: token t < stage_len (and flags[t] != 0 when flags is set)
+// quantized once with gs_arr[0] (every group of the call has that gs; prep_grouped_a checks it)
+// into token-major st_codes [stage_len, k/2] and st_sf [stage_len, k/16] (linear, not
+// swizzled). Grid (stage_len, ceil(k/16 / 256)), 256 threads, one 16-value block per thread.
+__global__ void pack_once_stage_k(
+    const __nv_bfloat16* __restrict__ act_global,
+    const unsigned char* __restrict__ flags,
+    int stage_len,
+    int k,
+    const float* __restrict__ gs_arr,
+    unsigned char* __restrict__ st_codes,
+    unsigned char* __restrict__ st_sf) {
+  const int t = blockIdx.x;
+  if (t >= stage_len || (flags != nullptr && flags[t] == 0)) {
+    return;
+  }
+  const int group = blockIdx.y * blockDim.x + threadIdx.x;
+  const int groups = k / 16;
+  if (group >= groups) {
+    return;
+  }
+  unsigned char c[8];
+  quant16_gs(act_global + (unsigned long long)t * k, group * 16, gs_arr[0], c,
+             st_sf + (unsigned long long)t * groups + group);
+  uint2 w;
+  w.x = (unsigned int)c[0] | ((unsigned int)c[1] << 8) | ((unsigned int)c[2] << 16) |
+        ((unsigned int)c[3] << 24);
+  w.y = (unsigned int)c[4] | ((unsigned int)c[5] << 8) | ((unsigned int)c[6] << 16) |
+        ((unsigned int)c[7] << 24);
+  *reinterpret_cast<uint2*>(st_codes + (unsigned long long)t * (k / 2) + group * 8) = w;
+}
+
+// 2026-10-06: PACK_ONCE gather: pack_act_grouped_gs's grid, row and SFA slot, but the 8 code
+// bytes and the scale byte of (row, group) are copied from the staged token instead of being
+// recomputed. A token the staging pass did not cover (outside [0, stage_len), or unflagged) is
+// quantized here exactly as pack_act_grouped_gs does, so every byte that kernel writes is
+// written with the same value and nothing else is written. 8-byte copies: a_e is 256-aligned
+// and row * (k/2) + group * 8 is a multiple of 8 (k % 16 == 0).
+template <class LayoutSFA_t>
+__global__ void pack_once_gather_k(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ ms_arr,
+    const int* __restrict__ m_arr,
+    unsigned char* const* __restrict__ packed_arr,
+    unsigned char* const* __restrict__ scales_arr,
+    const float* __restrict__ gs_arr,
+    int k,
+    const unsigned char* __restrict__ st_codes,
+    const unsigned char* __restrict__ st_sf,
+    const unsigned char* __restrict__ flags,
+    int stage_len,
+    LayoutSFA_t layout_sfa_dummy) {
+  const int e = blockIdx.z;
+  const int m_e = m_arr[e];
+  const int row = blockIdx.x;
+  if (row >= m_e) {
+    return;
+  }
+  const int group = blockIdx.y * blockDim.x + threadIdx.x;
+  const int groups = k / 16;
+  if (group >= groups) {
+    return;
+  }
+  auto layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(m_e, 1, k, 1));
+  (void)layout_sfa_dummy;
+  const int base = group * 16;
+  const int tok = sorted_token_ids[ms_arr[e] + row];
+  unsigned char* dst = packed_arr[e] + (unsigned long long)row * (k / 2) + base / 2;
+  unsigned char* sdst = scales_arr[e] + layout_sfa(row, base, 0);
+  if (tok >= 0 && tok < stage_len && (flags == nullptr || flags[tok] != 0)) {
+    *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(
+        st_codes + (unsigned long long)tok * (k / 2) + base / 2);
+    *sdst = st_sf[(unsigned long long)tok * groups + group];
+  } else {
+    unsigned char c[8];
+    quant16_gs(act_global + (unsigned long long)tok * k, base, gs_arr[e], c, sdst);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      dst[i] = c[i];
+    }
+  }
+}
+
+// 2026-10-06: PACK_ONCE known-bad hook (glm_moe_w4a4_pack_once_microtest): flips bit 0 of the
+// first staged scale byte of the token of sorted row ms0, so the gathered SFA must differ.
+__global__ void pack_once_fault_k(
+    const int* __restrict__ sorted_token_ids,
+    int ms0,
+    int stage_len,
+    int groups,
+    unsigned char* __restrict__ st_sf) {
+  const int tok = sorted_token_ids[ms0];
+  if (tok >= 0 && tok < stage_len) {
+    st_sf[(unsigned long long)tok * groups] ^= 0x01u;
+  }
+}
+
 // 2026-10-03: pack_weight_sfb_group for `count` experts in one launch: slot s swizzles
 // src_ptrs[first + s] (skipped when null) into out_base + s * out_stride. Grid
 // (ceil(n * k/16 / 256), count), 256 threads, one scale byte per thread.
@@ -733,6 +867,26 @@ static bool amax_dedup_on() {
   return g_amax_dedup_override >= 0 ? g_amax_dedup_override != 0 : amax_dedup_lever();
 }
 
+// 2026-10-06: Test hooks (glm_moe_w4a4_pack_once_microtest). A nonzero fault makes every
+// engaged PACK_ONCE call flip one staged scale byte (pack_once_fault_k) before the gather.
+static std::atomic<int> g_pack_once_fault{0};
+
+extern "C" void metrale_cutlass_set_w4a4_pack_once_fault(int v) {
+  g_pack_once_fault.store(v, std::memory_order_relaxed);
+}
+
+// 2026-10-06: What the last W4A4 prep_grouped_a call did, for the microtest to read the packed A
+// and SFA it left in the workspace: [0] workspace base, [1] SFA offset (= packed-A bytes rounded
+// up to 256), [2] SFA bytes, [3] offset of the [G] float gs array, [4] G, [5] PACK_ONCE engaged,
+// [6] the external amax engaged. Diagnostic only; concurrent callers may interleave.
+static std::atomic<unsigned long long> g_last_prep[7];
+
+extern "C" void metrale_cutlass_w4a4_last_prep(unsigned long long* out, int n) {
+  for (int i = 0; i < n && i < 7; ++i) {
+    out[i] = g_last_prep[i].load(std::memory_order_relaxed);
+  }
+}
+
 static bool sfb_pack_tiled_lever() {
   static const bool on = [] {
     const char* v = std::getenv("METRALE_CUTLASS_SFB_PACK_TILED");
@@ -878,6 +1032,19 @@ struct GroupedAPrep {
 // by pack_act_grouped_gs, and for j < n_alpha (at most 2) p.dAlpha[j][g] = alpha_s2_host[j][e]
 // * gs. Before any launch the A side is checked against workspace_size: on overflow p.status =
 // -2 and p.G = 0, nothing launched.
+// 2026-10-06: W4A4 mode only, both default off (every pre-existing caller):
+// - pack_once (METRALE_CUTLASS_W4A4_PACK_ONCE, gathered A): when every group has the same gs
+//   (all dynamic, or all static with equal bits), each token row is quantized ONCE into a
+//   token-major staging area (packed codes [T, k/2] + scales [T, k/16], T = num_tokens, or the
+//   flagged tokens below min(num_tokens, flag count) when the dedup amax flagged them), carved
+//   from the workspace at the current cursor (scratch: the cursor does not move, and everything
+//   later carved there is written after the gather on the same stream); pack_once_gather_k then
+//   copies each routed row's bytes to the slots pack_act_grouped_gs writes. Not engaged (that
+//   kernel runs) when the gs differ or the staging does not fit.
+// - pre_amax (METRALE_GLM_MOE_SWIGLU_AMAX, row-ordered A): a device float-bits amax over rows
+//   [pre_lo, pre_hi) of A. Used instead of the amax kernels only when the dynamic groups' rows
+//   are exactly [pre_lo, pre_hi) (the set act_amax_rows_flat / act_amax_grouped read).
+// *engaged gets bit 0 for pack_once, bit 1 for pre_amax.
 static GroupedAPrep prep_grouped_a(
     const __nv_bfloat16* A_global,
     const int* sorted_token_ids,
@@ -891,7 +1058,13 @@ static GroupedAPrep prep_grouped_a(
     const float* act_gs_host = nullptr,
     int n_alpha = 0,
     const float* const* alpha_s2_host = nullptr,
-    size_t workspace_size = 0) {
+    size_t workspace_size = 0,
+    int num_tokens = 0,
+    int pack_once = 0,
+    const unsigned int* pre_amax = nullptr,
+    int pre_lo = 0,
+    int pre_hi = 0,
+    int* engaged = nullptr) {
 
 
   // 2026-09-25: METRALE_CUTLASS_EP_NULL_GUARD starting with '0' turns the guard off: every
@@ -1045,7 +1218,28 @@ static GroupedAPrep prep_grouped_a(
       unsigned int* d_amax = reinterpret_cast<unsigned int*>(ws + cursor + f_b);
       cursor = align_up_(cursor + f_b + 256, 256);
       cudaMemcpyAsync(d_gs, h_gs.data(), G * sizeof(float), cudaMemcpyHostToDevice, stream);
-      if (any_dyn) {
+      // 2026-10-06: pre_amax engages only when the dynamic groups (in group order, ascending
+      // disjoint row ranges) chain exactly from pre_lo to pre_hi: then the rows the amax kernels
+      // below would read are exactly the rows the caller's amax covered.
+      bool pre_ok = false;
+      if (pre_amax != nullptr && sorted_token_ids == nullptr && any_dyn) {
+        int next = pre_lo;
+        bool chain = pre_lo < pre_hi;
+        for (int g = 0; g < G && chain; ++g) {
+          if (!(h_gs[g] > 0.0f)) {
+            chain = h_ms[g] == next;
+            next += h_me[g];
+          }
+        }
+        pre_ok = chain && next == pre_hi;
+      }
+      if (pre_ok) {
+        resolve_act_gs<<<(G + 255) / 256, 256, 0, stream>>>(d_gs, G, pre_amax);
+      }
+      // 2026-10-06: The dedup flags (gathered A, all dynamic groups' tokens) for PACK_ONCE.
+      const unsigned char* po_flags = nullptr;
+      int po_flag_len = 0;
+      if (any_dyn && !pre_ok) {
         cudaMemsetAsync(d_amax, 0, sizeof(unsigned int), stream);
         if (dedup_ok) {
           // 2026-10-06: METRALE_CUTLASS_W4A4_AMAX_DEDUP (amax_dedup_lever): the dynamic groups'
@@ -1077,6 +1271,8 @@ static GroupedAPrep prep_grouped_a(
                 A_global, sorted_token_ids, d_dms, d_dpre, gd, k, d_flags, flag_len, d_amax);
             act_amax_flagged<<<std::min(blocks, flag_len), 256, 0, stream>>>(
                 A_global, d_flags, flag_len, k, vec, d_amax);
+            po_flags = d_flags;
+            po_flag_len = flag_len;
           } else if (rows > 0) {
             act_amax_rows_flat<<<std::min(blocks, rows), 256, 0, stream>>>(
                 A_global, d_dms, d_dpre, gd, k, vec, d_amax);
@@ -1089,9 +1285,70 @@ static GroupedAPrep prep_grouped_a(
         }
         resolve_act_gs<<<(G + 255) / 256, 256, 0, stream>>>(d_gs, G, d_amax);
       }
-      pack_act_grouped_gs<<<grd, blk, 0, stream>>>(
-          A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
-          (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, d_gs, k, lsa0);
+      // 2026-10-06: PACK_ONCE: one gs for every group (all dynamic: resolve_act_gs wrote the
+      // same value to each; or all static with equal bits), gathered A, and room for staging.
+      bool po = false;
+      int stage_len = 0;
+      unsigned char* st_codes = nullptr;
+      unsigned char* st_sf = nullptr;
+      if (pack_once != 0 && sorted_token_ids != nullptr && num_tokens > 0) {
+        bool all_dyn = true;
+        bool all_same_static = true;
+        unsigned int bits0 = 0;
+        std::memcpy(&bits0, &h_gs[0], sizeof(bits0));
+        for (int g = 0; g < G; ++g) {
+          unsigned int bits = 0;
+          std::memcpy(&bits, &h_gs[g], sizeof(bits));
+          if (h_gs[g] > 0.0f) {
+            all_dyn = false;
+          } else {
+            all_same_static = false;
+          }
+          if (bits != bits0) {
+            all_same_static = false;
+          }
+        }
+        stage_len = po_flags != nullptr ? std::min(num_tokens, po_flag_len) : num_tokens;
+        const size_t codes_b = align_up_((size_t)stage_len * (k / 2), 256);
+        const size_t sf_b = align_up_((size_t)stage_len * (k / 16), 256);
+        po = (all_dyn || all_same_static) && stage_len > 0 &&
+             cursor + codes_b + sf_b <= workspace_size;
+        if (po) {
+          st_codes = ws + cursor;
+          st_sf = st_codes + codes_b;
+        }
+      }
+      if (po) {
+        // 2026-10-06: Flags exist only when every group is dynamic (one gs) and the dedup amax
+        // ran: they mark every in-range token a group reads; the gather re-checks them anyway.
+        const unsigned char* flags = po_flags;
+        dim3 sgrd(stage_len, (k / 16 + blk.x - 1) / blk.x);
+        pack_once_stage_k<<<sgrd, blk, 0, stream>>>(
+            A_global, flags, stage_len, k, d_gs, st_codes, st_sf);
+        if (g_pack_once_fault.load(std::memory_order_relaxed) != 0) {
+          pack_once_fault_k<<<1, 1, 0, stream>>>(sorted_token_ids, h_ms[0], stage_len, k / 16,
+                                                 st_sf);
+        }
+        pack_once_gather_k<<<grd, blk, 0, stream>>>(
+            A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
+            (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, d_gs, k, st_codes, st_sf,
+            flags, stage_len, lsa0);
+      } else {
+        pack_act_grouped_gs<<<grd, blk, 0, stream>>>(
+            A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
+            (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, d_gs, k, lsa0);
+      }
+      if (engaged != nullptr) {
+        *engaged = (po ? 1 : 0) | (pre_ok ? 2 : 0);
+      }
+      g_last_prep[0].store((unsigned long long)(uintptr_t)ws, std::memory_order_relaxed);
+      g_last_prep[1].store(sfa_off, std::memory_order_relaxed);
+      g_last_prep[2].store(sfa_acc, std::memory_order_relaxed);
+      g_last_prep[3].store((unsigned long long)((unsigned char*)d_gs - ws),
+                           std::memory_order_relaxed);
+      g_last_prep[4].store((unsigned long long)G, std::memory_order_relaxed);
+      g_last_prep[5].store(po ? 1ull : 0ull, std::memory_order_relaxed);
+      g_last_prep[6].store(pre_ok ? 1ull : 0ull, std::memory_order_relaxed);
       for (int j = 0; j < n_alpha && j < 2; ++j) {
         std::vector<float> h_s2(G);
         for (int g = 0; g < G; ++g) {
@@ -1384,7 +1641,11 @@ extern "C" int metrale_cutlass_nvfp4_grouped_down(
 // gate and up; otherwise dynamic per-tensor amax / (6 * 448) over those experts' rows), and
 // gate's / up's epilogue alpha is scale2[e] * that scale. Status: as the fused entry, plus -2
 // when the A side does not fit the workspace (nothing launched). Tags 100000 gate, 200000 up.
-extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
+// 2026-10-06: metrale_cutlass_nvfp4_grouped_gate_up_w4a4 with METRALE_CUTLASS_W4A4_PACK_ONCE:
+// num_tokens (rows of A_bf16, the bound of the staging area) and pack_once (nonzero asks for
+// it; prep_grouped_a engages it only when provably identical). *engaged (nullable) gets 1 when
+// it engaged, else 0. With pack_once 0 this is exactly the plain entry.
+extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4_ex(
     const void* A_bf16,
     const int* sorted_token_ids,
     const unsigned long long* gate_packed_ptrs,
@@ -1400,19 +1661,30 @@ extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
     int num_experts,
     int n,
     int k,
+    int num_tokens,
+    int pack_once,
+    int* engaged,
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  if (engaged != nullptr) {
+    *engaged = 0;
+  }
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0 || act_gscale_vals == nullptr) {
     return -1;
   }
   unsigned char* ws = static_cast<unsigned char*>(workspace);
   const float* s2[2] = {gate_scale2_vals, up_scale2_vals};
+  int eng = 0;
   GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16),
                                   sorted_token_ids, expert_offsets_host,
                                   gate_packed_ptrs, num_experts,
-                                  n, k, ws, stream, act_gscale_vals, 2, s2, workspace_size);
+                                  n, k, ws, stream, act_gscale_vals, 2, s2, workspace_size,
+                                  num_tokens, pack_once, nullptr, 0, 0, &eng);
+  if (engaged != nullptr) {
+    *engaged = eng & 1;
+  }
   if (a.status != 0) {
     return a.status;
   }
@@ -1444,6 +1716,8 @@ extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
   (void)num_experts;
   (void)n;
   (void)k;
+  (void)num_tokens;
+  (void)pack_once;
   (void)workspace;
   (void)workspace_size;
   (void)stream;
@@ -1451,11 +1725,42 @@ extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
 #endif
 }
 
+extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
+    const void* A_bf16,
+    const int* sorted_token_ids,
+    const unsigned long long* gate_packed_ptrs,
+    const unsigned long long* gate_sfb_ptrs,
+    const float* gate_scale2_vals,
+    const unsigned long long* up_packed_ptrs,
+    const unsigned long long* up_sfb_ptrs,
+    const float* up_scale2_vals,
+    const float* act_gscale_vals,
+    void* C_gate_bf16,
+    void* C_up_bf16,
+    const int* expert_offsets_host,
+    int num_experts,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+  return metrale_cutlass_nvfp4_grouped_gate_up_w4a4_ex(
+      A_bf16, sorted_token_ids, gate_packed_ptrs, gate_sfb_ptrs, gate_scale2_vals,
+      up_packed_ptrs, up_sfb_ptrs, up_scale2_vals, act_gscale_vals, C_gate_bf16, C_up_bf16,
+      expert_offsets_host, num_experts, n, k, 0, 0, nullptr, workspace, workspace_size, stream);
+}
+
 // 2026-10-03: W4A4 grouped down with an NVFP4 global activation scale: as
 // metrale_cutlass_nvfp4_grouped_down (A in sorted-row order, no gather), with act_gscale_vals
 // and alpha as in metrale_cutlass_nvfp4_grouped_gate_up_w4a4. Status tag 300000; -2 when the
 // A side does not fit the workspace (nothing launched).
-extern "C" int metrale_cutlass_nvfp4_grouped_down_w4a4(
+// 2026-10-06: metrale_cutlass_nvfp4_grouped_down_w4a4 with METRALE_GLM_MOE_SWIGLU_AMAX: pre_amax
+// (device, nullable) holds max |A| as float bits over rows [pre_lo, pre_hi) of A, computed by
+// the caller (glm5next_swiglu_clamp_amax while it wrote those rows). prep_grouped_a uses it
+// instead of the amax kernels only when the dynamic groups' rows are exactly that range.
+// *engaged (nullable) gets 1 when it did, else 0. With pre_amax null this is exactly the plain
+// entry.
+extern "C" int metrale_cutlass_nvfp4_grouped_down_w4a4_ex(
     const void* A_bf16,
     const unsigned long long* packed_ptrs,
     const unsigned long long* sfb_ptrs,
@@ -1466,18 +1771,30 @@ extern "C" int metrale_cutlass_nvfp4_grouped_down_w4a4(
     int num_experts,
     int n,
     int k,
+    const unsigned int* pre_amax,
+    int pre_lo,
+    int pre_hi,
+    int* engaged,
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  if (engaged != nullptr) {
+    *engaged = 0;
+  }
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0 || act_gscale_vals == nullptr) {
     return -1;
   }
   unsigned char* ws = static_cast<unsigned char*>(workspace);
   const float* s2[1] = {scale2_vals};
+  int eng = 0;
   GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16), nullptr,
                                   expert_offsets_host, packed_ptrs, num_experts, n, k,
-                                  ws, stream, act_gscale_vals, 1, s2, workspace_size);
+                                  ws, stream, act_gscale_vals, 1, s2, workspace_size, 0, 0,
+                                  pre_amax, pre_lo, pre_hi, &eng);
+  if (engaged != nullptr) {
+    *engaged = (eng >> 1) & 1;
+  }
   if (a.status != 0) {
     return a.status;
   }
@@ -1498,9 +1815,31 @@ extern "C" int metrale_cutlass_nvfp4_grouped_down_w4a4(
   (void)num_experts;
   (void)n;
   (void)k;
+  (void)pre_amax;
+  (void)pre_lo;
+  (void)pre_hi;
   (void)workspace;
   (void)workspace_size;
   (void)stream;
   return -120;
 #endif
+}
+
+extern "C" int metrale_cutlass_nvfp4_grouped_down_w4a4(
+    const void* A_bf16,
+    const unsigned long long* packed_ptrs,
+    const unsigned long long* sfb_ptrs,
+    const float* scale2_vals,
+    const float* act_gscale_vals,
+    void* C_bf16,
+    const int* expert_offsets_host,
+    int num_experts,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+  return metrale_cutlass_nvfp4_grouped_down_w4a4_ex(
+      A_bf16, packed_ptrs, sfb_ptrs, scale2_vals, act_gscale_vals, C_bf16, expert_offsets_host,
+      num_experts, n, k, nullptr, 0, 0, nullptr, workspace, workspace_size, stream);
 }

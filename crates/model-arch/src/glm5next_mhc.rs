@@ -15,6 +15,9 @@
 //! - 2026-10-01: `METRALE_GLM_MHC_TOKMAJOR=1` swaps `hc_mix_bf16` for `hc_mix_bf16_tokmajor`
 //!   (one block per token) in calls of at least `MHC_TOKMAJOR_MIN_ROWS` tokens; the mix bytes
 //!   are the same (argument in the `.cu`), and `hc_finish` / `hc_post` are unchanged.
+//! - 2026-10-06: `glm_hc_post_mix_finish` (`METRALE_GLM_MHC_POST_MIX_FINISH=1`) writes the bytes
+//!   of `glm_hc_post_mix` then `glm_hc_pre_part_premixed` of the same site in one launch
+//!   (argument in the `.cu`); without its handle the pair runs.
 
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -52,6 +55,10 @@ pub struct Glm5NextMhcKernels {
     /// mix (`glm_hc_post_mix`, `METRALE_GLM_MHC_POST_MIX`). Optional (`try_kernel`, 0 when
     /// absent).
     pub hc_post_mix_bf16: KernelHandle,
+    /// 2026-10-06: `glm5next_hc_post_mix_finish_bf16`: `hc_post_mix_bf16` followed by the next
+    /// site's `hc_finish` in one launch (`glm_hc_post_mix_finish`,
+    /// `METRALE_GLM_MHC_POST_MIX_FINISH`). Optional (`try_kernel`, 0 when absent: the pair runs).
+    pub hc_post_mix_finish_bf16: KernelHandle,
 }
 
 /// 2026-09-25: The kernel module every GLM mHC kernel resolves from.
@@ -83,6 +90,11 @@ impl Glm5NextMhcKernels {
                 gpu,
                 GLM5NEXT_MHC_MODULE,
                 "glm5next_hc_post_mix_bf16",
+            ),
+            hc_post_mix_finish_bf16: metrale_model_layers::layers::try_kernel(
+                gpu,
+                GLM5NEXT_MHC_MODULE,
+                "glm5next_hc_post_mix_finish_bf16",
             ),
         })
     }
@@ -614,6 +626,105 @@ pub fn glm_hc_post_mix(
         .launch(stream)
 }
 
+/// 2026-10-06: `METRALE_GLM_MHC_POST_MIX_FINISH` is on only for `1`.
+pub(crate) fn parse_mhc_post_mix_finish(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// 2026-10-06: `METRALE_GLM_MHC_POST_MIX_FINISH=1` (with `METRALE_GLM_MHC_POST_MIX=1`): where
+/// the sequence-parallel staged prefill fuses a back's `hc_post` with the next site's mix, the
+/// same launch also runs that site's `hc_finish` (`glm_hc_post_mix_finish`), and the next front
+/// runs the norm only. Byte-identical by construction. Off unless set to `1`; without
+/// `METRALE_GLM_MHC_POST_MIX=1` it is ignored (logged). Read once.
+pub fn mhc_post_mix_finish() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_MHC_POST_MIX_FINISH").ok();
+        let on = parse_mhc_post_mix_finish(raw.as_deref());
+        if on && !mhc_post_mix() {
+            tracing::warn!(
+                "METRALE_GLM_MHC_POST_MIX_FINISH=1 IGNORED: it needs METRALE_GLM_MHC_POST_MIX=1"
+            );
+            return false;
+        }
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_MHC_POST_MIX_FINISH=1 - GLM mHC: the fused post+mix also runs the \
+                 next site's hc_finish (glm5next_hc_post_mix_finish_bf16; byte-identical by \
+                 construction)"
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-06: Whether `glm5next_hc_post_mix_finish_bf16` can stand in for
+/// `glm5next_hc_post_mix_bf16` then `hc_finish` of `next`: `post_mix_usable` and its handle
+/// resolved.
+pub fn post_mix_finish_usable(
+    kernels: &Glm5NextMhcKernels,
+    next: &Glm5NextMhcSiteWeights,
+    hidden_size: u32,
+    hc_mult: u32,
+) -> bool {
+    post_mix_usable(kernels, next, hidden_size, hc_mult) && kernels.hc_post_mix_finish_bf16.0 != 0
+}
+
+/// 2026-10-06: `glm_hc_post_mix` (highway into `out`, `out` may alias `residual`; the mix of
+/// `next` into `mix_out`) and then, in the same launch, `hc_finish` of `next` over the new
+/// highway rows: `y_out` (`[num_tokens, H]` BF16), `post_out` (`[num_tokens, hc]`) and
+/// `comb_out` (`[num_tokens, hc, hc]`), the bytes `glm_hc_pre_part_premixed` would write.
+/// `y_out` may alias `block_out`, `post_out` `post` and `comb_out` `comb` (the kernel reads a
+/// token's inputs before it writes that token's outputs). `next` supplies `hc_fn`, `hc_scale`
+/// and `hc_base`. The caller checks `post_mix_finish_usable`.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_hc_post_mix_finish(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextMhcKernels,
+    block_out: DevicePtr,
+    residual: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    out: DevicePtr,
+    next: &Glm5NextMhcSiteWeights,
+    mix_out: DevicePtr,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    if num_tokens == 0 {
+        return Ok(());
+    }
+    KernelLaunch::new(gpu, kernels.hc_post_mix_finish_bf16)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(block_out)
+        .arg_ptr(residual)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_ptr(out)
+        .arg_ptr(next.hc_fn)
+        .arg_ptr(mix_out)
+        .arg_ptr(next.hc_scale)
+        .arg_ptr(next.hc_base)
+        .arg_ptr(y_out)
+        .arg_ptr(post_out)
+        .arg_ptr(comb_out)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_u32(sinkhorn_iters)
+        .arg_f32(norm_eps)
+        .arg_f32(hc_eps)
+        .launch(stream)
+}
+
 /// 2026-10-06: `glm_hc_pre_part` when `w.mix` already holds this call's mix rows (written by
 /// `glm_hc_post_mix`): the same `hc_finish` launches over the same `MHC_SLICE_ROWS` slices, no
 /// mix launch.
@@ -764,6 +875,31 @@ mod mhc_shape_tests {
         for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("01")] {
             assert!(!parse_mhc_post_mix(v), "{v:?}");
         }
+    }
+
+    /// 2026-10-06: `METRALE_GLM_MHC_POST_MIX_FINISH` is on only for `1`.
+    #[test]
+    fn post_mix_finish_lever_parses_one_as_on_and_everything_else_as_off() {
+        assert!(parse_mhc_post_mix_finish(Some("1")));
+        assert!(parse_mhc_post_mix_finish(Some(" 1 ")));
+        for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("01")] {
+            assert!(!parse_mhc_post_mix_finish(v), "{v:?}");
+        }
+    }
+
+    /// 2026-10-06: `Glm5NextMhcKernels::resolve` asks for `glm5next_hc_post_mix_finish_bf16`; a
+    /// rename in the `.cu` alone fails here instead of silently running the pair at serve.
+    #[test]
+    fn post_mix_finish_entry_point_matches_the_kernel_file() {
+        let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../kernels/gb10/common")
+            .join(format!("{GLM5NEXT_MHC_MODULE}.cu"));
+        let src = std::fs::read_to_string(&cu).expect("glm5next_mhc.cu readable");
+        assert!(
+            src.contains("__global__ void __launch_bounds__(GLM_HC_BLOCK) \
+                 glm5next_hc_post_mix_finish_bf16("),
+            "{cu:?} no longer defines glm5next_hc_post_mix_finish_bf16"
+        );
     }
 
     /// 2026-10-01: `METRALE_GLM_MHC_TOKMAJOR` is on only for `1`.

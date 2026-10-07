@@ -18,6 +18,10 @@ pub struct PremixTicket {
     pub seq_len_start: usize,
     pub total: usize,
     pub hidden: u64,
+    /// 2026-10-06: `METRALE_GLM_MHC_POST_MIX_FINISH`: the FFN back also ran the next layer's
+    /// attention `hc_finish` (its `y`, `post` and `comb` rows are written, not only the mix).
+    /// The issuer says what it did; `take_handoff` reports it back.
+    pub finished: bool,
 }
 
 /// 2026-10-06: `METRALE_GLM_MHC_POST_MIX` across layers: the FFN back of a layer also writes
@@ -43,10 +47,18 @@ impl CrossLayerPremix {
     /// 2026-10-06: Clear the ticket and say whether it was `t`. A layer calls this once per
     /// chunk, so a ticket is used at most once.
     pub fn take_matches(&self, t: PremixTicket) -> bool {
-        self.ticket
-            .lock()
-            .map(|mut g| g.take() == Some(t))
-            .unwrap_or(false)
+        self.take_handoff(t) == Some(t.finished)
+    }
+
+    /// 2026-10-06: Clear the ticket; when it was `t` apart from `finished`, `Some` of the
+    /// issuer's `finished` (whether the front may skip `hc_finish` too), else `None`.
+    pub fn take_handoff(&self, t: PremixTicket) -> Option<bool> {
+        let taken = self.ticket.lock().ok().and_then(|mut g| g.take())?;
+        let same = PremixTicket {
+            finished: t.finished,
+            ..taken
+        } == t;
+        same.then_some(taken.finished)
     }
 }
 
@@ -60,6 +72,7 @@ mod tests {
             seq_len_start: 8192,
             total: 8192,
             hidden: 0x1000,
+            finished: false,
         }
     }
 
@@ -82,5 +95,27 @@ mod tests {
         };
         p.issue(t(4));
         assert!(q.take_matches(t(4)), "layers share one ticket");
+    }
+
+    /// 2026-10-06: `take_handoff` matches on the chunk identity and reports the issuer's
+    /// `finished`, once.
+    #[test]
+    fn a_handoff_reports_whether_the_issuer_finished() {
+        let p = CrossLayerPremix::default();
+        assert_eq!(p.take_handoff(t(2)), None, "no ticket issued");
+        p.issue(PremixTicket {
+            finished: true,
+            ..t(2)
+        });
+        assert_eq!(p.take_handoff(t(2)), Some(true));
+        assert_eq!(p.take_handoff(t(2)), None, "taken once");
+        p.issue(t(2));
+        assert_eq!(p.take_handoff(t(2)), Some(false));
+        p.issue(PremixTicket {
+            finished: true,
+            ..t(3)
+        });
+        assert_eq!(p.take_handoff(t(2)), None, "another layer");
+        assert_eq!(p.take_handoff(t(3)), None, "the miss above consumed it");
     }
 }

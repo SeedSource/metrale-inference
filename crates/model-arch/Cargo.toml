@@ -277,6 +277,10 @@ name = "glm_moe_w4a4_cutlass_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm_moe_w4a4_pack_once_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm_cutlass_sfb_pack_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -391,6 +395,10 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "hc_post_mix_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "hc_post_mix_finish_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

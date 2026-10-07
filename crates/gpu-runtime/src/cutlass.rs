@@ -32,8 +32,10 @@ pub use fp8_blockwise::{
 };
 pub use gemm::{bf16_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t};
 pub use grouped::{
-    nvfp4_grouped_down, nvfp4_grouped_down_w4a4, nvfp4_grouped_gate_up,
-    nvfp4_grouped_gate_up_fused, nvfp4_grouped_gate_up_w4a4, set_w4a4_amax_dedup_override,
+    W4a4LastPrep, nvfp4_grouped_down, nvfp4_grouped_down_w4a4, nvfp4_grouped_down_w4a4_ex,
+    nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused, nvfp4_grouped_gate_up_w4a4,
+    nvfp4_grouped_gate_up_w4a4_ex, set_w4a4_amax_dedup_override, set_w4a4_pack_once_fault,
+    w4a4_last_prep, workspace,
 };
 pub use pack::{
     pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched, pack_weight_sfb_batched_mode,
@@ -184,6 +186,8 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     pub(crate) fn metrale_cutlass_set_w4a4_amax_dedup_override(v: i32);
+    pub(crate) fn metrale_cutlass_set_w4a4_pack_once_fault(v: i32);
+    pub(crate) fn metrale_cutlass_w4a4_last_prep(out: *mut u64, n: i32);
     pub(crate) fn metrale_cutlass_pack_weight_sfb_batched_mode(
         scale_ptrs_dev: *const u64,
         first: i32,
@@ -196,7 +200,9 @@ unsafe extern "C" {
         mode: i32,
         stream: *mut c_void,
     ) -> i32;
-    pub(crate) fn metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
+    // 2026-10-06: The plain `metrale_cutlass_nvfp4_grouped_{gate_up,down}_w4a4` entries call
+    // these with the levers off; the wrappers call these directly.
+    pub(crate) fn metrale_cutlass_nvfp4_grouped_gate_up_w4a4_ex(
         a_bf16: *const c_void,
         sorted_token_ids: *const i32,
         gate_packed_ptrs: *const u64,
@@ -212,11 +218,14 @@ unsafe extern "C" {
         num_experts: i32,
         n: i32,
         k: i32,
+        num_tokens: i32,
+        pack_once: i32,
+        engaged: *mut i32,
         workspace: *mut c_void,
         workspace_size: usize,
         stream: *mut c_void,
     ) -> i32;
-    pub(crate) fn metrale_cutlass_nvfp4_grouped_down_w4a4(
+    pub(crate) fn metrale_cutlass_nvfp4_grouped_down_w4a4_ex(
         a_bf16: *const c_void,
         packed_ptrs: *const u64,
         sfb_ptrs: *const u64,
@@ -227,6 +236,10 @@ unsafe extern "C" {
         num_experts: i32,
         n: i32,
         k: i32,
+        pre_amax: *const u32,
+        pre_lo: i32,
+        pre_hi: i32,
+        engaged: *mut i32,
         workspace: *mut c_void,
         workspace_size: usize,
         stream: *mut c_void,

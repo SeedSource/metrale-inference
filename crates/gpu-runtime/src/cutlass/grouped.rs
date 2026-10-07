@@ -330,7 +330,59 @@ pub fn nvfp4_grouped_gate_up_w4a4(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    nvfp4_grouped_gate_up_w4a4_ex(
+        a,
+        sorted_token_ids,
+        gate_packed_ptrs,
+        gate_sfb_ptrs,
+        gate_scale2_vals,
+        up_packed_ptrs,
+        up_sfb_ptrs,
+        up_scale2_vals,
+        act_gscale_vals,
+        c_gate,
+        c_up,
+        expert_offsets_host,
+        n,
+        k,
+        0,
+        false,
+        stream,
+    )
+    .map(|_| ())
+}
+
+/// 2026-10-06: [`nvfp4_grouped_gate_up_w4a4`] with `METRALE_CUTLASS_W4A4_PACK_ONCE`: when
+/// `pack_once`, the C side quantizes each of the `num_tokens` rows of `a` once into workspace
+/// scratch and copies each routed row's packed bytes and block scales into the slots the
+/// per-route pack writes, but only when that is byte-identical (every expert of the call has
+/// the same global scale, and the staging fits the workspace); otherwise it runs the per-route
+/// pack. `num_tokens` must not exceed the rows of `a` (the staging reads rows
+/// `0..num_tokens`). Returns whether the pack-once path ran.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_gate_up_w4a4_ex(
+    a: u64,
+    sorted_token_ids: u64,
+    gate_packed_ptrs: &[u64],
+    gate_sfb_ptrs: &[u64],
+    gate_scale2_vals: &[f32],
+    up_packed_ptrs: &[u64],
+    up_sfb_ptrs: &[u64],
+    up_scale2_vals: &[f32],
+    act_gscale_vals: &[f32],
+    c_gate: u64,
+    c_up: u64,
+    expert_offsets_host: &[i32],
+    n: u32,
+    k: u32,
+    num_tokens: usize,
+    pack_once: bool,
+    stream: u64,
+) -> Result<bool> {
     let num_experts = gate_packed_ptrs.len();
+    if num_tokens > i32::MAX as usize {
+        bail!("nvfp4_grouped_gate_up_w4a4_ex: {num_tokens} tokens overflow the C ABI's int");
+    }
     ensure_group_arrays(
         "nvfp4_grouped_gate_up_w4a4",
         num_experts,
@@ -347,8 +399,9 @@ pub fn nvfp4_grouped_gate_up_w4a4(
     #[cfg(metrale_cutlass)]
     {
         let ctx = ctx()?;
+        let mut engaged = 0i32;
         let status = unsafe {
-            metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
+            metrale_cutlass_nvfp4_grouped_gate_up_w4a4_ex(
                 a as *const c_void,
                 sorted_token_ids as *const i32,
                 gate_packed_ptrs.as_ptr(),
@@ -364,6 +417,9 @@ pub fn nvfp4_grouped_gate_up_w4a4(
                 num_experts as i32,
                 n as i32,
                 k as i32,
+                num_tokens as i32,
+                i32::from(pack_once),
+                &mut engaged,
                 ctx.workspace as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
@@ -376,7 +432,7 @@ pub fn nvfp4_grouped_gate_up_w4a4(
                 ctx.ws_size >> 20
             );
         }
-        Ok(())
+        Ok(engaged != 0)
     }
     #[cfg(not(metrale_cutlass))]
     {
@@ -395,6 +451,7 @@ pub fn nvfp4_grouped_gate_up_w4a4(
             expert_offsets_host,
             n,
             k,
+            pack_once,
             stream,
         );
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
@@ -416,7 +473,48 @@ pub fn nvfp4_grouped_down_w4a4(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    nvfp4_grouped_down_w4a4_ex(
+        a,
+        packed_ptrs,
+        sfb_ptrs,
+        scale2_vals,
+        act_gscale_vals,
+        c,
+        expert_offsets_host,
+        n,
+        k,
+        None,
+        stream,
+    )
+    .map(|_| ())
+}
+
+/// 2026-10-06: [`nvfp4_grouped_down_w4a4`] with `METRALE_GLM_MOE_SWIGLU_AMAX`: `pre_amax =
+/// Some((ptr, rows))`, `ptr` a device `u32` holding max |a| as float bits over `rows` of `a`
+/// (computed on `stream` before this call). The C side uses it instead of its own amax pass
+/// only when the dynamic experts' rows are exactly `rows`; otherwise it runs that pass. Returns
+/// whether `pre_amax` was used.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_grouped_down_w4a4_ex(
+    a: u64,
+    packed_ptrs: &[u64],
+    sfb_ptrs: &[u64],
+    scale2_vals: &[f32],
+    act_gscale_vals: &[f32],
+    c: u64,
+    expert_offsets_host: &[i32],
+    n: u32,
+    k: u32,
+    pre_amax: Option<(u64, std::ops::Range<usize>)>,
+    stream: u64,
+) -> Result<bool> {
     let num_experts = packed_ptrs.len();
+    let (pre_ptr, pre_lo, pre_hi) = match &pre_amax {
+        Some((p, r)) if *p != 0 && r.end <= i32::MAX as usize && r.start < r.end => {
+            (*p, r.start as i32, r.end as i32)
+        }
+        _ => (0u64, 0i32, 0i32),
+    };
     ensure_group_arrays(
         "nvfp4_grouped_down_w4a4",
         num_experts,
@@ -430,8 +528,9 @@ pub fn nvfp4_grouped_down_w4a4(
     #[cfg(metrale_cutlass)]
     {
         let ctx = ctx()?;
+        let mut engaged = 0i32;
         let status = unsafe {
-            metrale_cutlass_nvfp4_grouped_down_w4a4(
+            metrale_cutlass_nvfp4_grouped_down_w4a4_ex(
                 a as *const c_void,
                 packed_ptrs.as_ptr(),
                 sfb_ptrs.as_ptr(),
@@ -442,6 +541,10 @@ pub fn nvfp4_grouped_down_w4a4(
                 num_experts as i32,
                 n as i32,
                 k as i32,
+                pre_ptr as *const u32,
+                pre_lo,
+                pre_hi,
+                &mut engaged,
                 ctx.workspace as *mut c_void,
                 ctx.ws_size,
                 stream as *mut c_void,
@@ -454,7 +557,7 @@ pub fn nvfp4_grouped_down_w4a4(
                 ctx.ws_size >> 20
             );
         }
-        Ok(())
+        Ok(engaged != 0)
     }
     #[cfg(not(metrale_cutlass))]
     {
@@ -468,6 +571,9 @@ pub fn nvfp4_grouped_down_w4a4(
             expert_offsets_host,
             n,
             k,
+            pre_ptr,
+            pre_lo,
+            pre_hi,
             stream,
         );
         bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
@@ -486,6 +592,66 @@ pub fn set_w4a4_amax_dedup_override(force: Option<bool>) {
     }
     #[cfg(not(metrale_cutlass))]
     let _ = force;
+}
+
+/// 2026-10-06: Known-bad hook for `METRALE_CUTLASS_W4A4_PACK_ONCE`
+/// (`glm_moe_w4a4_pack_once_microtest`): when `on`, every later engaged pack-once call flips one
+/// staged block-scale byte before the gather, so its SFA must differ from the per-route pack.
+pub fn set_w4a4_pack_once_fault(on: bool) {
+    #[cfg(metrale_cutlass)]
+    unsafe {
+        metrale_cutlass_set_w4a4_pack_once_fault(i32::from(on));
+    }
+    #[cfg(not(metrale_cutlass))]
+    let _ = on;
+}
+
+/// 2026-10-06: Where the last W4A4 grouped call (gate/up or down) left its quantized A in the
+/// CUTLASS workspace, and what it engaged. Diagnostic (microtests): concurrent callers may
+/// interleave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct W4a4LastPrep {
+    /// 2026-10-06: Workspace base; packed A is `[base, base + sfa_off)`.
+    pub ws_base: u64,
+    /// 2026-10-06: SFA offset (packed-A bytes rounded up to 256) and SFA bytes.
+    pub sfa_off: u64,
+    pub sfa_bytes: u64,
+    /// 2026-10-06: Offset of the per-group F32 global scales, `groups` of them.
+    pub gs_off: u64,
+    pub groups: u64,
+    pub pack_once: bool,
+    pub pre_amax: bool,
+}
+
+/// 2026-10-06: [`W4a4LastPrep`] of the last W4A4 call; `None` without CUTLASS.
+pub fn w4a4_last_prep() -> Option<W4a4LastPrep> {
+    #[cfg(metrale_cutlass)]
+    {
+        let mut v = [0u64; 7];
+        unsafe { metrale_cutlass_w4a4_last_prep(v.as_mut_ptr(), v.len() as i32) };
+        Some(W4a4LastPrep {
+            ws_base: v[0],
+            sfa_off: v[1],
+            sfa_bytes: v[2],
+            gs_off: v[3],
+            groups: v[4],
+            pack_once: v[5] != 0,
+            pre_amax: v[6] != 0,
+        })
+    }
+    #[cfg(not(metrale_cutlass))]
+    None
+}
+
+/// 2026-10-06: The shared CUTLASS workspace (device base, bytes), allocated on first use.
+pub fn workspace() -> Result<(u64, usize)> {
+    #[cfg(metrale_cutlass)]
+    {
+        let c = ctx()?;
+        Ok((c.workspace, c.ws_size))
+    }
+    #[cfg(not(metrale_cutlass))]
+    bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
 }
 
 #[cfg(test)]

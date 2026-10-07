@@ -745,6 +745,10 @@ fn main() -> Result<()> {
                 tables: &tables,
                 skip_down: false,
                 swiglu_rows: 0..te,
+                tokens,
+                pack_once: false,
+                swiglu_amax: KernelHandle(0),
+                amax_slot: DevicePtr(0),
             };
             g.memset_async(act_b, 0, te * mi() * 2, 0)?;
             g.memset_async(out_b, 0, te * H * 2, 0)?;
@@ -782,6 +786,10 @@ fn main() -> Result<()> {
                     tables: &tables,
                     skip_down: false,
                     swiglu_rows: span.clone(),
+                    tokens,
+                    pack_once: false,
+                    swiglu_amax: KernelHandle(0),
+                    amax_slot: DevicePtr(0),
                 };
                 g.memset_async(act_b, 0x5A, te * mi() * 2, 0)?;
                 g.memset_async(out_b, 0, te * H * 2, 0)?;

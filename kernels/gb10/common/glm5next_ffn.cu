@@ -45,6 +45,61 @@ extern "C" __global__ void glm5next_swiglu_clamp(
     out[i] = __float2bfloat16(s * u);
 }
 
+// 2026-10-06: METRALE_GLM_MOE_SWIGLU_AMAX: glm5next_swiglu_clamp (the same expressions, so the
+// same `out` bytes), plus the max |value| of the BF16 values it stores, folded into *amax_bits
+// as float bits with atomicMax (non-negative floats order like their bits): the value
+// act_amax_rows_flat (cutlass_nvfp4_grouped_gemm.cu) computes over the same elements (fmaxf
+// from 0 drops NaN, fabsf maps -0 to +0). The caller zeroes *amax_bits before the launch.
+// Same grid as glm5next_swiglu_clamp (ceil(n / 256) blocks of 256); blockDim must be a
+// multiple of 32, at most 1024. One atomic per block, skipped when *amax_bits already holds at
+// least the block's max (the slot only grows, so the final value is the same).
+extern "C" __global__ void glm5next_swiglu_clamp_amax(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ out,
+    const unsigned int n,
+    const float limit,
+    unsigned int* __restrict__ amax_bits
+) {
+    __shared__ float warp_max[32];
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float m = 0.0f;
+    if (i < n) {
+        float g = (float)gate[i];
+        float u = (float)up[i];
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+        float s = g / (1.0f + expf(-g));
+        const __nv_bfloat16 o = __float2bfloat16(s * u);
+        out[i] = o;
+        m = fmaxf(m, fabsf(__bfloat162float(o)));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+    }
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        warp_max[warp] = m;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned int nw = blockDim.x >> 5;
+        m = lane < nw ? warp_max[lane] : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+        }
+        if (lane == 0) {
+            const unsigned int bits = __float_as_uint(m);
+            if (bits > *((volatile unsigned int*)amax_bits)) {
+                atomicMax(amax_bits, bits);
+            }
+        }
+    }
+}
+
 
 // 2026-09-25: glm5next_swiglu_clamp with an FP32 output. No host code launches it.
 extern "C" __global__ void glm5next_swiglu_clamp_f32out(

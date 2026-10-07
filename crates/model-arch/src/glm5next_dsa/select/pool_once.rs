@@ -79,6 +79,13 @@ pub fn compress_window(
     if inputs.geom_dev.0 != 0 {
         bail!("DSA pool compress: the once-per-window compress takes host geometry only");
     }
+    if inputs.pool_cache.is_some() || crate::glm5next_dsa::pool_cache::dsa_pool_cache() {
+        // 2026-10-07 (comb23): the pool-cache scratch has no pool regions to compress into.
+        bail!(
+            "DSA pool compress: METRALE_GLM_DSA_KPOOL_ONCE does not compose with \
+             METRALE_GLM_DSA_POOL_CACHE"
+        );
+    }
     scratch.fits(cfg, geom)?;
     // 2026-10-07: logged once so a serve shows the lever reached the prefill (gate scripts grep it).
     static ENGAGED: OnceLock<()> = OnceLock::new();

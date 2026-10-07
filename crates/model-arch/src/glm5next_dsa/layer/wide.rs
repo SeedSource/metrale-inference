@@ -424,7 +424,9 @@ impl Glm5NextDsaLayer {
         // compress the pools of the window's end length once into the selection scratch; every
         // sub-chunk below reads its own first `n_pools` of them (`select::pool_once`). Nothing
         // else writes the scratch's pool regions between here and the last sub-chunk.
-        let once = pool_once::dsa_kpool_once();
+        // 2026-10-07 (comb23): off under `METRALE_GLM_DSA_POOL_CACHE=1`, whose scratch has no pool
+        // regions and whose sub-chunks already compress only the new pools into the state's arrays.
+        let once = pool_once::dsa_kpool_once() && !super::super::pool_cache::dsa_pool_cache();
         if once {
             gpu.memset_async(st.valid.offset(st.len()), 1, k, stream)?;
             let wg = DsaSelectGeometry::plan(c, st.len() + k, 1)?;
@@ -439,6 +441,7 @@ impl Glm5NextDsaLayer {
                 q_mask: w.q_mask_rows,
                 first_key: 0,
                 geom_dev: DevicePtr::NULL,
+                pool_cache: None,
             };
             let t = profile::start();
             let sk = &self.select_kernels;

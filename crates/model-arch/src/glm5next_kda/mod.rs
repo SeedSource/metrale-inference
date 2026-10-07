@@ -670,22 +670,62 @@ impl Glm5NextKdaLayer {
         ws: &Glm5NextKdaWorkspace,
         stream: u64,
     ) -> Result<()> {
-        self.back_end_with(gpu, t, ws, self.kernels.o_norm, ws.core, stream)
+        let fused = self.kernels.o_norm_fp8q;
+        self.back_end_with(gpu, t, ws, self.kernels.o_norm, fused, ws.core, stream)
     }
 
     /// 2026-10-03: [`Self::back_end`] with the norm kernel and its input named: `back_end` passes
     /// `kda_o_norm_gated_bf16` over the FP32 `ws.core`, the FlashKDA prefill
     /// `kda_o_norm_gated_bf16in` over the library's BF16 output. Same launches otherwise.
+    ///
+    /// 2026-10-07: `fused` is the twin of `o_norm` that also writes the FP8 activation of
+    /// `o_proj` (`kda_o_norm_gated_*_fp8q`; `KernelHandle(0)` when absent). With
+    /// `METRALE_GLM_NORM_FP8_QUANT_FUSE=1`, a head dim of 128 (one quantizer K-group per head)
+    /// and a call the W8A8 arm takes (`dense_fp8::w8a8_fused_input`), the twin replaces the
+    /// norm and `o_proj`'s separate quant launch; otherwise this is the unfused pair.
+    #[allow(clippy::too_many_arguments)]
     fn back_end_with(
         &self,
         gpu: &dyn GpuBackend,
         t: usize,
         ws: &Glm5NextKdaWorkspace,
         o_norm: KernelHandle,
+        fused: KernelHandle,
         core: DevicePtr,
         stream: u64,
     ) -> Result<()> {
         let c = &self.cfg;
+        if fused.0 != 0
+            && c.head_dim == 128
+            && crate::glm5next_layer::dense_fp8::w8a8_fused_input(
+                gpu,
+                self.kernels.gemv,
+                ws.o_norm_out,
+                self.weights.o_proj.weight,
+                ws.final_out,
+                (t, c.hidden, c.qkv_dim()),
+                stream,
+                &mut |a_fp8, a_scale| {
+                    // 2026-10-07: Block `row = token * heads + head` is quantizer K-group `head`
+                    // of token `token` (head_dim == 128 == the group), so the scale array is
+                    // indexed by `row` and the FP8 bytes by `row * 128`, both packed [t, qkv].
+                    KernelLaunch::new(gpu, fused)
+                        .grid([(t * c.heads) as u32, 1, 1])
+                        .block([c.head_dim as u32, 1, 1])
+                        .arg_ptr(core)
+                        .arg_ptr(ws.out_gate)
+                        .arg_ptr(self.weights.o_norm.weight)
+                        .arg_ptr(ws.o_norm_out)
+                        .arg_ptr(a_fp8)
+                        .arg_ptr(a_scale)
+                        .arg_u32(c.head_dim as u32)
+                        .arg_f32(c.rms_norm_eps)
+                        .launch(stream)
+                },
+            )?
+        {
+            return Ok(());
+        }
         KernelLaunch::new(gpu, o_norm)
             .grid([(t * c.heads) as u32, 1, 1])
             .block([c.head_dim as u32, 1, 1])

@@ -26,7 +26,11 @@
 //! (`METRALE_GLM_KDA_CHUNK_PREFILL`) otherwise uses, so the lever allocates nothing: Q' + W in
 //! `q_f32`, K'^T in `k_f32`, u in `v_f32`, M + decay in `chunk_gc` (`KDA_TC_REC_BYTES` per
 //! record; [`chunked_tc_refusal`] checks they fit).
+//!
+//! 2026-10-07: Under `METRALE_GLM_KDA_FRONT_FUSE=1` the first three launches and the front
+//! end's pack, gate and beta sigmoid become two (prefill_tc_fuse.rs); the scan is unchanged.
 
+use super::prefill_tc_fuse::{front_fuse_refusal, kda_front_fuse, kda_front_fuse_fallback};
 use super::*;
 
 impl Glm5NextKdaLayer {
@@ -46,6 +50,24 @@ impl Glm5NextKdaLayer {
         ws: &Glm5NextKdaWorkspace,
         stream: u64,
     ) -> Result<()> {
+        self.prefill_chunked_tc_arm(gpu, hidden, k, state, ws, kda_front_fuse(), stream)
+    }
+
+    /// 2026-10-07: [`Self::prefill_chunked_tc`] with `METRALE_GLM_KDA_FRONT_FUSE` passed in as
+    /// `front_fuse` instead of read from the environment, so `kda_front_fuse_microtest` runs
+    /// both arms in one process. `front_fuse` true still falls back to the unfused launches
+    /// (warning once) when [`front_fuse_refusal`] names a reason.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_chunked_tc_arm(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        k: usize,
+        state: &KdaSeqState,
+        ws: &Glm5NextKdaWorkspace,
+        front_fuse: bool,
+        stream: u64,
+    ) -> Result<()> {
         if k == 0 || k > ws.max_tokens {
             bail!(
                 "KDA chunked-TC prefill of {k} tokens does not fit a workspace built for {}",
@@ -61,13 +83,28 @@ impl Glm5NextKdaLayer {
             kda_chunked_tc_fallback(why);
             return self.decode_k(gpu, hidden, k, state, ws, &[], stream);
         }
+        // 2026-10-07: METRALE_GLM_KDA_FRONT_FUSE=1: the front end skips the pack, the gate and
+        // the beta sigmoid, and the recurrence computes them inside its prepare
+        // (prefill_tc_fuse.rs); byte-identical.
+        let fuse = front_fuse
+            && match front_fuse_refusal(&self.cfg, self.kernels.has_front_fuse()) {
+                Some(why) => {
+                    kda_front_fuse_fallback(why);
+                    false
+                }
+                None => true,
+            };
         use crate::glm5next_layer::profile;
         // 2026-10-01: The same three profile buckets as `decode_k`.
         let t_front = profile::start();
-        self.front_end(gpu, hidden, k, ws, stream)?;
+        self.front_end_opts(gpu, hidden, k, ws, stream, !fuse, !fuse)?;
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
         let t_recur = profile::start();
-        self.stateful_chunked_tc(gpu, k, state, ws, stream)?;
+        if fuse {
+            self.stateful_chunked_tc_fused(gpu, k, state, ws, stream)?;
+        } else {
+            self.stateful_chunked_tc(gpu, k, state, ws, stream)?;
+        }
         profile::end(profile::KDA_RECUR, t_recur, gpu, stream);
         let t_back = profile::start();
         let r = self.back_end(gpu, k, ws, stream);
@@ -144,6 +181,22 @@ impl Glm5NextKdaLayer {
             .arg_u32(c.heads as u32)
             .arg_f32(1.0 / (d as f32).sqrt())
             .launch(stream)?;
+        self.launch_tc_scan(gpu, k, state, ws, stream)
+    }
+
+    /// 2026-10-07: `kda_tc_scan` over the chunk records of rows `0..k` (moved out of
+    /// `stateful_chunked_tc` unchanged; the fused front launches it too).
+    pub(super) fn launch_tc_scan(
+        &self,
+        gpu: &dyn GpuBackend,
+        k: usize,
+        state: &KdaSeqState,
+        ws: &Glm5NextKdaWorkspace,
+        stream: u64,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let (qkv, d) = (c.qkv_dim(), c.head_dim);
+        let nchunks = k.div_ceil(KDA_TC_C);
         KernelLaunch::new(gpu, self.kernels.tc_scan)
             .grid([c.heads as u32, (d / (16 * KDA_TC_SCAN_WARPS)) as u32, 1])
             .block([(32 * KDA_TC_SCAN_WARPS) as u32, 1, 1])

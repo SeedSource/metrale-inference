@@ -216,7 +216,8 @@ impl Glm5NextKdaLayer {
         let t_back = profile::start();
         // 2026-10-03: The library's BF16 output, `[k, heads, head_dim]` rows of `qkv`, sits at
         // the start of `conv_out`.
-        let r = self.back_end_with(gpu, k, ws, self.kernels.flk_o_norm, ws.conv_out, stream);
+        let (o_norm, fused) = (self.kernels.flk_o_norm, self.kernels.flk_o_norm_fp8q);
+        let r = self.back_end_with(gpu, k, ws, o_norm, fused, ws.conv_out, stream);
         profile::end(profile::KDA_BACK, t_back, gpu, stream);
         r.map(|()| true)
     }

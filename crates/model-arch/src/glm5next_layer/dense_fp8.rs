@@ -109,6 +109,14 @@
 //!   `front_end_with` (q/k/v/g_a over `hidden`), DSA `decode_k` / `decode_k_wide` (q_a and
 //!   kv_a over `hidden`, kv_a issued right after q_a), MLP `forward_dense_sliced` (gate/up
 //!   over each row slice).
+//! - 2026-10-07: `METRALE_GLM_NORM_FP8_QUANT_FUSE=1` ([`w8a8_fused_input`], module `fused`;
+//!   inert without W8A8): a caller whose W8A8 input is made by an RMSNorm-class kernel that
+//!   holds each quantizer K-group in registers (today the KDA gated output norm before
+//!   `o_proj`) lets that kernel write the BF16 input AND the FP8 bytes and scales into the
+//!   W8A8 scratch; the GEMM then runs without the separate quant launch and its BF16 re-read.
+//!   Byte-identical to the unfused pair: the kernel quantizes the BF16-rounded value it
+//!   stores, with the quantizer's arithmetic. Any call the W8A8 arm would skip returns
+//!   `false` without launching, and the caller runs its unfused norm + [`route`].
 //! - 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW=1` ([`super::dense_fp8_gw`]; inert
 //!   without W8A8, refused without CUTLASS): [`register`] quantizes a weight that also gets an
 //!   NVFP4 decode copy (N, K multiples of 128) to 128x128 block-scaled FP8 instead of per-row
@@ -116,6 +124,11 @@
 //!   entry never takes the per-row decode GEMVs (its 1..=16-row calls go to the NVFP4 GEMV or
 //!   the dequant), its W8A8 GEMM runs `dense_fp8_gw::gemm` (CUTLASS Sm120 FP8 blockwise) and
 //!   its dequant `dequant_fp8_blockscaled_bf16`. Off, no entry has `bs` and nothing changes.
+
+// 2026-10-07: `METRALE_GLM_NORM_FP8_QUANT_FUSE`: the fused norm + quant entry (child module,
+// so it reaches this file's private W8A8 state).
+mod fused;
+pub use fused::{norm_fp8_quant_fuse, w8a8_fused_input};
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -872,7 +885,7 @@ pub fn route(
     // when it can (module doc), else falls through to the dequant.
     if dense_fp8_w8a8()
         && m > ops::DENSE_GEMV_FP8W_BATCHM_MAX_M as usize
-        && w8a8(gpu, gemv.0 == kk.bf16_gemv.0, a, &e, c, m, stream)?
+        && w8a8(gpu, gemv.0 == kk.bf16_gemv.0, a, &e, c, m, stream, None)?
     {
         return Ok(Route::Done);
     }
@@ -1058,6 +1071,13 @@ fn w8a8_skip(why: W8a8Skip, m: usize, n: usize, k: usize) -> Result<bool> {
 /// `bf16_out`: the caller passed the BF16-out `dense_gemv_bf16` handle): quantize
 /// `a` into the scratch, then the per-row-scale GEMM over the FP8 copy, both on `stream`.
 /// `Ok(false)`, launching nothing, otherwise.
+///
+/// 2026-10-07: With `fill` (`METRALE_GLM_NORM_FP8_QUANT_FUSE`, [`w8a8_fused_input`]) the quant
+/// launch is replaced by `fill(a_fp8, a_scale)`: the caller's kernel, run on `stream`, writes
+/// `a` itself AND the FP8 bytes and scales the quantizer would make from it. `fill` runs only
+/// when this returns `Ok(true)`; any skip returns `Ok(false)` before calling it. The held
+/// share-scope quant is dropped (the scratch changes under it).
+#[allow(clippy::too_many_arguments)]
 fn w8a8(
     gpu: &dyn GpuBackend,
     bf16_out: bool,
@@ -1066,6 +1086,7 @@ fn w8a8(
     c: DevicePtr,
     m: usize,
     stream: u64,
+    fill: Option<&mut dyn FnMut(DevicePtr, DevicePtr) -> Result<()>>,
 ) -> Result<bool> {
     let (n, k) = (e.n, e.k);
     // The rowscale GEMM writes BF16; a caller passing another GEMV family (the FP32-out
@@ -1107,7 +1128,7 @@ fn w8a8(
     }
     // 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT` (module doc): reuse the held quant
     // when this input is the one it was made from, inside the same share scope.
-    let generation = if w8a8_share_quant() && !capturing {
+    let generation = if fill.is_none() && w8a8_share_quant() && !capturing {
         share_generation_for(a, m * k * 2)
     } else {
         None
@@ -1119,7 +1140,11 @@ fn w8a8(
         stream,
         generation,
     });
-    if want.is_some() && st.held == want {
+    if let Some(fill) = fill {
+        // 2026-10-07: The caller's fused kernel writes `a` and the quant; nothing is held.
+        fill(s.a_fp8, s.a_scale)?;
+        st.held = None;
+    } else if want.is_some() && st.held == want {
         W8A8_REUSED.fetch_add(1, Ordering::Relaxed);
         if !W8A8_REUSE_FIRST.swap(true, Ordering::Relaxed) {
             tracing::info!(

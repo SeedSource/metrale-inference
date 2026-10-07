@@ -18,6 +18,7 @@
 
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 
 
@@ -74,6 +75,126 @@ extern "C" __global__ void kda_o_norm_gated_f32(
 #define KDA_ONORM_OUT_F32(val) output[(size_t)row * head_dim + i] = (val)
     KDA_ONORM_BODY(gate[(size_t)row * head_dim + i], weight[i], KDA_ONORM_OUT_F32)
 #undef KDA_ONORM_OUT_F32
+}
+
+// 2026-10-07: METRALE_GLM_NORM_FP8_QUANT_FUSE: kda_o_norm_gated_*_fp8q write what
+// kda_o_norm_gated_bf16 / kda_o_norm_gated_bf16in write PLUS the FP8 E4M3 activation and FP32
+// scale that per_token_group_quant_fp8 (kernels/gb10/common/per_token_group_quant_fp8.cu, and
+// its Hopper twin) would make from that BF16 output, so the o_proj W8A8 GEMM skips the
+// quantizer launch and its BF16 re-read of the whole [T, qkv] activation.
+// Invariants (the fused kernels):
+// - blockDim.x == head_dim == 128: one thread per element and one block per quantizer
+//   K-group, so block `row` (= token * heads + head) is group `row % heads` of token
+//   `row / heads`. The quantizer's [M, K/128] scale array (K = heads * 128) is then indexed by
+//   `row`, and its [M, K] bytes by `row * 128 + tid`.
+// - The BF16 output is computed by the same statements as the unfused kernel (same reduction
+//   order, same `x * inv * w * s` association), and the quantizer then runs on the BF16-ROUNDED
+//   value (`__float2bfloat16`, widened back), exactly the bytes a separate launch would read.
+//   The scale (`amax / 448.0f`, 1e-12f floor), the per-element division by the scale, the
+//   clamp and the saturating `__nv_cvt_float_to_fp8` are the quantizer's. `fmaxf` is exact and
+//   drops a NaN operand and the amax is seeded with 0.0f, as there, so the reduction tree
+//   cannot change the result.
+// - Gate: crates/model-arch/examples/kda_o_norm_fp8q_microtest.rs (bitwise).
+#define KDA_FP8Q_MAX 448.0f
+
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+// 2026-10-07: SCALE and HIP builds encode E4M3 in software, as per_token_group_quant_fp8.cu does.
+__device__ __forceinline__ unsigned char kda_fp8q_encode(float v) {
+    if (v != v) return 0x7F;
+    unsigned int bb = __float_as_uint(v); unsigned int sign = (bb >> 31) & 1u;
+    int e = (int)((bb >> 23) & 0xFF) - 127; unsigned int man = bb & 0x7FFFFFu;
+    int ee = e + 7; unsigned int em;
+    if (ee < 1) { ee = 0; em = 0; if (e >= -10) { float a = v < 0 ? -v : v; em = (unsigned int)(a / 0.001953125f + 0.5f); if (em > 7u) em = 7u; } }
+    else if (ee > 15) { ee = 15; em = 6; }
+    else { em = (man + (1u << 19)) >> 20; if (em > 7u) { em = 0; ee++; if (ee > 15) { ee = 15; em = 6; } } }
+    return (unsigned char)((sign << 7) | ((unsigned)ee << 3) | em);
+}
+#else
+__device__ __forceinline__ unsigned char kda_fp8q_encode(float v) {
+    return (unsigned char)__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+}
+#endif
+
+// 2026-10-07: Quantize the block's 128 BF16-rounded values `v` (thread `tid` holds element
+// `tid`) as one K-group: scale into `scale[row]`, byte into `fp8[row * 128 + tid]`. Every
+// thread of the 128-thread block must call it (it synchronizes).
+__device__ __forceinline__ void kda_onorm_fp8_group(
+    float v,
+    unsigned int row,
+    unsigned char* __restrict__ fp8,
+    float* __restrict__ scale
+) {
+    __shared__ float qred[4];
+    const unsigned int tid = threadIdx.x;
+    float a = fmaxf(0.0f, fabsf(v));
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
+    if ((tid & 31) == 0) qred[tid >> 5] = a;
+    __syncthreads();
+    const float amax = fmaxf(fmaxf(qred[0], qred[1]), fmaxf(qred[2], qred[3]));
+    float sc = amax / KDA_FP8Q_MAX;
+    if (sc < 1e-12f) sc = 1e-12f;
+    if (tid == 0) scale[row] = sc;
+    float q = v / sc;
+    q = fmaxf(fminf(q, KDA_FP8Q_MAX), -KDA_FP8Q_MAX);
+    fp8[(size_t)row * 128 + tid] = kda_fp8q_encode(q);
+}
+
+// 2026-10-07: KDA_ONORM_BODY's reduction and per-element expression, one element per thread
+// (blockDim.x == head_dim), ending in the quantizer instead of the plain store. X_LD, GATE_LD
+// and W_LD read element `tid` of the input, gate and weight as float.
+#define KDA_ONORM_FP8Q_BODY(X_LD, GATE_LD, W_LD)                                              \
+    const unsigned int row = blockIdx.x;                                                      \
+    const unsigned int tid = threadIdx.x;                                                     \
+    const float xv = (X_LD);                                                                  \
+    float acc = 0.0f;                                                                         \
+    acc += xv * xv;                                                                           \
+    __shared__ float red[32];                                                                 \
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);     \
+    if ((tid & 31) == 0) red[tid >> 5] = acc;                                                 \
+    __syncthreads();                                                                          \
+    if (tid < 32) {                                                                           \
+        float v = (tid < ((blockDim.x + 31) / 32)) ? red[tid] : 0.0f;                          \
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);      \
+        if (tid == 0) red[0] = v;                                                             \
+    }                                                                                         \
+    __syncthreads();                                                                          \
+    const float inv = rsqrtf(red[0] / (float)head_dim + eps);                                 \
+    const float g = (GATE_LD);                                                                \
+    const float s = 1.0f / (1.0f + __expf(-g));                                               \
+    const __nv_bfloat16 ob = __float2bfloat16(xv * inv * (W_LD) * s);                          \
+    output[(size_t)row * head_dim + tid] = ob;                                                \
+    kda_onorm_fp8_group(__bfloat162float(ob), row, out_fp8, out_scale);
+
+// 2026-10-07: kda_o_norm_gated_bf16 (FP32 input) plus the quantizer's FP8 bytes and scales.
+extern "C" __global__ void kda_o_norm_gated_bf16_fp8q(
+    const float* __restrict__ input,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    unsigned char* __restrict__ out_fp8,
+    float* __restrict__ out_scale,
+    unsigned int head_dim,
+    float eps
+) {
+    KDA_ONORM_FP8Q_BODY(input[(size_t)row * head_dim + tid],
+                        __bfloat162float(gate[(size_t)row * head_dim + tid]),
+                        __bfloat162float(weight[tid]))
+}
+
+// 2026-10-07: kda_o_norm_gated_bf16in (BF16 input, the FlashKDA prefill's) plus the same.
+extern "C" __global__ void kda_o_norm_gated_bf16in_fp8q(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    unsigned char* __restrict__ out_fp8,
+    float* __restrict__ out_scale,
+    unsigned int head_dim,
+    float eps
+) {
+    KDA_ONORM_FP8Q_BODY(__bfloat162float(input[(size_t)row * head_dim + tid]),
+                        __bfloat162float(gate[(size_t)row * head_dim + tid]),
+                        __bfloat162float(weight[tid]))
 }
 
 // 2026-09-25: Splits the [T, 3 * qkv] BF16 q|k|v rows into three FP32 [T_pad, qkv] buffers;

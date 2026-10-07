@@ -13,8 +13,9 @@
 //!   arm runs the fused kernel with separate output buffers.
 //! - Exits 0 only if, at every row count, both fused arms equal the pair bit for bit on every
 //!   output (highway, mix, y, post, comb), and both known-bads are detected: the input `comb`
-//!   nudged by one ULP (highway and y must differ) and the next site's `hc_base` nudged (post,
-//!   comb and y must differ while highway and mix stay equal).
+//!   nudged by one ULP (highway, mix and comb must differ; BF16 `y` usually absorbs a one-ULP
+//!   highway change) and the next site's `hc_base` nudged (post, comb and y must differ while
+//!   highway and mix stay equal).
 //!
 //! Shapes: GLM-5.3 (hidden 4096, hc_mult 4, mix_hc 24, BF16 `hc_fn`, 20 Sinkhorn iterations)
 //! at 4096, 257 and 1 rows. Timing (4096 rows, cold: a 64 MiB memset between launches evicts
@@ -322,8 +323,9 @@ fn main() -> Result<()> {
             bad += 1;
         }
 
-        // 2026-10-06: Known-bad 1: the input comb nudged by one ULP must change the highway
-        // and, through it, y.
+        // 2026-10-07: Known-bad 1: the input comb nudged by one ULP must change the highway and,
+        // through it, the f32 mix and the next comb. Not y: a one-ULP f32 highway change in one
+        // row rarely survives the BF16 rounding of y (measured 0 differing at 4096, 257, 1 rows).
         reset(g, &io, &h, &h.comb_bad)?;
         run_fused(g, &k, &io, &next, t, false)?;
         let kb1 = diffs(&want, &read(g, t, io.hw, io.mix, aliased)?);
@@ -336,7 +338,7 @@ fn main() -> Result<()> {
         next.hc_base = good_base;
         println!("KNOWN_BAD rows={t}: comb+1ulp: {}", show(&kb1));
         println!("KNOWN_BAD rows={t}: hc_base nudge: {}", show(&kb2));
-        let kb1_ok = kb1[0] != 0 && kb1[2] != 0;
+        let kb1_ok = kb1[0] != 0 && kb1[1] != 0 && kb1[4] != 0;
         let kb2_ok = kb2[0] == 0 && kb2[1] == 0 && kb2[2] != 0 && kb2[3] != 0 && kb2[4] != 0;
         if !kb1_ok || !kb2_ok {
             println!("KNOWN_BAD not detected rows={t} (the comparison is blind)");

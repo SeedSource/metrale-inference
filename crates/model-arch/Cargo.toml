@@ -345,6 +345,10 @@ name = "kda_gate_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "kda_o_norm_fp8q_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kda_layer_microtest"
 required-features = ["cuda", "gpu-examples"]
 

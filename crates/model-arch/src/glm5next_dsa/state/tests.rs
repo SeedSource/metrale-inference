@@ -76,6 +76,7 @@ fn advancing_past_the_cap_is_refused_not_clamped() {
         released: false,
         lazy: None,
         lookahead: 0,
+        pool: None,
     };
     assert!(s.is_empty());
     s.advance(cap - 1).unwrap();
@@ -104,6 +105,7 @@ fn row_offsets_are_flat_bf16_rows() {
         released: false,
         lazy: None,
         lookahead: 0,
+        pool: None,
     };
     assert_eq!(s.row_offset(0), 0);
     assert_eq!(s.row_offset(1), 128 * 2);
@@ -140,6 +142,7 @@ fn ensure_room_refuses_before_the_write_and_moves_nothing() {
         released: false,
         lazy: None,
         lookahead: 0,
+        pool: None,
     };
     s.advance(cap).unwrap();
     assert!(

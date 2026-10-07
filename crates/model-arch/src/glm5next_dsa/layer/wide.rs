@@ -31,6 +31,8 @@
 //!   blocking copies, ordered only against the default stream, as in the row loop).
 //! - The lockstep check, `ensure_room(k)` and the block-table checks run before the first
 //!   launch; the indexer cache ends at `seq_len + k`, as after `k` rows of `decode_k`.
+//! - 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: `ensure_room(k)` bounds the whole window by
+//!   the ring; ring writes are `wide_ring.rs`; each sub-chunk compresses only new pools.
 
 use std::sync::Arc;
 
@@ -383,8 +385,10 @@ impl Glm5NextDsaLayer {
         // cache rows `[len, len + k)` (validity and length follow per sub-chunk below), the
         // head weights and the selector queries into the arena.
         let t = profile::start();
-        let off = st.row_offset(st.len());
-        let k_rows = st.k_normed.offset(off);
+        // 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: ring slots, staged through `arena.q_idx`
+        // when the ring wraps inside the window (`wide_ring.rs`). Lever off: the cache rows.
+        let win = self.pool_window_begin(gpu, st, arena.q_idx, k, stream)?;
+        let (k_rows, gate_rows) = (win.k_rows, win.gate_rows);
         let w_wk = self.weights.wk;
         gemm(gpu, g, gv, bm, hidden, w_wk, k_rows, k, d, h, stream)?;
         // 2026-10-01: `nllb_layernorm_bf16` normalises row `blockIdx.x` in place, as in
@@ -400,9 +404,9 @@ impl Glm5NextDsaLayer {
             .arg_u32(d as u32)
             .arg_f32(self.rms_eps)
             .launch(stream)?;
-        let gate_rows = st.gate.offset(off);
         let w_gate = self.weights.compress_gate;
         gemm(gpu, g, gv, bm, hidden, w_gate, gate_rows, k, d, h, stream)?;
+        win.scatter(gpu, st, d, stream)?;
         let w_wp = self.weights.weights_proj;
         self.gemm_f32_rows(gpu, hidden, w_wp, arena.head_weights, k, heads, h, stream)?;
         let (w_qb, qr, qi) = (self.weights.wq_b, arena.q_resid, arena.q_idx);
@@ -430,6 +434,8 @@ impl Glm5NextDsaLayer {
                 first_key: 0,
                 // 2026-10-01: Host geometry, as `select_rows_batched` passes.
                 geom_dev: DevicePtr::NULL,
+                // 2026-10-06: Pool cache on: only the pools completed since the last sub-chunk.
+                pool_cache: st.pool_select_args()?,
             };
             let t = profile::start();
             // 2026-10-01: Rows `0..n` of the workspace's `[max_rows, out_width]` selection,
@@ -445,6 +451,7 @@ impl Glm5NextDsaLayer {
                 }
                 None => select_tokens(gpu, sk, c, &geom, &inputs, sel, Exact, stream)?,
             }
+            st.note_selected();
             profile::end(profile::DSA_SELECT, t, gpu, stream);
 
             // 2026-10-01: `attend_rows`' launch at offset inputs: all sub-chunk rows share the

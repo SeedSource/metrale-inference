@@ -10,6 +10,9 @@
 //!   ahead of the sequence is rewound to `seq_len` first.
 //! - `indexer_forward` checks that the indexer cache has room (`ensure_room`) before it
 //!   writes.
+//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` that check includes the ring bound, and
+//!   `check_lockstep`'s rewind the rewind bound (`pool_cache::RingBook`); the replay pre-check
+//!   (`check_replay_room`) runs both for the rewind and write a replay will do.
 //!
 //! Decode, end to end:
 //!
@@ -52,6 +55,7 @@ mod row_batch;
 mod row_src;
 mod rows;
 mod wide;
+mod wide_ring;
 mod workspace;
 mod xseq;
 
@@ -183,9 +187,14 @@ impl Glm5NextDsaLayer {
         let pos = state.len();
         let off = state.row_offset(pos);
         let w = &self.workspace;
+        // 2026-10-06: Pool cache on, `off` is the row's ring slot (`row_offset`); a host-path
+        // write first clamps the device `pk_len` after a rewind (`pool_clamp_before_write`).
         let (k_dst, gate_dst) = match pos_dev {
             Some(_) => (w.stage_k, w.stage_gate),
-            None => (state.k_normed.offset(off), state.gate.offset(off)),
+            None => {
+                self.pool_clamp_before_write(gpu, state, pos, stream)?;
+                (state.k_normed.offset(off), state.gate.offset(off))
+            }
         };
 
         gemm(
@@ -418,7 +427,7 @@ impl metrale_model_layers::layer::LayerGraphHooks for Glm5NextDsaLayer {
             .ok_or_else(|| {
                 anyhow::anyhow!("Glm5NextDsaLayer got a state that is not Glm5NextDsaState")
             })?
-            .ensure_room_through(seq_len + k)
+            .replay_room(seq_len, k)
             .with_context(|| {
                 format!("DSA replay pre-check (before launch_graph, seq_len {seq_len} + k {k})")
             })

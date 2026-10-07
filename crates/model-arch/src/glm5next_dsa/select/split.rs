@@ -219,6 +219,7 @@ mod tests {
             q_mask: DevicePtr(8 << 40),
             first_key: 0,
             geom_dev: DevicePtr::NULL,
+            pool_cache: None,
         };
         let s = RowSplit::new(256, 1).unwrap();
         let i = s.inputs(&cfg, &full);

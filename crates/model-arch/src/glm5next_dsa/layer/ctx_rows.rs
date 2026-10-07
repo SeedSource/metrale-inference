@@ -10,6 +10,11 @@
 //!   projections run through the batched GEMV twins that are bit-identical per row to the
 //!   M = 1 GEMV (see `row_batch.rs`) and the norms are one block per row.
 //! - No collective is issued, as in `write_kv_row`.
+//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` the indexer rows go to ring slots, split
+//!   at the ring's end; `ensure_room(k)` refuses a write the ring cannot hold. Context rows are
+//!   written without a selection, so each call ends with a compress-only pass
+//!   (`pool_compress_written`) that advances the pool watermark, and a call longer than
+//!   `ring_rows - kpool` rows runs as several (`write_kv_row` compresses per completed pool).
 //! - Not written: the selector head weights (`weights_proj`). `write_kv_row` leaves them in
 //!   workspace scratch that a context row never reads, so no carried state differs.
 
@@ -65,6 +70,35 @@ impl Glm5NextDsaLayer {
             ),
             std::cmp::Ordering::Equal => {}
         }
+        // 2026-10-06: Pool cache: after a compress the ring holds at most
+        // `ring_rows - len % kpool` new rows, so a longer call runs as calls of at most
+        // `ring_rows - kpool` rows, each compressed before the next (the drafter's tiles are
+        // `CTX_TILE` = 256 rows and never split).
+        let chunk = st
+            .pool_cache()
+            .map(|pc| pc.book.ring_rows() - pc.book.kpool())
+            .filter(|&c| k > c);
+        if let Some(chunk) = chunk {
+            let (h, kvr) = (self.cfg.hidden, self.cfg.kv_lora_rank);
+            let mut r0 = 0;
+            while r0 < k {
+                let n = chunk.min(k - r0);
+                self.write_kv_rows(
+                    gpu,
+                    hidden.offset(r0 * h * 2),
+                    n,
+                    kv_a.offset(r0 * kvr * 2),
+                    slots.offset(r0 * 8),
+                    state,
+                    kv_cache,
+                    seq_len + r0,
+                    block_table,
+                    stream,
+                )?;
+                r0 += n;
+            }
+            return Ok(());
+        }
         // Checked before any write, as `indexer_forward`'s `ensure_room(1)` is per row.
         st.ensure_room(k)?;
         let bm = self.kernels.gemv_batchm;
@@ -113,24 +147,32 @@ impl Glm5NextDsaLayer {
             .arg_f32(1.0 / self.kv_scale)
             .launch(stream)?;
         // Indexer key side for all k rows, as `indexer_rows_batched` writes it.
+        // 2026-10-06: Including its pool-cache ring runs (one run with the lever off).
         let pos0 = st.len();
-        let off = st.row_offset(pos0);
-        let k_rows = st.k_normed.offset(off);
-        batchm_rows(gpu, bm, 2, hidden, self.weights.wk, k_rows, k, d, h, stream)?;
-        KernelLaunch::new(gpu, self.select_kernels.k_norm)
-            .grid([k as u32, 1, 1])
-            .block([d.min(1024) as u32, 1, 1])
-            .shared_mem((d.min(1024) * 4) as u32)
-            .arg_ptr(k_rows)
-            .arg_ptr(self.weights.k_norm_weight)
-            .arg_ptr(self.weights.k_norm_bias)
-            .arg_u32(k as u32)
-            .arg_u32(d as u32)
-            .arg_f32(self.rms_eps)
-            .launch(stream)?;
-        let gate = st.gate.offset(off);
-        batchm_rows(gpu, bm, 2, hidden, self.weights.compress_gate, gate, k, d, h, stream)?;
+        self.pool_clamp_before_write(gpu, st, pos0, stream)?;
+        for (r0, n) in st.ring_runs(pos0, k) {
+            let off = st.row_offset(pos0 + r0);
+            let x = hidden.offset(r0 * h * 2);
+            let (w_wk, w_gate) = (self.weights.wk, self.weights.compress_gate);
+            let k_rows = st.k_normed.offset(off);
+            batchm_rows(gpu, bm, 2, x, w_wk, k_rows, n, d, h, stream)?;
+            KernelLaunch::new(gpu, self.select_kernels.k_norm)
+                .grid([n as u32, 1, 1])
+                .block([d.min(1024) as u32, 1, 1])
+                .shared_mem((d.min(1024) * 4) as u32)
+                .arg_ptr(k_rows)
+                .arg_ptr(self.weights.k_norm_weight)
+                .arg_ptr(self.weights.k_norm_bias)
+                .arg_u32(n as u32)
+                .arg_u32(d as u32)
+                .arg_f32(self.rms_eps)
+                .launch(stream)?;
+            let gate = st.gate.offset(off);
+            batchm_rows(gpu, bm, 2, x, w_gate, gate, n, d, h, stream)?;
+        }
         gpu.memset_async(st.valid.offset(pos0), 1, k, stream)?;
-        st.advance(k)
+        st.advance(k)?;
+        // 2026-10-06: Pool cache: no selection follows a context write, so compress here.
+        self.pool_compress_written(gpu, st, stream)
     }
 }

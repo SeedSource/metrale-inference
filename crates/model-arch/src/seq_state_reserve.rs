@@ -24,10 +24,14 @@
 //! Owner: model-arch (serve memory reserve).
 //! Invariants:
 //! - Any `model_type` other than `glm5_next` is charged zero.
+//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` every indexer cache (each text DSA
+//!   layer's and the proposer's) is charged what `Glm5NextDsaState::alloc_pool_cache`
+//!   allocates (`pool_cache::pool_cache_state_bytes`); lever off, the charge is unchanged.
 
 use anyhow::Result;
 use metrale_config::{LayerType, ModelConfig};
 
+use crate::glm5next_dsa::pool_cache::{dsa_pool_cache, pool_cache_state_bytes, ring_rows_for};
 use crate::glm5next_dsa::state::{dsa_capacity, indexer_state_bytes};
 use crate::glm5next_skeleton::{Glm5NextTextSkeleton, Mixer};
 
@@ -63,11 +67,28 @@ pub fn per_sequence_state_bytes(
     max_seq_len: usize,
     spec_on: bool,
 ) -> Result<PerSequenceState> {
+    per_sequence_state_bytes_with(config, max_seq_len, spec_on, dsa_pool_cache())
+}
+
+/// 2026-10-06: [`per_sequence_state_bytes`] with the pool-cache lever as a parameter
+/// (`METRALE_GLM_DSA_POOL_CACHE`): `pool_cache` charges each indexer cache
+/// `pool_cache_state_bytes` (persistent pool arrays, the raw-row rings, `valid`) instead of
+/// `indexer_state_bytes`.
+pub fn per_sequence_state_bytes_with(
+    config: &ModelConfig,
+    max_seq_len: usize,
+    spec_on: bool,
+    pool_cache: bool,
+) -> Result<PerSequenceState> {
     if config.model_type != "glm5_next" {
         return Ok(PerSequenceState::default());
     }
     let capacity = dsa_capacity(max_seq_len, config.index_kpool);
-    let per_layer = indexer_state_bytes(capacity, config.index_head_dim);
+    let per_layer = if pool_cache {
+        pool_cache_state_bytes(capacity, config.index_head_dim, config.index_kpool)
+    } else {
+        indexer_state_bytes(capacity, config.index_head_dim)
+    };
 
     // 2026-09-25: The skeleton, built from the config alone, says which layers carry a DSA
     // mixer. The per-layer bytes use the pool-rounded capacity (`dsa_capacity`), the same
@@ -144,6 +165,29 @@ pub fn lazy_indexer_reserve(
     max_batch_size: usize,
     pool_gb: Option<f64>,
 ) -> Result<Option<LazyIndexerReserve>> {
+    let pool_cache = dsa_pool_cache();
+    lazy_indexer_reserve_with(
+        config,
+        max_seq_len,
+        spec_on,
+        max_batch_size,
+        pool_gb,
+        pool_cache,
+    )
+}
+
+/// 2026-10-06: [`lazy_indexer_reserve`] with the pool-cache lever as a parameter. With
+/// `pool_cache` the shared pool backs each cache's pool keys and ids
+/// (`LazyShape::pool_cache`), and the eager part per cache adds `pvalid`, `pk_len_dev` and the
+/// two raw-row rings.
+pub fn lazy_indexer_reserve_with(
+    config: &ModelConfig,
+    max_seq_len: usize,
+    spec_on: bool,
+    max_batch_size: usize,
+    pool_gb: Option<f64>,
+    pool_cache: bool,
+) -> Result<Option<LazyIndexerReserve>> {
     use crate::glm5next_dsa::lazy::{LazyShape, PoolConfig};
     use metrale_gpu_runtime::lazy_buffer::DEFAULT_GRANULE;
     if config.model_type != "glm5_next" {
@@ -162,6 +206,8 @@ pub fn lazy_indexer_reserve(
         proposer,
         index_head_dim: config.index_head_dim,
         capacity,
+        pool_cache,
+        index_kpool: config.index_kpool,
     };
     let mb = max_batch_size.max(1);
     let full = mb * shape.seq_mapped_bytes(capacity, DEFAULT_GRANULE);
@@ -174,12 +220,21 @@ pub fn lazy_indexer_reserve(
     } else {
         0
     };
+    // 2026-10-06: Pool cache: per cache also `pvalid` (`capacity / kpool`), `pk_len_dev`
+    // (4 B) and the `k_normed`/`gate` rings, all eager (`PoolCache::alloc`).
+    let pool_cache_eager = if pool_cache {
+        let ring = ring_rows_for(capacity);
+        capacity / config.index_kpool.max(1) + 4 + 2 * ring * config.index_head_dim * 2
+    } else {
+        0
+    };
+    let caches = dsa_layers + usize::from(proposer);
     Ok(Some(LazyIndexerReserve {
         pool: PoolConfig {
             limit_bytes: limit,
             shape,
         },
-        eager_per_seq: (dsa_layers + usize::from(proposer)) * capacity + proposer_scratch,
+        eager_per_seq: caches * (capacity + pool_cache_eager) + proposer_scratch,
     }))
 }
 

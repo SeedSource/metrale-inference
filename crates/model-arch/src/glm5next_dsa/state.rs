@@ -7,6 +7,13 @@
 //! Invariants:
 //! - `len <= capacity`: `advance` and `sync_to` refuse to pass `capacity`, and `rewind_to`
 //!   only shrinks.
+//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` (`pool_cache.rs`), `k_normed` and `gate`
+//!   are rings of `ring_rows` rows (row `r` at slot `r % ring_rows`, [`Self::row_offset`]) and
+//!   the `RingBook` invariants hold: `ensure_room` (so every write path, and `advance`)
+//!   refuses a write that would overwrite rows the next compress needs, `rewind_to` refuses a
+//!   rewind whose recompute rows left the ring, and `pool_select_args` refuses a compress that
+//!   would read a row outside `[kpool * pk_len, len)`. All three return `Err` in release
+//!   builds. `valid` stays full length.
 //!
 //! The indexer keys and gates are projections of the hidden state (`indexer.wk`,
 //! `index_kpool_compress_gate`), which the MLA latent cache does not hold, so they get their
@@ -16,13 +23,14 @@
 //!
 //! `dsa_kpool_compress` reads `k[raw * D + d]` and `gate[raw * D + d]` at absolute
 //! positions, so this is one contiguous buffer per sequence. The MLA latent cache stays
-//! paged.
+//! paged. 2026-10-06: Lever on, `dsa_kpool_compress_incr` reads `k[(raw % ring) * D + d]`.
 
 use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_gpu_runtime::lazy_buffer::LazyBuffer;
 
 use super::Glm5NextDsaConfig;
+use super::pool_cache::PoolCache;
 use super::select::DsaSelectGeometry;
 use metrale_model_layers::layer::LayerState;
 
@@ -82,6 +90,9 @@ pub struct Glm5NextDsaState {
     /// 2026-10-03: Rows `map_rows_through` maps past the end it is given (the MTP proposer's
     /// draft look-ahead, `lazy::PROPOSER_LOOKAHEAD_ROWS`; 0 for a target layer).
     lookahead: usize,
+    /// 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: the persistent pool arrays, the rings
+    /// `k_normed`/`gate` point at, and their bookkeeping; `None` = lever off (today's layout).
+    pool: Option<PoolCache>,
 }
 
 impl Glm5NextDsaState {
@@ -98,6 +109,10 @@ impl Glm5NextDsaState {
         cfg: &Glm5NextDsaConfig,
         lookahead: usize,
     ) -> Result<Self> {
+        if super::pool_cache::dsa_pool_cache() {
+            let pool = super::lazy::dsa_indexer_lazy().then(super::lazy::indexer_pool);
+            return Self::alloc_pool_cache(gpu, cfg, lookahead, pool);
+        }
         if super::lazy::dsa_indexer_lazy() {
             return Self::alloc_lazy(gpu, cfg, lookahead, super::lazy::indexer_pool());
         }
@@ -114,6 +129,41 @@ impl Glm5NextDsaState {
             released: false,
             lazy: None,
             lookahead,
+            pool: None,
+        })
+    }
+
+    /// 2026-10-06: The pool-cache layout (`METRALE_GLM_DSA_POOL_CACHE=1`): `k_normed` and
+    /// `gate` are `ring_rows`-row rings, the pool arrays persist (`pk`/`pidx` lazily mapped
+    /// from `pool` when given, else eager), `valid` is full length and eager.
+    pub fn alloc_pool_cache(
+        gpu: &dyn GpuBackend,
+        cfg: &Glm5NextDsaConfig,
+        lookahead: usize,
+        pool: Option<std::sync::Arc<metrale_gpu_runtime::lazy_buffer::MapBudget>>,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        let capacity = max_dsa_context(cfg);
+        let d = cfg.index_head_dim;
+        let pc = PoolCache::alloc(gpu, capacity, d, cfg.index_kpool, pool)?;
+        let valid = match gpu.alloc(capacity) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = pc.free(gpu);
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            k_normed: pc.k_ring,
+            gate: pc.g_ring,
+            valid,
+            len: 0,
+            capacity,
+            index_head_dim: d,
+            released: false,
+            lazy: None,
+            lookahead,
+            pool: Some(pc),
         })
     }
 
@@ -154,12 +204,17 @@ impl Glm5NextDsaState {
             released: false,
             lazy: Some([k, g]),
             lookahead,
+            pool: None,
         })
     }
 
     /// 2026-10-03: Rows backed in `k_normed` and `gate` (the smaller of the two); `None` when
     /// the buffers are eager.
+    /// 2026-10-06: Pool cache on: the rows backed in `pk` and `pidx` (`PoolCache::mapped_rows`).
     pub fn mapped_rows(&self) -> Option<usize> {
+        if let Some(pc) = &self.pool {
+            return pc.mapped_rows();
+        }
         let row = self.index_head_dim * 2;
         self.lazy
             .as_ref()
@@ -181,6 +236,17 @@ impl Glm5NextDsaState {
     /// the rows are backed) and the write paths stay consistent; set the limit on a granule
     /// boundary (multiple of 8,192 rows) to refuse exactly at the next granule.
     pub(crate) fn map_rows_limited(&self, end: usize, fail_above: usize) -> Result<()> {
+        // 2026-10-06: Pool cache on: the same refusal, then the pools covering the rows.
+        if let Some(pc) = self.pool.as_ref().filter(|pc| pc.is_lazy()) {
+            let rows = end.min(self.capacity);
+            if fail_above > 0 && rows > fail_above && rows > self.mapped_rows().unwrap_or(0) {
+                anyhow::bail!(
+                    "KV cache exhausted: DSA indexer lazy map of {rows} rows refused by the \
+                     test fault-injection lever METRALE_LAZY_MAP_FAIL_ABOVE_ROWS={fail_above}"
+                );
+            }
+            return pc.map_rows(rows);
+        }
         if let Some(bufs) = &self.lazy {
             let rows = end.min(self.capacity);
             if fail_above > 0 && rows > fail_above && rows > self.mapped_rows().unwrap_or(0) {
@@ -213,15 +279,26 @@ impl Glm5NextDsaState {
     }
 
     /// 2026-09-25: Byte offset of row `pos` in `k_normed` / `gate`.
+    /// 2026-10-06: Pool cache on: of ring slot `pos % ring_rows`. A multi-row write splits at
+    /// the ring's end ([`Self::ring_runs`]).
     pub fn row_offset(&self, pos: usize) -> usize {
-        pos * self.index_head_dim * 2
+        match &self.pool {
+            Some(pc) => (pos % pc.book.ring_rows()) * self.index_head_dim * 2,
+            None => pos * self.index_head_dim * 2,
+        }
     }
 
     /// 2026-09-25: Fails when `n` more rows would pass `capacity`.
     ///
     /// `Glm5NextDsaLayer::indexer_forward` writes row `len()` before it advances, so it calls
     /// this first: at `len == capacity` that row is past the end of every buffer.
+    ///
+    /// 2026-10-06: Pool cache on, it also runs the release-mode ring check for a write of rows
+    /// `[len, len + n)` (`RingBook::check_write`) before anything is mapped or written.
     pub fn ensure_room(&self, n: usize) -> Result<()> {
+        if let Some(pc) = &self.pool {
+            pc.book.check_write(self.len, self.len + n)?;
+        }
         self.ensure_room_through(self.len + n)
     }
 
@@ -250,7 +327,9 @@ impl Glm5NextDsaState {
     /// changing `len`, when that would pass `capacity`.
     pub fn advance(&mut self, n: usize) -> Result<()> {
         self.ensure_room(n)?;
-        self.len += n;
+        let end = self.len + n;
+        self.note_ring_write(end);
+        self.len = end;
         Ok(())
     }
 
@@ -267,6 +346,12 @@ impl Glm5NextDsaState {
                  means the caller lost the sequence position",
                 self.len
             );
+        }
+        // 2026-10-06: Pool cache on: the release-mode rewind check, then the watermark clamp
+        // `pk_len = min(pk_len, n / kpool)`.
+        if let Some(pc) = &mut self.pool {
+            pc.book.check_rewind(self.len, n)?;
+            pc.book.note_rewind(n);
         }
         self.len = n;
         Ok(())
@@ -288,7 +373,12 @@ impl Glm5NextDsaState {
             ),
             std::cmp::Ordering::Equal => {}
         }
-        self.advance(k)
+        self.advance(k)?;
+        // 2026-10-06: A replayed step selects after every row it writes (`select_row_at` on
+        // the replay-safe path; the batched selector never runs under capture), so its last
+        // compress left pools `[0, len / kpool)` final on the device.
+        self.note_selected();
+        Ok(())
     }
 
     /// 2026-09-25: Plan a selection over everything cached so far.
@@ -307,6 +397,15 @@ impl Glm5NextDsaState {
             return Ok(());
         }
         self.released = true;
+        if let Some(pc) = self.pool.take() {
+            pc.free(gpu)?;
+            gpu.free(self.valid)?;
+            self.k_normed = DevicePtr(0);
+            self.gate = DevicePtr(0);
+            self.valid = DevicePtr(0);
+            self.len = 0;
+            return Ok(());
+        }
         match self.lazy.take() {
             Some([k, g]) => {
                 k.release(gpu)?;
@@ -338,7 +437,8 @@ impl LayerState for Glm5NextDsaState {
     /// 2026-10-03: Back rows through `end + lookahead` (capped at capacity) ahead of the step,
     /// so the write paths and any capture or replay find them mapped. Eager: nothing to do.
     fn map_rows_through(&self, end: usize) -> Result<()> {
-        if self.lazy.is_none() || self.released {
+        let pool_lazy = self.pool.as_ref().is_some_and(|pc| pc.is_lazy());
+        if (self.lazy.is_none() && !pool_lazy) || self.released {
             return Ok(());
         }
         self.map_rows(end.saturating_add(self.lookahead))
@@ -358,6 +458,9 @@ impl LayerState for Glm5NextDsaState {
         Some(mapped.saturating_sub(self.lookahead))
     }
 }
+
+mod pool;
+pub use pool::ring_runs_for;
 
 #[cfg(test)]
 mod tests;

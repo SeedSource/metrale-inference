@@ -129,6 +129,12 @@ pub(super) fn assert_rank_levers_agree(
                     0
                 },
             ),
+            // 2026-10-06: The DSA pool cache changes per-sequence state, the reserve and when a
+            // write or rewind is refused (ring bounds), so ranks must agree on it.
+            (
+                "METRALE_GLM_DSA_POOL_CACHE",
+                u64::from(metrale_model_arch::glm5next_dsa::pool_cache::dsa_pool_cache()),
+            ),
         ],
     )?;
     // 2026-09-29 (A153): Log the resolved NoPE MLA softmax-scale choice once, on rank 0 only

@@ -8,6 +8,8 @@
 //! Invariants:
 //! - The lockstep check (`check_lockstep`) and the `k` and metadata checks run before the
 //!   first launch.
+//! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` the replay-safe path fills the geometry
+//!   with `dsa_write_geom_pk` (six slots; the workspace allocates six), never `dsa_write_geom`.
 
 use anyhow::{Result, bail};
 use metrale_cache::kv_cache::PagedKvCache;
@@ -387,7 +389,10 @@ impl Glm5NextDsaLayer {
                 block_size,
                 cache_stride_bytes: (block_size * self.cfg.kv_lora_rank) as u64,
             };
-            if replay_safe {
+            if replay_safe && st.is_pool_cache() {
+                // 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: `dsa_write_geom_pk` (`rows.rs`).
+                self.pool_write_geom_pk(gpu, st, d_sl, w.geom_dev, stream)?;
+            } else if replay_safe {
                 // 2026-09-25: `dsa_write_geom` reads S from `d_sl`, this row's `seq_len` entry
                 // in the metadata.
                 KernelLaunch::new(gpu, self.select_kernels.write_geom)

@@ -97,6 +97,10 @@ name = "dsa_depth_decode_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dsa_pool_cache_parity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_grid_stride_microtest"
 required-features = ["cuda", "gpu-examples"]
 

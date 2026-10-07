@@ -121,3 +121,64 @@ fn a_non_glm_config_is_charged_nothing() {
     assert_eq!(s, PerSequenceState::default());
     assert_eq!(s.total(), 0);
 }
+
+/// 2026-10-06: The real GLM-5.3 config (`model-engine/tests/fixtures`), for the pool-cache
+/// reserve pins below.
+fn glm53_config() -> ModelConfig {
+    metrale_config::parse_config(include_str!(
+        "../../model-engine/tests/fixtures/glm53-nvfp4-9e0d74e3-config.json"
+    ))
+    .expect("the real checkpoint config parses")
+}
+
+/// 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE`: each indexer cache (11 target layers and the
+/// proposer's) is charged `pool_cache_state_bytes`, the rest of the proposer term unchanged;
+/// lever off, the `_with` form is the function the server calls.
+#[test]
+fn the_pool_cache_reserve_charges_each_indexer_cache_its_pool_arrays_and_rings() {
+    use crate::glm5next_dsa::pool_cache::pool_cache_state_bytes;
+    let cfg = glm53_config();
+    let msl = 540_672;
+    let off = per_sequence_state_bytes_with(&cfg, msl, true, false).unwrap();
+    assert_eq!(off, per_sequence_state_bytes(&cfg, msl, true).unwrap());
+    let on = per_sequence_state_bytes_with(&cfg, msl, true, true).unwrap();
+    let per = pool_cache_state_bytes(dsa_capacity(msl, KPOOL), HEAD_DIM, KPOOL);
+    assert_eq!(per, 76_369_924);
+    assert_eq!(on.target_layers, DSA_LAYERS * per);
+    let old = indexer_state_bytes(dsa_capacity(msl, KPOOL), HEAD_DIM);
+    assert_eq!(
+        off.proposer - old,
+        on.proposer - per,
+        "proposer scratch unchanged"
+    );
+    // 2026-10-06: 2.41 GB less per sequence at 540,672 tokens with MTP on.
+    assert_eq!(off.total() - on.total(), 2_411_937_744);
+}
+
+/// 2026-10-06: The lazily mapped reserve with the pool cache: the pool backs pool keys and
+/// ids (`LazyShape::pool_cache`), the eager part adds `pvalid`, `pk_len_dev` and the rings per
+/// cache.
+#[test]
+fn the_lazy_pool_cache_reserve_maps_pool_arrays_and_keeps_rings_eager() {
+    let cfg = glm53_config();
+    let msl = 131_072;
+    let off = lazy_indexer_reserve_with(&cfg, msl, true, 4, None, false)
+        .unwrap()
+        .unwrap();
+    let lever_read = lazy_indexer_reserve(&cfg, msl, true, 4, None);
+    assert_eq!(off, lever_read.unwrap().unwrap());
+    let on = lazy_indexer_reserve_with(&cfg, msl, true, 4, None, true)
+        .unwrap()
+        .unwrap();
+    assert!(on.pool.shape.pool_cache && !off.pool.shape.pool_cache);
+    let ring = 2 * 8_448 * HEAD_DIM * 2;
+    assert_eq!(
+        on.eager_per_seq - off.eager_per_seq,
+        12 * (msl / KPOOL + 4 + ring)
+    );
+    // 2026-10-06: Default pool, 4 x 32,768 tokens: 2 key granules + 1 id granule per target
+    // cache, 3 + 1 for the proposer's (its 256-row look-ahead crosses a key granule); was 8 and
+    // 10.
+    assert_eq!(on.pool.limit_bytes, 4 * (11 * 3 + 4) * (2 << 20));
+    assert_eq!(off.pool.limit_bytes, 784 << 20);
+}

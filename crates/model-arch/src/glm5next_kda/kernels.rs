@@ -15,6 +15,8 @@
 //!   `kda_tc_conv_state_tail` resolved.
 //! - 2026-10-06: The two `kda_snap_fuse` entry points resolve to handle 0 when absent;
 //!   [`Glm5NextKdaKernels::has_snap_fuse`] is false unless both resolved.
+//! - 2026-10-07: The two `kda_front_fuse` entry points resolve to handle 0 when absent;
+//!   [`Glm5NextKdaKernels::has_front_fuse`] is false unless both resolved.
 
 use super::*;
 
@@ -70,6 +72,13 @@ pub struct Glm5NextKdaKernels {
     /// walk with its snapshot copies.
     pub conv_io: KernelHandle,
     pub recurrent_io: KernelHandle,
+    /// 2026-10-07: The fused front of the chunked-TC prefill (`METRALE_GLM_KDA_FRONT_FUSE=1`,
+    /// prefill_tc_fuse.rs), kernels/gb10/common/kda_front_fuse.cu: `tc_prepare` computing its
+    /// inputs from the projections (pack, conv, gate and beta sigmoid in registers) and the
+    /// conv-state tail read from the projections. Resolved with `try_kernel`; either `0` keeps
+    /// the unfused launches.
+    pub ff_prepare: KernelHandle,
+    pub ff_tail: KernelHandle,
     pub o_norm: KernelHandle,
     pub split_widen: KernelHandle,
     pub sigmoid: KernelHandle,
@@ -157,6 +166,16 @@ impl Glm5NextKdaKernels {
                 "kda_snap_fuse",
                 "kda_recurrent_decode_bf16_smem_io",
             ),
+            ff_prepare: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_front_fuse",
+                "kda_ff_prepare",
+            ),
+            ff_tail: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_front_fuse",
+                "kda_ff_conv_state_tail",
+            ),
             o_norm: gpu.kernel("kda_layer_ops", "kda_o_norm_gated_bf16")?,
             split_widen: gpu.kernel("kda_layer_ops", "kda_split_widen")?,
             sigmoid: gpu.kernel("kda_layer_ops", "kda_sigmoid_bf16_f32")?,
@@ -195,5 +214,10 @@ impl Glm5NextKdaKernels {
     /// 2026-10-06: Whether both `kda_snap_fuse` kernels resolved.
     pub fn has_snap_fuse(&self) -> bool {
         self.conv_io.0 != 0 && self.recurrent_io.0 != 0
+    }
+
+    /// 2026-10-07: Whether both `kda_front_fuse` kernels resolved.
+    pub fn has_front_fuse(&self) -> bool {
+        self.ff_prepare.0 != 0 && self.ff_tail.0 != 0
     }
 }

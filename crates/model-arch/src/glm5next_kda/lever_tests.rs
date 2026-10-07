@@ -176,3 +176,25 @@ fn flashkda_scratch_bytes() {
         32 * 7 * 13_824 + 128 + state
     );
 }
+
+#[test]
+fn front_fuse_lever_is_on_only_for_one() {
+    use prefill_tc_fuse::front_fuse_requested;
+    assert!(front_fuse_requested(Some("1")));
+    for v in [None, Some(""), Some("0"), Some("true"), Some("on"), Some(" 1"), Some("2")] {
+        assert!(!front_fuse_requested(v), "{v:?}");
+    }
+}
+
+/// 2026-10-07: The GLM geometry with both kernels takes the fused front; a missing kernel or
+/// another conv width is refused with a reason.
+#[test]
+fn front_fuse_refusals() {
+    use prefill_tc_fuse::front_fuse_refusal;
+    let cfg = glm_cfg();
+    assert_eq!(front_fuse_refusal(&cfg, true), None);
+    assert!(front_fuse_refusal(&cfg, false).is_some());
+    let mut c = cfg;
+    c.conv_kernel = 3;
+    assert!(front_fuse_refusal(&c, true).is_some());
+}

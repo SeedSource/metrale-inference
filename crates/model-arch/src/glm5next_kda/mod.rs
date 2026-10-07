@@ -42,6 +42,7 @@ mod lever_tests;
 mod prefill;
 mod prefill_flashkda;
 mod prefill_tc;
+mod prefill_tc_fuse;
 mod snap_fuse;
 pub use config::{Glm5NextKdaConfig, Glm5NextKdaWeights};
 pub use kernels::Glm5NextKdaKernels;
@@ -541,6 +542,24 @@ impl Glm5NextKdaLayer {
         stream: u64,
         activate_gates: bool,
     ) -> Result<()> {
+        self.front_end_opts(gpu, hidden, t, ws, stream, activate_gates, true)
+    }
+
+    /// 2026-10-07: [`Self::front_end_with`]; with `pack` false it also skips
+    /// `kda_pack_qkv_bf16`, leaving the three projections in `ws.qkv_parts` and `ws.qkv_proj`
+    /// unwritten (the fused chunked-TC front, prefill_tc_fuse.rs, reads the parts directly).
+    /// Every other launch is the same.
+    #[allow(clippy::too_many_arguments)]
+    fn front_end_opts(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        t: usize,
+        ws: &Glm5NextKdaWorkspace,
+        stream: u64,
+        activate_gates: bool,
+        pack: bool,
+    ) -> Result<()> {
         let c = &self.cfg;
         let (hid, qkv, hd) = (c.hidden, c.qkv_dim(), c.head_dim);
         // 2026-10-06: `METRALE_GLM_DENSE_FP8_W8A8_SHARE_QUANT`: q/k/v/g_a read `hidden`, which
@@ -568,16 +587,18 @@ impl Glm5NextKdaLayer {
                 stream,
             )?;
         }
-        KernelLaunch::new(gpu, self.kernels.pack)
-            .grid([div_ceil(qkv as u32, 256), t as u32, 1])
-            .block([256, 1, 1])
-            .arg_ptr(ws.qkv_parts)
-            .arg_ptr(ws.qkv_parts.offset(t * qkv * 2))
-            .arg_ptr(ws.qkv_parts.offset(2 * t * qkv * 2))
-            .arg_ptr(ws.qkv_proj)
-            .arg_u32(t as u32)
-            .arg_u32(qkv as u32)
-            .launch(stream)?;
+        if pack {
+            KernelLaunch::new(gpu, self.kernels.pack)
+                .grid([div_ceil(qkv as u32, 256), t as u32, 1])
+                .block([256, 1, 1])
+                .arg_ptr(ws.qkv_parts)
+                .arg_ptr(ws.qkv_parts.offset(t * qkv * 2))
+                .arg_ptr(ws.qkv_parts.offset(2 * t * qkv * 2))
+                .arg_ptr(ws.qkv_proj)
+                .arg_u32(t as u32)
+                .arg_u32(qkv as u32)
+                .launch(stream)?;
+        }
 
         // 2026-09-25: Low-rank forget gate, hidden -> head_dim -> heads * head_dim, then
         // `lower_bound * sigmoid(exp(A_log[h]) * (g[c] + dt_bias[c]))` in `kda_gate_bf16`.

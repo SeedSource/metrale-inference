@@ -120,6 +120,10 @@ pub struct Glm5NextMlpKernels {
     /// 2026-09-25: `glm5next_swiglu_clamp`, the asymmetric clamped SwiGLU. `moe_silu_mul`
     /// does not clamp.
     pub swiglu: KernelHandle,
+    /// 2026-10-06: `glm5next_swiglu_clamp_amax` (`METRALE_GLM_MOE_SWIGLU_AMAX`): [`Self::swiglu`]
+    /// plus the max |output| into a device amax slot; 0 when the PTX lacks it (the lever then
+    /// stays off).
+    pub swiglu_amax: KernelHandle,
     pub router: KernelHandle,
     pub combine: KernelHandle,
     /// 2026-09-25: `moe_sort_by_expert` (`moe_permute.cu`): counting sort of the `[rows, top_k]`
@@ -249,6 +253,11 @@ impl Glm5NextMlpKernels {
                 "glm5next_moe_row_union",
             ),
             swiglu: gpu.kernel(FFN_MODULE, "glm5next_swiglu_clamp")?,
+            swiglu_amax: metrale_model_layers::layers::try_kernel(
+                gpu,
+                FFN_MODULE,
+                "glm5next_swiglu_clamp_amax",
+            ),
             router: gpu.kernel(FFN_MODULE, "glm5next_router_topk")?,
             combine: gpu.kernel(FFN_MODULE, "glm5next_moe_combine")?,
             moe_sort_by_expert: metrale_model_layers::layers::try_kernel(

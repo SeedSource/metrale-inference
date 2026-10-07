@@ -41,6 +41,14 @@
 //!     layout either way: `swiglu_rows` writes `[te, moe_intermediate]` BF16 in expert-sorted
 //!     row order, exactly what the production down launch reads (null gather map).
 //!
+//! 2026-10-06: two exact speed levers (each default off, each only with the lever above):
+//!   - `METRALE_CUTLASS_W4A4_PACK_ONCE=1`: the gate/up call quantizes each token row of `x` once
+//!     into workspace scratch and copies it to every routed copy (see the C side's
+//!     `prep_grouped_a`), when every expert of the call has the same global scale.
+//!   - `METRALE_GLM_MOE_SWIGLU_AMAX=1`: the SwiGLU (`glm5next_swiglu_clamp_amax`) also folds max
+//!     |a_act| into a device slot; the W4A4 down call uses it instead of its own amax pass when
+//!     its dynamic rows are exactly the SwiGLU's rows.
+//!
 //! The weight block scales are swizzled into CUTLASS's SFB layout per layer into one cache
 //! (`SfbCache`, local experts x (gate + up + down), 216 MB at GLM-5.3 EP=2) and re-swizzled
 //! only when the layer changes; the staged prefill runs all FFN windows of a layer back to
@@ -87,6 +95,81 @@ pub fn down_w4a16_on() -> bool {
 /// 2026-10-06: `METRALE_GLM_MOE_SWIGLU_LOCAL_ROWS=1` (read once, `metrale_config`).
 pub fn swiglu_local_rows_on() -> bool {
     metrale_config::glm_moe_swiglu_local_rows()
+}
+
+/// 2026-10-06: `METRALE_CUTLASS_W4A4_PACK_ONCE=1` (read once, `metrale_config`); warns once
+/// when on.
+pub fn pack_once_on() -> bool {
+    let on = metrale_config::cutlass_w4a4_pack_once();
+    if on {
+        static W: std::sync::Once = std::sync::Once::new();
+        W.call_once(|| {
+            tracing::warn!(
+                "METRALE_CUTLASS_W4A4_PACK_ONCE=1: W4A4 MoE prefill gate/up quantizes each token \
+                 row once and copies it to every route, when every expert of the call shares \
+                 one global scale (byte-identical)"
+            );
+        });
+    }
+    on
+}
+
+/// 2026-10-06: `METRALE_GLM_MOE_SWIGLU_AMAX=1` (read once, `metrale_config`); warns once when
+/// on.
+pub fn swiglu_amax_on() -> bool {
+    let on = metrale_config::glm_moe_swiglu_amax();
+    if on {
+        static W: std::sync::Once = std::sync::Once::new();
+        W.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_MOE_SWIGLU_AMAX=1: the W4A4 MoE prefill SwiGLU computes the down \
+                 projection's dynamic amax as it writes a_act; the down call uses it when the \
+                 rows match (byte-identical)"
+            );
+        });
+    }
+    on
+}
+
+/// 2026-10-06: Log `what` once per process (the first time a lever actually engages).
+fn engaged_once(flag: &std::sync::Once, what: &str) {
+    flag.call_once(|| tracing::warn!("{what}"));
+}
+
+/// 2026-10-06: The device amax slot of `METRALE_GLM_MOE_SWIGLU_AMAX` (one `u32`, allocated with
+/// the SFB cache at load when the lever is on).
+const AMAX_SLOT_BYTES: usize = 256;
+static AMAX_SLOT: OnceLock<DevicePtr> = OnceLock::new();
+
+/// 2026-10-06: `glm5next_swiglu_clamp_amax` over `n` elements: the bytes `glm5next_swiglu_clamp`
+/// writes into `out`, plus max |output| folded into `*amax_slot` (float bits; the caller zeroes
+/// it first). Same grid as the plain SwiGLU.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_rows_amax(
+    gpu: &dyn GpuBackend,
+    k: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    out: DevicePtr,
+    n: usize,
+    limit: f32,
+    amax_slot: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    if n > u32::MAX as usize {
+        bail!("glm5next_swiglu_clamp_amax: {n} elements overflow the kernel's u32");
+    }
+    metrale_gpu_runtime::kernel_args::KernelLaunch::new(gpu, k)
+        .grid([(n as u32).div_ceil(256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(out)
+        .arg_u32(n as u32)
+        .arg_f32(limit)
+        .arg_ptr(amax_slot)
+        .launch(stream)?;
+    Ok(())
 }
 
 /// 2026-10-06: The sorted rows the SwiGLU must cover: the local experts' span
@@ -429,15 +512,26 @@ pub struct RunArgs<'a> {
     pub skip_down: bool,
     /// 2026-10-06: Sorted rows the SwiGLU covers ([`swiglu_span`]); `0..te` writes every row.
     pub swiglu_rows: std::ops::Range<usize>,
+    /// 2026-10-06: Rows of `x` (`te / top_k`), the bound of the pack-once staging.
+    pub tokens: usize,
+    /// 2026-10-06: `METRALE_CUTLASS_W4A4_PACK_ONCE` (the C side engages it only when exact).
+    pub pack_once: bool,
+    /// 2026-10-06: `METRALE_GLM_MOE_SWIGLU_AMAX`: `glm5next_swiglu_clamp_amax` and its device
+    /// amax slot; either 0 keeps the plain SwiGLU and the down call's own amax.
+    pub swiglu_amax: KernelHandle,
+    pub amax_slot: DevicePtr,
 }
 
 /// 2026-10-03: CUTLASS W4A4 gate/up, the clamped SwiGLU, CUTLASS W4A4 down, all on `stream`.
 /// 2026-10-04: With `skip_down`, only gate/up and the SwiGLU (`a_act` is then ready for a W4A16
 /// down; `expert_out` is not written).
+/// 2026-10-06: `pack_once` asks the gate/up call for the pack-once path; with `swiglu_amax` and
+/// `amax_slot` set (and a W4A4 down), the SwiGLU also writes the down call's amax, which that
+/// call uses when its dynamic rows are exactly `swiglu_rows`. Both are byte-identical.
 pub fn run(gpu: &dyn GpuBackend, a: &RunArgs<'_>, stream: u64) -> Result<()> {
     let t = a.tables;
     let (h, mi) = (a.hidden as u32, a.moe_intermediate as u32);
-    metrale_gpu_runtime::cutlass::nvfp4_grouped_gate_up_w4a4(
+    let packed_once = metrale_gpu_runtime::cutlass::nvfp4_grouped_gate_up_w4a4_ex(
         a.x.0,
         a.sorted_token_ids.0,
         &t.gate.packed,
@@ -452,18 +546,50 @@ pub fn run(gpu: &dyn GpuBackend, a: &RunArgs<'_>, stream: u64) -> Result<()> {
         a.offsets,
         mi,
         h,
+        a.tokens,
+        a.pack_once,
         stream,
     )?;
+    if packed_once {
+        static F: std::sync::Once = std::sync::Once::new();
+        engaged_once(
+            &F,
+            &format!(
+                "METRALE_CUTLASS_W4A4_PACK_ONCE ENGAGED: gate/up A packed once per token \
+                 ({} tokens, {} routed rows)",
+                a.tokens, a.te
+            ),
+        );
+    }
     // 2026-10-06: Elementwise over `swiglu_rows` only (BF16 `[te, moe_intermediate]` buffers).
     let (r, row_bytes) = (&a.swiglu_rows, a.moe_intermediate * 2);
-    if !r.is_empty() {
+    let n = r.len() * a.moe_intermediate;
+    let amax = !a.skip_down
+        && a.swiglu_amax.0 != 0
+        && a.amax_slot.0 != 0
+        && !r.is_empty()
+        && n <= u32::MAX as usize;
+    if amax {
+        gpu.memset_async(a.amax_slot, 0, 4, stream)?;
+        swiglu_rows_amax(
+            gpu,
+            a.swiglu_amax,
+            a.a_gate.offset(r.start * row_bytes),
+            a.a_up.offset(r.start * row_bytes),
+            a.a_act.offset(r.start * row_bytes),
+            n,
+            a.swiglu_limit,
+            a.amax_slot,
+            stream,
+        )?;
+    } else if !r.is_empty() {
         super::super::forward::swiglu_rows(
             gpu,
             a.swiglu,
             a.a_gate.offset(r.start * row_bytes),
             a.a_up.offset(r.start * row_bytes),
             a.a_act.offset(r.start * row_bytes),
-            r.len() * a.moe_intermediate,
+            n,
             a.swiglu_limit,
             stream,
         )?;
@@ -471,7 +597,7 @@ pub fn run(gpu: &dyn GpuBackend, a: &RunArgs<'_>, stream: u64) -> Result<()> {
     if a.skip_down {
         return Ok(());
     }
-    metrale_gpu_runtime::cutlass::nvfp4_grouped_down_w4a4(
+    let used = metrale_gpu_runtime::cutlass::nvfp4_grouped_down_w4a4_ex(
         a.a_act.0,
         &t.down.packed,
         &t.down.sfb,
@@ -481,8 +607,20 @@ pub fn run(gpu: &dyn GpuBackend, a: &RunArgs<'_>, stream: u64) -> Result<()> {
         a.offsets,
         h,
         mi,
+        amax.then(|| (a.amax_slot.0, r.clone())),
         stream,
-    )
+    )?;
+    if used {
+        static F: std::sync::Once = std::sync::Once::new();
+        engaged_once(
+            &F,
+            &format!(
+                "METRALE_GLM_MOE_SWIGLU_AMAX ENGAGED: down amax from the SwiGLU over rows {}..{}",
+                r.start, r.end
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// 2026-10-03: The process's cache, set by [`prepare_at_load`].
@@ -519,6 +657,14 @@ pub fn prepare_at_load(gpu: &dyn GpuBackend, cfg: &Glm5NextMlpConfig) -> Result<
     let cache = SfbCache::new(gpu, cfg.local_experts, cfg.hidden, cfg.moe_intermediate)?;
     let sfb = SfbCache::bytes(cfg.local_experts, cfg.hidden, cfg.moe_intermediate);
     let ws = metrale_gpu_runtime::cutlass::warm_workspace()?;
+    // 2026-10-06: `METRALE_GLM_MOE_SWIGLU_AMAX`: its amax slot, reserved with the cache.
+    let slot = if swiglu_amax_on() && AMAX_SLOT.get().is_none() {
+        let p = gpu.alloc(AMAX_SLOT_BYTES)?;
+        let _ = AMAX_SLOT.set(p);
+        AMAX_SLOT_BYTES
+    } else {
+        0
+    };
     let _ = CACHE.set(cache);
     tracing::warn!(
         "GLM routed-MoE prefill: CUTLASS W4A4 ON (METRALE_GLM_MOE_PREFILL_CUTLASS_W4A4=1) — NVFP4 \
@@ -530,7 +676,7 @@ pub fn prepare_at_load(gpu: &dyn GpuBackend, cfg: &Glm5NextMlpConfig) -> Result<
         cfg.local_experts,
         ws as f64 / 1e6
     );
-    Ok(Some(sfb + ws))
+    Ok(Some(sfb + ws + slot))
 }
 
 /// 2026-10-04: Startup-log wording of the activation-scale mode.
@@ -676,7 +822,28 @@ pub(crate) fn forward(
             te,
             swiglu_local_rows_on(),
         ),
+        tokens: te / cfg.top_k.max(1),
+        pack_once: pack_once_on(),
+        swiglu_amax: if swiglu_amax_on() {
+            k.swiglu_amax
+        } else {
+            KernelHandle(0)
+        },
+        amax_slot: AMAX_SLOT.get().copied().unwrap_or(DevicePtr(0)),
     };
+    if swiglu_amax_on() && (k.swiglu_amax.0 == 0 || args.amax_slot.0 == 0) {
+        static W: std::sync::Once = std::sync::Once::new();
+        W.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_MOE_SWIGLU_AMAX=1 has no effect: {}",
+                if k.swiglu_amax.0 == 0 {
+                    "the PTX lacks glm5next_swiglu_clamp_amax"
+                } else {
+                    "no amax slot was reserved at load"
+                }
+            );
+        });
+    }
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         if swiglu_local_rows_on() {

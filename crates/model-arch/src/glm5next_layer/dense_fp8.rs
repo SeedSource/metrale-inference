@@ -609,13 +609,8 @@ fn kernels(gpu: &dyn GpuBackend) -> Option<Kernels> {
     })
 }
 
-/// 2026-10-07: `METRALE_GLM_NV4_B3_STAGED=1` routes the 3-row NVFP4 GEMV through
-/// `w4a16_gemv_batch3_staged` (activations staged in shared memory, next weight word
-/// prefetched; same arithmetic order, so the same bits as `w4a16_gemv_batch3`). Read once.
-pub fn nv4_b3_staged() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var("METRALE_GLM_NV4_B3_STAGED").as_deref() == Ok("1"))
-}
+/// 2026-10-07: `METRALE_GLM_NV4_B3_STAGED`; see `super::dense_nv4_b3`.
+pub use super::dense_nv4_b3::nv4_b3_staged;
 
 /// 2026-10-05: The NVFP4 kernels, resolved once; `None` (logged) when any is missing, which
 /// leaves the weights FP8-only.
@@ -954,13 +949,7 @@ pub fn nv4_gemv_uncounted(
     let (h, takes_m) = match m {
         1 => (kk.gemv1, false),
         2 => (kk.b2, false),
-        3 => (
-            match kk.b3s {
-                Some(h) if nv4_b3_staged() => h,
-                _ => kk.b3,
-            },
-            false,
-        ),
+        3 => (super::dense_nv4_b3::pick_b3(kk.b3s, kk.b3), false),
         4..=8 => (kk.tiers[m - 4], true),
         9..=NV4_MAX_M => (kk.tiers[5], true),
         _ => bail!("METRALE_GLM_DENSE_NVFP4: {m} rows is outside 1..={NV4_MAX_M}"),

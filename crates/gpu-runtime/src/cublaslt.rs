@@ -17,10 +17,12 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 mod fp8;
+mod pin;
 pub use fp8::{
     fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_blkscaled_ldc,
     fp8_gemm_act_weight_t_rowwise,
 };
+pub use pin::{BF16_PIN_M, bf16_pin_describe, bf16_pin_fallbacks};
 
 pub mod scale_layout;
 
@@ -80,6 +82,24 @@ unsafe extern "C" {
         size: usize,
     ) -> i32;
     fn cublasLtMatmulPreferenceDestroy(pref: cublasLtMatmulPreference_t) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn cublasLtMatmulAlgoCheck(
+        handle: cublasLtHandle_t,
+        desc: cublasLtMatmulDesc_t,
+        a: cublasLtMatrixLayout_t,
+        b: cublasLtMatrixLayout_t,
+        c: cublasLtMatrixLayout_t,
+        d: cublasLtMatrixLayout_t,
+        algo: *const c_void,
+        result: *mut c_void,
+    ) -> i32;
+    fn cublasLtMatmulAlgoConfigGetAttribute(
+        algo: *const c_void,
+        attr: u32,
+        buf: *mut c_void,
+        size: usize,
+        written: *mut usize,
+    ) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn cublasLtMatmulAlgoGetHeuristic(
         handle: cublasLtHandle_t,
@@ -208,7 +228,8 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    gemm_act_weight_t_out(act, weight, out, m, n, k, CUDA_R_16BF, stream)
+    let pin = pin::enabled().then_some(BF16_PIN_M);
+    gemm_act_weight_t_out(act, weight, out, m, n, k, CUDA_R_16BF, pin, stream)
 }
 
 /// 2026-09-25: [`bf16_gemm_act_weight_t`] with an FP32 `out`. Only the D
@@ -222,11 +243,173 @@ pub fn bf16_gemm_act_weight_t_f32_out(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    gemm_act_weight_t_out(act, weight, out, m, n, k, CUDA_R_32F, stream)
+    let pin = pin::enabled().then_some(BF16_PIN_M);
+    gemm_act_weight_t_out(act, weight, out, m, n, k, CUDA_R_32F, pin, stream)
 }
 
-/// 2026-09-25: Shared body of the two wrappers above; `out_dtype` is the D
-/// layout's type.
+/// 2026-10-07: [`bf16_gemm_act_weight_t`] / [`bf16_gemm_act_weight_t_f32_out`]
+/// (`out_f32`) with the algorithm choice explicit instead of read from
+/// `METRALE_CUBLAS_BF16_ALGO_PIN`: `pin_m = None` asks the heuristic at this
+/// call's M (the default path); `Some(p)` runs the algorithm pinned for
+/// (N, K, out type) at M = `p` (see `pin`). For microtests.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_with(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    out_f32: bool,
+    pin_m: Option<u32>,
+    stream: u64,
+) -> Result<()> {
+    let dtype = if out_f32 { CUDA_R_32F } else { CUDA_R_16BF };
+    gemm_act_weight_t_out(act, weight, out, m, n, k, dtype, pin_m, stream)
+}
+
+/// 2026-10-07: The descriptors of one BF16 `act @ weightᵀ` GEMM, destroyed on
+/// drop. A = weight, row-major [N,K] = col-major [K,N], ld K, opT. B = act,
+/// row-major [M,K] = col-major [K,M], ld K, opN. D = out, row-major [M,N] =
+/// col-major [N,M], ld N. The preference caps the workspace at `ws_size`.
+struct Descs {
+    desc: cublasLtMatmulDesc_t,
+    la: cublasLtMatrixLayout_t,
+    lb: cublasLtMatrixLayout_t,
+    ld: cublasLtMatrixLayout_t,
+    pref: cublasLtMatmulPreference_t,
+}
+
+impl Descs {
+    fn new(m: u32, n: u32, k: u32, out_dtype: i32, ws_size: usize) -> Result<Self> {
+        let mut d = Descs {
+            desc: std::ptr::null_mut(),
+            la: std::ptr::null_mut(),
+            lb: std::ptr::null_mut(),
+            ld: std::ptr::null_mut(),
+            pref: std::ptr::null_mut(),
+        };
+        unsafe {
+            chk(
+                cublasLtMatmulDescCreate(&mut d.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+                "DescCreate",
+            )?;
+            let ta = CUBLAS_OP_T;
+            let tb = CUBLAS_OP_N;
+            chk(
+                cublasLtMatmulDescSetAttribute(
+                    d.desc,
+                    DESC_TRANSA,
+                    &ta as *const i32 as *const c_void,
+                    4,
+                ),
+                "TRANSA",
+            )?;
+            chk(
+                cublasLtMatmulDescSetAttribute(
+                    d.desc,
+                    DESC_TRANSB,
+                    &tb as *const i32 as *const c_void,
+                    4,
+                ),
+                "TRANSB",
+            )?;
+            chk(
+                cublasLtMatrixLayoutCreate(&mut d.la, CUDA_R_16BF, k as u64, n as u64, k as i64),
+                "LayoutA",
+            )?;
+            chk(
+                cublasLtMatrixLayoutCreate(&mut d.lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
+                "LayoutB",
+            )?;
+            chk(
+                cublasLtMatrixLayoutCreate(&mut d.ld, out_dtype, n as u64, m as u64, n as i64),
+                "LayoutD",
+            )?;
+            chk(cublasLtMatmulPreferenceCreate(&mut d.pref), "PrefCreate")?;
+            chk(
+                cublasLtMatmulPreferenceSetAttribute(
+                    d.pref,
+                    PREF_MAX_WORKSPACE_BYTES,
+                    &ws_size as *const usize as *const c_void,
+                    std::mem::size_of::<usize>(),
+                ),
+                "PrefWorkspace",
+            )?;
+        }
+        Ok(d)
+    }
+
+    /// 2026-10-07: Up to `out.len()` heuristic results, best first; returns
+    /// how many cuBLASLt filled.
+    fn heuristic(&self, ctx: &Ctx, out: &mut [HeuristicResult]) -> Result<usize> {
+        let mut returned: i32 = 0;
+        unsafe {
+            chk(
+                cublasLtMatmulAlgoGetHeuristic(
+                    ctx.handle,
+                    self.desc,
+                    self.la,
+                    self.lb,
+                    self.ld,
+                    self.ld,
+                    self.pref,
+                    out.len() as i32,
+                    out.as_mut_ptr() as *mut c_void,
+                    &mut returned,
+                ),
+                "AlgoGetHeuristic",
+            )?;
+        }
+        Ok(returned.max(0) as usize)
+    }
+}
+
+impl Drop for Descs {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.pref.is_null() {
+                cublasLtMatmulPreferenceDestroy(self.pref);
+            }
+            for l in [self.la, self.lb, self.ld] {
+                if !l.is_null() {
+                    cublasLtMatrixLayoutDestroy(l);
+                }
+            }
+            if !self.desc.is_null() {
+                cublasLtMatmulDescDestroy(self.desc);
+            }
+        }
+    }
+}
+
+/// 2026-10-07: `cublasLtMatmulHeuristicResult_t` as the CUDA 13 cublasLt.h lays
+/// it out (96 bytes): the 64-byte `cublasLtMatmulAlgo_t`, then workspaceSize,
+/// state, wavesCount, reserved[4].
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HeuristicResult {
+    algo: [u64; 8],
+    workspace_size: usize,
+    state: i32,
+    waves_count: f32,
+    reserved: [i32; 4],
+}
+
+impl HeuristicResult {
+    const ZERO: Self = HeuristicResult {
+        algo: [0; 8],
+        workspace_size: 0,
+        state: 0,
+        waves_count: 0.0,
+        reserved: [0; 4],
+    };
+}
+
+/// 2026-09-25: Shared body of the wrappers above; `out_dtype` is the D
+/// layout's type. 2026-10-07: with `pin_m = Some(p)` it runs the algorithm
+/// `pin` chose for (N, K, `out_dtype`) at M = `p` when `cublasLtMatmulAlgoCheck`
+/// accepts it at this M, and asks the heuristic at this M otherwise (logged).
 #[allow(clippy::too_many_arguments)]
 fn gemm_act_weight_t_out(
     act: u64,
@@ -236,114 +419,66 @@ fn gemm_act_weight_t_out(
     n: u32,
     k: u32,
     out_dtype: i32,
+    pin_m: Option<u32>,
     stream: u64,
 ) -> Result<()> {
     let ctx = ctx()?;
-    unsafe {
-        let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
-        chk(
-            cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
-            "DescCreate",
-        )?;
-        let ta = CUBLAS_OP_T;
-        let tb = CUBLAS_OP_N;
-        chk(
-            cublasLtMatmulDescSetAttribute(
-                desc,
-                DESC_TRANSA,
-                &ta as *const i32 as *const c_void,
-                4,
-            ),
-            "TRANSA",
-        )?;
-        chk(
-            cublasLtMatmulDescSetAttribute(
-                desc,
-                DESC_TRANSB,
-                &tb as *const i32 as *const c_void,
-                4,
-            ),
-            "TRANSB",
-        )?;
-        // 2026-09-25: A = weight, row-major [N,K] = col-major [K,N], ld K, opT.
-        // B = act, row-major [M,K] = col-major [K,M], ld K, opN.
-        // D = out, row-major [M,N] = col-major [N,M], ld N.
-        let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        chk(
-            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, k as u64, n as u64, k as i64),
-            "LayoutA",
-        )?;
-        chk(
-            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
-            "LayoutB",
-        )?;
-        chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, out_dtype, n as u64, m as u64, n as i64),
-            "LayoutD",
-        )?;
-        let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
-        chk(cublasLtMatmulPreferenceCreate(&mut pref), "PrefCreate")?;
-        let ws_size = ctx.ws_size;
-        chk(
-            cublasLtMatmulPreferenceSetAttribute(
-                pref,
-                PREF_MAX_WORKSPACE_BYTES,
-                &ws_size as *const usize as *const c_void,
-                std::mem::size_of::<usize>(),
-            ),
-            "PrefWorkspace",
-        )?;
-        // 2026-09-25: Holds one cublasLtMatmulHeuristicResult_t (96 bytes in
-        // the CUDA 13 cublasLt.h: 64-byte algo first, then workspaceSize,
-        // state, wavesCount, reserved[4]); `algo` is read from offset 0.
-        let mut result = [0u8; 128];
-        let mut returned: i32 = 0;
-        chk(
-            cublasLtMatmulAlgoGetHeuristic(
-                ctx.handle,
-                desc,
-                la,
-                lb,
-                ld_,
-                ld_,
-                pref,
-                1,
-                result.as_mut_ptr() as *mut c_void,
-                &mut returned,
-            ),
-            "AlgoGetHeuristic",
-        )?;
-        if returned < 1 {
+    let d = Descs::new(m, n, k, out_dtype, ctx.ws_size)?;
+    let mut result = [HeuristicResult::ZERO];
+    let pinned = match pin_m {
+        Some(p) => pin::algo(ctx, p, n, k, out_dtype)?,
+        None => None,
+    };
+    let use_pinned = match pinned {
+        Some(algo) => {
+            result[0].algo = algo;
+            let st = unsafe {
+                cublasLtMatmulAlgoCheck(
+                    ctx.handle,
+                    d.desc,
+                    d.la,
+                    d.lb,
+                    d.ld,
+                    d.ld,
+                    result.as_ptr() as *const c_void,
+                    result.as_mut_ptr() as *mut c_void,
+                )
+            };
+            let ok = st == 0 && result[0].workspace_size <= ctx.ws_size;
+            if !ok {
+                pin::note_fallback(m, n, k, out_dtype, st, result[0].workspace_size);
+            }
+            ok
+        }
+        None => false,
+    };
+    if !use_pinned {
+        // 2026-09-25: One heuristic result; `algo` is read from offset 0.
+        if d.heuristic(ctx, &mut result)? < 1 {
             bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
         }
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        let status = cublasLtMatmul(
+    }
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    let status = unsafe {
+        cublasLtMatmul(
             ctx.handle,
-            desc,
+            d.desc,
             &alpha as *const f32 as *const c_void,
             weight as *const c_void,
-            la,
+            d.la,
             act as *const c_void,
-            lb,
+            d.lb,
             &beta as *const f32 as *const c_void,
             out as *const c_void,
-            ld_,
+            d.ld,
             out as *mut c_void,
-            ld_,
+            d.ld,
             result.as_ptr() as *const c_void,
             ctx.workspace as *mut c_void,
             ctx.ws_size,
             stream as *mut c_void,
-        );
-        cublasLtMatmulPreferenceDestroy(pref);
-        cublasLtMatrixLayoutDestroy(la);
-        cublasLtMatrixLayoutDestroy(lb);
-        cublasLtMatrixLayoutDestroy(ld_);
-        cublasLtMatmulDescDestroy(desc);
-        chk(status, "Matmul")?;
-    }
-    Ok(())
+        )
+    };
+    chk(status, "Matmul")
 }

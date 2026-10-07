@@ -144,54 +144,7 @@ impl Glm5NextDsaLayer {
         stream: u64,
     ) -> Result<()> {
         let w = &self.workspace;
-        match pos_dev {
-            // 2026-09-25: Placement and the validity mark both use the device-side position;
-            // a memset at `valid.offset(pos)` would fix a host address in a captured graph.
-            Some(pd) if state.is_pool_cache() => {
-                let (pk_len_dev, ring) = match state.pool_cache() {
-                    Some(p) => (p.pk_len_dev, p.book.ring_rows()),
-                    None => (DevicePtr::NULL, 1),
-                };
-                let kernel = self.select_kernels.indexer_store_ring;
-                if kernel.0 == 0 {
-                    bail!(
-                        "DSA layer {}: METRALE_GLM_DSA_POOL_CACHE=1 needs dsa_indexer_store_ring \
-                         for a captured indexer write",
-                        self.layer_idx
-                    );
-                }
-                KernelLaunch::new(gpu, kernel)
-                    .grid([1, 1, 1])
-                    .block([d.min(1024) as u32, 1, 1])
-                    .arg_ptr(w.stage_k)
-                    .arg_ptr(w.stage_gate)
-                    .arg_ptr(pd)
-                    .arg_ptr(state.k_normed)
-                    .arg_ptr(state.gate)
-                    .arg_ptr(state.valid)
-                    .arg_u32(d as u32)
-                    .arg_u32(ring as u32)
-                    .arg_u32(self.cfg.index_kpool as u32)
-                    .arg_ptr(pk_len_dev)
-                    .launch(stream)?;
-                state.note_device_store(pos);
-            }
-            Some(pd) => {
-                KernelLaunch::new(gpu, self.select_kernels.indexer_store)
-                    .grid([1, 1, 1])
-                    .block([d.min(1024) as u32, 1, 1])
-                    .arg_ptr(w.stage_k)
-                    .arg_ptr(w.stage_gate)
-                    .arg_ptr(pd)
-                    .arg_ptr(state.k_normed)
-                    .arg_ptr(state.gate)
-                    .arg_ptr(state.valid)
-                    .arg_u32(d as u32)
-                    .launch(stream)?;
-            }
-            None => gpu.memset_async(state.valid.offset(pos), 1, 1, stream)?,
-        }
-        state.advance(1)
+        self.store_indexer_row_from(gpu, state, pos_dev, pos, d, (w.stage_k, w.stage_gate), stream)
     }
 
     /// 2026-10-06: Before a host-path indexer write from row `pos0` with the pool cache on:

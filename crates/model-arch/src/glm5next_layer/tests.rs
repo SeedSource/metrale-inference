@@ -303,3 +303,29 @@ fn batched_verify_stays_behind_its_lever_and_indexes_each_sequence() {
         "MLP rows"
     );
 }
+
+/// 2026-10-07: The graphed multi-sequence decode stays default-off behind
+/// `METRALE_GLM_MS_DECODE_GRAPHS`: GLM answers eager-only unless it is set and always unpadded,
+/// the engine's batched replay runs the per-row replay hooks, and the xseq indexer store has a
+/// device-position arm.
+#[test]
+fn ms_decode_graphs_stays_behind_its_lever() {
+    let g = include_str!("ms_graphs.rs");
+    assert!(g.contains("std::env::var(\"METRALE_GLM_MS_DECODE_GRAPHS\").as_deref() == Ok(\"1\")"));
+    let m = include_str!("mod.rs");
+    let start = m
+        .find("fn decode_multi_seq_eager_only(&self) -> bool {")
+        .expect("override present");
+    assert!(m[start..start + 100].contains("!ms_graphs::ms_decode_graphs()"));
+    let start = m
+        .find("fn decode_multi_seq_unpadded(&self) -> bool {")
+        .expect("override present");
+    assert!(m[start..start + 80].contains("true"));
+    let e = include_str!("../../../model-engine/src/model/trait_impl/decode_a2.rs");
+    assert!(
+        e.contains("self.ms_replay_check_room(seqs)?;\n                self.gpu.launch_graph(graph, stream)?;\n                self.ms_replay_sync(seqs)?;"),
+        "batched replay runs the per-row hooks around the launch"
+    );
+    let r = include_str!("../glm5next_dsa/layer/row_src.rs");
+    assert!(r.contains("return self.store_indexer_row_from(gpu, state, pos_dev, pos, d, (src_k, src_g), stream);"));
+}

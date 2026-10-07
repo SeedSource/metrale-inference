@@ -24,6 +24,12 @@ impl TransformerModel {
         self.layers.iter().any(|l| l.decode_multi_seq_eager_only())
     }
 
+    /// 2026-10-07: True when some layer needs the batched step unpadded even when graphed
+    /// (`decode_multi_seq_unpadded`): exactly `n` rows, no graph borrowing.
+    pub(super) fn ms_unpadded(&self) -> bool {
+        self.layers.iter().any(|l| l.decode_multi_seq_unpadded())
+    }
+
     /// 2026-10-01: Log, once per process, which route the first multi-sequence step took. The
     /// two routes differ in correctness as well as speed, and the boot-time concurrency note is
     /// printed from `max_batch_size` alone, so it does not say which one ran. From rsafier's

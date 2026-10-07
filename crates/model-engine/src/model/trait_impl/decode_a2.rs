@@ -24,6 +24,7 @@ use metrale_model_layers::layers::ops;
 
 mod pad_states;
 mod perseq;
+mod replay_sync;
 mod route;
 
 /// 2026-09-25: Multi-sequence decode CUDA graphs: on unless
@@ -170,7 +171,9 @@ impl TransformerModel {
         // 2026-09-25: Pad to the graph ladder in `traits::padded_batch_n`.
         // 2026-10-01: An eager-only layer stack (`ms_eager_only`) runs exactly `n` rows.
         let ms_eager = self.ms_eager_only();
-        let padded_n = if ms_eager {
+        // 2026-10-07: So does a layer stack that is graphed but unpadded (`ms_unpadded`).
+        let ms_unpadded = self.ms_unpadded();
+        let padded_n = if ms_eager || ms_unpadded {
             n
         } else {
             crate::traits::padded_batch_n(n)
@@ -222,6 +225,7 @@ impl TransformerModel {
                 e.1 = tick;
                 replay = Some(e.0);
             } else if super::graph_borrow::graph_borrow_enabled()
+                && !ms_unpadded
                 && self.comm.is_none()
                 && self.config.num_ssm_layers() > 0
             {
@@ -319,7 +323,10 @@ impl TransformerModel {
 
         if let Some(graph) = replay {
             if graph.0 != 0 {
+                // 2026-10-07: Per-row room check and host bookkeeping (`replay_sync.rs`).
+                self.ms_replay_check_room(seqs)?;
                 self.gpu.launch_graph(graph, stream)?;
+                self.ms_replay_sync(seqs)?;
             }
 
             if let Some(tokens) = input.host() {

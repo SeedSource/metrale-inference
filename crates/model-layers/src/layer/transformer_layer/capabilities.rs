@@ -60,6 +60,13 @@ pub trait LayerCapabilities {
         false
     }
 
+    /// 2026-10-07: True when a batched multi-sequence decode step must run exactly `n` rows even
+    /// when it is graphed: `decode_a2.rs` then skips the padding ladder and graph borrowing, and
+    /// captures one graph per exact width. GLM-5.3 answers true (per-sequence DSA state).
+    fn decode_multi_seq_unpadded(&self) -> bool {
+        false
+    }
+
     /// 2026-10-01: True when this layer cannot share the fused decode + prefill forward
     /// (`decode_b.rs`), where the prefill chunk's highway rows start at `hc_row_offset`. GLM-5.3
     /// answers true: its prefill numbers highway slots from 0, over the decode rows' slots.

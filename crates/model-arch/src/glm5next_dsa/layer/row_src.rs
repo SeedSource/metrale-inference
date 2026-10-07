@@ -12,6 +12,7 @@
 
 use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
+use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
 use super::super::state::Glm5NextDsaState;
 use super::Glm5NextDsaLayer;
@@ -82,8 +83,11 @@ pub(super) struct PreRow {
 impl Glm5NextDsaLayer {
     /// 2026-10-03: `indexer_forward` for row `row` of `pre`, whose projections and `k_norm`
     /// already ran: copy the row's key and gate into indexer cache row `state.len()`, then
-    /// `store_indexer_row` (validity mark, advance). Host-offset placement only; `pos_dev`
-    /// (graph capture) is refused, and `xseq_ready` never engages while capturing.
+    /// `store_indexer_row` (validity mark, advance).
+    /// 2026-10-07: With `pos_dev` (graph capture, `METRALE_GLM_MS_DECODE_GRAPHS`) the
+    /// replay-safe store kernel reads the key and gate straight from `pre`'s row (fixed arena
+    /// addresses) and places them at the device position, as `indexer_forward` does from its
+    /// stage buffers; no host offset enters the graph.
     pub(super) fn store_pre_indexer_row(
         &self,
         gpu: &dyn GpuBackend,
@@ -94,24 +98,84 @@ impl Glm5NextDsaLayer {
         stream: u64,
     ) -> Result<()> {
         state.ensure_room(1)?;
-        if pos_dev.is_some() {
-            bail!(
-                "DSA layer {}: a precomputed indexer row has no replay-safe placement",
-                self.layer_idx
-            );
-        }
         let d = self.cfg.index_head_dim;
         let pos = state.len();
-        // 2026-10-06: Pool cache on, `off` is the ring slot and the device `pk_len` is clamped
-        // first after a rewind.
-        self.pool_clamp_before_write(gpu, state, pos, stream)?;
-        let off = state.row_offset(pos);
         let (src_k, src_g) = (
             pre.k_normed.offset(row * d * 2),
             pre.gate.offset(row * d * 2),
         );
+        if pos_dev.is_some() {
+            return self.store_indexer_row_from(gpu, state, pos_dev, pos, d, (src_k, src_g), stream);
+        }
+        // 2026-10-06: Pool cache on, `off` is the ring slot and the device `pk_len` is clamped
+        // first after a rewind.
+        self.pool_clamp_before_write(gpu, state, pos, stream)?;
+        let off = state.row_offset(pos);
         gpu.copy_d2d_async(src_k, state.k_normed.offset(off), d * 2, stream)?;
         gpu.copy_d2d_async(src_g, state.gate.offset(off), d * 2, stream)?;
         self.store_indexer_row(gpu, state, None, pos, d, stream)
+    }
+
+    /// 2026-10-07: [`Self::store_indexer_row`] whose device-position store reads the key and gate
+    /// from `src` (the host-offset path ignores it: its caller already copied them).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn store_indexer_row_from(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut Glm5NextDsaState,
+        pos_dev: Option<DevicePtr>,
+        pos: usize,
+        d: usize,
+        src: (DevicePtr, DevicePtr),
+        stream: u64,
+    ) -> Result<()> {
+        match pos_dev {
+            // 2026-09-25: Placement and the validity mark both use the device-side position;
+            // a memset at `valid.offset(pos)` would fix a host address in a captured graph.
+            Some(pd) if state.is_pool_cache() => {
+                let (pk_len_dev, ring) = match state.pool_cache() {
+                    Some(p) => (p.pk_len_dev, p.book.ring_rows()),
+                    None => (DevicePtr::NULL, 1),
+                };
+                let kernel = self.select_kernels.indexer_store_ring;
+                if kernel.0 == 0 {
+                    bail!(
+                        "DSA layer {}: METRALE_GLM_DSA_POOL_CACHE=1 needs dsa_indexer_store_ring \
+                         for a captured indexer write",
+                        self.layer_idx
+                    );
+                }
+                KernelLaunch::new(gpu, kernel)
+                    .grid([1, 1, 1])
+                    .block([d.min(1024) as u32, 1, 1])
+                    .arg_ptr(src.0)
+                    .arg_ptr(src.1)
+                    .arg_ptr(pd)
+                    .arg_ptr(state.k_normed)
+                    .arg_ptr(state.gate)
+                    .arg_ptr(state.valid)
+                    .arg_u32(d as u32)
+                    .arg_u32(ring as u32)
+                    .arg_u32(self.cfg.index_kpool as u32)
+                    .arg_ptr(pk_len_dev)
+                    .launch(stream)?;
+                state.note_device_store(pos);
+            }
+            Some(pd) => {
+                KernelLaunch::new(gpu, self.select_kernels.indexer_store)
+                    .grid([1, 1, 1])
+                    .block([d.min(1024) as u32, 1, 1])
+                    .arg_ptr(src.0)
+                    .arg_ptr(src.1)
+                    .arg_ptr(pd)
+                    .arg_ptr(state.k_normed)
+                    .arg_ptr(state.gate)
+                    .arg_ptr(state.valid)
+                    .arg_u32(d as u32)
+                    .launch(stream)?;
+            }
+            None => gpu.memset_async(state.valid.offset(pos), 1, 1, stream)?,
+        }
+        state.advance(1)
     }
 }

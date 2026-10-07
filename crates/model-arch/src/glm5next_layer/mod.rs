@@ -77,6 +77,8 @@ pub mod dense_fp8_gw;
 pub mod dense_fp8_min_rows;
 pub mod dense_nv4_b3;
 pub mod dense_nv4_bm;
+// 2026-10-07: `METRALE_GLM_MS_DECODE_GRAPHS` (graphed batched multi-sequence decode).
+pub mod ms_graphs;
 // 2026-10-01: Decode L2 weight prefetch plan and launcher (`METRALE_GLM_DECODE_L2_PREFETCH`).
 pub mod prefetch;
 pub mod scratch_union;
@@ -371,7 +373,14 @@ impl LayerCapabilities for Glm5NextLayer {
     /// 2026-10-01: True: DSA state is allocated per sequence (a padding row would allocate one
     /// each step) and the indexer's host-side length advances only when this code runs, so the
     /// batched decode runs eager and unpadded.
+    /// 2026-10-07: False under `METRALE_GLM_MS_DECODE_GRAPHS=1` ([`ms_graphs`]): the engine then
+    /// syncs the indexer length after each replay, and the step stays unpadded below.
     fn decode_multi_seq_eager_only(&self) -> bool {
+        !ms_graphs::ms_decode_graphs()
+    }
+
+    /// 2026-10-07: True: a DSA padding row would allocate per-sequence state inside a capture.
+    fn decode_multi_seq_unpadded(&self) -> bool {
         true
     }
 

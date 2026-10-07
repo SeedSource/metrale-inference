@@ -792,6 +792,305 @@ extern "C" __global__ void __launch_bounds__(DSA_TC_THREADS) dsa_index_scores_tc
     }
 }
 
+// 2026-10-07: 2d. dsa_index_scores_tc2: dsa_index_scores_tc in mode 1 ("bf16") with the
+// same bytes (out as bit patterns, valid_cand) and a faster dataflow. Opt-in
+// (METRALE_GLM_DSA_SCORES_TC2=1, default off), and only where METRALE_GLM_DSA_SCORES_TC=bf16
+// would launch dsa_index_scores_tc; resolved with try_kernel; gated on a GPU by
+// crates/model-arch/examples/dsa_indexer_tc2_bitparity_microtest.rs (bitwise against
+// dsa_index_scores_tc mode 1, and timing).
+//
+// Why 2c is slow (measured 13 TF/s at P >= 8192, 142 registers, 25% occupancy): every warp
+// re-reads q from global in FP32 for every head and K step and converts it, and splits its
+// keys into hi + lo though mode 1 uses only hi.
+//
+// Layout: DSA_TC2_THREADS threads (8 warps); a block covers DSA_TC2_ROWS (32) rows x
+// DSA_TC2_POOLS (128) pools, warp w the pools [16 w, 16 w + 16) as two 8-pool n-tiles for
+// both 16-row m-tiles. Keys: as in 2c, the warp's pool keys are read once from global (FP32,
+// float2) into BF16 B fragments that stay in registers for every head (hi only). q: per head,
+// the block's 32 rows are read once from global (FP32, float4), rounded to BF16 and stored
+// in shared memory (row stride D + 8 BF16, so the 8 rows of an ldmatrix phase hit distinct
+// bank groups); the A fragments come from there with ldmatrix.x4. The next head's q is
+// loaded into registers before this head's MMAs and stored into the other buffer after them,
+// with one __syncthreads per head. The block's weights sit in shared memory as
+// [32][H + 1] floats (rows past Q as 0.0f). Dynamic shared memory: 2 x 32 x (D + 8) x 2 B of
+// q plus 32 x (H + 1) x 4 B of weights (21,504 B at D = 128, H = 32).
+//
+// Why the bytes equal 2c mode 1 for every (row r, pool p) it stores:
+// - Operands: q and key elements are __float2bfloat16_rn of the same FP32 values (q rows past
+//   Q and keys of pools past P are 0, as in 2c, and are never stored). The A fragment of
+//   K step s holds row r's K indices 16 s .. 16 s + 15 and the B fragment pool p's same 16
+//   indices, packed lower K in the low half, as dsa_tc_pack does; ldmatrix.x4 matrices
+//   (rows 0-7 | 8-15) x (K 0-7 | 8-15) give exactly the a0..a3 registers 2c loads.
+// - Dot: per head, acc starts at 0.0f and takes one mma.sync.m16n8k16 BF16 -> FP32 per K step
+//   s = 0 .. D / 16 - 1 in ascending order, as 2c's mode-1 chain. Each MMA even has the
+//   same whole operands as one of 2c's: m-tiles start at multiples of 16 rows and n-tiles at
+//   multiples of 8 pools in both kernels, rows past Q and pools past P are zeros in both, so
+//   (r, p) is tile row r % 16, column p % 8 of the same 16 x 8 x 16 product with the same C
+//   (the microtest checks the bytes).
+// - Head sum: sum += w * fmaxf(scale * acc, 0.0f) from 0.0f in ascending h, the same source
+//   expression in the same file, so the same nvcc flags (--fmad=false, KERNEL.toml): one
+//   rounded multiply, max, multiply, add, as in 2c. The weight is weights[r * H + h], read
+//   through shared memory instead of global (the same float).
+// - Candidacy, valid_cand and the -FLT_MAX store are 2c's code.
+// ptxas (CUDA 13.0, sm_121f, -O3 --fmad=false, Tower, 2026-10-07): 122 registers, no spills,
+// so two 256-thread blocks per SM (__launch_bounds__(256, 2)); 2c: 142 registers.
+//
+// Not supported (traps): device geometry (geom != NULL), D not a multiple of 16 or above 128,
+// mode other than 1. The host also caps H at SCORES_TC2_MAX_H (64), bounding the weights in
+// shared memory. The host never selects it outside that envelope.
+
+#define DSA_TC2_ROWS 32u
+#define DSA_TC2_POOLS 128u
+#define DSA_TC2_THREADS 256u
+#define DSA_TC2_WARPS 8u
+
+// 2026-10-07: d0..d3 = the four 8x8 BF16 matrices whose row addresses lanes 0-7, 8-15, 16-23,
+// 24-31 pass; register j of a lane holds row lane / 4, columns 2 (lane % 4), + 1 of matrix j.
+__device__ __forceinline__ void dsa_tc2_ldsm_x4(unsigned int addr, unsigned int& d0,
+                                                unsigned int& d1, unsigned int& d2,
+                                                unsigned int& d3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+                 : "r"(addr)
+                 : "memory");
+}
+
+// 2026-10-07: One block, NKS = D / 16 K steps. `qs` is two [32][D + 8] BF16 q buffers, `ws`
+// [32][H + 1] floats, both in dynamic shared memory.
+template <int NKS>
+__device__ __forceinline__ void dsa_scores_tc2_tile(
+    const float* __restrict__ q,
+    const float* __restrict__ pool_keys,
+    const float* __restrict__ weights,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ pool_valid,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    float* __restrict__ out,
+    unsigned char* __restrict__ valid_cand,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int H,
+    unsigned int KP,
+    unsigned int S,
+    float scale,
+    __nv_bfloat16* qs,
+    float* ws
+) {
+    constexpr unsigned int D = 16u * (unsigned int)NKS;
+    constexpr unsigned int LD = D + 8u;                 // q row stride, BF16 elements
+    constexpr unsigned int BUF = DSA_TC2_ROWS * LD;     // one q buffer, BF16 elements
+    constexpr unsigned int F4_ROW = D / 4u;             // float4 per q row
+    constexpr unsigned int F4_ALL = DSA_TC2_ROWS * F4_ROW;
+    constexpr int F4_IT = (int)((F4_ALL + DSA_TC2_THREADS - 1u) / DSA_TC2_THREADS);
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int g = lane >> 2;
+    const unsigned int t = lane & 3u;
+    const unsigned int r0 = blockIdx.y * DSA_TC2_ROWS;
+    const unsigned int pw = blockIdx.x * DSA_TC2_POOLS + warp * 16u;
+    // 2026-10-07: Warp-uniform. A warp past P still stages q and meets every barrier.
+    const bool active = pw < P;
+    const unsigned int WS = H + 1u;
+
+    // 2026-10-07: Weights of the block's rows, 0.0f past Q (2c's `va ? ... : 0.0f`).
+    for (unsigned int e = tid; e < DSA_TC2_ROWS * H; e += DSA_TC2_THREADS) {
+        const unsigned int rr = e / H;
+        const unsigned int hh = e - rr * H;
+        const unsigned int r = r0 + rr;
+        ws[rr * WS + hh] = r < Q ? weights[(size_t)r * H + hh] : 0.0f;
+    }
+
+    // 2026-10-07: B fragments, 2c's layout and rounding (hi only): register b of n-tile j at
+    // step s holds K indices 16 s + 8 b + 2 t, + 1 of pool pw + 8 j + g.
+    unsigned int bk[2][NKS][2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const unsigned int p = pw + 8u * (unsigned int)j + g;
+        const bool vp = active && p < P;
+        const float* __restrict__ pk = pool_keys + (size_t)(vp ? p : 0u) * D;
+#pragma unroll
+        for (int s = 0; s < NKS; ++s) {
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+                const unsigned int k = 16u * (unsigned int)s + 8u * (unsigned int)b + 2u * t;
+                const float2 v = dsa_tc_ld2(pk, k, vp);
+                bk[j][s][b] = dsa_tc_pack(__float2bfloat16_rn(v.x), __float2bfloat16_rn(v.y));
+            }
+        }
+    }
+
+    // 2026-10-07: q staging: float4 e of the block's head-h tile is row e / F4_ROW, elements
+    // 4 (e % F4_ROW) .. + 3; rows past Q are zeros (2c's dsa_tc_ld2 with ok = false).
+    float4 pf[F4_IT];
+    auto q_load = [&](unsigned int h) {
+#pragma unroll
+        for (int it = 0; it < F4_IT; ++it) {
+            const unsigned int e = tid + (unsigned int)it * DSA_TC2_THREADS;
+            const unsigned int rr = e / F4_ROW;
+            const unsigned int c4 = e - rr * F4_ROW;
+            const unsigned int r = r0 + rr;
+            pf[it] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (e < F4_ALL && r < Q)
+                pf[it] = *reinterpret_cast<const float4*>(q + ((size_t)r * H + h) * D + 4u * c4);
+        }
+    };
+    auto q_store = [&](unsigned int buf) {
+#pragma unroll
+        for (int it = 0; it < F4_IT; ++it) {
+            const unsigned int e = tid + (unsigned int)it * DSA_TC2_THREADS;
+            if (e >= F4_ALL) continue;
+            const unsigned int rr = e / F4_ROW;
+            const unsigned int c4 = e - rr * F4_ROW;
+            uint2 v;
+            v.x = dsa_tc_pack(__float2bfloat16_rn(pf[it].x), __float2bfloat16_rn(pf[it].y));
+            v.y = dsa_tc_pack(__float2bfloat16_rn(pf[it].z), __float2bfloat16_rn(pf[it].w));
+            *reinterpret_cast<uint2*>(qs + buf * BUF + rr * LD + 4u * c4) = v;
+        }
+    };
+
+    // 2026-10-07: ldmatrix row address of lane l for m-tile i at K step 0: matrix l / 8 is
+    // (rows + 8 ((l / 8) & 1)) x (K + 8 (l / 16)), row l % 8 of it.
+    const unsigned int qs_base = (unsigned int)__cvta_generic_to_shared(qs);
+    unsigned int a_off[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const unsigned int row = 16u * (unsigned int)i + (lane & 7u) + ((lane >> 3) & 1u) * 8u;
+        a_off[i] = (row * LD + (lane >> 4) * 8u) * 2u;
+    }
+
+    float sum[2][2][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            sum[i][j][0] = 0.0f; sum[i][j][1] = 0.0f; sum[i][j][2] = 0.0f; sum[i][j][3] = 0.0f;
+        }
+    }
+
+    if (H > 0u) {
+        q_load(0u);
+        q_store(0u);
+    }
+    __syncthreads();
+
+    for (unsigned int h = 0; h < H; ++h) {
+        const unsigned int cur = h & 1u;
+        if (h + 1u < H) q_load(h + 1u);
+        if (active) {
+            float acc[2][2][4];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    acc[i][j][0] = 0.0f; acc[i][j][1] = 0.0f;
+                    acc[i][j][2] = 0.0f; acc[i][j][3] = 0.0f;
+                }
+            }
+            const unsigned int qb = qs_base + cur * BUF * 2u;
+#pragma unroll
+            for (int s = 0; s < NKS; ++s) {
+                unsigned int a[2][4];
+#pragma unroll
+                for (int i = 0; i < 2; ++i)
+                    dsa_tc2_ldsm_x4(qb + a_off[i] + 32u * (unsigned int)s, a[i][0], a[i][1],
+                                    a[i][2], a[i][3]);
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                    for (int j = 0; j < 2; ++j)
+                        dsa_tc_mma(acc[i][j], a[i][0], a[i][1], a[i][2], a[i][3], bk[j][s][0],
+                                   bk[j][s][1]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const float wa = ws[(16u * (unsigned int)i + g) * WS + h];
+                const float wb = ws[(16u * (unsigned int)i + g + 8u) * WS + h];
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    sum[i][j][0] += wa * fmaxf(scale * acc[i][j][0], 0.0f);
+                    sum[i][j][1] += wa * fmaxf(scale * acc[i][j][1], 0.0f);
+                    sum[i][j][2] += wb * fmaxf(scale * acc[i][j][2], 0.0f);
+                    sum[i][j][3] += wb * fmaxf(scale * acc[i][j][3], 0.0f);
+                }
+            }
+        }
+        // 2026-10-07: The other buffer was last read for head h - 1, before the barrier that
+        // ended that iteration; this head's buffer is read again only after the next barrier.
+        if (h + 1u < H) q_store(cur ^ 1u);
+        __syncthreads();
+    }
+
+    if (!active) return;
+    // 2026-10-07: Candidacy and stores, 2c's code per owned (row, pool).
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const unsigned int r = r0 + 16u * (unsigned int)i + g + ((e < 2) ? 0u : 8u);
+                const unsigned int p = pw + 8u * (unsigned int)j + 2u * t + (unsigned int)(e & 1);
+                if (r >= Q || p >= P) continue;
+                const int end = pool_indices[(size_t)p * KP + KP - 1];
+                const int end_c = end < 0 ? 0 : (end >= (int)S ? (int)S - 1 : end);
+                const bool vis = (end_c <= q_pos[r]) && (valid_keys[end_c] != 0);
+                const bool cand = (pool_valid[p] != 0) && vis;
+                valid_cand[(size_t)r * P + p] = cand ? 1 : 0;
+                out[(size_t)r * P + p] = cand ? sum[i][j][e] : -FLT_MAX;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(DSA_TC2_THREADS, 2) dsa_index_scores_tc2(
+    const float* __restrict__ q,
+    const float* __restrict__ pool_keys,
+    const float* __restrict__ weights,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ pool_valid,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    float* __restrict__ out,
+    unsigned char* __restrict__ valid_cand,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int H,
+    unsigned int D,
+    unsigned int KP,
+    unsigned int S,
+    float scale,
+    const int* __restrict__ geom,
+    unsigned int mode
+) {
+    if (geom || D == 0u || (D & 15u) != 0u || D > 16u * DSA_TC_MAX_KSTEP || mode != 1u)
+        __trap();
+    extern __shared__ uint4 dsa_tc2_smem[];
+    __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(dsa_tc2_smem);
+    float* ws = reinterpret_cast<float*>(qs + 2u * DSA_TC2_ROWS * (D + 8u));
+#define DSA_TC2_CASE(N)                                                                      \
+    case N:                                                                                  \
+        dsa_scores_tc2_tile<N>(q, pool_keys, weights, pool_indices, pool_valid, valid_keys,  \
+                               q_pos, out, valid_cand, Q, P, H, KP, S, scale, qs, ws);       \
+        break;
+    switch (D >> 4) {
+        DSA_TC2_CASE(1)
+        DSA_TC2_CASE(2)
+        DSA_TC2_CASE(3)
+        DSA_TC2_CASE(4)
+        DSA_TC2_CASE(5)
+        DSA_TC2_CASE(6)
+        DSA_TC2_CASE(7)
+        DSA_TC2_CASE(8)
+    default:
+        __trap();
+    }
+#undef DSA_TC2_CASE
+}
+
 // 2026-09-25: 3. Deterministic top-k over pools, one block per query. A tiled bitonic
 // select: the pool axis is walked in tiles of NP2 and a running best-NP2 list is kept in
 // shared memory (two tiles of [f32, i32], 16 * NP2 bytes, whatever the context). The order

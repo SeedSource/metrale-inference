@@ -121,7 +121,20 @@ pub fn select_tokens(
             geom.index_heads,
             geom.n_pools,
         );
-        log_scores_tc(tc_mode, tc, kernels, ceiling.is_some(), geom);
+        // 2026-10-07: `METRALE_GLM_DSA_SCORES_TC2=1` swaps `dsa_index_scores_tc2` (same
+        // arguments, same bytes as mode 1) in for `dsa_index_scores_tc`; see `scores_tc2_for`.
+        let tc2_requested = tc2::dsa_scores_tc2();
+        let tc2_on = tc2::scores_tc2_for(
+            tc2_requested,
+            kernels.index_scores_tc2.0 != 0,
+            tc,
+            tc_mode,
+            geom.index_heads,
+        );
+        tc2::log_scores_tc2(tc2_requested, tc2_on, tc, tc_mode, kernels, geom);
+        if !tc2_on {
+            log_scores_tc(tc_mode, tc, kernels, ceiling.is_some(), geom);
+        }
         let requested = crate::glm5next_layer::levers::dsa_scores_tiled();
         let tiled = !tc
             && scores_tiled_for(
@@ -135,7 +148,14 @@ pub fn select_tokens(
         if !tc {
             log_scores_tiled(requested, tiled, kernels, ceiling.is_some(), geom);
         }
-        let (handle, grid, block, smem) = if tc {
+        let (handle, grid, block, smem) = if tc2_on {
+            (
+                kernels.index_scores_tc2,
+                tc2::scores_tc2_grid(geom.q_rows, geom.n_pools),
+                tc2::SCORES_TC2_BLOCK,
+                tc2::scores_tc2_smem(d, geom.index_heads) as u32,
+            )
+        } else if tc {
             (
                 kernels.index_scores_tc,
                 scores_tc_grid(geom.q_rows, geom.n_pools),
@@ -181,6 +201,7 @@ pub fn select_tokens(
             .arg_f32((d as f32).powf(-0.5))
             .arg_ptr(gd);
         // 2026-10-01: `dsa_index_scores_tc` takes one argument more, the precision mode.
+        // 2026-10-07: So does `dsa_index_scores_tc2` (`tc2_on` implies `tc`).
         let scores = if tc { scores.arg_u32(tc_mode) } else { scores };
         scores.launch(stream)?;
 

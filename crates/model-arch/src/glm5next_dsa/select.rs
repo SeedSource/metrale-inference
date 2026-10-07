@@ -488,6 +488,7 @@ pub mod grid_stride;
 pub mod radix;
 pub mod shared;
 pub mod split;
+pub mod tc2;
 
 #[cfg(test)]
 mod tests;

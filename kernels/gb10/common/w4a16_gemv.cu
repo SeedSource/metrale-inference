@@ -892,6 +892,191 @@ extern "C" __global__ void w4a16_gemv_batch3_staged(
 }
 
 
+// 2026-10-07: METRALE_GLM_NV4_BATCHM_STAGED. w4a16_gemv_batchm_impl<MAX_M> (rows t < M) with the
+// BF16 activation rows staged in shared memory, as w4a16_gemv_batch3_staged does for 3 rows; same
+// FP operations in the same order, so each row's bits equal the tier's (w4a16_gemv_batch{4..8,16})
+// and the M = 1 kernel's. Without staging, every thread reloads M x 32 B of activations per 9 B of
+// weight, so the tiers slow with M (ra-t22 dense microtest, KDA 4096^2: M=1 42.6 us, M=8 72.2 us;
+// in the C4 serve batch16 at 12 rows averages 88.6 us vs batch4 47.8 us).
+// The window is one 64-chunk phase slice: window (pair pr, phase ph) holds chunks
+// [128 pr + 64 ph, +64), and thread `lane` of an output takes chunk 128 pr + 64 ph + lane, which
+// is the base kernel's walk kk = lane + 64 phase + 128 j (j = pr) in ascending j into the phase's
+// own accumulators. The next chunk's weight word and scale byte are loaded before the current
+// FMAs. The windows (MAX_M x 2 KiB) and the reduction scratch s_vl (MAX_M x 1 KiB) share one
+// buffer, which is dead after the walk's last barrier: 32 KiB at MAX_M = 16, no dynamic-smem
+// opt-in. Threads with n >= N take no part in the math but reach every __syncthreads.
+#define NV4BM_WCH 64
+template <int MAX_M>
+__device__ __forceinline__ void w4a16_gemv_batchm_staged_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64 = NV4BM_WCH
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool valid = n < N;  // uniform per warp (64 threads share an output)
+    const unsigned int rows = M < (unsigned int)MAX_M ? M : (unsigned int)MAX_M;
+
+    constexpr unsigned int A_BYTES = MAX_M * 2 * NV4BM_WCH * 16;
+    constexpr unsigned int VL_BYTES = MAX_M * N_PER_BLOCK * 2 * WARP_SIZE * 4;
+    __shared__ __align__(16) unsigned char s_buf[A_BYTES > VL_BYTES ? A_BYTES : VL_BYTES];
+    uint4 (*s_a)[2][NV4BM_WCH] = reinterpret_cast<uint4 (*)[2][NV4BM_WCH]>(s_buf);
+    float (*s_vl)[N_PER_BLOCK][2 * WARP_SIZE] =
+        reinterpret_cast<float (*)[N_PER_BLOCK][2 * WARP_SIZE]>(s_buf);
+    __shared__ float s_lut[16];
+    __shared__ float smem[MAX_M][N_PER_BLOCK * 2];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+    const unsigned int npair = (K16 + 2u * NV4BM_WCH - 1u) / (2u * NV4BM_WCH);
+    const unsigned char* wrow = B_packed + (unsigned long long)(valid ? n : 0u) * half_K;
+    const unsigned char* srow = B_scale + (unsigned long long)(valid ? n : 0u) * num_groups;
+
+    unsigned long long cur_w = 0ull;
+    unsigned char cur_s = 0;
+    if (valid && lane < K16) {
+        cur_w = *(const unsigned long long*)(wrow + (unsigned long long)lane * 8);
+        cur_s = srow[lane];
+    }
+    float acc[2][MAX_M];
+    #pragma unroll
+    for (int p = 0; p < 2; p++) {
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) acc[p][t] = 0.0f;
+    }
+
+    #pragma unroll 1
+    for (unsigned int pr = 0; pr < npair; pr++) {
+        #pragma unroll
+        for (int ph = 0; ph < 2; ph++) {
+            const unsigned int base = pr * (2u * NV4BM_WCH) + (unsigned int)ph * NV4BM_WCH;
+            if (base >= K16) break;  // uniform: the last pair may have one window
+            const unsigned int cnt = min((unsigned int)NV4BM_WCH, K16 - base);
+            const unsigned int per = cnt * 2u;  // uint4 per row in this window
+            // Cooperative staging: coalesced uint4 loads, 2 uint4 (= 16 BF16) per chunk per row.
+            for (unsigned int u = threadIdx.x; u < rows * per; u += BLOCK_SIZE) {
+                const unsigned int t = u / per;
+                const unsigned int r = u - t * per;
+                s_a[t][r & 1u][r >> 1] =
+                    ((const uint4*)(A + (unsigned long long)t * K))[(unsigned long long)base * 2 + r];
+            }
+            __syncthreads();  // staged window (and s_lut on the first pass) visible
+            const unsigned int kk = base + lane;
+            const unsigned int nk = kk + NV4BM_WCH;  // this thread's next chunk (next window)
+            unsigned long long nxt_w = 0ull;
+            unsigned char nxt_s = 0;
+            if (valid && nk < K16) {
+                nxt_w = *(const unsigned long long*)(wrow + (unsigned long long)nk * 8);
+                nxt_s = srow[nk];
+            }
+            if (valid && kk < K16) {
+                __nv_fp8_e4m3 fp8;
+                *(unsigned char*)&fp8 = cur_s;
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+                float scale = scl_fp8(cur_s) * scale2;
+#else
+                float scale = (float)fp8 * scale2;
+#endif
+                float wl[16];
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    unsigned char byte_val = (unsigned char)(cur_w >> (b * 8));
+                    wl[b * 2]     = s_lut[byte_val & 0xF];
+                    wl[b * 2 + 1] = s_lut[byte_val >> 4];
+                }
+                #pragma unroll
+                for (int t = 0; t < MAX_M; t++) {
+                    if ((unsigned int)t >= M) continue;
+                    const uint4 a_lo = s_a[t][0][lane];
+                    const uint4 a_hi = s_a[t][1][lane];
+                    const unsigned int ar[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                                a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+                    float part = 0.0f;
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        const float ax = __uint_as_float(ar[b] << 16);
+                        const float ay = __uint_as_float(ar[b] & 0xFFFF0000u);
+                        part = fmaf(ax, wl[b * 2], part);
+                        part = fmaf(ay, wl[b * 2 + 1], part);
+                    }
+                    acc[ph][t] = fmaf(scale, part, acc[ph][t]);
+                }
+            }
+            cur_w = nxt_w;
+            cur_s = nxt_s;
+            __syncthreads();  // window consumed before the next staging (or s_vl) overwrites it
+        }
+    }
+
+    if (valid) {
+        #pragma unroll
+        for (int ph = 0; ph < 2; ph++) {
+            #pragma unroll
+            for (int t = 0; t < MAX_M; t++) {
+                if ((unsigned int)t >= M) continue;
+                const float v = acc[ph][t] + __shfl_xor_sync(0xFFFFFFFF, acc[ph][t], 1);
+                if ((lane & 1u) == 0u) {
+                    s_vl[t][local_out][ph * WARP_SIZE + (lane >> 1)] = v;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const unsigned int warp_in_out = lane / WARP_SIZE;
+    if (valid) {
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t >= M) continue;
+            float a = s_vl[t][local_out][lane];
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+            }
+            if (lane % WARP_SIZE == 0) smem[t][local_out * 2 + warp_in_out] = a;
+        }
+    }
+    __syncthreads();
+    if (valid && lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t >= M) continue;
+            float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
+            C[(unsigned long long)t * N + n] = __float2bfloat16(r);
+        }
+    }
+}
+
+// 2026-10-07: The staged tiers; same arguments as w4a16_gemv_batch{4..8,16}.
+#define METRALE_NV4BM_STAGED_ENTRY(R)                                                \
+extern "C" __global__ void w4a16_gemv_batch##R##_staged(                           \
+    const __nv_bfloat16* __restrict__ A,                                           \
+    const unsigned char* __restrict__ B_packed,                                    \
+    const unsigned char* __restrict__ B_scale,                                     \
+    const float scale2,                                                            \
+    __nv_bfloat16* __restrict__ C,                                                 \
+    unsigned int M,                                                                \
+    unsigned int N,                                                                \
+    unsigned int K                                                                 \
+) {                                                                                \
+    w4a16_gemv_batchm_staged_impl<R>(A, B_packed, B_scale, scale2, C, M, N, K);    \
+}
+
+METRALE_NV4BM_STAGED_ENTRY(4)
+METRALE_NV4BM_STAGED_ENTRY(5)
+METRALE_NV4BM_STAGED_ENTRY(6)
+METRALE_NV4BM_STAGED_ENTRY(7)
+METRALE_NV4BM_STAGED_ENTRY(8)
+METRALE_NV4BM_STAGED_ENTRY(16)
+
 extern "C" __global__ void w4a16_gemv_batch4(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,

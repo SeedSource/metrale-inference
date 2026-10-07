@@ -389,6 +389,8 @@ struct Nv4Kernels {
     b3s: Option<KernelHandle>,
     /// `w4a16_gemv_batch4` ..= `batch8` at 0..=4, `batch16` at 5.
     tiers: [KernelHandle; 6],
+    /// 2026-10-07: their `_staged` twins (`METRALE_GLM_NV4_BATCHM_STAGED`); `None` on older images.
+    tiers_s: Option<[KernelHandle; 6]>,
 }
 
 #[derive(Clone, Copy)]
@@ -626,6 +628,7 @@ fn nv4_kernels(gpu: &dyn GpuBackend) -> Option<Nv4Kernels> {
                 b3: t(3)?,
                 b3s: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3_staged").ok(),
                 tiers: [t(4)?, t(5)?, t(6)?, t(7)?, t(8)?, t(16)?],
+                tiers_s: super::dense_nv4_bm::load_staged(gpu),
             })
         })();
         match r {
@@ -950,8 +953,8 @@ pub fn nv4_gemv_uncounted(
         1 => (kk.gemv1, false),
         2 => (kk.b2, false),
         3 => (super::dense_nv4_b3::pick_b3(kk.b3s, kk.b3), false),
-        4..=8 => (kk.tiers[m - 4], true),
-        9..=NV4_MAX_M => (kk.tiers[5], true),
+        4..=8 => (super::dense_nv4_bm::pick_tier(kk.tiers_s, m - 4, kk.tiers[m - 4]), true),
+        9..=NV4_MAX_M => (super::dense_nv4_bm::pick_tier(kk.tiers_s, 5, kk.tiers[5]), true),
         _ => bail!("METRALE_GLM_DENSE_NVFP4: {m} rows is outside 1..={NV4_MAX_M}"),
     };
     let mut l = KernelLaunch::new(gpu, h)

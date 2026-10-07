@@ -76,6 +76,7 @@ pub mod dense_fp8;
 pub mod dense_fp8_gw;
 pub mod dense_fp8_min_rows;
 pub mod dense_nv4_b3;
+pub mod dense_nv4_bm;
 // 2026-10-01: Decode L2 weight prefetch plan and launcher (`METRALE_GLM_DECODE_L2_PREFETCH`).
 pub mod prefetch;
 pub mod scratch_union;

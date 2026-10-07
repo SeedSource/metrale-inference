@@ -431,9 +431,26 @@ fn every_select_launch_reads_the_pools_the_cache_match_chose() {
     let arm = src.find("match inputs.pool_cache {").expect("the cache match");
     let none = src[arm..].find("None => {").expect("the full-compress arm") + arm;
     let end = src[none..].find("if has_pools {").expect("the scores block") + none;
+    // 2026-10-07 (comb23, idx merge): the full compress moved into `launch_kpool_compress`,
+    // which writes the three scratch regions. It is called from the None arm here and from
+    // `pool_once::compress_window`, which bails when the pool cache is on.
+    let helper = src.find("pub(super) fn launch_kpool_compress(").expect("the compress helper");
+    let helper_end = src[helper..].find(".launch(stream)").unwrap() + helper;
     let hits: Vec<usize> = src.match_indices("scratch.pool_").map(|(i, _)| i).collect();
-    assert_eq!(hits.len(), 6, "three compress outputs and the three returned regions");
-    assert!(hits.iter().all(|&i| none < i && i < end), "a scratch pool region outside the None arm");
+    assert_eq!(hits.len(), 6, "the helper's three compress outputs and the three returned regions");
+    let inside = |i: usize| (none < i && i < end) || (helper < i && i < helper_end);
+    assert!(hits.iter().all(|&i| inside(i)), "a scratch pool region outside the None arm");
+    let calls: Vec<usize> = src
+        .match_indices("launch_kpool_compress(")
+        .map(|(i, _)| i)
+        .filter(|&i| !(helper..helper_end).contains(&i))
+        .collect();
+    assert!(!calls.is_empty(), "the None arm compresses through the helper");
+    assert!(calls.iter().all(|&i| none < i && i < end), "a compress call outside the None arm");
+    let once = read("pool_once.rs");
+    let window = &once[once.find("pub fn compress_window(").expect("compress_window")..];
+    let bail = window.find("dsa_pool_cache()").expect("compress_window checks the pool cache");
+    assert!(bail < window.find("launch_kpool_compress(").unwrap(), "the check precedes the compress");
     let scores = &src[end..src[end..].find(".launch(stream)").unwrap() + end];
     for p in [".arg_ptr(pool_keys)", ".arg_ptr(pool_indices)", ".arg_ptr(pool_valid)"] {
         assert!(scores.contains(p), "scores launch lacks {p}");

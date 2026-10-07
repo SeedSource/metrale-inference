@@ -295,8 +295,11 @@ fn batched_verify_stays_behind_its_lever_and_indexes_each_sequence() {
     assert!(l.contains("if batched_verify() { 64 } else { 0 }"));
     let ld = include_str!("../weight_loader/glm5_next_load/loader.rs");
     assert!(ld.contains(".max(wide_rows.unwrap_or(0)).max(bv_rows);"), "KDA rows");
+    // 2026-10-07: Whitespace-free compare: rustfmt splits the MLP rows chain over lines
+    // (e698ae59), which the code meaning does not depend on.
+    let ld_flat: String = ld.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        ld.contains(".max(crate::glm5next_layer::prefill_rows_ffn()).max(bv_rows);"),
+        ld_flat.contains(".max(crate::glm5next_layer::prefill_rows_ffn()).max(bv_rows);"),
         "MLP rows"
     );
 }

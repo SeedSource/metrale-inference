@@ -45,6 +45,10 @@ name = "bf16_batch_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "cublas_bf16_pin_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_dense_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
 

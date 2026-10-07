@@ -25,6 +25,28 @@ pub fn select_tokens(
     launch: DsaSelectLaunch,
     stream: u64,
 ) -> Result<()> {
+    select_tokens_with(
+        gpu, kernels, cfg, geom, inputs, scratch, launch, true, stream,
+    )
+}
+
+/// 2026-10-07: [`select_tokens`], with `compress` choosing whether `dsa_kpool_compress` runs.
+/// `false` (`METRALE_GLM_DSA_KPOOL_ONCE`, `pool_once`) leaves the pool keys, indices and
+/// validity the scratch already holds: the caller compressed a window covering this pass's
+/// pools earlier, and the first `geom.n_pools` pools there are what this pass's own compress
+/// would write. `true` is `select_tokens` exactly.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn select_tokens_with(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextDsaKernels,
+    cfg: &Glm5NextDsaConfig,
+    geom: &DsaSelectGeometry,
+    inputs: &DsaSelectInputs,
+    scratch: &DsaSelectScratch,
+    launch: DsaSelectLaunch,
+    compress: bool,
+    stream: u64,
+) -> Result<()> {
     scratch.fits(cfg, geom)?;
 
     let d = geom.index_head_dim;
@@ -89,22 +111,18 @@ pub fn select_tokens(
 
     // 2026-09-25: Pool compression over the full pool count; the trailing partial pool is
     // written and marked invalid, and no later kernel reads it.
-    KernelLaunch::new(gpu, kernels.kpool_compress)
-        .grid([compress_x as u32, 1, 1])
-        .block([d.min(1024) as u32, 1, 1])
-        .arg_ptr(inputs.k_normed)
-        .arg_ptr(inputs.gate)
-        .arg_ptr(inputs.valid)
-        .arg_ptr(inputs.ape)
-        .arg_ptr(scratch.pool_keys)
-        .arg_ptr(scratch.pool_indices)
-        .arg_ptr(scratch.pool_valid)
-        .arg_u32(seq_a as u32)
-        .arg_u32(d as u32)
-        .arg_u32(kp as u32)
-        .arg_i32(inputs.first_key)
-        .arg_ptr(gd)
-        .launch(stream)?;
+    // 2026-10-07: Skipped when the caller compressed the window's pools once (`compress`).
+    if compress {
+        launch_kpool_compress(
+            gpu,
+            kernels,
+            inputs,
+            scratch,
+            (compress_x, seq_a),
+            (d, kp),
+            stream,
+        )?;
+    }
 
     if has_pools {
         // 2026-10-01: `METRALE_GLM_DSA_SCORES_TILED=1` swaps in `dsa_index_scores_tiled`
@@ -247,6 +265,37 @@ pub fn select_tokens(
         .launch(stream)?;
 
     Ok(())
+}
+
+/// 2026-10-07: The `dsa_kpool_compress` launch of [`select_tokens_with`] (and of
+/// `pool_once::compress_window`): `grid_x` blocks over `seq` tokens of `[seq, d]` keys, `kp`
+/// slots per pool, into `scratch`'s pool regions. The scalar arguments are those of the launch
+/// `select_tokens` always issued, so the compress is the same call from both.
+pub(super) fn launch_kpool_compress(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextDsaKernels,
+    inputs: &DsaSelectInputs,
+    scratch: &DsaSelectScratch,
+    (grid_x, seq): (usize, usize),
+    (d, kp): (usize, usize),
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernels.kpool_compress)
+        .grid([grid_x as u32, 1, 1])
+        .block([d.min(1024) as u32, 1, 1])
+        .arg_ptr(inputs.k_normed)
+        .arg_ptr(inputs.gate)
+        .arg_ptr(inputs.valid)
+        .arg_ptr(inputs.ape)
+        .arg_ptr(scratch.pool_keys)
+        .arg_ptr(scratch.pool_indices)
+        .arg_ptr(scratch.pool_valid)
+        .arg_u32(seq as u32)
+        .arg_u32(d as u32)
+        .arg_u32(kp as u32)
+        .arg_i32(inputs.first_key)
+        .arg_ptr(inputs.geom_dev)
+        .launch(stream)
 }
 
 /// 2026-10-01: Log once whether `METRALE_GLM_DSA_SCORES_TILED=1` engaged, and once why a

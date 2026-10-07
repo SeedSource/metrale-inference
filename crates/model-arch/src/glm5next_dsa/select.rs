@@ -484,6 +484,7 @@ impl DsaSelectScratch {
 
 mod launch;
 pub use launch::select_tokens;
+pub mod pool_once;
 pub mod grid_stride;
 pub mod radix;
 pub mod shared;

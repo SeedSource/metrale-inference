@@ -18,6 +18,9 @@
 //! - 2026-10-06: `glm_hc_post_mix_finish` (`METRALE_GLM_MHC_POST_MIX_FINISH=1`) writes the bytes
 //!   of `glm_hc_post_mix` then `glm_hc_pre_part_premixed` of the same site in one launch
 //!   (argument in the `.cu`); without its handle the pair runs.
+//! - 2026-10-08: `METRALE_GLM_HC_POST_MIX_FAST=1` runs `glm_hc_post_mix_finish` as two launches
+//!   (`glm_hc_post_mix_finish_fast`) with the fused kernel's bytes (argument in the `.cu`);
+//!   without both handles the fused kernel runs.
 
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -59,6 +62,12 @@ pub struct Glm5NextMhcKernels {
     /// site's `hc_finish` in one launch (`glm_hc_post_mix_finish`,
     /// `METRALE_GLM_MHC_POST_MIX_FINISH`). Optional (`try_kernel`, 0 when absent: the pair runs).
     pub hc_post_mix_finish_bf16: KernelHandle,
+    /// 2026-10-08: `glm5next_hc_post_mix_y_bf16` and `glm5next_hc_comb_from_mix`: the bytes of
+    /// `hc_post_mix_finish_bf16` from two launches (`glm_hc_post_mix_finish_fast`,
+    /// `METRALE_GLM_HC_POST_MIX_FAST`). Optional (`try_kernel`, 0 when absent: the fused kernel
+    /// runs).
+    pub hc_post_mix_y_bf16: KernelHandle,
+    pub hc_comb_from_mix: KernelHandle,
 }
 
 /// 2026-09-25: The kernel module every GLM mHC kernel resolves from.
@@ -95,6 +104,16 @@ impl Glm5NextMhcKernels {
                 gpu,
                 GLM5NEXT_MHC_MODULE,
                 "glm5next_hc_post_mix_finish_bf16",
+            ),
+            hc_post_mix_y_bf16: metrale_model_layers::layers::try_kernel(
+                gpu,
+                GLM5NEXT_MHC_MODULE,
+                "glm5next_hc_post_mix_y_bf16",
+            ),
+            hc_comb_from_mix: metrale_model_layers::layers::try_kernel(
+                gpu,
+                GLM5NEXT_MHC_MODULE,
+                "glm5next_hc_comb_from_mix",
             ),
         })
     }
@@ -670,6 +689,44 @@ pub fn post_mix_finish_usable(
     post_mix_usable(kernels, next, hidden_size, hc_mult) && kernels.hc_post_mix_finish_bf16.0 != 0
 }
 
+/// 2026-10-08: `METRALE_GLM_HC_POST_MIX_FAST` is on only for `1`.
+pub(crate) fn parse_hc_post_mix_fast(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// 2026-10-08: `METRALE_GLM_HC_POST_MIX_FAST=1` (with `METRALE_GLM_MHC_POST_MIX_FINISH=1`):
+/// `glm_hc_post_mix_finish` runs `glm_hc_post_mix_finish_fast` (two launches, the same bytes)
+/// instead of the fused kernel. Off unless set to `1`; without the finish lever it is ignored
+/// (logged). Read once.
+pub fn hc_post_mix_fast() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_HC_POST_MIX_FAST").ok();
+        let on = parse_hc_post_mix_fast(raw.as_deref());
+        if on && !mhc_post_mix_finish() {
+            tracing::warn!(
+                "METRALE_GLM_HC_POST_MIX_FAST=1 IGNORED: it needs \
+                 METRALE_GLM_MHC_POST_MIX_FINISH=1"
+            );
+            return false;
+        }
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_HC_POST_MIX_FAST=1 - GLM mHC: the post+mix+finish back runs \
+                 glm5next_hc_post_mix_y_bf16 + glm5next_hc_comb_from_mix (byte-identical by \
+                 construction)"
+            );
+        }
+        on
+    })
+}
+
+/// 2026-10-08: Whether `glm_hc_post_mix_finish_fast` can run: both of its handles resolved (the
+/// shape conditions are `post_mix_finish_usable`'s).
+pub fn post_mix_fast_usable(kernels: &Glm5NextMhcKernels) -> bool {
+    kernels.hc_post_mix_y_bf16.0 != 0 && kernels.hc_comb_from_mix.0 != 0
+}
+
 /// 2026-10-06: `glm_hc_post_mix` (highway into `out`, `out` may alias `residual`; the mix of
 /// `next` into `mix_out`) and then, in the same launch, `hc_finish` of `next` over the new
 /// highway rows: `y_out` (`[num_tokens, H]` BF16), `post_out` (`[num_tokens, hc]`) and
@@ -677,8 +734,61 @@ pub fn post_mix_finish_usable(
 /// `y_out` may alias `block_out`, `post_out` `post` and `comb_out` `comb` (the kernel reads a
 /// token's inputs before it writes that token's outputs). `next` supplies `hc_fn`, `hc_scale`
 /// and `hc_base`. The caller checks `post_mix_finish_usable`.
+/// 2026-10-08: With `hc_post_mix_fast()` and `post_mix_fast_usable` it runs
+/// `glm_hc_post_mix_finish_fast` (the same bytes); otherwise `glm_hc_post_mix_finish_base`.
 #[allow(clippy::too_many_arguments)]
 pub fn glm_hc_post_mix_finish(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextMhcKernels,
+    block_out: DevicePtr,
+    residual: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    out: DevicePtr,
+    next: &Glm5NextMhcSiteWeights,
+    mix_out: DevicePtr,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    let f = if hc_post_mix_fast() && post_mix_fast_usable(kernels) {
+        static ENGAGED: std::sync::Once = std::sync::Once::new();
+        ENGAGED.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_HC_POST_MIX_FAST: ENGAGED (glm5next_hc_post_mix_y_bf16 + \
+                 glm5next_hc_comb_from_mix, first call of {num_tokens} rows)"
+            );
+        });
+        glm_hc_post_mix_finish_fast
+    } else {
+        if hc_post_mix_fast() {
+            static FALLBACK: std::sync::Once = std::sync::Once::new();
+            FALLBACK.call_once(|| {
+                tracing::warn!(
+                    "METRALE_GLM_HC_POST_MIX_FAST=1 but glm5next_hc_post_mix_y_bf16 or \
+                     glm5next_hc_comb_from_mix is missing: the fused kernel runs"
+                );
+            });
+        }
+        glm_hc_post_mix_finish_base
+    };
+    f(
+        gpu, kernels, block_out, residual, post, comb, out, next, mix_out, y_out, post_out,
+        comb_out, num_tokens, hidden_size, hc_mult, sinkhorn_iters, norm_eps, hc_eps, stream,
+    )
+}
+
+/// 2026-10-08: `glm_hc_post_mix_finish` with the fused `glm5next_hc_post_mix_finish_bf16`
+/// whatever the levers say (the reference of `hc_post_mix_fast_bitparity_microtest`).
+#[allow(clippy::too_many_arguments)]
+pub fn glm_hc_post_mix_finish_base(
     gpu: &dyn GpuBackend,
     kernels: &Glm5NextMhcKernels,
     block_out: DevicePtr,
@@ -724,6 +834,73 @@ pub fn glm_hc_post_mix_finish(
         .arg_f32(hc_eps)
         .launch(stream)
 }
+
+/// 2026-10-08: `glm_hc_post_mix_finish_base`'s bytes from two launches
+/// (`METRALE_GLM_HC_POST_MIX_FAST`): `glm5next_hc_post_mix_y_bf16` (grid `(num_tokens, 1)`)
+/// writes `out`, `mix_out` and `y_out`; `glm5next_hc_comb_from_mix` (one thread per token)
+/// then writes `post_out` and `comb_out` from those `mix_out` rows. The same aliasing is allowed:
+/// the first launch reads `post` / `comb` and the second alone writes `post_out` / `comb_out`.
+/// The caller checks `post_mix_finish_usable` and `post_mix_fast_usable`.
+#[allow(clippy::too_many_arguments)]
+pub fn glm_hc_post_mix_finish_fast(
+    gpu: &dyn GpuBackend,
+    kernels: &Glm5NextMhcKernels,
+    block_out: DevicePtr,
+    residual: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    out: DevicePtr,
+    next: &Glm5NextMhcSiteWeights,
+    mix_out: DevicePtr,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    if num_tokens == 0 {
+        return Ok(());
+    }
+    KernelLaunch::new(gpu, kernels.hc_post_mix_y_bf16)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(block_out)
+        .arg_ptr(residual)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_ptr(out)
+        .arg_ptr(next.hc_fn)
+        .arg_ptr(mix_out)
+        .arg_ptr(next.hc_scale)
+        .arg_ptr(next.hc_base)
+        .arg_ptr(y_out)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_f32(norm_eps)
+        .arg_f32(hc_eps)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, kernels.hc_comb_from_mix)
+        .grid([num_tokens.div_ceil(HC_COMB_FROM_MIX_BLOCK), 1, 1])
+        .block([HC_COMB_FROM_MIX_BLOCK, 1, 1])
+        .arg_ptr(mix_out)
+        .arg_ptr(next.hc_scale)
+        .arg_ptr(next.hc_base)
+        .arg_ptr(post_out)
+        .arg_ptr(comb_out)
+        .arg_u32(num_tokens)
+        .arg_u32(hc_mult)
+        .arg_u32(sinkhorn_iters)
+        .arg_f32(hc_eps)
+        .launch(stream)
+}
+
+/// 2026-10-08: `glm5next_hc_comb_from_mix`'s block size (`GLM_HC_CFM_BLOCK` in the `.cu`).
+pub const HC_COMB_FROM_MIX_BLOCK: u32 = 128;
 
 /// 2026-10-06: `glm_hc_pre_part` when `w.mix` already holds this call's mix rows (written by
 /// `glm_hc_post_mix`): the same `hc_finish` launches over the same `MHC_SLICE_ROWS` slices, no
@@ -900,6 +1077,34 @@ mod mhc_shape_tests {
                  glm5next_hc_post_mix_finish_bf16("),
             "{cu:?} no longer defines glm5next_hc_post_mix_finish_bf16"
         );
+    }
+
+    /// 2026-10-08: `METRALE_GLM_HC_POST_MIX_FAST` is on only for `1`.
+    #[test]
+    fn post_mix_fast_lever_parses_one_as_on_and_everything_else_as_off() {
+        assert!(parse_hc_post_mix_fast(Some("1")));
+        assert!(parse_hc_post_mix_fast(Some(" 1 ")));
+        for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("01")] {
+            assert!(!parse_hc_post_mix_fast(v), "{v:?}");
+        }
+    }
+
+    /// 2026-10-08: `Glm5NextMhcKernels::resolve` asks for the two kernels of
+    /// `glm_hc_post_mix_finish_fast`, and the comb kernel's block size matches the launcher's.
+    #[test]
+    fn post_mix_fast_entry_points_match_the_kernel_file() {
+        let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../kernels/gb10/common")
+            .join(format!("{GLM5NEXT_MHC_MODULE}.cu"));
+        let src = std::fs::read_to_string(&cu).expect("glm5next_mhc.cu readable");
+        for decl in [
+            "__global__ void __launch_bounds__(GLM_HC_BLOCK, 2) glm5next_hc_post_mix_y_bf16(",
+            "__global__ void __launch_bounds__(GLM_HC_CFM_BLOCK) glm5next_hc_comb_from_mix(",
+        ] {
+            assert!(src.contains(decl), "{cu:?} no longer has {decl}");
+        }
+        let block = format!("#define GLM_HC_CFM_BLOCK {HC_COMB_FROM_MIX_BLOCK}\n");
+        assert!(src.contains(&block), "{cu:?}: GLM_HC_CFM_BLOCK != HC_COMB_FROM_MIX_BLOCK");
     }
 
     /// 2026-10-01: `METRALE_GLM_MHC_TOKMAJOR` is on only for `1`.

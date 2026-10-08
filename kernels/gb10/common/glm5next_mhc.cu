@@ -26,6 +26,9 @@
 //   glm5next_hc_post_mix_bf16 and the same y, post and comb bytes as glm5next_hc_finish run
 //   after it (argument above the kernel; checked by model-arch
 //   examples/hc_post_mix_finish_bitparity_microtest.rs).
+// - 2026-10-08: glm5next_hc_post_mix_y_bf16 then glm5next_hc_comb_from_mix write the same out,
+//   mix, y, post and comb bytes as glm5next_hc_post_mix_finish_bf16 (argument above the first;
+//   checked by model-arch examples/hc_post_mix_fast_bitparity_microtest.rs).
 //
 // All of them resolve from the module glm5next_mhc (GLM5NEXT_MHC_MODULE in model-arch
 // glm5next_mhc.rs), so a target without the DeepSeek-V4 model directory has every GLM mHC
@@ -1010,6 +1013,255 @@ extern "C" __global__ void __launch_bounds__(GLM_HC_BLOCK) glm5next_hc_post_mix_
     }
     // 2026-10-06: No exact column projection after the loop, as in glm5next_hc_finish.
     for (unsigned int k = tid; k < hc * hc; k += 32)
+        comb_out[(size_t)t * hc * hc + k] = comb[k];
+}
+
+
+// 2026-10-08: glm5next_hc_post_mix_y_bf16 + glm5next_hc_comb_from_mix: the bytes of
+// glm5next_hc_post_mix_finish_bf16 from two launches (METRALE_GLM_HC_POST_MIX_FAST, model-arch
+// glm5next_mhc.rs glm_hc_post_mix_finish_fast). The first writes out (highway), mix_out and y_out;
+// the second, one thread per token, writes post_out and comb_out from the mix rows the first
+// stored. Same arguments and aliasing as the fused kernel (y_out == block_out, out == residual;
+// post_out / comb_out == post_in / comb_in are written only by the second launch, after every
+// read of them by the first). GLM-5.3 shape only (H = 4096, hc = 4, mix_hc = 24). Why it should
+// be faster (c23kprof 32K: 3.80 ms per 4096-row call, 160 GB/s):
+// - The fused kernel's pointers carry no __restrict__ (they alias), so its 64 residual and 16
+//   block_out loads are plain ld.global interleaved with the 64 stores of out: column m + 1's
+//   loads cannot move above column m's stores, and the post phase is 16 serial DRAM round trips
+//   per thread. Here every load of the post phase is issued, in source order, before the first
+//   store (and before the s_p / s_c barrier).
+// - The Sinkhorn (20 iterations on 4 lanes of warp 0) no longer holds a 256-thread block slot.
+// - The 8-level, 8-barrier tree with an integer divide per add becomes 2 barriers and shuffles.
+// Every output bit equals the fused kernel's:
+// - Highway: per (d, j) the same acc = s_p[j] * xd; acc += s_c[i * hc + j] * rv[i] (i ascending)
+//   from the same operands; only the load order changes (thread tid owns columns
+//   d = tid + 256 m, as there, so no other thread touches its residual or out elements).
+// - Mix chains: glm5next_hc_post_mix_bf16's loop verbatim (v[j * 16 + m] is out[j * H + d]).
+// - Tree: the old tree adds red[e] += red[e + s] for e < s, s = 128 .. 1. For lane l the result
+//   of levels 128, 64, 32 is ((P[l] + P[l+128]) + (P[l+64] + P[l+192])) + ((P[l+32] +
+//   P[l+160]) + (P[l+96] + P[l+224])), written with that association below; levels 16 .. 1 are
+//   val += __shfl_down_sync(val, s), lane l adding lane l + s's value of the previous level,
+//   the same pair. Lane 0 ends with red[a][0].
+// - rsqrt, mix_out and pre: the same expressions on the same floats (s_fin[1 + i] * rs is the
+//   fused kernel's r * rsqrt, i.e. s_mix[i]); every thread computes pre itself instead of
+//   reading s_pre after a barrier.
+// - Collapse: ya = 0.f; ya += pre[i] * v[i * 16 + m], i ascending, then __float2bfloat16.
+// - post and comb: glm5next_hc_comb_from_mix (below).
+// - No contraction anywhere (common/ builds with --fmad=false); expf, rsqrtf and the IEEE
+//   division are the same code in the same translation unit.
+// Registers: as glm5next_hc_post_mix_bf16 (v and the 24 mix accumulators); the post phase holds
+// 64 + 16 loaded values at once. __launch_bounds__(256, 2) keeps 2 blocks per SM.
+extern "C" __global__ void __launch_bounds__(GLM_HC_BLOCK, 2) glm5next_hc_post_mix_y_bf16(
+    const __nv_bfloat16* block_out,
+    const float* residual,
+    const float* post_in,
+    const float* comb_in,
+    float* out,
+    const __nv_bfloat16* __restrict__ hc_fn,
+    float* __restrict__ mix_out,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* y_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const float norm_eps,
+    const float hc_eps
+) {
+    if (hidden_size != GLM_HC_PM_H || hc_mult != GLM_HC_PM_HC) return;
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31;
+    const unsigned int warp = tid >> 5;
+    const unsigned int H = GLM_HC_PM_H;
+    const unsigned int hc = GLM_HC_PM_HC;
+    const unsigned int hc_dim = GLM_HC_PM_HC * GLM_HC_PM_H;
+
+    const __nv_bfloat16* x = block_out + (size_t)t * H;
+    const float* res = residual + (size_t)t * hc * H;
+    const float* p = post_in + (size_t)t * hc;
+    const float* c = comb_in + (size_t)t * hc * hc;
+    float* o = out + (size_t)t * hc * H;
+
+    __shared__ float s_p[GLM_HC_MAX_MULT];
+    __shared__ float s_c[GLM_HC_MAX_MULT * GLM_HC_MAX_MULT];
+    __shared__ float red[1 + GLM_HC_MAX_MIX][GLM_HC_BLOCK];
+    __shared__ float s_fin[1 + GLM_HC_MAX_MIX];
+
+    // 2026-10-08: Every load of the post phase first: v[i * 16 + m] = residual stream i at
+    // column tid + 256 m, xs[m] = block_out there.
+    float v[GLM_HC_PM_HC * GLM_HC_PM_M];
+    float xs[GLM_HC_PM_M];
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_PM_M; ++m) xs[m] = (float)x[tid + GLM_HC_BLOCK * m];
+#pragma unroll
+    for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) {
+#pragma unroll
+        for (unsigned int m = 0; m < GLM_HC_PM_M; ++m)
+            v[i * GLM_HC_PM_M + m] = res[i * H + tid + GLM_HC_BLOCK * m];
+    }
+    if (tid < hc) s_p[tid] = p[tid];
+    if (tid < hc * hc) s_c[tid] = c[tid];
+    __syncthreads();
+
+    // 2026-10-08: Post, glm5next_hc_post_mix_bf16's arithmetic; v now keeps every value written.
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_PM_M; ++m) {
+        const unsigned int d = tid + GLM_HC_BLOCK * m;
+        float rv[GLM_HC_PM_HC];
+#pragma unroll
+        for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) rv[i] = v[i * GLM_HC_PM_M + m];
+#pragma unroll
+        for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j) {
+            float acc = s_p[j] * xs[m];
+#pragma unroll
+            for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) acc += s_c[i * hc + j] * rv[i];
+            o[j * H + d] = acc;
+            v[j * GLM_HC_PM_M + m] = acc;
+        }
+    }
+
+    // 2026-10-08: Mix of the next site, glm5next_hc_post_mix_bf16 verbatim.
+    float ss = 0.f;
+    float acc[GLM_HC_PM_MIX];
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_PM_MIX; ++m) acc[m] = 0.f;
+#pragma unroll
+    for (unsigned int jj = 0; jj < GLM_HC_PM_HC * GLM_HC_PM_M; ++jj) {
+        const unsigned int k = tid + GLM_HC_BLOCK * jj;
+        const float vv = v[jj];
+        ss += vv * vv;
+#pragma unroll
+        for (unsigned int m = 0; m < GLM_HC_PM_MIX; ++m)
+            acc[m] += __bfloat162float(hc_fn[(size_t)m * hc_dim + k]) * vv;
+    }
+    red[0][tid] = ss;
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_PM_MIX; ++m) red[1 + m][tid] = acc[m];
+    __syncthreads();
+
+    // 2026-10-08: The old tree's pairs: levels 128, 64, 32 from shared memory with that
+    // association, levels 16 .. 1 by shuffle. Warp w reduces arrays w, w + 8, w + 16 (and 24).
+    for (unsigned int a = warp; a < 1 + GLM_HC_PM_MIX; a += GLM_HC_BLOCK / 32) {
+        const float* r = red[a];
+        const float lo = (r[lane] + r[lane + 128]) + (r[lane + 64] + r[lane + 192]);
+        const float hi = (r[lane + 32] + r[lane + 160]) + (r[lane + 96] + r[lane + 224]);
+        float val = lo + hi;
+#pragma unroll
+        for (unsigned int s = 16; s > 0; s >>= 1) val += __shfl_down_sync(0xffffffffu, val, s);
+        if (lane == 0) s_fin[a] = val;
+    }
+    __syncthreads();
+
+    const float rs = rsqrtf(s_fin[0] / (float)hc_dim + norm_eps);
+    if (tid < GLM_HC_PM_MIX) mix_out[(size_t)t * GLM_HC_PM_MIX + tid] = s_fin[1 + tid] * rs;
+    // 2026-10-08: pre from the mix floats mix_out holds, glm5next_hc_finish's expression.
+    float pre[GLM_HC_PM_HC];
+#pragma unroll
+    for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) {
+        const float mv = s_fin[1 + i] * rs;
+        const float pr = mv * hc_scale[0] + hc_base[i];
+        pre[i] = 1.f / (1.f + expf(-pr)) + hc_eps;
+    }
+
+    // 2026-10-08: Collapse from the registers; block_out was read before the first barrier.
+#pragma unroll
+    for (unsigned int m = 0; m < GLM_HC_PM_M; ++m) {
+        const unsigned int d = tid + GLM_HC_BLOCK * m;
+        float ya = 0.f;
+#pragma unroll
+        for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) ya += pre[i] * v[i * GLM_HC_PM_M + m];
+        y_out[(size_t)t * H + d] = __float2bfloat16(ya);
+    }
+}
+
+
+// 2026-10-08: glm5next_hc_comb_from_mix: post_out [T, hc] and comb_out [T, hc, hc] of
+// glm5next_hc_finish from mix [T, mix_hc], one thread per token (grid ceil(T / 128), block 128),
+// the second launch of METRALE_GLM_HC_POST_MIX_FAST. hc = 4 only. Every bit equals
+// glm5next_hc_post_mix_finish_bf16's (and so glm5next_hc_finish's): post and the comb logits are
+// the same expressions; the softmax runs per row i (max, then exp and sum over j ascending,
+// then / sum + hc_eps); each normalisation sums a row (j ascending) or column (i ascending) from
+// hc_eps and divides each element by it, rows before columns, the fused kernel's order. There
+// one lane per row or column ran each and the values went through shared memory; here one
+// thread runs them all in sequence in registers. Rows (or columns) of one step read and write
+// disjoint elements, so the order among them changes nothing; a division is never turned into
+// a multiply by a reciprocal.
+#define GLM_HC_CFM_BLOCK 128
+extern "C" __global__ void __launch_bounds__(GLM_HC_CFM_BLOCK) glm5next_hc_comb_from_mix(
+    const float* __restrict__ mix,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int num_tokens,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float hc_eps
+) {
+    if (hc_mult != GLM_HC_PM_HC) return;
+    const unsigned int t = blockIdx.x * GLM_HC_CFM_BLOCK + threadIdx.x;
+    if (t >= num_tokens) return;
+    const unsigned int hc = GLM_HC_PM_HC;
+    const float* s_mix = mix + (size_t)t * GLM_HC_PM_MIX;
+
+    float comb[GLM_HC_PM_HC * GLM_HC_PM_HC];
+#pragma unroll
+    for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) {
+        float po = s_mix[hc + i] * hc_scale[1] + hc_base[hc + i];
+        post_out[(size_t)t * hc + i] = 2.f * (1.f / (1.f + expf(-po)));
+#pragma unroll
+        for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j)
+            comb[i * hc + j] =
+                s_mix[2 * hc + i * hc + j] * hc_scale[2] + hc_base[2 * hc + i * hc + j];
+    }
+
+#pragma unroll
+    for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) {
+        float mx = -1e30f;
+#pragma unroll
+        for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j) mx = fmaxf(mx, comb[i * hc + j]);
+        float sum = 0.f;
+#pragma unroll
+        for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j) {
+            float e = expf(comb[i * hc + j] - mx);
+            comb[i * hc + j] = e;
+            sum += e;
+        }
+#pragma unroll
+        for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j)
+            comb[i * hc + j] = comb[i * hc + j] / sum + hc_eps;
+    }
+
+#pragma unroll
+    for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j) {
+        float cs = hc_eps;
+#pragma unroll
+        for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) cs += comb[i * hc + j];
+#pragma unroll
+        for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) comb[i * hc + j] /= cs;
+    }
+
+    for (unsigned int it = 0; it + 1 < sinkhorn_iters; ++it) {
+#pragma unroll
+        for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) {
+            float r = hc_eps;
+#pragma unroll
+            for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j) r += comb[i * hc + j];
+#pragma unroll
+            for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j) comb[i * hc + j] /= r;
+        }
+#pragma unroll
+        for (unsigned int j = 0; j < GLM_HC_PM_HC; ++j) {
+            float cs = hc_eps;
+#pragma unroll
+            for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) cs += comb[i * hc + j];
+#pragma unroll
+            for (unsigned int i = 0; i < GLM_HC_PM_HC; ++i) comb[i * hc + j] /= cs;
+        }
+    }
+    // 2026-10-08: No exact column projection after the loop, as in glm5next_hc_finish.
+#pragma unroll
+    for (unsigned int k = 0; k < GLM_HC_PM_HC * GLM_HC_PM_HC; ++k)
         comb_out[(size_t)t * hc * hc + k] = comb[k];
 }
 

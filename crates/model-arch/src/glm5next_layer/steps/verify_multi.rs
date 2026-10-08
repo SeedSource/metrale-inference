@@ -80,6 +80,7 @@ impl Glm5NextLayer {
         stream: u64,
     ) -> Result<()> {
         let n = ks.len();
+        let _tc = crate::glm5next_layer::dense_nv4_tc::MultiSeqScope::enter(n);
         let off = verify_row_offsets(ks);
         let r = off[n];
         if n == 0

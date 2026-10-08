@@ -38,6 +38,7 @@ impl Glm5NextLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let _tc = crate::glm5next_layer::dense_nv4_tc::MultiSeqScope::enter(num_seqs);
         if states.len() < num_seqs || seq_lens.len() < num_seqs || block_tables.len() < num_seqs {
             bail!(
                 "GLM layer {}: decode_multi_seq of {num_seqs} sequences got states={} \

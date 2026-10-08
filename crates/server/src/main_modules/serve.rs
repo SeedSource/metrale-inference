@@ -71,6 +71,9 @@ pub(crate) async fn serve(
     let startup_host = host.clone();
     match tokio::task::spawn_blocking(move || startup(args, tui_progress, startup_host)).await?? {
         Startup::Serve(prepared) => {
+            // 2026-10-08: Before the publish and the bind, so the readiness
+            // line follows it and no clone of the state outlives it.
+            super::serve_warmup::run_if_enabled(&prepared.state).await;
             host.publish(prepared.state);
             // 2026-09-26: The host owns the first load's scheduler thread too,
             // so the first swap can join it before tearing the model down.

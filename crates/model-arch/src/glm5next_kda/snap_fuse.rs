@@ -27,6 +27,10 @@
 
 use super::*;
 
+// 2026-10-08: `METRALE_GLM_KDA_ROWS_FUSE`, a child so it shares this walk's private helpers.
+#[path = "rows_fuse.rs"]
+mod rows_fuse;
+
 /// 2026-10-06: Whether a `METRALE_GLM_KDA_SNAP_FUSE` value asks for the fused snapshot: `1`
 /// only.
 pub(super) fn snap_fuse_requested(v: Option<&str>) -> bool {
@@ -159,7 +163,11 @@ impl Glm5NextKdaLayer {
         }
         let c = &self.cfg;
         let (h_bytes, conv_bytes) = (c.recurrent_state_elems() * 4, c.conv_state_elems() * 4);
-        for (t, io) in snap_fuse_plan(k, state, snapshots).iter().enumerate() {
+        let plan = snap_fuse_plan(k, state, snapshots);
+        if self.rows_walk(gpu, row0, &plan, ws, stream)? {
+            return Ok(true);
+        }
+        for (t, io) in plan.iter().enumerate() {
             self.conv_row_io(gpu, row0 + t, io.c_in, io.c_out, ws, stream)?;
             self.recurrent_row_io(gpu, row0 + t, io.h_in, io.h_out, ws, stream)?;
             if let Some((h_dst, conv_dst)) = io.copy_to {

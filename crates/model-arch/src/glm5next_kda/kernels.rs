@@ -72,6 +72,10 @@ pub struct Glm5NextKdaKernels {
     /// walk with its snapshot copies.
     pub conv_io: KernelHandle,
     pub recurrent_io: KernelHandle,
+    /// 2026-10-08: `METRALE_GLM_KDA_ROWS_FUSE=1` (rows_fuse.rs): the verify walk's recurrent rows
+    /// in one launch writing every row's state (unlike `recurrent_rows`, which keeps only the
+    /// last), kernels/gb10/common/kda_snap_fuse.cu; 0 when the PTX lacks it.
+    pub recurrent_rows_io: KernelHandle,
     /// 2026-10-07: The fused front of the chunked-TC prefill (`METRALE_GLM_KDA_FRONT_FUSE=1`,
     /// prefill_tc_fuse.rs), kernels/gb10/common/kda_front_fuse.cu: `tc_prepare` computing its
     /// inputs from the projections (pack, conv, gate and beta sigmoid in registers) and the
@@ -172,6 +176,11 @@ impl Glm5NextKdaKernels {
                 gpu,
                 "kda_snap_fuse",
                 "kda_recurrent_decode_bf16_smem_io",
+            ),
+            recurrent_rows_io: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_snap_fuse",
+                "kda_recurrent_decode_bf16_smem_rows",
             ),
             ff_prepare: metrale_model_layers::layers::try_kernel(
                 gpu,

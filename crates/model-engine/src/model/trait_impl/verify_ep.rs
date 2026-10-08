@@ -408,19 +408,15 @@ impl TransformerModel {
     }
 
     /// 2026-10-02: One sequence's worker-side commit: proposer trim, then the checkpoint (no
-    /// rewind) or the rewind plus rollback-and-checkpoint, as the per-sequence K=4 arm does.
+    /// rewind) or the rewind plus rollback-and-checkpoint, as the per-sequence K=4 arm does
+    /// (`ep_worker_commit_rows`; `METRALE_EP_WORKER_PREFIX_COMMIT` gives it rank 0's commit).
     fn verify_batch_commit_seq(&self, seq: &mut SequenceState, v: &SeqVerdict) -> Result<()> {
         self.trim_proposer_state(seq, v.accepted, 0)?;
-        if v.rewind == 0 {
-            self.start_checkpoint_async(seq)?;
-        } else {
-            seq.seq_len -= v.rewind;
-            for _ in 0..v.rewind {
-                seq.tokens.pop();
-            }
-            self.start_rollback_and_checkpoint_async(seq, v.accepted + 1)?;
+        seq.seq_len -= v.rewind;
+        for _ in 0..v.rewind {
+            seq.tokens.pop();
         }
-        Ok(())
+        self.ep_worker_commit_rows(seq, v.accepted + 1, v.accepted + 1 + v.rewind)
     }
 }
 

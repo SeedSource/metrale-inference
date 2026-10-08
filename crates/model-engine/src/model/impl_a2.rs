@@ -282,13 +282,13 @@ impl TransformerModel {
                 self.decode_verify_graphed(&[t0, t1], seq, stream)?;
                 let accepted = self.ep_broadcast_u32(0)?;
                 if accepted == 1 {
-                    self.start_checkpoint_async(seq)?;
+                    self.ep_worker_commit_rows(seq, 2, 2)?;
                     self.trim_proposer_state(seq, 1, 0)?;
                 } else {
                     seq.seq_len -= 1;
                     seq.tokens.pop();
                     self.trim_proposer_state(seq, 0, 0)?;
-                    self.start_rollback_and_checkpoint_async(seq, 1)?;
+                    self.ep_worker_commit_rows(seq, 1, 2)?;
                 }
             }
             crate::model::trait_impl::decode_checkpoint::EP_CMD_DECODE_CKPT => {
@@ -344,18 +344,18 @@ impl TransformerModel {
                 self.trim_proposer_state(seq, num_accepted as usize, 0)?;
                 match num_accepted {
                     2 => {
-                        self.start_checkpoint_async(seq)?;
+                        self.ep_worker_commit_rows(seq, 3, 3)?;
                     }
                     1 => {
                         seq.seq_len -= 1;
                         seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 2)?;
+                        self.ep_worker_commit_rows(seq, 2, 3)?;
                     }
                     _ => {
                         seq.seq_len -= 2;
                         seq.tokens.pop();
                         seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 1)?;
+                        self.ep_worker_commit_rows(seq, 1, 3)?;
                     }
                 }
             }
@@ -371,25 +371,25 @@ impl TransformerModel {
                 self.trim_proposer_state(seq, num_accepted as usize, 0)?;
                 match num_accepted {
                     3 => {
-                        self.start_checkpoint_async(seq)?;
+                        self.ep_worker_commit_rows(seq, 4, 4)?;
                     }
                     2 => {
                         seq.seq_len -= 1;
                         seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 3)?;
+                        self.ep_worker_commit_rows(seq, 3, 4)?;
                     }
                     1 => {
                         seq.seq_len -= 2;
                         seq.tokens.pop();
                         seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 2)?;
+                        self.ep_worker_commit_rows(seq, 2, 4)?;
                     }
                     _ => {
                         seq.seq_len -= 3;
                         seq.tokens.pop();
                         seq.tokens.pop();
                         seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 1)?;
+                        self.ep_worker_commit_rows(seq, 1, 4)?;
                     }
                 }
             }

@@ -83,6 +83,7 @@ pub(in crate::model) mod verify_ep;
 // (`EP_CMD_MTP_PROPOSE_BATCH`).
 pub(in crate::model) mod propose_batch_ep;
 mod verify_fused;
+mod worker_commit;
 
 impl Model for TransformerModel {}
 

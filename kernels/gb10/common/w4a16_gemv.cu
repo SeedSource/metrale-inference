@@ -2605,6 +2605,55 @@ extern "C" __global__ void glm5next_moe_row_union(
     }
 }
 
+// 2026-10-08: METRALE_GLM_MOE_UNION_SCAN=1: glm5next_moe_row_union with the same launch shape
+// and the same u_eid / u_slot, entry for entry. ids are staged in shared memory once, each
+// position's first-occurrence flag is computed from them, and a first occurrence's union index
+// is the count of flags before it (the old kernel recomputed every earlier flag per thread
+// from global memory, O(T^3) loads at T = 64). T = rows * top_k <= 64.
+
+#define MOE_ROW_UNION_SCAN_MAX 64
+
+extern "C" __global__ void glm5next_moe_row_union_scan(
+    const int* __restrict__ ids,
+    int* __restrict__ u_eid,
+    int* __restrict__ u_slot,
+    unsigned int rows,
+    unsigned int top_k
+) {
+    __shared__ int s_ids[MOE_ROW_UNION_SCAN_MAX];
+    __shared__ int s_first[MOE_ROW_UNION_SCAN_MAX];
+    const unsigned int T = rows * top_k;
+    const unsigned int t = threadIdx.x;
+
+    if (t < T) {
+        s_ids[t] = ids[t];
+        u_eid[t] = -1;
+        for (unsigned int r = 0; r < rows; r++) u_slot[t * rows + r] = -1;
+    }
+    __syncthreads();
+
+    int eid = -1;
+    int first = 0;
+    if (t < T) {
+        eid = s_ids[t];
+        first = eid >= 0;
+        for (unsigned int tp = 0; tp < t && first; tp++) {
+            if (s_ids[tp] == eid) first = 0;
+        }
+        s_first[t] = first;
+    }
+    __syncthreads();
+    if (!first) return;
+
+    int uidx = 0;
+    for (unsigned int tp = 0; tp < t; tp++) uidx += s_first[tp];
+
+    u_eid[uidx] = eid;
+    for (unsigned int tp = t; tp < T; tp++) {
+        if (s_ids[tp] == eid) u_slot[uidx * rows + tp / top_k] = (int)(tp % top_k);
+    }
+}
+
 // 2026-09-25: w4a16_gemv_partial for R rows over one weight read. Aptr[r] == nullptr skips
 // row r (not read, contributes nothing); every other row gets w4a16_gemv_partial's result.
 

@@ -13,6 +13,7 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::ACT_BLOCK;
+use crate::glm5next_mlp::Glm5NextMlpKernels;
 use crate::glm5next_mlp::weights::{Glm5NextExpertPtrTable, Nvfp4Proj};
 
 const W4_TILE: u32 = 64;
@@ -286,4 +287,98 @@ fn batchm_cols(gpu: &dyn GpuBackend, rows: usize) -> Option<(KernelHandle, u32)>
         );
     });
     Some((h, j))
+}
+
+/// 2026-10-08: The router logits `[n, experts]` (FP32) of `n` rows of `x`: one
+/// `gemv_f32` per row, or one batched launch per [`router_batchm`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn router_logits(
+    gpu: &dyn GpuBackend,
+    k: &Glm5NextMlpKernels,
+    x: DevicePtr,
+    router: DevicePtr,
+    logits: DevicePtr,
+    n: usize,
+    experts: usize,
+    hidden: usize,
+    stream: u64,
+) -> Result<()> {
+    let (bm, m) = router_batchm(gpu, n);
+    for r in (0..n).step_by(m) {
+        gemm(
+            gpu,
+            k.gemm_f32,
+            k.gemv_f32,
+            bm,
+            x.offset(r * hidden * 2),
+            router,
+            logits.offset(r * experts * 4),
+            m,
+            experts,
+            hidden,
+            stream,
+        )?;
+    }
+    Ok(())
+}
+
+/// 2026-10-08: `METRALE_GLM_MOE_ROUTER_BATCHM=1`: the router logits of 2..=16 rows run as one
+/// `dense_gemv_bf16_fp32out_batchm` launch (the weight read once) instead of one
+/// `dense_gemv_bf16_fp32out` per row. Each row keeps the single-row kernel's reduction (kernel
+/// header, `examples/glm5next_moe_rowb_microtest.rs`), so the logits are bit-identical.
+/// Returns the handle and the rows per launch; `(KernelHandle(0), 1)` keeps the per-row loop
+/// (lever off, another row count, or no kernel).
+fn router_batchm(gpu: &dyn GpuBackend, rows: usize) -> (KernelHandle, usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static H: OnceLock<KernelHandle> = OnceLock::new();
+    let max = metrale_model_layers::layers::ops::DENSE_GEMV_BATCHM_MAX_M as usize;
+    if !*ON.get_or_init(|| std::env::var("METRALE_GLM_MOE_ROUTER_BATCHM").as_deref() == Ok("1"))
+        || !(2..=max).contains(&rows)
+    {
+        return (KernelHandle(0), 1);
+    }
+    let h = *H.get_or_init(|| {
+        metrale_model_layers::layers::try_kernel(
+            gpu,
+            "dense_gemv_bf16_batchm",
+            "dense_gemv_bf16_fp32out_batchm",
+        )
+    });
+    if h.0 == 0 {
+        return (h, 1);
+    }
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_MOE_ROUTER_BATCHM=1: ENGAGED - router logits of 2..={max} rows run one \
+             dense_gemv_bf16_fp32out_batchm launch (first: {rows} rows, bit-identical)"
+        );
+    });
+    (h, rows)
+}
+
+/// 2026-10-08: `METRALE_GLM_MOE_UNION_SCAN=1`: the row union runs `glm5next_moe_row_union_scan`
+/// (ids staged in shared memory, each first occurrence's index counted from shared flags)
+/// instead of `glm5next_moe_row_union`'s serial global-memory rescans. Same launch shape and
+/// the same tables, entry for entry. `default` when the lever is off or the kernel is missing.
+pub(super) fn union_kernel(gpu: &dyn GpuBackend, default: KernelHandle) -> KernelHandle {
+    static H: OnceLock<KernelHandle> = OnceLock::new();
+    let h = *H.get_or_init(|| {
+        if std::env::var("METRALE_GLM_MOE_UNION_SCAN").as_deref() != Ok("1") {
+            return KernelHandle(0);
+        }
+        let h = metrale_model_layers::layers::try_kernel(
+            gpu,
+            crate::glm5next_mlp::W4A16_GEMV_MODULE,
+            "glm5next_moe_row_union_scan",
+        );
+        if h.0 != 0 {
+            tracing::warn!(
+                "METRALE_GLM_MOE_UNION_SCAN=1: ENGAGED - the MoE row union runs \
+                 glm5next_moe_row_union_scan (same tables)"
+            );
+        }
+        h
+    });
+    if h.0 != 0 { h } else { default }
 }

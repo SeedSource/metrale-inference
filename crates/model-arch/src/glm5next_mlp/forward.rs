@@ -25,7 +25,7 @@ mod workspace;
 
 use dense::row_slices;
 pub use dense::{forward_dense, forward_dense_sliced};
-use launch::{gemm, swiglu};
+use launch::swiglu;
 pub use workspace::{
     mlp_ws_bytes, mlp_ws_bytes_sized, mlp_ws_permute_bytes, mlp_ws_total_bytes,
     mlp_ws_total_bytes_sized,
@@ -379,21 +379,8 @@ pub fn forward_moe_sliced(
                 stream,
             )?;
         } else {
-            for r in 0..n {
-                gemm(
-                    gpu,
-                    k.gemm_f32,
-                    k.gemv_f32,
-                    KernelHandle(0),
-                    xs.offset(r * cfg.hidden * 2),
-                    w.router,
-                    ls.offset(r * cfg.num_experts * 4),
-                    1,
-                    cfg.num_experts,
-                    cfg.hidden,
-                    stream,
-                )?;
-            }
+            let (h, e) = (cfg.hidden, cfg.num_experts);
+            launch::router_logits(gpu, k, xs, w.router, ls, n, e, h, stream)?;
         }
     }
     // 2026-09-25: One top-k launch for all rows: `glm5next_router_topk` handles row `blockIdx.x`.

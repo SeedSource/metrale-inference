@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
-use super::launch::{swiglu, w4a16_gemv, w4a16_gemv_moe, w4a16_gemv_moe_batchm};
+use super::launch::{swiglu, union_kernel, w4a16_gemv, w4a16_gemv_moe, w4a16_gemv_moe_batchm};
 use super::{Glm5NextMlpWorkspace, announce_dispatch, host_dispatch_forced};
 use crate::glm5next_layer::profile;
 use crate::glm5next_mlp::weights::Glm5NextMoeWeights;
@@ -255,7 +255,7 @@ pub(super) fn row_batched_experts(site: &MoeSite<'_>, groups: &[(usize, usize)])
         // 2026-09-25: Each sub-group rebuilds the union tables over its slice of `ids`,
         // overwriting the previous sub-group's; stream order puts that after the previous
         // sweeps.
-        KernelLaunch::new(gpu, k.moe_row_union)
+        KernelLaunch::new(gpu, union_kernel(gpu, k.moe_row_union))
             .grid([1, 1, 1])
             .block([(w_rows * cfg.top_k) as u32, 1, 1])
             .arg_ptr(ws.ids.offset(r0 * cfg.top_k * 4))

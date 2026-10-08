@@ -428,6 +428,10 @@ fn run() -> Result<i32> {
             format!("FAIL {fails} case(s) differ: router {f1}, union {f2}")
         }
     );
+    // 2026-10-08: build-mt's verdict line (a line starting "PASS"); the GATE lines carry the detail.
+    if exact_ok {
+        println!("PASS: glm5next_moe_rowb_microtest {total} compares bit-identical");
+    }
     let saves = LAYERS * ((router_old - router_new) + (union_old - union_new)) / 1e3;
     let verdict = if saves >= GO_MS {
         "GO"

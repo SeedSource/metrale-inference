@@ -124,6 +124,14 @@
 //!   entry never takes the per-row decode GEMVs (its 1..=16-row calls go to the NVFP4 GEMV or
 //!   the dequant), its W8A8 GEMM runs `dense_fp8_gw::gemm` (CUTLASS Sm120 FP8 blockwise) and
 //!   its dequant `dequant_fp8_blockscaled_bf16`. Off, no entry has `bs` and nothing changes.
+//! - 2026-10-08: `METRALE_GLM_PREFILL_DENSE_W4A4` ([`super::dense_w4a4`], a class list; off
+//!   unless set): [`route`] on a weight whose [`Class`] the lever lists and that has an NVFP4
+//!   copy, with at least `dense_w4a4::MIN_ROWS` rows and the BF16-out GEMV handle, runs the
+//!   CUTLASS NVFP4 W4A4 GEMM over that copy into `c` and returns `Route::Done`, ahead of the
+//!   W8A8 arm; a call the CUTLASS entry refuses falls through to the paths above unchanged.
+//!   [`w8a8_fused_input`] declines such a call, so its caller writes the BF16 input unfused.
+//!   Each entry records its class at registration (MTP block: `Class::Mtp`; the
+//!   `convert_weight*` helpers: `Class::Keep` unless given one).
 
 // 2026-10-07: `METRALE_GLM_NORM_FP8_QUANT_FUSE`: the fused norm + quant entry (child module,
 // so it reaches this file's private W8A8 state).
@@ -222,15 +230,39 @@ impl Nvfp4Classes {
 
 /// 2026-10-05: The [`Nvfp4Classes`] class of a weight [`register_layer`] / [`register_mtp`]
 /// converts; `Keep` never gets an NVFP4 copy.
+/// 2026-10-08: Public, and kept in the registry entry, for `METRALE_GLM_PREFILL_DENSE_W4A4`
+/// (which selects by class) and its microtest ([`convert_weight_nvfp4_class`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Class {
+pub enum Class {
+    /// KDA `q_proj`, `k_proj`, `v_proj`, `o_proj`.
     Kda,
+    /// DSA `q_a_proj`, `q_absorb`, `kv_a_proj`.
     Dsa,
+    /// DSA `o_absorb`.
     DsaO,
+    /// Shared-expert `gate_proj`, `up_proj`, `down_proj`.
     Shared,
+    /// Dense-layer `gate_proj`, `up_proj`, `down_proj`.
     Mlp,
+    /// The MTP block's converted weights.
     Mtp,
+    /// No class (KDA `g_a` / `g_b`; the class-less `convert_weight*` helpers).
     Keep,
+}
+
+impl Class {
+    /// 2026-10-08: The class's name in the lever syntax (`Keep`: "keep").
+    pub fn name(self) -> &'static str {
+        match self {
+            Class::Kda => "kda",
+            Class::Dsa => "dsa",
+            Class::DsaO => "dsa_o",
+            Class::Shared => "shared",
+            Class::Mlp => "mlp",
+            Class::Mtp => "mtp",
+            Class::Keep => "keep",
+        }
+    }
 }
 
 /// 2026-10-05: Parse a `METRALE_GLM_DENSE_NVFP4` value: unset, empty, `0` or `off` = none;
@@ -372,6 +404,11 @@ struct Entry {
     /// 2026-10-06: `w` is 128x128 block-scaled (`METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW`):
     /// `w.row_scale` holds `[N/128, K/128]` block scales, not per-row ones.
     bs: bool,
+    /// 2026-10-08: The class the weight was registered with (`METRALE_GLM_PREFILL_DENSE_W4A4`).
+    class: Class,
+    /// 2026-10-08: The projection's name (`q_proj`, `o_absorb`, ...; `-` from the class-less
+    /// helpers), for the `PREFILL_DENSE_W4A4 BLOCKSTATS` line.
+    proj: &'static str,
 }
 
 /// 2026-10-05: The `METRALE_GLM_DENSE_NVFP4` kernels: the load-time quantizer and the decode
@@ -644,6 +681,7 @@ fn nv4_kernels(gpu: &dyn GpuBackend) -> Option<Nv4Kernels> {
 /// 2026-10-03: Quantize one BF16 `[n, k]` weight, free the BF16 original and register the
 /// FP8 copy with arena offset `off`. Returns the FP8 copy (its `weight` is the new key),
 /// or `None` with nothing changed (lever off, kernels missing, empty, or `k % 16 != 0`).
+#[allow(clippy::too_many_arguments)]
 fn register(
     gpu: &dyn GpuBackend,
     bf16: DevicePtr,
@@ -652,6 +690,8 @@ fn register(
     off: usize,
     free_original: bool,
     nv4: bool,
+    class: Class,
+    proj: &'static str,
 ) -> Result<Option<Fp8DenseWeight>> {
     if !dense_fp8() || n == 0 || k == 0 || !k.is_multiple_of(16) || bf16.is_null() {
         return Ok(None);
@@ -712,7 +752,7 @@ fn register(
     map()
         .write()
         .unwrap()
-        .insert(w.weight.0, Entry { w, n, k, off, nv, bs });
+        .insert(w.weight.0, Entry { w, n, k, off, nv, bs, class, proj });
     Ok(Some(w))
 }
 
@@ -891,6 +931,16 @@ pub fn route(
             );
         }
     }
+    // 2026-10-08: `METRALE_GLM_PREFILL_DENSE_W4A4`: a wide BF16-out call on a listed class's
+    // weight with an NVFP4 copy runs the CUTLASS NVFP4 W4A4 GEMM (module doc); a call it
+    // refuses falls through to the paths below. The first engaged call of each class also logs
+    // its activation's NVFP4 block statistics (`dense_w4a4::block_stats_once`).
+    if let Some(q) = w4a4_copy(&e, m, gemv.0 == kk.bf16_gemv.0)
+        && super::dense_w4a4::gemm(a, &q, c, m, n, k, stream)?
+    {
+        super::dense_w4a4::block_stats_once(gpu, e.class, e.proj, a, m, k, stream);
+        return Ok(Route::Done);
+    }
     // 2026-10-05: `METRALE_GLM_DENSE_FP8_W8A8=1`: a wide call runs the W8A8 GEMM into `c`
     // when it can (module doc), else falls through to the dequant.
     if dense_fp8_w8a8()
@@ -901,6 +951,43 @@ pub fn route(
     }
     let p = dequant(gpu, &kk, b.0, &e, m, stream)?;
     Ok(Route::Weight(p))
+}
+
+/// 2026-10-08: The NVFP4 copy a [`route`] call on `e` runs `METRALE_GLM_PREFILL_DENSE_W4A4` on:
+/// the lever lists `e`'s class, `e` has a copy, the call has at least `dense_w4a4::MIN_ROWS`
+/// rows and BF16 output (`bf16_out`: the caller passed `dense_gemv_bf16`). `None` otherwise,
+/// and always with the lever off.
+fn w4a4_copy(e: &Entry, m: usize, bf16_out: bool) -> Option<QuantizedWeight> {
+    let c = super::dense_w4a4::classes();
+    if !c.any() || !bf16_out || m < super::dense_w4a4::MIN_ROWS || !c.has(e.class) {
+        return None;
+    }
+    e.nv
+}
+
+/// 2026-10-08: At load: fail on a bad `METRALE_GLM_PREFILL_DENSE_W4A4` value, and with it
+/// engaged log the registered weights per listed class that will run W4A4 and the listed
+/// classes whose registered weights have no NVFP4 copy (they keep FP8).
+fn finish_load_w4a4() -> Result<()> {
+    let w4 = super::dense_w4a4::classes();
+    let mut engaged: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut no_copy = Vec::new();
+    if w4.any() {
+        let m = map().read().unwrap();
+        for e in m.values().filter(|e| w4.has(e.class) && e.nv.is_some()) {
+            *engaged.entry(e.class.name()).or_default() += 1;
+        }
+        for c in [Class::Kda, Class::Dsa, Class::DsaO, Class::Shared, Class::Mlp, Class::Mtp] {
+            if w4.has(c)
+                && !engaged.contains_key(c.name())
+                && m.values().any(|e| e.class == c)
+            {
+                no_copy.push(c.name());
+            }
+        }
+    }
+    let engaged: Vec<(&str, usize)> = engaged.into_iter().collect();
+    super::dense_w4a4::log_load(&engaged, &no_copy)
 }
 
 /// 2026-10-05: `C[m, n] = A[m, k] @ W^T` over the NVFP4 copy `q`, 1..=[`NV4_MAX_M`] packed
@@ -1391,27 +1478,27 @@ pub fn register_layer(
     // 2026-10-05: A bad `METRALE_GLM_DENSE_NVFP4` value fails the load here, not silently.
     parse_nvfp4_classes(std::env::var("METRALE_GLM_DENSE_NVFP4").ok().as_deref())?;
     let nvc = dense_nvfp4();
-    let mut list: Vec<(&mut DevicePtr, usize, usize, Class)> = Vec::new();
+    let mut list: Vec<(&mut DevicePtr, usize, usize, Class, &'static str)> = Vec::new();
     match mixer {
         Glm5NextMixer::Kda { layer, cfg, .. } => {
             let w = &mut layer.weights;
             let (hid, qkv, hd) = (cfg.hidden, cfg.qkv_dim(), cfg.head_dim);
-            list.push((&mut w.q_proj.weight, qkv, hid, Class::Kda));
-            list.push((&mut w.k_proj.weight, qkv, hid, Class::Kda));
-            list.push((&mut w.v_proj.weight, qkv, hid, Class::Kda));
-            list.push((&mut w.g_a.weight, hd, hid, Class::Keep));
-            list.push((&mut w.g_b.weight, qkv, hd, Class::Keep));
-            list.push((&mut w.o_proj.weight, hid, qkv, Class::Kda));
+            list.push((&mut w.q_proj.weight, qkv, hid, Class::Kda, "q_proj"));
+            list.push((&mut w.k_proj.weight, qkv, hid, Class::Kda, "k_proj"));
+            list.push((&mut w.v_proj.weight, qkv, hid, Class::Kda, "v_proj"));
+            list.push((&mut w.g_a.weight, hd, hid, Class::Keep, "g_a"));
+            list.push((&mut w.g_b.weight, qkv, hd, Class::Keep, "g_b"));
+            list.push((&mut w.o_proj.weight, hid, qkv, Class::Kda, "o_proj"));
         }
         Glm5NextMixer::Dsa(l) => {
             // Shapes as `decode_k` / `decode_k_wide` pass them to `gemm`.
             let l = &mut **l;
             let (c, w) = (&l.cfg, &mut l.weights);
             let heads_lat = c.local_heads * c.kv_lora_rank;
-            list.push((&mut w.q_a_proj, c.q_lora_rank, c.hidden, Class::Dsa));
-            list.push((&mut w.q_absorb, heads_lat, c.q_lora_rank, Class::Dsa));
-            list.push((&mut w.kv_a_proj, c.kv_lora_rank, c.hidden, Class::Dsa));
-            list.push((&mut w.o_absorb, c.hidden, heads_lat, Class::DsaO));
+            list.push((&mut w.q_a_proj, c.q_lora_rank, c.hidden, Class::Dsa, "q_a_proj"));
+            list.push((&mut w.q_absorb, heads_lat, c.q_lora_rank, Class::Dsa, "q_absorb"));
+            list.push((&mut w.kv_a_proj, c.kv_lora_rank, c.hidden, Class::Dsa, "kv_a_proj"));
+            list.push((&mut w.o_absorb, c.hidden, heads_lat, Class::DsaO, "o_absorb"));
         }
     }
     let (w, inter, class) = match mlp {
@@ -1422,12 +1509,12 @@ pub fn register_layer(
             Class::Shared,
         ),
     };
-    list.push((&mut w.gate_proj, inter, mlp_cfg.hidden, class));
-    list.push((&mut w.up_proj, inter, mlp_cfg.hidden, class));
-    list.push((&mut w.down_proj, mlp_cfg.hidden, inter, class));
+    list.push((&mut w.gate_proj, inter, mlp_cfg.hidden, class, "gate_proj"));
+    list.push((&mut w.up_proj, inter, mlp_cfg.hidden, class, "up_proj"));
+    list.push((&mut w.down_proj, mlp_cfg.hidden, inter, class, "down_proj"));
     let mut out = LayerFp8::default();
-    for (field, n, k, class) in list {
-        convert_weight_with(gpu, field, n, k, &mut out, true, nvc.has(class))?;
+    for (field, n, k, class, proj) in list {
+        convert_weight_with(gpu, field, n, k, &mut out, true, nvc.has(class), class, proj)?;
     }
     Ok(out)
 }
@@ -1444,7 +1531,7 @@ pub fn convert_weight(
     k: usize,
     acc: &mut LayerFp8,
 ) -> Result<bool> {
-    convert_weight_with(gpu, field, n, k, acc, true, false)
+    convert_weight_with(gpu, field, n, k, acc, true, false, Class::Keep, "-")
 }
 
 /// 2026-10-05: [`convert_weight`] that also makes the NVFP4 decode copy (as
@@ -1458,11 +1545,27 @@ pub fn convert_weight_nvfp4(
     k: usize,
     acc: &mut LayerFp8,
 ) -> Result<bool> {
-    convert_weight_with(gpu, field, n, k, acc, true, true)
+    convert_weight_with(gpu, field, n, k, acc, true, true, Class::Keep, "-")
+}
+
+/// 2026-10-08: [`convert_weight_nvfp4`] registering the weight as `class` / `proj` (what
+/// [`register_layer`] records), so `METRALE_GLM_PREFILL_DENSE_W4A4` can select it; for
+/// `examples/glm_dense_w4a4_prefill_microtest.rs`.
+pub fn convert_weight_nvfp4_class(
+    gpu: &dyn GpuBackend,
+    field: &mut DevicePtr,
+    n: usize,
+    k: usize,
+    acc: &mut LayerFp8,
+    class: Class,
+    proj: &'static str,
+) -> Result<bool> {
+    convert_weight_with(gpu, field, n, k, acc, true, true, class, proj)
 }
 
 /// 2026-10-05: [`convert_weight`], with `free_original = false` for a store-owned BF16 original
 /// that the caller must not free (see [`take_deferred_free`]).
+#[allow(clippy::too_many_arguments)]
 fn convert_weight_with(
     gpu: &dyn GpuBackend,
     field: &mut DevicePtr,
@@ -1471,9 +1574,11 @@ fn convert_weight_with(
     acc: &mut LayerFp8,
     free_original: bool,
     nv4: bool,
+    class: Class,
+    proj: &'static str,
 ) -> Result<bool> {
     let off = acc.arena_bytes;
-    let Some(w) = register(gpu, *field, n, k, off, free_original, nv4)? else {
+    let Some(w) = register(gpu, *field, n, k, off, free_original, nv4, class, proj)? else {
         return Ok(false);
     };
     *field = w.weight;
@@ -1511,17 +1616,18 @@ pub fn register_mtp(
     let hid = layer.mlp_cfg.hidden;
     let nv_mtp = dense_nvfp4().has(Class::Mtp);
     let mut out = LayerFp8::default();
-    convert_weight_with(gpu, &mut eh_proj.weight, hid, 2 * hid, &mut out, false, nv_mtp)?;
-    let mut list: Vec<(&mut DevicePtr, usize, usize)> = Vec::new();
+    let eh = &mut eh_proj.weight;
+    convert_weight_with(gpu, eh, hid, 2 * hid, &mut out, false, nv_mtp, Class::Mtp, "eh_proj")?;
+    let mut list: Vec<(&mut DevicePtr, usize, usize, &'static str)> = Vec::new();
     match &mut layer.mixer {
         Glm5NextMixer::Dsa(l) => {
             let l = &mut **l;
             let (c, w) = (&l.cfg, &mut l.weights);
             let heads_lat = c.local_heads * c.kv_lora_rank;
-            list.push((&mut w.q_a_proj, c.q_lora_rank, c.hidden));
-            list.push((&mut w.q_absorb, heads_lat, c.q_lora_rank));
+            list.push((&mut w.q_a_proj, c.q_lora_rank, c.hidden, "q_a_proj"));
+            list.push((&mut w.q_absorb, heads_lat, c.q_lora_rank, "q_absorb"));
             // `kv_a_proj` stays BF16: `write_kv_rows` reads it directly.
-            list.push((&mut w.o_absorb, c.hidden, heads_lat));
+            list.push((&mut w.o_absorb, c.hidden, heads_lat, "o_absorb"));
         }
         Glm5NextMixer::Kda { .. } => {
             bail!("METRALE_GLM_DENSE_FP8: the MTP block is not a DSA layer")
@@ -1532,11 +1638,11 @@ pub fn register_mtp(
         Glm5NextMlpSite::Dense(w) => (w, mlp_cfg.local_dense_intermediate),
         Glm5NextMlpSite::Moe(w) => (&mut w.shared, mlp_cfg.local_shared_intermediate),
     };
-    list.push((&mut w.gate_proj, inter, mlp_cfg.hidden));
-    list.push((&mut w.up_proj, inter, mlp_cfg.hidden));
-    list.push((&mut w.down_proj, mlp_cfg.hidden, inter));
-    for (field, n, k) in list {
-        convert_weight_with(gpu, field, n, k, &mut out, true, nv_mtp)?;
+    list.push((&mut w.gate_proj, inter, mlp_cfg.hidden, "gate_proj"));
+    list.push((&mut w.up_proj, inter, mlp_cfg.hidden, "up_proj"));
+    list.push((&mut w.down_proj, mlp_cfg.hidden, inter, "down_proj"));
+    for (field, n, k, proj) in list {
+        convert_weight_with(gpu, field, n, k, &mut out, true, nv_mtp, Class::Mtp, proj)?;
     }
     let arena = finish_load(gpu)?;
     tracing::info!(
@@ -1573,6 +1679,9 @@ pub fn finish_load(gpu: &dyn GpuBackend) -> Result<usize> {
     let _ = dense_fp8_w8a8();
     // 2026-10-06: Likewise `METRALE_GLM_DENSE_FP8_W8A8_CUTLASS_GW` (REFUSED / NOT engaged logs).
     let _ = super::dense_fp8_gw::cutlass_gw();
+    // 2026-10-08: Likewise `METRALE_GLM_PREFILL_DENSE_W4A4` (a bad value fails the load below,
+    // in `finish_load_w4a4`, when the lever is not inert).
+    let _ = super::dense_w4a4::classes();
     if !dense_fp8() {
         return Ok(0);
     }
@@ -1588,6 +1697,7 @@ pub fn finish_load(gpu: &dyn GpuBackend) -> Result<usize> {
         GW_WEIGHTS.load(Ordering::Relaxed),
         GW_SCALE_BYTES.load(Ordering::Relaxed),
     )?;
+    finish_load_w4a4()?;
     if dense_nvfp4().any() {
         tracing::info!(
             "METRALE_GLM_DENSE_NVFP4: {} NVFP4 decode copies, {:.2} GB/rank (on top of the FP8 \

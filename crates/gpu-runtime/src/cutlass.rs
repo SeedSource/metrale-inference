@@ -3,8 +3,9 @@
 //! 2026-09-25: Host-side FFI to the CUTLASS GEMM wrappers in `cuda/cutlass_*.cu`:
 //! the shared `extern` block and workspace here; dense BF16 and NVFP4 GEMMs in
 //! `gemm`, grouped per-expert NVFP4 MoE GEMMs in `grouped`, NVFP4 weight
-//! pack, SFB swizzle and transpose in `pack`, and (2026-10-06) the FP8
-//! blockwise-scaled W8A8 GEMM in `fp8_blockwise`.
+//! pack, SFB swizzle and transpose in `pack`, (2026-10-06) the FP8
+//! blockwise-scaled W8A8 GEMM in `fp8_blockwise`, and (2026-10-08) the dense
+//! NVFP4 W4A4 GEMM in `dense_w4a4`.
 //!
 //! Owner: gpu-runtime.
 //! Invariants:
@@ -21,11 +22,16 @@ use std::ffi::c_void;
 #[cfg(metrale_cutlass)]
 use std::sync::OnceLock;
 
+mod dense_w4a4;
 mod fp8_blockwise;
 mod gemm;
 mod grouped;
 mod pack;
 
+pub use dense_w4a4::{
+    DenseW4a4Args, DenseW4a4Outcome, dense_w4a4_sfb_bytes, dense_w4a4_shape_ok,
+    nvfp4_dense_w4a4_gemm, nvfp4_dense_w4a4_pack_sfb,
+};
 pub use fp8_blockwise::{
     FP8_BLOCKWISE_BLOCK, Fp8BlockwiseSchedule, fp8_blockwise_gemm_bf16, fp8_blockwise_scale_k_major,
     fp8_blockwise_shape_ok,
@@ -107,6 +113,32 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     pub(crate) fn metrale_cutlass_fp8_blockwise_scale_k_major() -> i32;
+    // 2026-10-08: `cuda/cutlass_nvfp4_gemm.cu` dense W4A4 entries (`dense_w4a4`).
+    pub(crate) fn metrale_cutlass_nvfp4_dense_w4a4_sfb_bytes(n: i32, k: i32) -> u64;
+    pub(crate) fn metrale_cutlass_nvfp4_dense_w4a4_pack_sfb(
+        scale_nk: *const c_void,
+        out: *mut c_void,
+        n: i32,
+        k: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn metrale_cutlass_nvfp4_dense_w4a4_gemm(
+        act_bf16: *const c_void,
+        w_packed: *const c_void,
+        w_scale_nk: *const c_void,
+        w_sfb: *const c_void,
+        alpha: f32,
+        act_gs: f32,
+        gs_mode: i32,
+        out_bf16: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        rows_per_launch: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
     pub(crate) fn metrale_cutlass_pack_bf16_weight_to_nvfp4_t(
         weight_bf16: *const c_void,
         packed_t: *mut c_void,

@@ -261,6 +261,9 @@ fn build_cutlass_object(cutlass_home: std::path::PathBuf, arch: &str) {
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
     }
+    // 2026-10-08: Device helpers included by cutlass_nvfp4_gemm.cu and
+    // cutlass_nvfp4_grouped_gemm.cu (W4A4 activation quantizer, SFB tile swizzle).
+    println!("cargo:rerun-if-changed=cuda/cutlass_nvfp4_w4a4_quant.cuh");
     println!("cargo:rustc-cfg=metrale_cutlass");
 
     let mut objects = Vec::new();

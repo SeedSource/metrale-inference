@@ -7,6 +7,10 @@
 // - Every extern "C" entry returns 0 on success and a nonzero status otherwise.
 // - Built with CUTLASS_ARCH_MMA_SM120/SM121 support, every entry returns -1 for k <= 0 or
 //   k % 16 != 0; built without it, every entry but the transpose returns -120.
+// - 2026-10-08: The dense W4A4 entries at the end (METRALE_GLM_PREFILL_DENSE_W4A4) reuse the
+//   dense GEMM type above and take n, k positive multiples of 128 (-1 otherwise; the SFB size
+//   query returns 0 bytes instead); the entries before them launch exactly what they launched
+//   before.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -537,6 +541,313 @@ extern "C" int metrale_cutlass_pack_bf16_weight_to_nvfp4_t(
   (void)scale_t;
   (void)n;
   (void)k;
+  (void)stream;
+  return -120;
+#endif
+}
+
+// =============================================================================================
+// 2026-10-08: METRALE_GLM_PREFILL_DENSE_W4A4 (GLM-5.3 dense prefill projections): NVFP4
+// activation x NVFP4 weight -> BF16 on the dense GEMM above (the CUTLASS example 79a
+// configuration: 128x128x128 tile, 1x1x1 cluster, KernelScheduleAuto), with
+// - the activation quantized per call by w4a4_dense_pack_act_k with a caller-given STATIC
+//   global scale gs (quant16_gs from cutlass_nvfp4_w4a4_quant.cuh, the routed-MoE W4A4
+//   quantizer: sf = UE4M3(min(amax16 / 6 / gs, 448)), codes E2M1_rne(v / (sf * gs))), so a row's
+//   codes and scale bytes depend only on that row;
+// - the weight as the GLM dense NVFP4 copy: packed E2M1 [N, K/2] (low nibble first, the
+//   ColumnMajor-B byte layout), E4M3 scales [N, K/16] row-major, swizzled per call into the
+//   workspace (w4a4_dense_pack_sfb_k, the tiled SFB pack of the MoE path) unless the caller
+//   passes an already swizzled SFB;
+// - epilogue D = alpha * acc (alpha = weight scale2 * gs), beta 0.
+// Status: 0 ok. Nothing launched (the caller may run another path): -1 shape (m <= 0, n or k
+// not a positive multiple of 128), -2 workspace too small, -3 can_implement refused, -4 a
+// misaligned pointer (act, weight, out, sfb 16 B; workspace 256 B) or no scale source, -5 gs
+// not > 0 / alpha not finite. -6: a failure before the first GEMM launch (only the workspace
+// was written; the output is untouched). -7 / -8: a later initialize / GEMM launch failed (the
+// output may be partly written). -120: built without SM120/121 support.
+
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+
+#include <cmath>
+
+#include "cutlass_nvfp4_w4a4_quant.cuh"
+
+// 2026-10-08: One thread per (row, 16-value group) of the [m, k] BF16 activation, flat
+// row-major index: two 16-byte loads (act 16-byte aligned, k % 128 == 0), quant16_gs on the
+// 16 values, 8 code bytes stored at packed[row * k/2 + group * 8] and the scale byte at
+// layout_sfa(row, group * 16). Grid ceil(m * k/16 / 256), 256 threads.
+template <class LayoutSFA_t>
+__global__ void w4a4_dense_pack_act_k(
+    const __nv_bfloat16* __restrict__ act,
+    unsigned char* __restrict__ packed,
+    unsigned char* __restrict__ sfa,
+    int m,
+    int k,
+    float gs,
+    LayoutSFA_t layout_sfa) {
+  const int groups = k / 16;
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long long)m * groups) {
+    return;
+  }
+  const int row = (int)(idx / groups);
+  const int group = (int)(idx - (long long)row * groups);
+  const uint4* src =
+      reinterpret_cast<const uint4*>(act + (unsigned long long)row * k + group * 16);
+  __align__(16) __nv_bfloat16 v[16];
+  *reinterpret_cast<uint4*>(&v[0]) = src[0];
+  *reinterpret_cast<uint4*>(&v[8]) = src[1];
+  unsigned char c[8];
+  unsigned char sf;
+  quant16_gs(v, 0, gs, c, &sf);
+  sfa[layout_sfa(row, group * 16, 0)] = sf;
+  uint2 w;
+  w.x = (unsigned int)c[0] | ((unsigned int)c[1] << 8) | ((unsigned int)c[2] << 16) |
+        ((unsigned int)c[3] << 24);
+  w.y = (unsigned int)c[4] | ((unsigned int)c[5] << 8) | ((unsigned int)c[6] << 16) |
+        ((unsigned int)c[7] << 24);
+  *reinterpret_cast<uint2*>(packed + (unsigned long long)row * (k / 2) + group * 8) = w;
+}
+
+// 2026-10-08: The SFB swizzle of one weight's [N, K/16] E4M3 scales (n % 128 == 0,
+// k % 64 == 0): one warp per 128 x 64 tile (sfb_tile_words, the body of the MoE path's
+// pack_weight_sfb_batched_tiled_k), one 16-byte store per lane. Grid ceil(tiles / 8), 256
+// threads; out 16-byte aligned.
+template <class LayoutSFB_t>
+__global__ void w4a4_dense_pack_sfb_k(
+    const unsigned char* __restrict__ src,
+    unsigned char* __restrict__ out,
+    int n,
+    int k,
+    LayoutSFB_t layout_sfb) {
+  const int groups = k / 16;
+  const int k_tiles = k / 64;
+  const long long tiles = (long long)(n / 128) * k_tiles;
+  const long long tile = (long long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (tile >= tiles) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nb = (int)(tile / k_tiles);
+  const int kb = (int)(tile % k_tiles);
+  const bool aligned =
+      ((reinterpret_cast<unsigned long long>(src) | (unsigned long long)groups) & 3ull) == 0;
+  unsigned int words[4];
+  sfb_tile_words(src, groups, nb, kb, lane, aligned, words);
+  unsigned char* dst = out + layout_sfb(nb * 128, kb * 64, 0) + (unsigned long long)lane * 16;
+  *reinterpret_cast<uint4*>(dst) = make_uint4(words[0], words[1], words[2], words[3]);
+}
+
+// 2026-10-08: Whether `p` is not a multiple of `a` (a power of two).
+static bool w4a4_misaligned(const void* p, unsigned long long a) {
+  return (reinterpret_cast<unsigned long long>(p) & (a - 1)) != 0;
+}
+
+// 2026-10-08: The dense GEMM's SFB layout for an [n, k] weight (it does not depend on M).
+static auto w4a4_layout_sfb(int n, int k) {
+  return CollectiveMainloop::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+      cute::make_shape(1, n, k, 1));
+}
+
+// 2026-10-08: Bytes of that SFB layout.
+static size_t w4a4_sfb_bytes(int n, int k) {
+  return static_cast<size_t>(size(filter_zeros(w4a4_layout_sfb(n, k))));
+}
+
+// 2026-10-08: The GEMM arguments of one launch over `rows` rows.
+static typename Gemm::Arguments w4a4_args(
+    int rows, int n, int k, const unsigned char* a, const unsigned char* sfa,
+    const unsigned char* sfb, const void* w_packed, float alpha, void* out) {
+  StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {rows, k, 1});
+  StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+  StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {rows, n, 1});
+  StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, {rows, n, 1});
+  auto layout_sfa = CollectiveMainloop::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(rows, n, k, 1));
+  auto layout_sfb = CollectiveMainloop::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+      cute::make_shape(rows, n, k, 1));
+  return typename Gemm::Arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {rows, n, k, 1},
+      {
+          reinterpret_cast<ElementA::DataType const*>(a),
+          stride_a,
+          reinterpret_cast<ElementB::DataType const*>(w_packed),
+          stride_b,
+          reinterpret_cast<ElementA::ScaleFactorType const*>(sfa),
+          layout_sfa,
+          reinterpret_cast<ElementB::ScaleFactorType const*>(sfb),
+          layout_sfb,
+      },
+      {
+          {alpha, 0.0f},
+          reinterpret_cast<ElementC const*>(out),
+          stride_c,
+          reinterpret_cast<ElementD*>(out),
+          stride_d,
+      }};
+}
+
+// 2026-10-08: Workspace offsets of one launch of `rows` rows after `base` bytes (the SFB):
+// packed A, SFA, then the CUTLASS GEMM workspace (its size depends on the arguments).
+struct W4a4Ws {
+  size_t a_off, sfa_off, gemm_off;
+};
+
+static W4a4Ws w4a4_ws(size_t base, int rows, int n, int k) {
+  auto layout_sfa = CollectiveMainloop::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(rows, n, k, 1));
+  W4a4Ws w;
+  w.a_off = base;
+  w.sfa_off = align_up(w.a_off + static_cast<size_t>(rows) * (k / 2), 256);
+  w.gemm_off = align_up(w.sfa_off + static_cast<size_t>(size(filter_zeros(layout_sfa))), 256);
+  return w;
+}
+
+#endif
+
+// 2026-10-08: Bytes of the swizzled SFB of an [n, k] weight (what
+// metrale_cutlass_nvfp4_dense_w4a4_pack_sfb writes); 0 for a shape the entry refuses (n, k not
+// positive multiples of 128) or a build without SM120/121 support.
+extern "C" unsigned long long metrale_cutlass_nvfp4_dense_w4a4_sfb_bytes(int n, int k) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (n <= 0 || k <= 0 || (n % 128) != 0 || (k % 128) != 0) {
+    return 0;
+  }
+  return static_cast<unsigned long long>(w4a4_sfb_bytes(n, k));
+#else
+  (void)n;
+  (void)k;
+  return 0;
+#endif
+}
+
+// 2026-10-08: Swizzle one weight's [n, k/16] E4M3 scales into `out` (16-byte aligned, at least
+// metrale_cutlass_nvfp4_dense_w4a4_sfb_bytes(n, k) bytes) on `stream`: the SFB the dense W4A4
+// GEMM reads. -1 bad shape / pointer, -cudaError on a launch failure, -120 without SM120/121.
+extern "C" int metrale_cutlass_nvfp4_dense_w4a4_pack_sfb(
+    const void* scale_nk, void* out, int n, int k, cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (scale_nk == nullptr || out == nullptr || w4a4_misaligned(out, 16) || n <= 0 || k <= 0 ||
+      (n % 128) != 0 || (k % 128) != 0) {
+    return -1;
+  }
+  const long long tiles = (long long)(n / 128) * (k / 64);
+  w4a4_dense_pack_sfb_k<<<(unsigned int)((tiles + 7) / 8), 256, 0, stream>>>(
+      static_cast<const unsigned char*>(scale_nk), static_cast<unsigned char*>(out), n, k,
+      w4a4_layout_sfb(n, k));
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? 0 : -static_cast<int>(err);
+#else
+  (void)scale_nk;
+  (void)out;
+  (void)n;
+  (void)k;
+  (void)stream;
+  return -120;
+#endif
+}
+
+// 2026-10-08: out[m, n] (BF16, row stride n) = alpha * nvfp4(act[m, k]; gs) @ W[n, k]^T (see the
+// section comment for the operands and the status codes). `w_sfb` null: the scales at
+// `w_scale_nk` are swizzled into the workspace once per call; else `w_sfb` is the swizzled SFB
+// and `w_scale_nk` is unused. rows_per_launch > 0 runs the rows in launches of at most that
+// many rows (each launch quantizes its own rows, then runs its GEMM; the workspace is reused
+// in stream order); <= 0 is one launch. No allocation, host sync or host copy: capture-safe.
+extern "C" int metrale_cutlass_nvfp4_dense_w4a4_gemm(
+    const void* act_bf16,
+    const void* w_packed,
+    const void* w_scale_nk,
+    const void* w_sfb,
+    float alpha,
+    float act_gs,
+    void* out_bf16,
+    int m,
+    int n,
+    int k,
+    int rows_per_launch,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (m <= 0 || n <= 0 || k <= 0 || (n % 128) != 0 || (k % 128) != 0) {
+    return -1;
+  }
+  if (act_bf16 == nullptr || w_packed == nullptr || out_bf16 == nullptr ||
+      workspace == nullptr || (w_sfb == nullptr && w_scale_nk == nullptr) ||
+      w4a4_misaligned(act_bf16, 16) || w4a4_misaligned(w_packed, 16) ||
+      w4a4_misaligned(out_bf16, 16) || (w_sfb != nullptr && w4a4_misaligned(w_sfb, 16)) ||
+      w4a4_misaligned(workspace, 256)) {
+    return -4;
+  }
+  if (!(act_gs > 0.0f) || !std::isfinite(act_gs) || !std::isfinite(alpha)) {
+    return -5;
+  }
+  unsigned char* ws = static_cast<unsigned char*>(workspace);
+  const size_t sfb_ws = w_sfb == nullptr ? align_up(w4a4_sfb_bytes(n, k), 256) : 0;
+  const unsigned char* sfb =
+      w_sfb != nullptr ? static_cast<const unsigned char*>(w_sfb) : ws;
+  const int step = (rows_per_launch > 0 && rows_per_launch < m) ? rows_per_launch : m;
+  const int last = m - ((m - 1) / step) * step;
+
+  // Everything that can refuse is checked before anything launches.
+  Gemm gemm;
+  for (int rows : {step, last}) {
+    const W4a4Ws w = w4a4_ws(sfb_ws, rows, n, k);
+    auto args = w4a4_args(rows, n, k, ws + w.a_off, ws + w.sfa_off, sfb, w_packed, alpha,
+                          out_bf16);
+    if (w.gemm_off + Gemm::get_workspace_size(args) > workspace_size) {
+      return -2;
+    }
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) {
+      return -3;
+    }
+  }
+
+  if (w_sfb == nullptr) {
+    const long long tiles = (long long)(n / 128) * (k / 64);
+    w4a4_dense_pack_sfb_k<<<(unsigned int)((tiles + 7) / 8), 256, 0, stream>>>(
+        static_cast<const unsigned char*>(w_scale_nk), ws, n, k, w4a4_layout_sfb(n, k));
+    if (cudaGetLastError() != cudaSuccess) {
+      return -6;
+    }
+  }
+  for (int r0 = 0; r0 < m; r0 += step) {
+    const int rows = (m - r0 < step) ? (m - r0) : step;
+    const W4a4Ws w = w4a4_ws(sfb_ws, rows, n, k);
+    auto layout_sfa = CollectiveMainloop::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+        cute::make_shape(rows, n, k, 1));
+    const long long items = (long long)rows * (k / 16);
+    w4a4_dense_pack_act_k<<<(unsigned int)((items + 255) / 256), 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(act_bf16) + (unsigned long long)r0 * k,
+        ws + w.a_off, ws + w.sfa_off, rows, k, act_gs, layout_sfa);
+    if (cudaGetLastError() != cudaSuccess) {
+      return r0 == 0 ? -6 : -7;
+    }
+    void* out = static_cast<__nv_bfloat16*>(out_bf16) + (unsigned long long)r0 * n;
+    auto args = w4a4_args(rows, n, k, ws + w.a_off, ws + w.sfa_off, sfb, w_packed, alpha, out);
+    if (gemm.initialize(args, ws + w.gemm_off, stream) != cutlass::Status::kSuccess) {
+      return r0 == 0 ? -6 : -7;
+    }
+    if (gemm.run(stream) != cutlass::Status::kSuccess) {
+      return -8;
+    }
+  }
+  return 0;
+#else
+  (void)act_bf16;
+  (void)w_packed;
+  (void)w_scale_nk;
+  (void)w_sfb;
+  (void)alpha;
+  (void)act_gs;
+  (void)out_bf16;
+  (void)m;
+  (void)n;
+  (void)k;
+  (void)rows_per_launch;
+  (void)workspace;
+  (void)workspace_size;
   (void)stream;
   return -120;
 #endif

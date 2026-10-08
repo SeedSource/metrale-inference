@@ -81,6 +81,10 @@ name = "dense_fp8_cutlass_gw_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm_dense_w4a4_prefill_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_dense_w8a8_minrows_microtest"
 required-features = ["cuda", "gpu-examples"]
 

@@ -329,3 +329,30 @@ fn ms_decode_graphs_stays_behind_its_lever() {
     let r = include_str!("../glm5next_dsa/layer/row_src.rs");
     assert!(r.contains("return self.store_indexer_row_from(gpu, state, pos_dev, pos, d, (src_k, src_g), stream);"));
 }
+
+/// 2026-10-07: `METRALE_GLM_BATCHED_VERIFY_GRAPHS` reaches the engine only through
+/// `decode_verify_multi_graphable`; the batched replay runs the per-sequence hooks, never borrows
+/// ghost rows for own-state layers, and `free_sequence` drops batched keys holding the slot.
+#[test]
+fn batched_verify_graphs_stays_behind_its_lever() {
+    let g = include_str!("ms_graphs.rs");
+    assert!(g.contains("std::env::var(\"METRALE_GLM_BATCHED_VERIFY_GRAPHS\").as_deref() == Ok(\"1\")"));
+    assert!(g.contains("ms_decode_graphs() || bv_graphs()"));
+    let m = include_str!("mod.rs");
+    let start = m
+        .find("fn decode_verify_multi_graphable(&self) -> bool {")
+        .expect("override present");
+    assert!(m[start..start + 90].contains("ms_graphs::bv_graphs()"));
+    let e = include_str!("../../../model-engine/src/model/trait_impl/verify_e.rs");
+    assert!(e.contains("let graphs_on = self.verify_graphs_on(k4_diag, own_states);"));
+    assert!(e.contains("self.replay_verify_graph(graph, seqs, ks, own_states, stream)?;"));
+    let gr = include_str!("../../../model-engine/src/model/trait_impl/verify_e/graphs.rs");
+    assert!(gr.contains(".all(|l| l.decode_verify_multi_graphable())"));
+    assert!(gr.contains("graph_borrow_enabled()\n                && !self.any_verify_own_states()"));
+    assert!(gr.contains("layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;"));
+    assert!(gr.contains("layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;"));
+    let s = include_str!("../../../model-engine/src/model/trait_impl/sequence.rs");
+    assert!(s.contains("let mut vb = self.verify_batched_graphs.lock();"));
+    let x = include_str!("../glm5next_dsa/layer/xseq.rs");
+    assert!(x.contains("!ctx.graph_capture || crate::glm5next_layer::ms_graphs::xseq_capture_ok()"));
+}

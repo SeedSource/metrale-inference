@@ -12,6 +12,15 @@
 //! DSA indexer's host length as the C=1 verify graphs do. The DSA cross-sequence projections
 //! (`METRALE_GLM_DSA_XSEQ_BATCH`) stay engaged under capture: their indexer rows are stored
 //! from the device position (`store_pre_indexer_row`). Off unless `1`; read once.
+//!
+//! 2026-10-07: `METRALE_GLM_BATCHED_VERIFY_GRAPHS`: the batched MTP verify
+//! (`METRALE_GLM_BATCHED_VERIFY=1`, `steps/verify_multi.rs`) as a CUDA graph.
+//! `decode_verify_multi_graphable` answers true, so model-engine `verify_e.rs` captures one graph
+//! per exact `(slot, k)` key (no ghost-row borrow) and runs each sequence's `check_replay_room`
+//! before and `sync_replayed_step` after a replay, as the C=1 verify graphs do; `free_sequence`
+//! drops every batched key holding a freed slot. Each row's DSA position comes from the staged
+//! verify metadata (`verify_rows_view`), so `decode_k` and the xseq group take the replay-safe
+//! store. Off unless `1`; read once.
 
 use std::sync::OnceLock;
 
@@ -28,4 +37,25 @@ pub fn ms_decode_graphs() -> bool {
         }
         on
     })
+}
+
+/// Whether `METRALE_GLM_BATCHED_VERIFY_GRAPHS=1` is set (read once; logged when on).
+pub fn bv_graphs() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        let on = std::env::var("METRALE_GLM_BATCHED_VERIFY_GRAPHS").as_deref() == Ok("1");
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_BATCHED_VERIFY_GRAPHS=1: ENGAGED - batched MTP verify steps run as \
+                 CUDA graphs (one per exact slot and row-count set)"
+            );
+        }
+        on
+    })
+}
+
+/// Whether the DSA cross-sequence projections may run under capture: either graph lever stores
+/// their indexer rows from the device position.
+pub fn xseq_capture_ok() -> bool {
+    ms_decode_graphs() || bv_graphs()
 }

@@ -208,7 +208,8 @@ impl TransformerModel {
         // not depend on k (`VERIFY_WY_LAYER_STRIDE_BYTES`). NULL means no
         // tables were staged, and the layers get a NULL slice below.
         // 2026-10-02: A layer that owns its verify state (`decode_verify_multi_own_states`,
-        // GLM-5.3) reads no tables: none are staged, so no carry, write-on-accept or graph.
+        // GLM-5.3) reads no tables: none are staged, so no carry or write-on-accept, and a graph
+        // only when it is `decode_verify_multi_graphable` (2026-10-07, `verify_graphs_on`).
         let own_states = self.any_verify_own_states();
         let wy_tables_base = if own_states {
             DevicePtr::NULL
@@ -240,7 +241,7 @@ impl TransformerModel {
         // WY entries. Each ghost slot must be free and, with WY tables, its
         // intermediate pool must cover the ghost's depth (the closure in
         // `pick_verify_graph`).
-        let graphs_on = super::verify_e2::verify_graphs_enabled() && !k4_diag && !own_states;
+        let graphs_on = self.verify_graphs_on(k4_diag, own_states);
         let graph_key = if graphs_on {
             self.verify_batched_graph_key(
                 &*seqs,
@@ -288,9 +289,7 @@ impl TransformerModel {
         if let Some(graph) = replay {
             // 2026-09-25: The graph reads this step's metadata and WY tables
             // from the fixed addresses refreshed above.
-            if graph.0 != 0 {
-                self.gpu.launch_graph(graph, stream)?;
-            }
+            self.replay_verify_graph(graph, seqs, ks, own_states, stream)?;
         } else {
             // 2026-09-25: No graph to replay: run the forward, under capture
             // when graphs are on. A full cache still captures: the insert

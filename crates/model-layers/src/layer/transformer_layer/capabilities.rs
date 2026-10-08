@@ -103,6 +103,16 @@ pub trait LayerCapabilities {
         false
     }
 
+    /// 2026-10-07: True when this own-state layer's `decode_verify_multi_seqs` is replay-safe
+    /// under capture: every position it writes comes from the staged metadata, and
+    /// `check_replay_room` / `sync_replayed_step` reconcile its host bookkeeping per sequence.
+    /// When every own-state layer answers true, the batched verify may capture a graph keyed by
+    /// the exact `(slot, k)` pairs, with no ghost-row borrow. Consulted only where
+    /// [`Self::decode_verify_multi_own_states`] is true.
+    fn decode_verify_multi_graphable(&self) -> bool {
+        false
+    }
+
     /// 2026-10-02: Most verify rows (`R = Σ ks`) one `decode_verify_multi_seqs` call takes;
     /// `can_batch_verify_dispatch` refuses a wider batch, which the scheduler then verifies in
     /// narrower chunks. Unbounded unless the layer's scratch is sized for fewer rows.

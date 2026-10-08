@@ -397,10 +397,14 @@ impl LayerCapabilities for Glm5NextLayer {
         !levers::batched_verify()
     }
 
-    /// 2026-10-02: True: the DSA state is per sequence and host-tracked, the KDA layer reads no
-    /// WY tables, and the batched verify runs eager (`steps/verify_multi.rs`).
+    /// 2026-10-02: True: per-sequence, host-tracked DSA state; no WY tables (`verify_multi.rs`).
     fn decode_verify_multi_own_states(&self) -> bool {
         true
+    }
+
+    /// 2026-10-07: Graphed under `METRALE_GLM_BATCHED_VERIFY_GRAPHS=1` ([`ms_graphs`]).
+    fn decode_verify_multi_graphable(&self) -> bool {
+        ms_graphs::bv_graphs()
     }
 
     /// 2026-10-02: The KDA and MLP workspace rows (`verify_rows_cap`).

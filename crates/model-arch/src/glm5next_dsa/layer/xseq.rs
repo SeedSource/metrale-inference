@@ -191,10 +191,11 @@ impl Glm5NextDsaLayer {
             && k.gemv_batchm.0 != 0
             && arena.gemv_batchm_f32.0 != 0
             && self.select_kernels.k_norm.0 != 0;
-        // 2026-10-07: Capture is allowed under `METRALE_GLM_MS_DECODE_GRAPHS` (replay-safe
-        // `store_pre_indexer_row`); otherwise eager only, as before.
+        // 2026-10-07: Capture is allowed under `METRALE_GLM_MS_DECODE_GRAPHS` or
+        // `METRALE_GLM_BATCHED_VERIFY_GRAPHS` (replay-safe `store_pre_indexer_row`); otherwise
+        // eager only, as before.
         let eager =
-            !ctx.graph_capture || crate::glm5next_layer::ms_graphs::ms_decode_graphs();
+            !ctx.graph_capture || crate::glm5next_layer::ms_graphs::xseq_capture_ok();
         let cap = w.max_rows.min(arena.max_rows);
         let rows_ok = !ks.is_empty() && ks.iter().all(|&k| (1..=cap).contains(&k));
         let ok = kernels && eager && rows_ok;

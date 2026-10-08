@@ -9,7 +9,10 @@
 
 use std::collections::HashMap;
 
+use anyhow::Result;
 use metrale_gpu_runtime::gpu::{DevicePtr, GraphHandle};
+
+use crate::traits::SequenceState;
 
 use super::super::super::types::TransformerModel;
 
@@ -18,6 +21,61 @@ pub(super) type VerifyGraphs<'a> =
     parking_lot::MutexGuard<'a, (HashMap<Vec<u32>, (GraphHandle, u64)>, u64)>;
 
 impl TransformerModel {
+    /// 2026-10-07: Whether this batched verify may capture or replay a graph: verify graphs on,
+    /// no `METRALE_K4_DIAG`, and, when a layer owns its verify state, every such layer
+    /// `decode_verify_multi_graphable` (GLM-5.3 under `METRALE_GLM_BATCHED_VERIFY_GRAPHS=1`).
+    pub(super) fn verify_graphs_on(&self, k4_diag: bool, own_states: bool) -> bool {
+        super::super::verify_e2::verify_graphs_enabled()
+            && !k4_diag
+            && (!own_states
+                || self
+                    .layers
+                    .iter()
+                    .filter(|l| l.decode_verify_multi_own_states())
+                    .all(|l| l.decode_verify_multi_graphable()))
+    }
+
+    /// 2026-10-07: Replay a batched-verify graph. With own-state layers, each sequence's
+    /// `check_replay_room` runs before the launch (the graph writes the DSA indexer rows at device
+    /// positions, so a step past the buffer is refused first) and `sync_replayed_step` after it
+    /// (reconciles the host length to `seq_len + k`), as the C=1 verify replay does
+    /// (`verify_c.rs`). `seq_len` is still the pre-verify length here.
+    pub(super) fn replay_verify_graph(
+        &self,
+        graph: GraphHandle,
+        seqs: &mut [&mut SequenceState],
+        ks: &[usize],
+        own_states: bool,
+        stream: u64,
+    ) -> Result<()> {
+        if graph.0 == 0 {
+            return Ok(());
+        }
+        if own_states {
+            for (seq, &k) in seqs.iter().zip(ks) {
+                for (i, layer) in self.layers.iter().enumerate() {
+                    layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;
+                }
+            }
+        }
+        self.gpu.launch_graph(graph, stream)?;
+        if own_states {
+            for (seq, &k) in seqs.iter_mut().zip(ks) {
+                for (i, layer) in self.layers.iter().enumerate() {
+                    layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;
+                }
+            }
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    "batched verify graph REPLAYED: first replay of an own-state batched verify \
+                     ks={ks:?}"
+                );
+            });
+        }
+        Ok(())
+    }
+
     /// 2026-09-26: Returns `(replay, ghosts, outcome)`: the graph to replay (exact or
     /// borrowed key), the borrowed key's ghost `(slot, k)` pairs, and what was decided.
     pub(super) fn pick_verify_graph(
@@ -46,7 +104,10 @@ impl TransformerModel {
                 e.1 = tick;
                 replay = Some(e.0);
                 outcome = super::super::verify_e2::VerifyGraphOutcome::Replay;
-            } else if super::super::graph_borrow::graph_borrow_enabled() {
+            } else if super::super::graph_borrow::graph_borrow_enabled()
+                && !self.any_verify_own_states()
+            {
+                // 2026-10-07: Never for own-state layers: a ghost row has no per-sequence state.
                 let wy_present = !wy_tables_base.is_null();
                 let borrowed = super::super::graph_borrow::find_borrowable_verify_key(
                     key,

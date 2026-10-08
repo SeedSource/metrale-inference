@@ -218,6 +218,28 @@ impl TransformerModel {
                     }
                 }
             }
+            {
+                // 2026-10-07: Batched-verify keys are `(slot, k)` pairs then a sentinel
+                // (`verify_graph_key`); a graphed own-state verify bakes every pair's state, so
+                // every key with a pair on this sequence's SSM slot (or slot index) is dropped.
+                let ssm = seq.ssm_slot_idx().map(|s| s as u32).unwrap_or(slot);
+                let mut vb = self.verify_batched_graphs.lock();
+                let keys: Vec<Vec<u32>> = vb
+                    .0
+                    .keys()
+                    .filter(|k| {
+                        k[..k.len().saturating_sub(1)]
+                            .chunks(2)
+                            .any(|p| p[0] == ssm || p[0] == slot)
+                    })
+                    .cloned()
+                    .collect();
+                for k in keys {
+                    if let Some((g, _)) = vb.0.remove(&k) {
+                        stale.push(g);
+                    }
+                }
+            }
             for g in stale {
                 if g.0 != 0
                     && let Err(e) = self.gpu.destroy_graph(g)

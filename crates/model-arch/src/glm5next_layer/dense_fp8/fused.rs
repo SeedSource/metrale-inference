@@ -13,8 +13,9 @@
 //! - [`w8a8_fused_input`] returns `Ok(false)`, launching nothing and NOT calling `fill`, for
 //!   every call the plain [`super::route`] would not send to the W8A8 arm (a call of at most 16
 //!   rows, which takes a GEMV; an unregistered weight; a non-BF16-out GEMV handle; too few
-//!   rows; a shape, scratch or kernel the arm declines). The caller then runs its unfused
-//!   norm and `route`, which makes the same decision again.
+//!   rows; a shape, scratch or kernel the arm declines; 2026-10-08: a call that
+//!   `METRALE_GLM_PREFILL_DENSE_W4A4` selects, which `route` sends to W4A4 first). The caller
+//!   then runs its unfused norm and `route`, which makes the same decision again.
 //! - On `Ok(true)` the GEMM has been issued on `stream`: `fill` ran first (it writes the
 //!   caller's BF16 input and the W8A8 scratch's `a_fp8 [m, k]` and `a_scale [m, k / 128]`), then
 //!   the same GEMM `route` would issue. Exact when `fill` writes the bytes the unfused norm and
@@ -85,6 +86,12 @@ pub fn w8a8_fused_input(
     let Some(kk) = kernels(gpu) else {
         return Ok(false);
     };
+    // 2026-10-08: `METRALE_GLM_PREFILL_DENSE_W4A4`: a call `route` runs as W4A4 needs the BF16
+    // input, not the FP8 quant; decline it so the caller runs its unfused norm and `route`.
+    if w4a4_copy(&e, m, gemv.0 == kk.bf16_gemv.0).is_some() {
+        super::super::dense_w4a4::note_fused_bypass(m, n, k);
+        return Ok(false);
+    }
     // 2026-10-07: logged once when the fused norm + quant first replaces a quant launch.
     static ENGAGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ENGAGED.get_or_init(|| tracing::warn!("METRALE_GLM_NORM_FP8_QUANT_FUSE=1: ENGAGED"));

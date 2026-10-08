@@ -22,6 +22,13 @@
 //! on one TP2 rank: 34 KDA, 11 DSA, 42 shared-expert, 3 dense-MLP layers), `SFB_RESIDENT_BYTES`
 //! (what a load-time pre-swizzled SFB would cost per rank), `ROUTE` / `ENGAGED_SITES` (child
 //! `--phase-route`, levers on: class gating, row floor, fused-quant bypass, bits = direct call).
+//! Every line above runs the static activation global scale (`GsMode::Static`, the default).
+//! 2026-10-08, print only (never FAIL): `ROWS_DYNAMIC <class>/<proj> M= split=[..]: <n> of <M>
+//! rows differ` (the same splits under `GsMode::Dynamic`, which is not row-invariant by
+//! design) and, per shape at M = 8192, `W4A4_AMP <class>/<proj> amp=<a> gs=<static|dynamic>
+//! cos=<> zero_blocks=<frac>`: the whole activation (N(0, 1) with its outlier channels)
+//! multiplied by amp in `AMPS`, W4A4 cos against cuBLASLt BF16 on the scaled activation, and
+//! the fraction of 16-value blocks whose UE4M3 scale is zero (`dense_w4a4::block_stats`).
 //! PASS iff every cos >= `TOL_COS`, no nonfinite, 0 rows differ in every split, 0 fallbacks and
 //! the route phase passes (speed is graded by the gate script). Last line `PASS ...` or
 //! `FAIL ...` (nonzero exit).
@@ -36,6 +43,7 @@ use half::bf16;
 use metrale_gpu_runtime::cuda_backend::MetraleCudaBackend;
 use metrale_gpu_runtime::cutlass;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
+use metrale_model_arch::glm5next_layer::dense_w4a4::GsMode::{Dynamic, Static};
 use metrale_model_arch::glm5next_layer::{dense_fp8 as df, dense_fp8_gw as gw, dense_w4a4 as w4};
 use metrale_model_layers::layers::ops;
 use metrale_model_layers::weight_map::{Fp8DenseWeight, QuantizedWeight};
@@ -64,6 +72,8 @@ const SPLITS_8192: [&[usize]; 4] = [
 ];
 const SPLITS_2048: [&[usize]; 3] = [&[1024, 1024], &[256, 1792], &[777, 1271]];
 const TOL_COS: f64 = 0.99;
+/// 2026-10-08: Activation amplitudes of the `W4A4_AMP` sweep (M = 8192, both gs modes).
+const AMPS: [f64; 4] = [0.01, 0.1, 1.0, 100.0];
 const WARMUP: usize = 5;
 const REPS: usize = 20;
 const KG: usize = 128;
@@ -252,15 +262,26 @@ impl Case {
             quant,
         })
     }
-    fn w4a4(&self, g: &dyn GpuBackend, c: DevicePtr, r0: usize, m: usize) -> Result<bool> {
+    /// 2026-10-08: Rows `r0..r0 + m` through `dense_w4a4::gemm_ex` (the engine's `gemm` with
+    /// an explicit gs mode; per-call SFB swizzle as in the engine).
+    fn w4a4(
+        &self,
+        g: &dyn GpuBackend,
+        c: DevicePtr,
+        r0: usize,
+        m: usize,
+        mode: w4::GsMode,
+    ) -> Result<bool> {
         let a = self.a.offset(r0 * self.k * 2);
-        w4::gemm(
+        w4::gemm_ex(
             a,
             &self.nv,
+            DevicePtr(0),
             c.offset(r0 * self.n * 2),
             m,
             self.n,
             self.k,
+            mode,
             g.default_stream(),
         )
     }
@@ -312,7 +333,7 @@ fn run_m(
     let (c_ref, c_w4, c_w16, c_f8, c_sp) = (c_ref?, c_w4?, c_w16?, c_f8?, c_sp?);
     ops::cublas_bf16_proj_dense(cs.a, cs.w_bf16, c_ref, m as u32, n as u32, k as u32, s)?;
     ops::cublas_bf16_proj_dense(cs.a, cs.w_deq, c_w16, m as u32, n as u32, k as u32, s)?;
-    let engaged = cs.w4a4(g, c_w4, 0, m)?;
+    let engaged = cs.w4a4(g, c_w4, 0, m, Static)?;
     cs.fp8(g, c_f8, m)?;
     g.synchronize(s)?;
     let r = dn_u16(g, c_ref, m * n)?;
@@ -351,7 +372,10 @@ fn run_m(
         g.memset(c_sp, 0xFF, bytes)?;
         let mut r0 = 0;
         for &p in *split {
-            ensure!(cs.w4a4(g, c_sp, r0, p)?, "W4A4 declined a {p}-row piece");
+            ensure!(
+                cs.w4a4(g, c_sp, r0, p, Static)?,
+                "W4A4 declined a {p}-row piece"
+            );
             r0 += p;
         }
         g.synchronize(s)?;
@@ -363,15 +387,40 @@ fn run_m(
         t.fails += usize::from(differ > 0);
         println!("ROWS {tag} M={m} split={split:?}: {differ} of {m} rows differ");
     }
+    // 2026-10-08: The same splits under the dynamic gs: print only (each piece has its own
+    // amax, so rows may differ by design).
+    ensure!(
+        cs.w4a4(g, c_w4, 0, m, Dynamic)?,
+        "W4A4 (dynamic gs) declined"
+    );
+    g.synchronize(s)?;
+    let y4d = dn_u16(g, c_w4, m * n)?;
+    for split in splits {
+        g.memset(c_sp, 0xFF, bytes)?;
+        let mut r0 = 0;
+        for &p in *split {
+            ensure!(
+                cs.w4a4(g, c_sp, r0, p, Dynamic)?,
+                "W4A4 declined a {p}-row piece"
+            );
+            r0 += p;
+        }
+        g.synchronize(s)?;
+        let ys = dn_u16(g, c_sp, m * n)?;
+        let differ = (0..m)
+            .filter(|i| ys[i * n..(i + 1) * n] != y4d[i * n..(i + 1) * n])
+            .count();
+        println!("ROWS_DYNAMIC {tag} M={m} split={split:?}: {differ} of {m} rows differ");
+    }
     let fp8_ms = median_ms(g, s, &mut || cs.fp8(g, c_f8, m))?;
-    let w4_ms = median_ms(g, s, &mut || cs.w4a4(g, c_w4, 0, m).map(|_| ()))?;
+    let w4_ms = median_ms(g, s, &mut || cs.w4a4(g, c_w4, 0, m, Static).map(|_| ()))?;
     let sfb = g.alloc(cutlass::dense_w4a4_sfb_bytes(n, k).max(16))?;
     let (sw, pre) = (cs.nv.weight_scale.0, sfb.0);
     let swz_ms = median_ms(g, s, &mut || {
         cutlass::nvfp4_dense_w4a4_pack_sfb(sw, pre, n as u32, k as u32, s)
     })?;
     let pre_ms = median_ms(g, s, &mut || {
-        w4::gemm_with_sfb(cs.a, &cs.nv, sfb, c_w4, m, n, k, s).map(|_| ())
+        w4::gemm_ex(cs.a, &cs.nv, sfb, c_w4, m, n, k, Static, s).map(|_| ())
     })?;
     let tf = 2.0 * (m * n * k) as f64 / (w4_ms * 1e-3) / 1e12;
     println!(
@@ -392,6 +441,43 @@ fn run_m(
     Ok(swz_ms / w4_ms)
 }
 
+/// 2026-10-08: The `W4A4_AMP` sweep of one shape at M = `MAX_M` (module doc): print only.
+fn amp_sweep(g: &dyn GpuBackend, cs: &Case, tag: &str) -> Result<()> {
+    let (n, k, m, s) = (cs.n, cs.k, MAX_M, g.default_stream());
+    let host = dn(g, cs.a, m * k * 2)?;
+    let [a, c_ref, c_w4] = [m * k * 2, m * n * 2, m * n * 2].map(|b| g.alloc(b));
+    let (a, c_ref, c_w4) = (a?, c_ref?, c_w4?);
+    for amp in AMPS {
+        let scaled: Vec<u8> = host
+            .chunks_exact(2)
+            .flat_map(|b| {
+                let x = bf(u16::from_le_bytes([b[0], b[1]])) * amp;
+                bf16::from_f64(x).to_bits().to_le_bytes()
+            })
+            .collect();
+        g.copy_h2d(&scaled, a)?;
+        ops::cublas_bf16_proj_dense(a, cs.w_bf16, c_ref, m as u32, n as u32, k as u32, s)?;
+        g.synchronize(s)?;
+        let r = dn_u16(g, c_ref, m * n)?;
+        for mode in [Static, Dynamic] {
+            let ok = w4::gemm_ex(a, &cs.nv, DevicePtr(0), c_w4, m, n, k, mode, s)?;
+            ensure!(ok, "W4A4 declined amp {amp} gs={}", mode.name());
+            g.synchronize(s)?;
+            let (cos, _, _) = metrics(&dn_u16(g, c_w4, m * n)?, &r);
+            let st = w4::block_stats(&scaled, m, k, mode);
+            println!(
+                "W4A4_AMP {tag} amp={amp} gs={} cos={cos:.6} zero_blocks={:.6}",
+                mode.name(),
+                st.frac(st.zero)
+            );
+        }
+    }
+    for p in [a, c_ref, c_w4] {
+        g.free(p)?;
+    }
+    Ok(())
+}
+
 /// 2026-10-08: `--phase-route` (levers on; see `main`): class gating, the row floor, the fused
 /// quant bypass and bits equal to a direct `dense_w4a4::gemm`, through `dense_fp8::route`.
 fn phase_route() -> Result<bool> {
@@ -405,11 +491,11 @@ fn phase_route() -> Result<bool> {
     let mut pa = upload(g, &gen_weight(&mut rng, n, k))?;
     let mut pb = upload(g, &gen_weight(&mut rng, nb, k))?;
     ensure!(
-        df::convert_weight_nvfp4_class(g, &mut pa, n, k, &mut acc, Class::Kda)?,
+        df::convert_weight_nvfp4_class(g, &mut pa, n, k, &mut acc, Class::Kda, "q_proj")?,
         "kda"
     );
     ensure!(
-        df::convert_weight_nvfp4_class(g, &mut pb, nb, k, &mut acc, Class::Shared)?,
+        df::convert_weight_nvfp4_class(g, &mut pb, nb, k, &mut acc, Class::Shared, "gate_proj")?,
         "sh"
     );
     df::finish_load(g)?;
@@ -494,6 +580,9 @@ fn main() -> Result<()> {
         let tag = format!("{class}/{proj}");
         for m in MS {
             worst_share = worst_share.max(run_m(g, &cs, m, (class, &tag), calls, &mut t)?);
+            if m == MAX_M {
+                amp_sweep(g, &cs, &tag)?;
+            }
         }
         t.sfb_bytes += cutlass::dense_w4a4_sfb_bytes(n, k) * calls;
         cs.free(g)?;

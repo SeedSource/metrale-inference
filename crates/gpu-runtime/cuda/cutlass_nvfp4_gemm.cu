@@ -550,24 +550,31 @@ extern "C" int metrale_cutlass_pack_bf16_weight_to_nvfp4_t(
 // 2026-10-08: METRALE_GLM_PREFILL_DENSE_W4A4 (GLM-5.3 dense prefill projections): NVFP4
 // activation x NVFP4 weight -> BF16 on the dense GEMM above (the CUTLASS example 79a
 // configuration: 128x128x128 tile, 1x1x1 cluster, KernelScheduleAuto), with
-// - the activation quantized per call by w4a4_dense_pack_act_k with a caller-given STATIC
-//   global scale gs (quant16_gs from cutlass_nvfp4_w4a4_quant.cuh, the routed-MoE W4A4
-//   quantizer: sf = UE4M3(min(amax16 / 6 / gs, 448)), codes E2M1_rne(v / (sf * gs))), so a row's
-//   codes and scale bytes depend only on that row;
+// - the activation quantized per call by w4a4_dense_pack_act_k with a global scale gs
+//   (quant16_gs from cutlass_nvfp4_w4a4_quant.cuh, the routed-MoE W4A4 quantizer:
+//   sf = UE4M3(min(amax16 / 6 / gs, 448)), codes E2M1_rne(v / (sf * gs))). gs_mode 0 (static):
+//   the caller's gs, so a row's codes and scale bytes depend only on that row. gs_mode 1
+//   (dynamic, 2026-10-08): per launch, gs = act_gs_from_amax_bits(amax of the launch's rows)
+//   (amax_row_partial / amax_block_commit, the MoE path's per-tensor amax), so with
+//   rows_per_launch each piece has its own gs and the rows depend on the piece they land in;
 // - the weight as the GLM dense NVFP4 copy: packed E2M1 [N, K/2] (low nibble first, the
 //   ColumnMajor-B byte layout), E4M3 scales [N, K/16] row-major, swizzled per call into the
 //   workspace (w4a4_dense_pack_sfb_k, the tiled SFB pack of the MoE path) unless the caller
 //   passes an already swizzled SFB;
-// - epilogue D = alpha * acc (alpha = weight scale2 * gs), beta 0.
+// - epilogue D = alpha * acc, beta 0: static, alpha = weight scale2 * gs (the caller's value);
+//   dynamic, the caller passes alpha = weight scale2 and the epilogue reads alpha * gs from the
+//   workspace (alpha_ptr), written on the device per launch.
 // Status: 0 ok. Nothing launched (the caller may run another path): -1 shape (m <= 0, n or k
 // not a positive multiple of 128), -2 workspace too small, -3 can_implement refused, -4 a
 // misaligned pointer (act, weight, out, sfb 16 B; workspace 256 B) or no scale source, -5 gs
-// not > 0 / alpha not finite. -6: a failure before the first GEMM launch (only the workspace
-// was written; the output is untouched). -7 / -8: a later initialize / GEMM launch failed (the
-// output may be partly written). -120: built without SM120/121 support.
+// not > 0 (static) / alpha not finite / gs_mode not 0 or 1. -6: a failure before the first
+// GEMM launch (only the workspace was written; the output is untouched). -7 / -8: a later
+// initialize / GEMM launch failed (the output may be partly written). -120: built without
+// SM120/121 support.
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 
+#include <algorithm>
 #include <cmath>
 
 #include "cutlass_nvfp4_w4a4_quant.cuh"
@@ -575,7 +582,8 @@ extern "C" int metrale_cutlass_pack_bf16_weight_to_nvfp4_t(
 // 2026-10-08: One thread per (row, 16-value group) of the [m, k] BF16 activation, flat
 // row-major index: two 16-byte loads (act 16-byte aligned, k % 128 == 0), quant16_gs on the
 // 16 values, 8 code bytes stored at packed[row * k/2 + group * 8] and the scale byte at
-// layout_sfa(row, group * 16). Grid ceil(m * k/16 / 256), 256 threads.
+// layout_sfa(row, group * 16). Grid ceil(m * k/16 / 256), 256 threads. The global scale is
+// `gs`, or *gs_dev when gs_dev is not null (the dynamic mode's device-resolved value).
 template <class LayoutSFA_t>
 __global__ void w4a4_dense_pack_act_k(
     const __nv_bfloat16* __restrict__ act,
@@ -584,6 +592,7 @@ __global__ void w4a4_dense_pack_act_k(
     int m,
     int k,
     float gs,
+    const float* __restrict__ gs_dev,
     LayoutSFA_t layout_sfa) {
   const int groups = k / 16;
   const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -599,7 +608,7 @@ __global__ void w4a4_dense_pack_act_k(
   *reinterpret_cast<uint4*>(&v[8]) = src[1];
   unsigned char c[8];
   unsigned char sf;
-  quant16_gs(v, 0, gs, c, &sf);
+  quant16_gs(v, 0, gs_dev != nullptr ? *gs_dev : gs, c, &sf);
   sfa[layout_sfa(row, group * 16, 0)] = sf;
   uint2 w;
   w.x = (unsigned int)c[0] | ((unsigned int)c[1] << 8) | ((unsigned int)c[2] << 16) |
@@ -637,6 +646,33 @@ __global__ void w4a4_dense_pack_sfb_k(
   unsigned char* dst = out + layout_sfb(nb * 128, kb * 64, 0) + (unsigned long long)lane * 16;
   *reinterpret_cast<uint4*>(dst) = make_uint4(words[0], words[1], words[2], words[3]);
 }
+
+// 2026-10-08: The dynamic mode's amax of one launch's rows x k BF16 values into *amax_bits
+// (zeroed before): grid-stride over rows, one block per row at a time, the MoE path's
+// amax_row_partial / amax_block_commit. 256 threads; `vec` as amax_row_partial.
+__global__ void w4a4_dense_amax_k(
+    const __nv_bfloat16* __restrict__ act, int rows, int k, int vec, unsigned int* amax_bits) {
+  float m = 0.0f;
+  for (int r = blockIdx.x; r < rows; r += gridDim.x) {
+    m = amax_row_partial(act + (unsigned long long)r * k, k, vec != 0, m);
+  }
+  amax_block_commit(m, amax_bits);
+}
+
+// 2026-10-08: The dynamic mode's per-launch scalars: gs_alpha[0] = gs from the amax,
+// gs_alpha[1] = alpha * gs (the epilogue's alpha_ptr). One thread.
+__global__ void w4a4_dense_resolve_gs_k(
+    const unsigned int* __restrict__ amax_bits, float alpha, float* __restrict__ gs_alpha) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const float gs = act_gs_from_amax_bits(*amax_bits);
+    gs_alpha[0] = gs;
+    gs_alpha[1] = alpha * gs;
+  }
+}
+
+// 2026-10-08: Bytes the dynamic mode reserves at the workspace start: the amax bits, gs and
+// alpha * gs of the current launch.
+static constexpr size_t kW4a4DynScalars = 256;
 
 // 2026-10-08: Whether `p` is not a multiple of `a` (a power of two).
 static bool w4a4_misaligned(const void* p, unsigned long long a) {
@@ -749,7 +785,7 @@ extern "C" int metrale_cutlass_nvfp4_dense_w4a4_pack_sfb(
 }
 
 // 2026-10-08: out[m, n] (BF16, row stride n) = alpha * nvfp4(act[m, k]; gs) @ W[n, k]^T (see the
-// section comment for the operands and the status codes). `w_sfb` null: the scales at
+// section comment for the operands, gs_mode and the status codes). `w_sfb` null: the scales at
 // `w_scale_nk` are swizzled into the workspace once per call; else `w_sfb` is the swizzled SFB
 // and `w_scale_nk` is unused. rows_per_launch > 0 runs the rows in launches of at most that
 // many rows (each launch quantizes its own rows, then runs its GEMM; the workspace is reused
@@ -761,6 +797,7 @@ extern "C" int metrale_cutlass_nvfp4_dense_w4a4_gemm(
     const void* w_sfb,
     float alpha,
     float act_gs,
+    int gs_mode,
     void* out_bf16,
     int m,
     int n,
@@ -780,13 +817,19 @@ extern "C" int metrale_cutlass_nvfp4_dense_w4a4_gemm(
       w4a4_misaligned(workspace, 256)) {
     return -4;
   }
-  if (!(act_gs > 0.0f) || !std::isfinite(act_gs) || !std::isfinite(alpha)) {
+  const bool dynamic = gs_mode == 1;
+  if ((gs_mode != 0 && !dynamic) || !std::isfinite(alpha) ||
+      (!dynamic && (!(act_gs > 0.0f) || !std::isfinite(act_gs)))) {
     return -5;
   }
   unsigned char* ws = static_cast<unsigned char*>(workspace);
-  const size_t sfb_ws = w_sfb == nullptr ? align_up(w4a4_sfb_bytes(n, k), 256) : 0;
+  // Dynamic: [amax bits, gs, alpha * gs] first; everything else starts after them.
+  const size_t dyn_ws = dynamic ? kW4a4DynScalars : 0;
+  unsigned int* amax_bits = reinterpret_cast<unsigned int*>(ws);
+  float* gs_alpha = reinterpret_cast<float*>(ws + 16);
+  const size_t sfb_ws = dyn_ws + (w_sfb == nullptr ? align_up(w4a4_sfb_bytes(n, k), 256) : 0);
   const unsigned char* sfb =
-      w_sfb != nullptr ? static_cast<const unsigned char*>(w_sfb) : ws;
+      w_sfb != nullptr ? static_cast<const unsigned char*>(w_sfb) : ws + dyn_ws;
   const int step = (rows_per_launch > 0 && rows_per_launch < m) ? rows_per_launch : m;
   const int last = m - ((m - 1) / step) * step;
 
@@ -807,7 +850,8 @@ extern "C" int metrale_cutlass_nvfp4_dense_w4a4_gemm(
   if (w_sfb == nullptr) {
     const long long tiles = (long long)(n / 128) * (k / 64);
     w4a4_dense_pack_sfb_k<<<(unsigned int)((tiles + 7) / 8), 256, 0, stream>>>(
-        static_cast<const unsigned char*>(w_scale_nk), ws, n, k, w4a4_layout_sfb(n, k));
+        static_cast<const unsigned char*>(w_scale_nk), ws + dyn_ws, n, k,
+        w4a4_layout_sfb(n, k));
     if (cudaGetLastError() != cudaSuccess) {
       return -6;
     }
@@ -818,14 +862,29 @@ extern "C" int metrale_cutlass_nvfp4_dense_w4a4_gemm(
     auto layout_sfa = CollectiveMainloop::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
         cute::make_shape(rows, n, k, 1));
     const long long items = (long long)rows * (k / 16);
+    const __nv_bfloat16* act_rows =
+        static_cast<const __nv_bfloat16*>(act_bf16) + (unsigned long long)r0 * k;
+    if (dynamic) {
+      // This launch's rows only: each piece gets its own amax and gs.
+      if (cudaMemsetAsync(amax_bits, 0, sizeof(unsigned int), stream) != cudaSuccess) {
+        return r0 == 0 ? -6 : -7;
+      }
+      // vec 1: act is 16-byte aligned (checked above) and k % 128 == 0.
+      w4a4_dense_amax_k<<<std::min(rows, 48 * 8), 256, 0, stream>>>(act_rows, rows, k, 1,
+                                                                   amax_bits);
+      w4a4_dense_resolve_gs_k<<<1, 32, 0, stream>>>(amax_bits, alpha, gs_alpha);
+    }
     w4a4_dense_pack_act_k<<<(unsigned int)((items + 255) / 256), 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(act_bf16) + (unsigned long long)r0 * k,
-        ws + w.a_off, ws + w.sfa_off, rows, k, act_gs, layout_sfa);
+        act_rows, ws + w.a_off, ws + w.sfa_off, rows, k, act_gs,
+        dynamic ? gs_alpha : nullptr, layout_sfa);
     if (cudaGetLastError() != cudaSuccess) {
       return r0 == 0 ? -6 : -7;
     }
     void* out = static_cast<__nv_bfloat16*>(out_bf16) + (unsigned long long)r0 * n;
     auto args = w4a4_args(rows, n, k, ws + w.a_off, ws + w.sfa_off, sfb, w_packed, alpha, out);
+    if (dynamic) {
+      args.epilogue.thread.alpha_ptr = gs_alpha + 1;
+    }
     if (gemm.initialize(args, ws + w.gemm_off, stream) != cutlass::Status::kSuccess) {
       return r0 == 0 ? -6 : -7;
     }
@@ -841,6 +900,7 @@ extern "C" int metrale_cutlass_nvfp4_dense_w4a4_gemm(
   (void)w_sfb;
   (void)alpha;
   (void)act_gs;
+  (void)gs_mode;
   (void)out_bf16;
   (void)m;
   (void)n;

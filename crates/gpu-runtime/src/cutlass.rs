@@ -129,6 +129,7 @@ unsafe extern "C" {
         w_sfb: *const c_void,
         alpha: f32,
         act_gs: f32,
+        gs_mode: i32,
         out_bf16: *mut c_void,
         m: i32,
         n: i32,

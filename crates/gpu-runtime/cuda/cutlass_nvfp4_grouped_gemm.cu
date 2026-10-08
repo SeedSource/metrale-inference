@@ -420,39 +420,7 @@ __device__ __forceinline__ int amax_dyn_group(const int* __restrict__ dyn_pre, i
   return lo;
 }
 
-// 2026-10-06: Block max of |row| over k BF16 values, all threads of the block; returns the
-// thread's partial (the caller reduces). 16-byte loads when `vec` (row and k % 8 aligned).
-__device__ __forceinline__ float amax_row_partial(
-    const __nv_bfloat16* __restrict__ arow, int k, bool vec, float m) {
-  if (vec) {
-    const uint4* r4 = reinterpret_cast<const uint4*>(arow);
-    for (int c = threadIdx.x; c < k / 8; c += blockDim.x) {
-      const uint4 q = r4[c];
-      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&q);
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float2 f = __bfloat1622float2(h[j]);
-        m = fmaxf(m, fabsf(f.x));
-        m = fmaxf(m, fabsf(f.y));
-      }
-    }
-  } else {
-    for (int c = threadIdx.x; c < k; c += blockDim.x) {
-      m = fmaxf(m, fabsf(__bfloat162float(arow[c])));
-    }
-  }
-  return m;
-}
-
-__device__ __forceinline__ void amax_block_commit(float m, unsigned int* __restrict__ amax_bits) {
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-  }
-  if ((threadIdx.x & 31) == 0) {
-    atomicMax(amax_bits, __float_as_uint(m));
-  }
-}
+// 2026-10-08: amax_row_partial and amax_block_commit are in cutlass_nvfp4_w4a4_quant.cuh.
 
 // 2026-10-06: Gathered A: flags[tok] = 1 for every token a dynamic group reads (one thread per
 // routed row). A token id outside [0, flag_len) is folded into the amax here (one thread reads
@@ -524,6 +492,7 @@ __global__ void act_amax_rows_flat(
 
 // 2026-10-03: Every gs[g] that is not > 0 becomes amax / (6 * 448) from act_amax_grouped, the
 // value a calibrated input_scale has for that amax; 1.0 when that amax is zero or not finite.
+// 2026-10-08: The expression is act_gs_from_amax_bits (cutlass_nvfp4_w4a4_quant.cuh).
 __global__ void resolve_act_gs(
     float* __restrict__ gs, int G, const unsigned int* __restrict__ amax_bits) {
   const int g = blockIdx.x * blockDim.x + threadIdx.x;
@@ -531,8 +500,7 @@ __global__ void resolve_act_gs(
     return;
   }
   if (!(gs[g] > 0.0f)) {
-    const float amax = __uint_as_float(*amax_bits);
-    gs[g] = (amax > 0.0f && isfinite(amax)) ? amax / (6.0f * 448.0f) : 1.0f;
+    gs[g] = act_gs_from_amax_bits(*amax_bits);
   }
 }
 

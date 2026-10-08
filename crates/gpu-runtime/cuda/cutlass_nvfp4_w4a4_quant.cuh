@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // 2026-10-08: Device helpers shared by the CUTLASS Sm120 NVFP4 W4A4 wrappers: the RNE E2M1
-// code, one 16-value block of the global-scale activation quantizer, and one 128 x 64 tile of
-// the weight-scale (SFB) swizzle. Moved verbatim out of cutlass_nvfp4_grouped_gemm.cu (routed
-// MoE W4A4) so the dense prefill W4A4 entry in cutlass_nvfp4_gemm.cu
-// (METRALE_GLM_PREFILL_DENSE_W4A4) quantizes with the same code.
+// code, one 16-value block of the global-scale activation quantizer, one 128 x 64 tile of
+// the weight-scale (SFB) swizzle, and the dynamic activation amax / global scale. Moved
+// verbatim out of cutlass_nvfp4_grouped_gemm.cu (routed MoE W4A4) so the dense prefill W4A4
+// entry in cutlass_nvfp4_gemm.cu (METRALE_GLM_PREFILL_DENSE_W4A4) quantizes with the same code.
 // Owner: gpu-runtime (CUTLASS reference objects).
 // Invariants:
 // - Include only inside a CUTLASS_ARCH_MMA_SM120/SM121_SUPPORTED block, after the CUTLASS
@@ -116,4 +116,50 @@ __device__ __forceinline__ void sfb_tile_words(
     }
     words[j] = w;
   }
+}
+
+// 2026-10-08: amax_row_partial and amax_block_commit moved verbatim from
+// cutlass_nvfp4_grouped_gemm.cu (the routed-MoE W4A4 dynamic activation amax), shared with the
+// dense W4A4 entry's METRALE_GLM_PREFILL_DENSE_W4A4_GS=dynamic amax.
+// 2026-10-06: Block max of |row| over k BF16 values, all threads of the block; returns the
+// thread's partial (the caller reduces). 16-byte loads when `vec` (row and k % 8 aligned).
+__device__ __forceinline__ float amax_row_partial(
+    const __nv_bfloat16* __restrict__ arow, int k, bool vec, float m) {
+  if (vec) {
+    const uint4* r4 = reinterpret_cast<const uint4*>(arow);
+    for (int c = threadIdx.x; c < k / 8; c += blockDim.x) {
+      const uint4 q = r4[c];
+      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&q);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float2 f = __bfloat1622float2(h[j]);
+        m = fmaxf(m, fabsf(f.x));
+        m = fmaxf(m, fabsf(f.y));
+      }
+    }
+  } else {
+    for (int c = threadIdx.x; c < k; c += blockDim.x) {
+      m = fmaxf(m, fabsf(__bfloat162float(arow[c])));
+    }
+  }
+  return m;
+}
+
+__device__ __forceinline__ void amax_block_commit(float m, unsigned int* __restrict__ amax_bits) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(amax_bits, __float_as_uint(m));
+  }
+}
+
+// 2026-10-08: The dynamic NVFP4 activation global scale for a per-tensor amax (float bits, as
+// amax_block_commit accumulates them): amax / (6 * 448), the value a calibrated input_scale has
+// for that amax; 1.0 when the amax is zero or not finite. The expression of the MoE path's
+// resolve_act_gs, which now calls this.
+__device__ __forceinline__ float act_gs_from_amax_bits(unsigned int amax_bits) {
+  const float amax = __uint_as_float(amax_bits);
+  return (amax > 0.0f && isfinite(amax)) ? amax / (6.0f * 448.0f) : 1.0f;
 }

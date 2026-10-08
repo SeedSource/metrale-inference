@@ -6,8 +6,10 @@
 //!
 //!   out[m, n] = bf16(alpha * Σ_k e2m1(A)[m, k] sfa[m, k/16] · e2m1(W)[n, k] sfb[n, k/16])
 //!
-//! with A quantized per call from BF16 under a caller-given static global scale `gs` and
-//! `alpha = weight scale2 * gs`.
+//! with A quantized per call from BF16 under a global scale `gs`: the caller's static value with
+//! `alpha = weight scale2 * gs`, or (2026-10-08, [`DenseW4a4Args::dynamic_gs`]) one resolved on
+//! the device per launch from the amax of that launch's rows (`amax / (6 * 448)`, 1.0 for a zero
+//! or non-finite amax; the routed-MoE W4A4 rule) with the caller's `alpha = weight scale2`.
 //!
 //! Owner: gpu-runtime.
 //! Invariants:
@@ -18,9 +20,10 @@
 //!   anything wrote the output (shape, alignment, scale, workspace, `can_implement`, or a failure
 //!   before the first GEMM launch): the caller may then run another path on the same output.
 //!   Any later failure is an `Err`.
-//! - Each row's activation codes and scales depend only on that row and `gs`, and each launch
-//!   covers whole rows, so the output rows do not depend on `m` or on `rows_per_launch`
-//!   (`glm_dense_w4a4_prefill_microtest` checks the bits).
+//! - Static `gs`: each row's activation codes and scales depend only on that row and `gs`, and
+//!   each launch covers whole rows, so the output rows do not depend on `m` or on
+//!   `rows_per_launch` (`glm_dense_w4a4_prefill_microtest` checks the bits). Dynamic `gs` is not
+//!   row-invariant: a row's result depends on the other rows of its launch.
 
 use anyhow::{Result, bail};
 
@@ -107,10 +110,12 @@ pub struct DenseW4a4Args {
     pub w_scale: u64,
     /// The swizzled SFB ([`nvfp4_dense_w4a4_pack_sfb`]), or 0 to swizzle per call.
     pub w_sfb: u64,
-    /// Epilogue scale: weight scale2 * `act_gs`.
+    /// Epilogue scale: weight scale2 * `act_gs` (static), weight scale2 alone (dynamic).
     pub alpha: f32,
-    /// Static activation global scale (> 0).
+    /// Static activation global scale (> 0); unused when `dynamic_gs`.
     pub act_gs: f32,
+    /// 2026-10-08: Resolve the global scale per launch from that launch's rows' amax.
+    pub dynamic_gs: bool,
     /// BF16 `[m, n]`, row stride `n`.
     pub out: u64,
     pub m: u32,
@@ -133,6 +138,7 @@ pub fn nvfp4_dense_w4a4_gemm(a: &DenseW4a4Args, stream: u64) -> Result<DenseW4a4
                 a.w_sfb as *const c_void,
                 a.alpha,
                 a.act_gs,
+                i32::from(a.dynamic_gs),
                 a.out as *mut c_void,
                 a.m as i32,
                 a.n as i32,

@@ -949,6 +949,9 @@ pub fn nv4_gemv_uncounted(
     let Some(kk) = nv4_kernels(gpu) else {
         bail!("METRALE_GLM_DENSE_NVFP4: a weight has an NVFP4 copy but the kernels are missing");
     };
+    if super::dense_nv4_tc::try_launch(gpu, a, q, c, m, n, k, stream)? {
+        return Ok(());
+    }
     let (h, takes_m) = match m {
         1 => (kk.gemv1, false),
         2 => (kk.b2, false),

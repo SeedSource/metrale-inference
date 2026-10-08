@@ -2667,7 +2667,11 @@ __device__ __forceinline__ void w4a16_gemv_partial_rows(
 
 // 2026-09-25: Grid (ceil(N/8), rows * top_k), block 256; blockIdx.y is the union entry. R
 // must equal the union's rows: u_slot is read as [u * R + r].
-template <int R>
+// 2026-10-08: J output columns per warp (METRALE_GLM_MOE_BATCHM_COLS, entries _c<J>): grid x is
+// ceil(N / (8 J)) and warp w of block bx computes columns bx * 8J + 8j + w, j = 0..J-1, each with
+// the J = 1 arithmetic (same partial chains, shuffle tree and acc_a + acc_b), so every output
+// is bit-identical to the J = 1 entry; only the per-block setup is shared by J columns.
+template <int R, int J = 1>
 __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_body(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ packed_ptrs,
@@ -2704,8 +2708,7 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_body(
 
     const unsigned int local_out = threadIdx.x / WARP_SIZE;
     const unsigned int lane = threadIdx.x % WARP_SIZE;
-    const unsigned int n = blockIdx.x * N_PER_BLOCK_SW + local_out;
-    if (n >= N) return;
+    if (blockIdx.x * (N_PER_BLOCK_SW * J) + local_out >= N) return;
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
@@ -2719,28 +2722,34 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_body(
     const float* __restrict__ warp_lut = E2M1_LUT;
 #endif
 
-    float acc_a[R], acc_b[R];
-    w4a16_gemv_partial_rows<R>(Aptr, B_packed, B_scale, scale2, n, half_K,
-                               num_groups, K16, lane, warp_lut, acc_a);
-    w4a16_gemv_partial_rows<R>(Aptr, B_packed, B_scale, scale2, n, half_K,
-                               num_groups, K16, lane + 32u, warp_lut, acc_b);
+    #pragma unroll 1
+    for (int j = 0; j < J; j++) {
+        const unsigned int n =
+            blockIdx.x * (N_PER_BLOCK_SW * J) + (unsigned int)j * N_PER_BLOCK_SW + local_out;
+        if (n >= N) break;
+        float acc_a[R], acc_b[R];
+        w4a16_gemv_partial_rows<R>(Aptr, B_packed, B_scale, scale2, n, half_K,
+                                   num_groups, K16, lane, warp_lut, acc_a);
+        w4a16_gemv_partial_rows<R>(Aptr, B_packed, B_scale, scale2, n, half_K,
+                                   num_groups, K16, lane + 32u, warp_lut, acc_b);
 
-    #pragma unroll
-    for (int r = 0; r < R; r++) {
-        #pragma unroll
-        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            acc_a[r] += __shfl_down_sync(0xFFFFFFFF, acc_a[r], offset);
-            acc_b[r] += __shfl_down_sync(0xFFFFFFFF, acc_b[r], offset);
-        }
-    }
-
-    if (lane == 0) {
         #pragma unroll
         for (int r = 0; r < R; r++) {
-            if (slot[r] < 0) continue;
-            float result = acc_a[r] + acc_b[r];
-            C[(unsigned long long)r * c_row_stride
-              + (unsigned long long)slot[r] * N + n] = __float2bfloat16(result);
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                acc_a[r] += __shfl_down_sync(0xFFFFFFFF, acc_a[r], offset);
+                acc_b[r] += __shfl_down_sync(0xFFFFFFFF, acc_b[r], offset);
+            }
+        }
+
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                if (slot[r] < 0) continue;
+                float result = acc_a[r] + acc_b[r];
+                C[(unsigned long long)r * c_row_stride
+                  + (unsigned long long)slot[r] * N + n] = __float2bfloat16(result);
+            }
         }
     }
 }
@@ -2773,3 +2782,29 @@ METRALE_MOE_BATCHM_ENTRY(5)
 METRALE_MOE_BATCHM_ENTRY(6)
 METRALE_MOE_BATCHM_ENTRY(7)
 METRALE_MOE_BATCHM_ENTRY(8)
+
+// 2026-10-08: METRALE_GLM_MOE_BATCHM_COLS entries: J columns per warp, grid x ceil(N / (8 J)),
+// same arguments as w4a16_gemv_sw_moe_batchm_m<R>, bit-identical outputs.
+#define METRALE_MOE_BATCHM_COLS_ENTRY(R, J)                                          \
+extern "C" __global__ void w4a16_gemv_sw_moe_batchm_m##R##_c##J(                   \
+    const __nv_bfloat16* __restrict__ A,                                           \
+    const unsigned long long* __restrict__ packed_ptrs,                            \
+    const unsigned long long* __restrict__ scale_ptrs,                             \
+    const float* __restrict__ scale2_vals,                                         \
+    __nv_bfloat16* __restrict__ C,                                                 \
+    const int* __restrict__ u_eid,                                                 \
+    const int* __restrict__ u_slot,                                                \
+    unsigned int N, unsigned int K, unsigned int num_experts,                      \
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
+{                                                                                  \
+    w4a16_gemv_sw_moe_batchm_body<R, J>(A, packed_ptrs, scale_ptrs, scale2_vals, C, \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+}
+#define METRALE_MOE_BATCHM_COLS_ENTRIES(J)                                           \
+    METRALE_MOE_BATCHM_COLS_ENTRY(2, J) METRALE_MOE_BATCHM_COLS_ENTRY(3, J)          \
+    METRALE_MOE_BATCHM_COLS_ENTRY(4, J) METRALE_MOE_BATCHM_COLS_ENTRY(5, J)          \
+    METRALE_MOE_BATCHM_COLS_ENTRY(6, J) METRALE_MOE_BATCHM_COLS_ENTRY(7, J)          \
+    METRALE_MOE_BATCHM_COLS_ENTRY(8, J)
+METRALE_MOE_BATCHM_COLS_ENTRIES(2)
+METRALE_MOE_BATCHM_COLS_ENTRIES(4)
+METRALE_MOE_BATCHM_COLS_ENTRIES(8)

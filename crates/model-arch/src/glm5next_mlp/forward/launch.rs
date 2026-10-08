@@ -6,9 +6,11 @@
 //! Owner: model-arch (GLM-5.3).
 //! Invariants: none beyond the types.
 
+use std::sync::{Once, OnceLock};
+
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use metrale_gpu_runtime::kernel_args::KernelLaunch;
+use metrale_gpu_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::ACT_BLOCK;
 use crate::glm5next_mlp::weights::{Glm5NextExpertPtrTable, Nvfp4Proj};
@@ -217,12 +219,15 @@ pub(super) fn w4a16_gemv_moe_batchm(
     c_row_stride: usize,
     stream: u64,
 ) -> Result<()> {
-    KernelLaunch::new(gpu, k)
-        .grid([
+    let (k, grid_x) = match batchm_cols(gpu, rows) {
+        Some((h, j)) => (h, div_ceil(n as u32, 8 * j)),
+        None => (
+            k,
             metrale_model_layers::layers::ops::w4a16_gemv_sw_grid_x(n as u32),
-            (rows * top_k) as u32,
-            1,
-        ])
+        ),
+    };
+    KernelLaunch::new(gpu, k)
+        .grid([grid_x, (rows * top_k) as u32, 1])
         .block([256, 1, 1])
         .arg_ptr(a)
         .arg_ptr(t.packed_ptrs)
@@ -238,4 +243,47 @@ pub(super) fn w4a16_gemv_moe_batchm(
         .arg_u32(a_slot_stride as u32)
         .arg_u32(c_row_stride as u32)
         .launch(stream)
+}
+
+/// 2026-10-08: `METRALE_GLM_MOE_BATCHM_COLS=2|4|8`: columns per warp of the row-batched union
+/// sweep (`w4a16_gemv_sw_moe_batchm_m<R>_c<J>`, kernels/gb10/common/w4a16_gemv.cu). Each output
+/// keeps the J = 1 arithmetic, so the results are bit-identical; a block covers 8 J columns,
+/// sharing its setup. Read once; any other value, or an image without the entries, keeps J = 1.
+pub fn moe_batchm_cols() -> u32 {
+    static J: OnceLock<u32> = OnceLock::new();
+    *J.get_or_init(
+        || match std::env::var("METRALE_GLM_MOE_BATCHM_COLS").as_deref() {
+            Ok("2") => 2,
+            Ok("4") => 4,
+            Ok("8") => 8,
+            _ => 1,
+        },
+    )
+}
+
+/// 2026-10-08: The `_c<J>` entry for a `rows`-row sweep and its J, when [`moe_batchm_cols`] is
+/// above 1 and the image has all seven entries for that J (resolved once, ENGAGED logged once).
+fn batchm_cols(gpu: &dyn GpuBackend, rows: usize) -> Option<(KernelHandle, u32)> {
+    static H: OnceLock<Option<Vec<KernelHandle>>> = OnceLock::new();
+    let j = moe_batchm_cols();
+    if j == 1 || !(2..=8).contains(&rows) {
+        return None;
+    }
+    let hs = H.get_or_init(|| {
+        (2..=8)
+            .map(|r| {
+                gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_m{r}_c{j}"))
+                    .ok()
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let h = hs.as_ref()?[rows - 2];
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_MOE_BATCHM_COLS={j}: ENGAGED - row-batched MoE union sweeps run \
+             w4a16_gemv_sw_moe_batchm_m<R>_c{j} ({j} columns per warp, bit-identical)"
+        );
+    });
+    Some((h, j))
 }

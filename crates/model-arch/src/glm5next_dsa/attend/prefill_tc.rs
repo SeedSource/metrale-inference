@@ -74,6 +74,9 @@ pub const MLA_PREFILL_TC2_HWCVT_ENTRY: &str = "glm5next_dsa_mla_prefill_tc2_hwcv
 /// codes through the old chain, the A1 converter and its fast path alone.
 pub const MLA_PREFILL_TC2_CVT_CHECK_ENTRY: &str = "glm5next_dsa_mla_prefill_tc2_cvt_check";
 
+/// 2026-10-08: The microtest's L2 eviction read kernel in the same module (cold-L2 timing).
+pub const MLA_PREFILL_TC2_L2_FLUSH_ENTRY: &str = "glm5next_dsa_mla_prefill_tc2_l2_flush";
+
 /// 2026-10-08: Heads per block of the rewrite, its `TC2_HEADS` (the same as the tensor-core
 /// kernel's, so the same refusals apply).
 pub const MLA_PREFILL_TC2_HEADS: usize = 32;
@@ -128,6 +131,20 @@ pub(crate) fn prefill_tc2_ignored(
         return Some(format!("{MLA_PREFILL_TC2_ENTRY} did not resolve"));
     }
     None
+}
+
+/// 2026-10-01: The one `METRALE_GLM_MLA_PREFILL_TC=1: ENGAGED` line of the process (2026-10-08:
+/// also when TC2 takes the launch in its place, so harness receipts still show TC engaged).
+fn log_tc_engaged(paging: &DsaDecodePaging, geom: &DsaSelectGeometry) {
+    static ENGAGED: std::sync::Once = std::sync::Once::new();
+    ENGAGED.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_MLA_PREFILL_TC=1: ENGAGED - {MLA_PREFILL_TC_ENTRY} attends \
+             prefill rows ({} q heads per rank, selection width {})",
+            paging.num_q_heads,
+            geom.out_width
+        );
+    });
 }
 
 /// 2026-10-08: The one `IGNORED` line of the process.
@@ -233,6 +250,7 @@ pub fn attention(
                             geom.out_width
                         );
                     });
+                    log_tc_engaged(paging, geom);
                     return prefill_attention_tc2(gpu, kernel, cfg, geom, paging, inputs, stream);
                 }
                 Some(why) => log_tc2_ignored(&why),
@@ -240,15 +258,7 @@ pub fn attention(
         }
         match refusal {
             None => {
-                static ENGAGED: std::sync::Once = std::sync::Once::new();
-                ENGAGED.call_once(|| {
-                    tracing::warn!(
-                        "METRALE_GLM_MLA_PREFILL_TC=1: ENGAGED - {MLA_PREFILL_TC_ENTRY} attends \
-                         prefill rows ({} q heads per rank, selection width {})",
-                        paging.num_q_heads,
-                        geom.out_width
-                    );
-                });
+                log_tc_engaged(paging, geom);
                 return prefill_attention_tc(gpu, kernel, cfg, geom, paging, inputs, stream);
             }
             Some(why) => {

@@ -310,6 +310,7 @@ fn prefill_tc2_names_and_mirrors_match_the_tensor_core_kernel() {
         MLA_PREFILL_TC2_ENTRY,
         MLA_PREFILL_TC2_HWCVT_ENTRY,
         MLA_PREFILL_TC2_CVT_CHECK_ENTRY,
+        MLA_PREFILL_TC2_L2_FLUSH_ENTRY,
     ] {
         assert!(e.starts_with(MLA_PREFILL_TC2_MODULE), "{e}");
     }

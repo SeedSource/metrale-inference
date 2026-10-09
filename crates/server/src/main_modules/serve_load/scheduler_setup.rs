@@ -96,6 +96,11 @@ pub(super) fn resolve_speculation(
             gdb::glm_dflash_perseq_k4(),
         ) {
             dflash_rung.pin_multi(k);
+            // 2026-10-09: Only the batched lever batches every eligible row at that width
+            // (thinking rows included); the per-sequence control keeps the old split.
+            if gdb::glm_dflash_batched_verify() {
+                dflash_rung.mark_multi_batched();
+            }
         }
         // 2026-10-09: `METRALE_DFLASH_CONF_TAU`: read once here (rank 0) and log ENGAGED.
         scheduler::dflash_conf_tau::init();

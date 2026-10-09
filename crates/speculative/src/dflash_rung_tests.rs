@@ -309,3 +309,17 @@ fn glm_dflash_levers_pin_c2_to_k4_under_explicit_gamma_8() {
         assert_eq!(rung.drafts_for(1, 7), 7, "K={k} C=1");
     }
 }
+
+/// 2026-10-09: `multi_batched` needs both the pin and the batched mark; the per-sequence control
+/// arm pins without the mark.
+#[test]
+fn multi_batched_needs_pin_and_mark() {
+    let rung = DflashRung::new();
+    rung.mark_multi_batched();
+    assert!(!rung.multi_batched(), "mark without a pin");
+    rung.pin_multi(4);
+    assert!(rung.multi_batched());
+    let control = DflashRung::new();
+    control.pin_multi(4);
+    assert!(control.multi_pinned() && !control.multi_batched(), "PERSEQ_K4 control");
+}

@@ -12,6 +12,9 @@
 //!   (`decode_verify_batched` sent the abort words) and finishes the batch, since a worker may
 //!   have advanced. The verify width `k` is whatever the caller's drafts carry (2..=4 across
 //!   ranks); nothing here assumes 4.
+//! - 2026-10-09: Under the batched GLM pin (`DflashRung::multi_batched`) each sequence's
+//!   verdict is picked on `step_verify_dflash`'s basis (`dflash_batch_rows::verdict_uses_pipeline`,
+//!   the logits pipeline at rows `i * k..`), before the verdict words; otherwise on the raw argmax.
 //!
 //! The single-sequence [`super::verify_dflash_step::step_verify_dflash`] runs
 //! one target forward per sequence. This step packs the `n` sequences'
@@ -30,7 +33,7 @@ pub fn step_verify_dflash_batched(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     drafts_per_seq: usize,
     num_drafts: usize,
-    _verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
 ) {
     let n = batch.len();
     let k = drafts_per_seq + 1;
@@ -116,17 +119,44 @@ pub fn step_verify_dflash_batched(
 
     // 2026-10-09: The accept walk for every sequence, then the verdict words (multi-rank)
     // before anything else this step does.
+    // 2026-10-09: Under the batched GLM pin (`DflashRung::multi_batched`) a row is judged on
+    // the basis `step_verify_dflash` would use for it (`verdict_uses_pipeline`): thinking and
+    // biased rows, and every row while `dflash_masked_verify` is on, go through the logits
+    // pipeline at their own rows (`row_base = i * k`), as the MTP batch does. Without the pin
+    // every row is judged on the raw argmax, the basis the drafter proposes on.
+    let pinned = sched.dflash_rung.multi_batched();
     let now = sched.io.clock.now();
+    let mut host_rows = 0usize;
+    let verdicts: Vec<Vec<u32>> = batch
+        .iter_mut()
+        .enumerate()
+        .map(|(i, a)| {
+            let raw = &results[i * k..i * k + k];
+            if !(pinned && super::dflash_batch_rows::verdict_uses_pipeline(sched, a)) {
+                return raw.to_vec();
+            }
+            host_rows += 1;
+            let picked = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+                model,
+                raw,
+                a,
+                verify_ctx,
+                i * k,
+            );
+            // 2026-10-09: A position with no pick falls back to the GPU argmax (as the MTP
+            // batch does).
+            (0..k)
+                .map(|j| picked.get(j).copied().unwrap_or(raw[j]))
+                .collect()
+        })
+        .collect();
     let accepted_per_seq: Vec<usize> = batch
         .iter_mut()
         .enumerate()
         .map(|(i, a)| {
-            let verified = &results[i * k..i * k + k];
+            let verified = &verdicts[i];
             let drafts = &drafts_all[i];
             a.last_token_time = now;
-            // 2026-09-25: judged on the raw argmax, the basis the drafter
-            // proposes on. Unlike `verify_dflash_step`, this path does not
-            // read `dflash_masked_verify`.
             let mut num_accepted = 0usize;
             for j in 0..drafts.len() {
                 if j + 1 >= verified.len() || drafts[j] != verified[j] {
@@ -147,7 +177,7 @@ pub fn step_verify_dflash_batched(
     let mut stash_rows: Vec<usize> = Vec::with_capacity(n);
     for (i, a) in batch.iter_mut().enumerate() {
         let off = i * k;
-        let verified = &results[off..off + k];
+        let verified = &verdicts[i];
         let drafts = &drafts_all[i];
         let num_accepted = accepted_per_seq[i];
 
@@ -360,7 +390,7 @@ pub fn step_verify_dflash_batched(
     let total_accepted: usize = accepted_per_seq.iter().sum();
     tracing::info!(
         "DFLASH BATCHED verify: n={n} γ={drafts_per_seq} accepted={total_accepted}/{} ({:.0}%) \
-         verify={verify_ms:.1}ms propose={:.1}ms",
+         verify={verify_ms:.1}ms propose={:.1}ms host_rows={host_rows}",
         n * drafts_per_seq,
         100.0 * (total_accepted as f64) / ((n * drafts_per_seq) as f64),
         sched

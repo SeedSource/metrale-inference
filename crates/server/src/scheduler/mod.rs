@@ -17,6 +17,9 @@ mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
+mod dflash_batch_rows;
+#[cfg(test)]
+mod dflash_batch_rows_tests;
 pub(crate) mod dflash_conf_tau;
 #[cfg(test)]
 mod emit_eos_thinking_tests;

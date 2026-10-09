@@ -168,6 +168,9 @@ struct Ctl {
     flips: AtomicU64,
     /// 2026-10-09: K at C >= 2 whether armed or not (`pin_multi`); 0 = no pin.
     multi_pin: AtomicUsize,
+    /// 2026-10-09: The pin belongs to the batched-verify lever, not the per-sequence control
+    /// (`mark_multi_batched`).
+    multi_batched: AtomicBool,
 }
 
 /// 2026-09-25: The DFlash gamma resolver. The serve builds and configures one
@@ -202,6 +205,7 @@ impl DflashRung {
                 last_n: AtomicUsize::new(0),
                 flips: AtomicU64::new(0),
                 multi_pin: AtomicUsize::new(0),
+                multi_batched: AtomicBool::new(false),
             },
         }
     }
@@ -290,6 +294,19 @@ impl DflashRung {
     /// 2026-10-09: Whether a C >= 2 pin is set (`pin_multi`).
     pub fn multi_pinned(&self) -> bool {
         self.ctl.multi_pin.load(Ordering::Relaxed) >= 2
+    }
+
+    /// 2026-10-09: Record that the C >= 2 pin is the batched-verify lever's
+    /// (`METRALE_GLM_DFLASH_BATCHED_VERIFY`), so the scheduler batches every eligible row at the
+    /// pinned width; the per-sequence control arm (`METRALE_GLM_DFLASH_PERSEQ_K4`) never calls it.
+    pub fn mark_multi_batched(&self) {
+        self.ctl.multi_batched.store(true, Ordering::Relaxed);
+    }
+
+    /// 2026-10-09: A C >= 2 pin is set and it is the batched-verify lever's
+    /// (`mark_multi_batched`).
+    pub fn multi_batched(&self) -> bool {
+        self.multi_pinned() && self.ctl.multi_batched.load(Ordering::Relaxed)
     }
 
     pub fn armed(&self) -> bool {

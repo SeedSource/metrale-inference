@@ -97,13 +97,12 @@ pub fn step_verify_dflash(
     // 2026-09-29: A144: raw argmax never sees `logit_bias`; when decode
     // would apply a non-empty bias to this row, take the masked pipeline
     // instead.
+    // 2026-09-29: A146: a thinking row never takes the raw verdict.
+    // 2026-10-09: The rule lives in `dflash_batch_rows::verdict_uses_pipeline`, which the
+    // batched step applies under the GLM batched pin.
     let verified = if dflash_verify_raw_argmax
-        && !sched.levers.dflash_masked_verify
-        // 2026-09-29: A146: a thinking row never takes the raw verdict.
-        && !crate::scheduler::sample_step::speculative_raw_argmax_forbidden(
-            a,
-            sched.levers.think_ended_gpu_argmax,
-        ) {
+        && !super::dflash_batch_rows::verdict_uses_pipeline(sched, a)
+    {
         verified_argmax
     } else {
         crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(

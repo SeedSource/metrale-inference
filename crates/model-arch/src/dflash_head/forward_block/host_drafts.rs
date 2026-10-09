@@ -49,6 +49,13 @@ impl BlockDiffusionDraftHead {
         gpu.copy_d2h_on_stream(self.scratch.draft_tokens_dev, host_buf, stream)?;
         gpu.record_event(self.scratch.draft_tokens_event, stream)?;
         gpu.event_synchronize(self.scratch.draft_tokens_event)?;
+        // 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`, single-sequence DFlash2 propose only: read
+        // the selector's top-16 logits back for the verify step's `DFLASH CONF` line. This
+        // is the lever's only sync: a blocking D2H on `stream`, after the graph replay and
+        // the draft copy above, so the drafted tokens are already fixed. Lever off: skipped.
+        if levers.conf_log && d.n_seq == 1 && self.dflash2_active() {
+            self.record_conf(gpu, width, stream)?;
+        }
         let mut drafts: Vec<u32> = host_buf
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -63,6 +70,33 @@ impl BlockDiffusionDraftHead {
             drafts.rotate_right(1);
         }
         Ok(drafts)
+    }
+}
+
+impl BlockDiffusionDraftHead {
+    /// 2026-10-08: Softmax the `width` rows of `scratch.sel_vals` (top-16 logits, descending)
+    /// and store `(p1, p1 - p2)` per draft. Drafts start at row 1 when `mask_token_id != 0`
+    /// (propose drops row 0), else at row 0.
+    fn record_conf(
+        &self,
+        gpu: &dyn metrale_gpu_runtime::gpu::GpuBackend,
+        width: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let mut raw = vec![0u8; width * 16 * 4];
+        gpu.copy_d2h_on_stream(self.scratch.sel_vals, &mut raw, stream)?;
+        let vals: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let skip = usize::from(self.mask_token_id != 0);
+        let rows = vals
+            .chunks_exact(16)
+            .skip(skip)
+            .map(crate::dflash_head::conf_log::row_conf)
+            .collect();
+        crate::dflash_head::conf_log::record(rows);
+        Ok(())
     }
 }
 

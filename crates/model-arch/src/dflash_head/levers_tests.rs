@@ -61,6 +61,7 @@ fn every_opt_in_is_off_until_it_is_exactly_one() {
             l.full_precompute
         }),
         ("METRALE_DFLASH_CTXLEN_PROBE", |l| l.ctxlen_probe),
+        ("METRALE_DFLASH_CONF_LOG", |l| l.conf_log),
         ("METRALE_DFLASH_DRAFT_GEMV", |l| l.draft_gemv),
     ];
     for (var, read) in cases {

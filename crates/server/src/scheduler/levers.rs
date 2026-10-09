@@ -62,6 +62,9 @@ pub struct SchedLevers {
     /// 2026-09-25: `METRALE_DFLASH_STEP_TIMING=1`: time a DFlash step's
     /// verify and propose separately.
     pub dflash_step_timing: bool,
+    /// 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: log the drafter's per-position
+    /// top-1 probability and margin beside the accepted count each DFlash verify.
+    pub dflash_conf_log: bool,
     /// 2026-09-25: `METRALE_VISION_TIMING` (presence): synchronize after
     /// each prefill chunk and log its wall time.
     pub vision_timing: bool,
@@ -316,6 +319,7 @@ impl SchedLevers {
 
             dflash_eagle_fix: on_unless_zero("METRALE_DFLASH_EAGLE_FIX"),
             dflash_step_timing: opt_in("METRALE_DFLASH_STEP_TIMING"),
+            dflash_conf_log: opt_in("METRALE_DFLASH_CONF_LOG"),
             vision_timing: present("METRALE_VISION_TIMING"),
             dflash_masked_verify: on_unless_zero("METRALE_DFLASH_MASKED_VERIFY"),
             dflash_seam_serial: on_unless_zero("METRALE_DFLASH_SEAM_SERIAL"),
@@ -429,6 +433,7 @@ impl SchedLevers {
             mtp_verify_sample: true,
             dflash_eagle_fix: true,
             dflash_step_timing: false,
+            dflash_conf_log: false,
             vision_timing: false,
             dflash_masked_verify: false,
             dflash_seam_serial: false,

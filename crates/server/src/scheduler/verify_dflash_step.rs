@@ -232,6 +232,28 @@ pub fn step_verify_dflash(
         a.seq.seq_len,
     );
 
+    // 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: the drafter's top-1 probability (p) and
+    // top-1 minus top-2 margin (m) per draft position, from the propose that made these
+    // drafts (`metrale_model_arch::dflash_head::conf_log`; softmax over the selector's
+    // top-16 logits). Absent when that propose was batched or not DFlash2.
+    if sched.levers.dflash_conf_log
+        && let Some(conf) = metrale_model_arch::dflash_head::conf_log::take_last()
+    {
+        let join = |f: fn(&(f32, f32)) -> f32| {
+            conf.iter()
+                .take(drafts.len())
+                .map(|c| format!("{:.4}", f(c)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        tracing::info!(
+            "DFLASH CONF: a={} p={} m={}",
+            num_accepted,
+            join(|c| c.0),
+            join(|c| c.1),
+        );
+    }
+
     // 2026-09-25: commit the SSM state to rows `0..=num_accepted` of the
     // `drafts.len() + 1` verified rows; `commit_accepted_prefix` treats a
     // full accept as a no-op. A failed commit finishes the sequence.

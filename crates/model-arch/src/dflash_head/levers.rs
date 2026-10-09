@@ -87,6 +87,10 @@ pub struct DFlashLevers {
     /// pipelined GEMM (`draft_gemm.rs`, SeedHQ/seed-skills#71 S1a).
     pub draft_gemv: bool,
 
+    /// 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: after a single-sequence DFlash2 propose, read
+    /// the selector's top-16 logits back (one blocking D2H) for the verify step's
+    /// `DFLASH CONF` line. Log-only; does not suppress CUDA graphs.
+    pub conf_log: bool,
     /// 2026-09-25: `METRALE_DFLASH_VERIFY_TRACE=1`: log every propose's drafts
     /// before the row-0 drop and the cap.
     pub verify_trace: bool,
@@ -181,6 +185,7 @@ fn from_values(
         draft_cap: parsed(value("METRALE_DFLASH_DRAFT_CAP").as_deref()),
         draft_gemv: opt_in(value("METRALE_DFLASH_DRAFT_GEMV").as_deref()),
 
+        conf_log: opt_in(value("METRALE_DFLASH_CONF_LOG").as_deref()),
         verify_trace: opt_in(value("METRALE_DFLASH_VERIFY_TRACE").as_deref()),
         precompute_dump: opt_in(value("METRALE_DFLASH_PRECOMPUTE_DUMP").as_deref()),
         ctx_parity_dump: opt_in(value("METRALE_DFLASH_CTX_PARITY_DUMP").as_deref()),

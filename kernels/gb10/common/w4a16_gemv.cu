@@ -2857,3 +2857,260 @@ extern "C" __global__ void w4a16_gemv_sw_moe_batchm_m##R##_c##J(                
 METRALE_MOE_BATCHM_COLS_ENTRIES(2)
 METRALE_MOE_BATCHM_COLS_ENTRIES(4)
 METRALE_MOE_BATCHM_COLS_ENTRIES(8)
+
+// 2026-10-08: METRALE_GLM_MOE_DOWN_FAST. w4a16_gemv_sw_moe_batchm_down_m<R>: the down-projection
+// union sweep (K <= 1024, K16 = K / 16 <= 64) with output bytes identical to
+// w4a16_gemv_sw_moe_batchm_m<R>_c8 (and so to _m<R>). Same arguments; grid
+// (ceil(N / 128), rows * top_k), block 256. Warp w of block bx computes columns
+// bx * 128 + 8 j + w, j = 0..15, two at a time.
+//
+// Bit-equality. In w4a16_gemv_partial_rows<R> with K16 <= 64, orig lane l < 32 (chain a) runs
+// exactly chunks kk = 2l (acc0) and 2l + 1 (acc1), each when kk < K16: part = the 16-step fmaf
+// chain from 0.0f over elements kk*16 + e, e = 0..15, with weight LUT[nibble e of the 8-byte
+// word] (low nibble of byte b is e = 2b, high is 2b + 1), then acc = fmaf(scale, part, 0.0f)
+// with scale = fp8 * scale2, out = acc0 + acc1. Orig lanes 32..63 (chain b) run no chunk, so
+// every acc_b is +0.0 and its shuffle tree gives +0.0 exactly. This kernel evaluates those same
+// fmaf chains with the same operands in the same order (activations are the exact BF16 -> FP32
+// values, staged once per block in shared memory; the weight values come from the same LUT,
+// dequantized once per column and reused across rows), the same scale mul and fmaf, the same
+// acc0 + acc1, and stores bf16(acc_a + 0.0f). The tree for acc_a is evaluated node by node:
+// node s_o[i] = s_{2o}[i] + s_{2o}[i + o] for o = 16, 8, 4, 2, 1, i < o, exactly the nodes lane 0
+// of the shuffle-down tree depends on. The first log2(V) levels are computed "transposed"
+// (lanes L and L ^ o each finish half of the values, swapping the other half with one
+// __shfl_xor_sync), the rest with a plain xor butterfly. Each node is the same two FP32
+// operands added once (FP32 addition commutes, so which lane holds the left operand does not
+// change the bits). With --fmad=false no mul/add pair is contracted, and fmaf is fused in both.
+#define MOE_DOWN_FAST_COLS_PER_WARP 16
+#define MOE_DOWN_FAST_LANE_STRIDE 36
+
+template <int R>
+__device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ packed_ptrs,
+    const unsigned long long* __restrict__ scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ u_eid,
+    const int* __restrict__ u_slot,
+    unsigned int N, unsigned int K, unsigned int num_experts,
+    unsigned int a_row_stride,
+    unsigned int a_slot_stride,
+    unsigned int c_row_stride)
+{
+    // 2026-10-08: RP rows padded to a power of two; V = 2 * RP values (two columns) per tree.
+    constexpr int RP = (R <= 2) ? 2 : ((R <= 4) ? 4 : 8);
+    constexpr int V = 2 * RP;
+    constexpr int LOGV = (V == 4) ? 2 : ((V == 8) ? 3 : 4);
+    constexpr int LS = MOE_DOWN_FAST_LANE_STRIDE;
+    // 2026-10-08: Row r, lane l's 32 activations (chunks 2l, 2l + 1) at s_a[r][l * 36 ..];
+    // the 4-float pad keeps a quarter-warp's float4 reads on distinct banks.
+    __shared__ __align__(16) float s_a[R * 32 * LS];
+    __shared__ float s_lut[16];
+
+    const unsigned int u = blockIdx.y;
+    const int eid = u_eid[u];
+    if (eid < 0 || (unsigned int)eid >= num_experts) return;
+    const unsigned char* B_packed = (const unsigned char*)packed_ptrs[eid];
+    if (B_packed == 0) return;
+    const unsigned char* B_scale = (const unsigned char*)scale_ptrs[eid];
+    const float scale2 = scale2_vals[eid];
+    const unsigned int K16 = K / 16;
+    // 2026-10-08: The host launches this entry only for K <= 1024.
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+    if (K16 > 64u) return;
+#else
+    if (K16 > 64u) __trap();
+#endif
+
+    bool live[R];
+    bool any = false;
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        live[r] = u_slot[u * R + r] >= 0;
+        any = any || live[r];
+    }
+    if (!any) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int w = tid / WARP_SIZE;
+    const unsigned int lane = tid % WARP_SIZE;
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int kk0 = 2u * lane, kk1 = 2u * lane + 1u;
+    const bool v0 = kk0 < K16, v1 = kk1 < K16;
+    const unsigned int nb = blockIdx.x * (N_PER_BLOCK_SW * MOE_DOWN_FAST_COLS_PER_WARP) + w;
+
+    // 2026-10-08: First column pair's weights, issued before the staging barrier.
+    unsigned long long q[2][2];
+    unsigned char sb[2][2];
+    #pragma unroll
+    for (int c = 0; c < 2; c++) {
+        const unsigned int n = nb + (unsigned int)c * N_PER_BLOCK_SW;
+        const bool ok = n < N;
+        q[c][0] = (ok && v0) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk0 * 8) : 0ull;
+        q[c][1] = (ok && v1) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk1 * 8) : 0ull;
+        sb[c][0] = (ok && v0) ? B_scale[(unsigned long long)n * num_groups + kk0] : (unsigned char)0;
+        sb[c][1] = (ok && v1) ? B_scale[(unsigned long long)n * num_groups + kk1] : (unsigned char)0;
+    }
+
+    // 2026-10-08: Stage the live rows' activations as FP32 (exact) and the E2M1 table.
+#if METRALE_WARP_LUT_STAGED
+    if (tid < 16u) s_lut[tid] = E2M1_LUT[tid];
+    const float* __restrict__ lut = s_lut;
+#else
+    const float* __restrict__ lut = E2M1_LUT;
+#endif
+    const unsigned int CH = K16 * 2u;  // 8-element (uint4) chunks per row
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        if (!live[r]) continue;
+        const int sl = u_slot[u * R + r];
+        const uint4* ar = (const uint4*)(A + (unsigned long long)r * a_row_stride
+                                           + (unsigned long long)sl * a_slot_stride);
+        for (unsigned int ch = tid; ch < CH; ch += blockDim.x) {
+            const uint4 x = ar[ch];
+            const unsigned int e = ch * 8u;
+            float* d = s_a + r * 32 * LS + (e >> 5) * LS + (e & 31u);
+            const float2 f0 = __bfloat1622float2(*(const __nv_bfloat162*)&x.x);
+            const float2 f1 = __bfloat1622float2(*(const __nv_bfloat162*)&x.y);
+            const float2 f2 = __bfloat1622float2(*(const __nv_bfloat162*)&x.z);
+            const float2 f3 = __bfloat1622float2(*(const __nv_bfloat162*)&x.w);
+            ((float4*)d)[0] = make_float4(f0.x, f0.y, f1.x, f1.y);
+            ((float4*)d)[1] = make_float4(f2.x, f2.y, f3.x, f3.y);
+        }
+    }
+    __syncthreads();
+    // 2026-10-08: No block barrier below; a warp past N leaves on its own.
+
+    // 2026-10-08: The value this lane stores after the tree: m = lane / (32 / V) when
+    // lane % (32 / V) == 0; column c = m / RP of the pair, row r = m % RP.
+    const unsigned int m = lane >> (5 - LOGV);
+    const bool holder = (lane & ((32u >> LOGV) - 1u)) == 0u;
+    const unsigned int my_c = m / RP, my_r = m % RP;
+    int my_slot = -1;
+    if (holder && my_r < (unsigned int)R) my_slot = u_slot[u * R + my_r];
+
+    #pragma unroll 1
+    for (int p = 0; p < MOE_DOWN_FAST_COLS_PER_WARP / 2; p++) {
+        const unsigned int n0 = nb + (unsigned int)p * (2 * N_PER_BLOCK_SW);
+        if (n0 >= N) break;
+
+        // 2026-10-08: Dequantize this pair (same LUT values and scale product as the car).
+        float wv[2][32];
+        float sc[2][2];
+        #pragma unroll
+        for (int c = 0; c < 2; c++) {
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                __nv_fp8_e4m3 fp8;
+                *(unsigned char*)&fp8 = sb[c][h];
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+                sc[c][h] = scl_fp8(sb[c][h]) * scale2;
+#else
+                sc[c][h] = (float)fp8 * scale2;
+#endif
+                #pragma unroll
+                for (int e = 0; e < 16; e++)
+                    wv[c][h * 16 + e] = lut[(unsigned int)(q[c][h] >> (4 * e)) & 0xFu];
+            }
+        }
+
+        // 2026-10-08: Prefetch the next pair's weights.
+        {
+            #pragma unroll
+            for (int c = 0; c < 2; c++) {
+                const unsigned int n = n0 + 2u * N_PER_BLOCK_SW + (unsigned int)c * N_PER_BLOCK_SW;
+                const bool ok = (p + 1 < MOE_DOWN_FAST_COLS_PER_WARP / 2) && n < N;
+                q[c][0] = (ok && v0) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk0 * 8) : 0ull;
+                q[c][1] = (ok && v1) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk1 * 8) : 0ull;
+                sb[c][0] = (ok && v0) ? B_scale[(unsigned long long)n * num_groups + kk0] : (unsigned char)0;
+                sb[c][1] = (ok && v1) ? B_scale[(unsigned long long)n * num_groups + kk1] : (unsigned char)0;
+            }
+        }
+
+        // 2026-10-08: Per row, both columns' chains over one read of the activations.
+        float v[V];
+        #pragma unroll
+        for (int i = 0; i < V; i++) v[i] = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (!live[r]) continue;
+            const float4* ar = (const float4*)(s_a + r * 32 * LS + lane * LS);
+            float pt[2][2];
+            #pragma unroll
+            for (int c = 0; c < 2; c++) { pt[c][0] = 0.0f; pt[c][1] = 0.0f; }
+            #pragma unroll
+            for (int f = 0; f < 8; f++) {
+                const float4 x = ar[f];
+                const int h = f >> 2;
+                const int e = (f & 3) * 4;
+                #pragma unroll
+                for (int c = 0; c < 2; c++) {
+                    pt[c][h] = fmaf(x.x, wv[c][h * 16 + e + 0], pt[c][h]);
+                    pt[c][h] = fmaf(x.y, wv[c][h * 16 + e + 1], pt[c][h]);
+                    pt[c][h] = fmaf(x.z, wv[c][h * 16 + e + 2], pt[c][h]);
+                    pt[c][h] = fmaf(x.w, wv[c][h * 16 + e + 3], pt[c][h]);
+                }
+            }
+            #pragma unroll
+            for (int c = 0; c < 2; c++) {
+                const float acc0 = v0 ? fmaf(sc[c][0], pt[c][0], 0.0f) : 0.0f;
+                const float acc1 = v1 ? fmaf(sc[c][1], pt[c][1], 0.0f) : 0.0f;
+                v[c * RP + r] = __fadd_rn(acc0, acc1);
+            }
+        }
+
+        // 2026-10-08: The shuffle-down tree's nodes. Transposed levels: at offset o the lane
+        // with bit o clear keeps values [0, h) and the other keeps [h, 2h); each finishes its
+        // half with the partner's copy.
+        #pragma unroll
+        for (int s = 0; s < LOGV; s++) {
+            const unsigned int o = 16u >> s;
+            const int hh = V >> (s + 1);
+            const bool hi = (lane & o) != 0u;
+            #pragma unroll
+            for (int k = 0; k < hh; k++) {
+                const float keep = hi ? v[k + hh] : v[k];
+                const float send = hi ? v[k] : v[k + hh];
+                const float recv = __shfl_xor_sync(0xFFFFFFFF, send, o);
+                v[k] = __fadd_rn(keep, recv);
+            }
+        }
+        float t = v[0];
+        #pragma unroll
+        for (unsigned int o = 16u >> LOGV; o > 0u; o >>= 1) {
+            t = __fadd_rn(t, __shfl_xor_sync(0xFFFFFFFF, t, o));
+        }
+
+        // 2026-10-08: result = acc_a + acc_b with acc_b = +0.0 (chain b ran no chunk).
+        const unsigned int n = n0 + my_c * N_PER_BLOCK_SW;
+        if (my_slot >= 0 && n < N) {
+            const float result = __fadd_rn(t, 0.0f);
+            C[(unsigned long long)my_r * c_row_stride
+              + (unsigned long long)my_slot * N + n] = __float2bfloat16(result);
+        }
+    }
+}
+
+#define METRALE_MOE_BATCHM_DOWN_ENTRY(R)                                             \
+extern "C" __global__ __launch_bounds__(256, 2) void w4a16_gemv_sw_moe_batchm_down_m##R( \
+    const __nv_bfloat16* __restrict__ A,                                           \
+    const unsigned long long* __restrict__ packed_ptrs,                            \
+    const unsigned long long* __restrict__ scale_ptrs,                             \
+    const float* __restrict__ scale2_vals,                                         \
+    __nv_bfloat16* __restrict__ C,                                                 \
+    const int* __restrict__ u_eid,                                                 \
+    const int* __restrict__ u_slot,                                                \
+    unsigned int N, unsigned int K, unsigned int num_experts,                      \
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
+{                                                                                  \
+    w4a16_gemv_sw_moe_batchm_down_body<R>(A, packed_ptrs, scale_ptrs, scale2_vals, C, \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+}
+METRALE_MOE_BATCHM_DOWN_ENTRY(2)
+METRALE_MOE_BATCHM_DOWN_ENTRY(3)
+METRALE_MOE_BATCHM_DOWN_ENTRY(4)
+METRALE_MOE_BATCHM_DOWN_ENTRY(5)
+METRALE_MOE_BATCHM_DOWN_ENTRY(6)
+METRALE_MOE_BATCHM_DOWN_ENTRY(7)
+METRALE_MOE_BATCHM_DOWN_ENTRY(8)

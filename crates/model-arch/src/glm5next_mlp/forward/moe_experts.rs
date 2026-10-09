@@ -268,6 +268,7 @@ pub(super) fn row_batched_experts(site: &MoeSite<'_>, groups: &[(usize, usize)])
         let kb = k.w4a16_gemv_sw_moe_batchm[w_rows - 2];
         w4a16_gemv_moe_batchm(
             gpu,
+            false,
             kb,
             x.offset(r0 * cfg.hidden * 2),
             &w.ptrs.gate,
@@ -286,6 +287,7 @@ pub(super) fn row_batched_experts(site: &MoeSite<'_>, groups: &[(usize, usize)])
         )?;
         w4a16_gemv_moe_batchm(
             gpu,
+            false,
             kb,
             x.offset(r0 * cfg.hidden * 2),
             &w.ptrs.up,
@@ -316,6 +318,7 @@ pub(super) fn row_batched_experts(site: &MoeSite<'_>, groups: &[(usize, usize)])
         )?;
         w4a16_gemv_moe_batchm(
             gpu,
+            true,
             kb,
             ws.a_act.offset(r0 * cfg.top_k * mi * 2),
             &w.ptrs.down,

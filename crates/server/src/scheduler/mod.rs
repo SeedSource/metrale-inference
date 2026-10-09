@@ -86,6 +86,9 @@ mod think_skip_tests;
 #[cfg(test)]
 mod trace_harness;
 mod types;
+mod verify_batch_ep;
+#[cfg(test)]
+mod verify_dflash_batch_ep_tests;
 mod verify_dflash_batch_step;
 mod verify_dflash_step;
 mod verify_k2_step;
@@ -123,6 +126,7 @@ use sample_step::*;
 use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;
 use types::*;
+use verify_batch_ep::*;
 use verify_dflash_batch_step::*;
 use verify_dflash_step::*;
 use verify_k2_step::*;

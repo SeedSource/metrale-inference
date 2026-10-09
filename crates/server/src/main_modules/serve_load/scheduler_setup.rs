@@ -57,6 +57,7 @@ pub(super) fn resolve_max_batch_size(
 pub(super) fn resolve_speculation(
     args: &cli::ServeArgs,
     scheduler_model: &dyn metrale_model_engine::traits::Model,
+    model_type: &str,
 ) -> (
     bool,
     bool,
@@ -85,6 +86,17 @@ pub(super) fn resolve_speculation(
             args.dflash_gamma.is_some(),
             metrale_model_layers::layers::qwen3_ssm::gdn_flags::gdn_woa_enabled(),
         );
+        // 2026-10-09: GLM DFlash C>=2 width (`METRALE_GLM_DFLASH_BATCHED_VERIFY`, or the
+        // per-sequence control `METRALE_GLM_DFLASH_PERSEQ_K4`): pinned even under an explicit
+        // `--dflash-gamma`, which still sets C=1 and the pools.
+        use metrale_model_layers::speculative::glm_dflash_batch as gdb;
+        if let Some(k) = gdb::glm_dflash_multi_k(
+            model_type,
+            gdb::glm_dflash_batched_verify(),
+            gdb::glm_dflash_perseq_k4(),
+        ) {
+            dflash_rung.pin_multi(k);
+        }
     }
 
     if args.dflash {

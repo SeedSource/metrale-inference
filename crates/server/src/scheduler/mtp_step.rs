@@ -385,6 +385,18 @@ pub fn step_mtp(
         if drafts.is_empty() {
             continue;
         }
+        // 2026-10-09: Under the GLM DFlash C>=2 pin (`METRALE_GLM_DFLASH_*`), a short DFlash
+        // block (a lone verifier at C>=2, or the first C=1 step after one) keeps the K=gamma
+        // arm at its own width, so its drafter ctx is committed as on every other step. A
+        // grammar-truncated block keeps the arm it took before.
+        let arm = if dflash_verify_raw_argmax
+            && sched.dflash_rung.multi_pinned()
+            && a.grammar_state.is_none()
+        {
+            metrale_speculative::spec_capacity::SerialArm::DFlash
+        } else {
+            arm
+        };
         let verify = match arm {
             metrale_speculative::spec_capacity::SerialArm::DFlash => step_verify_dflash,
             metrale_speculative::spec_capacity::SerialArm::K4 => step_verify_k4,

@@ -12,6 +12,8 @@
 //! - Armed, it returns `K - 1` capped at `num_drafts`, and at least 1.
 //! - The single-stream state changes at most once per `dwell` single-stream
 //!   verify steps.
+//! - A C >= 2 pin (`DflashRung::pin_multi`, 2026-10-09) sets K at C >= 2 armed or
+//!   not, capped at `num_drafts + 1`; C = 1 is unchanged by it.
 //!
 //! K is `Rungs::multi` at C >= 2, and at C = 1 `Rungs::wide` or
 //! `Rungs::narrow` by the single-stream state (`k_for`). That state is decided
@@ -164,6 +166,8 @@ struct Ctl {
     /// `observe_step` scores a step only when it is 1.
     last_n: AtomicUsize,
     flips: AtomicU64,
+    /// 2026-10-09: K at C >= 2 whether armed or not (`pin_multi`); 0 = no pin.
+    multi_pin: AtomicUsize,
 }
 
 /// 2026-09-25: The DFlash gamma resolver. The serve builds and configures one
@@ -197,6 +201,7 @@ impl DflashRung {
                 last_switch: AtomicU64::new(0),
                 last_n: AtomicUsize::new(0),
                 flips: AtomicU64::new(0),
+                multi_pin: AtomicUsize::new(0),
             },
         }
     }
@@ -273,6 +278,20 @@ impl DflashRung {
         }
     }
 
+    /// 2026-10-09: Pin K at C >= 2 to `k` (>= 2) even when the resolver is
+    /// unarmed (an explicit `--dflash-gamma`): the GLM DFlash levers
+    /// (`glm_dflash_batch::glm_dflash_multi_k`). `configure_with` keeps the pin.
+    pub fn pin_multi(&self, k: usize) {
+        let k = k.max(2);
+        self.ctl.multi_pin.store(k, Ordering::Relaxed);
+        tracing::info!("DFlash gamma: C>=2 PINNED at K={k} (C=1 unchanged)");
+    }
+
+    /// 2026-10-09: Whether a C >= 2 pin is set (`pin_multi`).
+    pub fn multi_pinned(&self) -> bool {
+        self.ctl.multi_pin.load(Ordering::Relaxed) >= 2
+    }
+
     pub fn armed(&self) -> bool {
         self.ctl.armed.load(Ordering::Relaxed)
     }
@@ -286,10 +305,17 @@ impl DflashRung {
     /// `num_drafts` is the serve's configured count (cap - 1) and is returned
     /// unchanged when the resolver is unarmed.
     pub fn drafts_for(&self, n_active: usize, num_drafts: usize) -> usize {
+        let pin = self.ctl.multi_pin.load(Ordering::Relaxed);
         if !self.armed() {
+            if pin >= 2 && n_active >= 2 {
+                return (pin - 1).min(num_drafts).max(1);
+            }
             return num_drafts;
         }
         self.ctl.last_n.store(n_active, Ordering::Relaxed);
+        if pin >= 2 && n_active >= 2 {
+            return (pin - 1).min(num_drafts).max(1);
+        }
         let k = k_for(
             n_active,
             self.ctl.wide.load(Ordering::Relaxed),

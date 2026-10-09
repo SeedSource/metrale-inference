@@ -35,7 +35,10 @@ use super::{Glm5NextDsaConfig, select::DsaSelectGeometry};
 pub mod prefill_tc;
 pub use prefill_tc::{
     MLA_PREFILL_TC_ENTRY, MLA_PREFILL_TC_HEADS, MLA_PREFILL_TC_MAX_SEL, MLA_PREFILL_TC_MODULE,
-    MLA_PREFILL_TC_SMEM_BYTES, attention, prefill_attention_tc,
+    MLA_PREFILL_TC_SMEM_BYTES, MLA_PREFILL_TC2_CVT_CHECK_ENTRY, MLA_PREFILL_TC2_ENTRY,
+    MLA_PREFILL_TC2_HEADS, MLA_PREFILL_TC2_HWCVT_ENTRY, MLA_PREFILL_TC2_MODULE,
+    MLA_PREFILL_TC2_SMEM_BYTES, attention, prefill_attention_tc, prefill_attention_tc2,
+    prefill_attention_tc2_hwcvt,
 };
 pub mod split;
 pub use split::{
@@ -134,6 +137,8 @@ pub(crate) fn headgroup_for(requested: usize, num_q_heads: usize, resolved: bool
 /// 2026-10-01: With the head-grouped variants, `KernelHandle(0)` where one did not resolve.
 /// 2026-10-01: And the tensor-core prefill kernel (`METRALE_GLM_MLA_PREFILL_TC`, see
 /// [`prefill_tc`]), `KernelHandle(0)` when it did not resolve.
+/// 2026-10-08: And its exact rewrite (`METRALE_GLM_MLA_PREFILL_TC2`): looked up only with the
+/// lever on (or by [`Self::with_prefill_tc2`]), `KernelHandle(0)` otherwise.
 /// 2026-10-05: And the split-key decode (`METRALE_GLM_DSA_MLA_SPLIT`, see [`split`]): its two
 /// entry points (`KernelHandle(0)` when absent), the device's SM count the split rule reads,
 /// and the partials scratch the launch writes (NULL, 0 partials, unless [`Self::resolve_for`]
@@ -143,6 +148,8 @@ pub struct Glm5NextDsaDecodeKernel {
     base: KernelHandle,
     headgroup: [KernelHandle; DSA_MLA_HEADGROUPS.len()],
     prefill_tc: KernelHandle,
+    prefill_tc2: KernelHandle,
+    prefill_tc2_hwcvt: KernelHandle,
     split: KernelHandle,
     split_merge: KernelHandle,
     sm_count: u32,
@@ -171,6 +178,17 @@ impl Glm5NextDsaDecodeKernel {
             MLA_PREFILL_TC_MODULE,
             MLA_PREFILL_TC_ENTRY,
         );
+        // 2026-10-08: The TC2 rewrite only with its lever on, so lever off looks up exactly
+        // what it did before.
+        let prefill_tc2 = if prefill_tc::mla_prefill_tc2() {
+            metrale_model_layers::layers::try_kernel(
+                gpu,
+                MLA_PREFILL_TC2_MODULE,
+                MLA_PREFILL_TC2_ENTRY,
+            )
+        } else {
+            KernelHandle(0)
+        };
         // 2026-10-05: The split pair is optional too; `sm_count` is read once here, as
         // `GpuBackend::sm_count` asks (the CUDA backend asks the driver, the mock says 48).
         let split =
@@ -185,6 +203,8 @@ impl Glm5NextDsaDecodeKernel {
             base,
             headgroup,
             prefill_tc,
+            prefill_tc2,
+            prefill_tc2_hwcvt: KernelHandle(0),
             split,
             split_merge,
             sm_count,
@@ -235,6 +255,37 @@ impl Glm5NextDsaDecodeKernel {
     /// 2026-10-01: Whether `glm5next_dsa_mla_prefill_tc_fp8` resolved.
     pub fn has_prefill_tc(&self) -> bool {
         self.prefill_tc.0 != 0
+    }
+
+    /// 2026-10-08: This kernel with both TC2 entry points looked up, whatever the lever says
+    /// (`KernelHandle(0)` for one that is absent). For the microtest.
+    pub fn with_prefill_tc2(mut self, gpu: &dyn GpuBackend) -> Self {
+        let get = |entry: &str| {
+            metrale_model_layers::layers::try_kernel(gpu, MLA_PREFILL_TC2_MODULE, entry)
+        };
+        self.prefill_tc2 = get(MLA_PREFILL_TC2_ENTRY);
+        self.prefill_tc2_hwcvt = get(MLA_PREFILL_TC2_HWCVT_ENTRY);
+        self
+    }
+
+    /// 2026-10-08: Whether `glm5next_dsa_mla_prefill_tc2_fp8` resolved.
+    pub fn has_prefill_tc2(&self) -> bool {
+        self.prefill_tc2.0 != 0
+    }
+
+    /// 2026-10-08: Whether `glm5next_dsa_mla_prefill_tc2_hwcvt_fp8` resolved (only
+    /// [`Self::with_prefill_tc2`] looks it up).
+    pub fn has_prefill_tc2_hwcvt(&self) -> bool {
+        self.prefill_tc2_hwcvt.0 != 0
+    }
+
+    /// 2026-10-08: The TC2 handle: the old-converter arm when `hwcvt`.
+    pub(crate) fn prefill_tc2_handle(&self, hwcvt: bool) -> KernelHandle {
+        if hwcvt {
+            self.prefill_tc2_hwcvt
+        } else {
+            self.prefill_tc2
+        }
     }
 
     /// 2026-10-01: The `_hg{g}` handle, `None` for a `g` without an entry point or one that

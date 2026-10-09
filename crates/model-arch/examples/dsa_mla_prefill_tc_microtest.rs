@@ -26,7 +26,7 @@
 //! against the tensor-core kernel: the whole output buffer as raw u16, each arm run twice with
 //! two sentinel fills (so written and unwritten elements must agree too). Cases: every case above
 //! (`edge` also at 33 rows, the odd count), `nan` (an edge case whose pool holds the E4M3 NaN
-//! codes on a few pages, so the converter's NaN fallback runs in place), and `ctx32k` / `ctx131k`:
+//! codes on a few pages, so the converter's NaN fallback runs in place), and `ctx32k` / `ctx128k`:
 //! the last 256 rows of a 32,768- and a 131,072-token prefill on one shared block table whose
 //! pages are spread over a pool larger than GB10's 24 MB L2 (48 MB / 64 MB), each row selecting
 //! 512 whole 4-token pools plus the 3 tail tokens, neighbouring rows sharing about 95% of their
@@ -34,8 +34,14 @@
 //! the device (`glm5next_dsa_mla_prefill_tc2_cvt_check`); a poisoned control (one cache byte of a
 //! selected token changed for a TC2 run only must change the output); and CUDA-event timing of
 //! the ctx cases (median of 15 after a warm call, arms alternated), printed as
-//! `GATE timing tc2 131k old X ms new Y ms ratio R; 32k old X ms new Y ms ratio R` with
-//! R = new / old (below 1 is faster). The final line starts `PASS` only when every check passed.
+//! `GATE timing tc2 128k old X ms new Y ms ratio R; 32k old X ms new Y ms ratio R` with
+//! R = new / old (below 1 is faster); `128k` is the 131,072-token case (seq / 1024). The GATE
+//! numbers are cold-L2 (as in the model, where every layer has its own cache): before each
+//! sample, outside the event window, a read kernel streams a 64 MB buffer through L2. Only the
+//! `cuLaunchKernel` sits between the events (validation, refusal checks and the shared-memory
+//! attribute run once before); a raw launch is checked bitwise against the checked launcher. A
+//! separate warm-L2 line is printed too. The final line starts `PASS` only when every check
+//! passed.
 //!
 //! Owner: model-arch examples.
 //! Invariants: none beyond the types.
@@ -55,8 +61,9 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_arch::glm5next_dsa::Glm5NextDsaConfig;
 use metrale_model_arch::glm5next_dsa::attend::{
-    DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, MLA_PREFILL_TC2_CVT_CHECK_ENTRY,
-    MLA_PREFILL_TC2_MODULE, decode_attention_headgroup, prefill_attention_tc,
+    DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, MLA_PREFILL_TC_SMEM_BYTES,
+    MLA_PREFILL_TC2_CVT_CHECK_ENTRY, MLA_PREFILL_TC2_L2_FLUSH_ENTRY, MLA_PREFILL_TC2_MODULE,
+    MLA_PREFILL_TC2_SMEM_BYTES, decode_attention_headgroup, mla_scale, prefill_attention_tc,
     prefill_attention_tc2, prefill_attention_tc2_hwcvt,
 };
 use metrale_model_arch::glm5next_dsa::select::DsaSelectGeometry;
@@ -90,7 +97,26 @@ unsafe extern "C" {
     fn cuEventSynchronize(event: u64) -> i32;
     fn cuEventElapsedTime(ms: *mut f32, start: u64, end: u64) -> i32;
     fn cuEventDestroy_v2(event: u64) -> i32;
+    // 2026-10-08: For launch-only timing (CUfunction / CUstream are pointers, passed as u64).
+    fn cuFuncSetAttribute(func: u64, attrib: i32, value: i32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn cuLaunchKernel(
+        func: u64,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+        smem: u32,
+        stream: u64,
+        params: *mut *mut std::ffi::c_void,
+        extra: *mut *mut std::ffi::c_void,
+    ) -> i32;
 }
+
+// 2026-10-08: The L2 eviction buffer of the cold-L2 timing (GB10 L2 is 24 MB).
+const FLUSH_BYTES: usize = 64 << 20;
 
 struct Lcg(u64);
 impl Lcg {
@@ -693,21 +719,174 @@ fn converter_check(g: &dyn GpuBackend) -> Result<bool> {
     Ok(ok)
 }
 
-/// 2026-10-08: Kernel milliseconds of one launch of each arm by CUDA events: one warm call of
-/// each, then `EVENT_ITERS` rounds alternating the arms; the median per arm.
+/// 2026-10-08: The L2 eviction read kernel and its 64 MB source (filled once) and sink word.
+struct L2Flush {
+    func: metrale_gpu_runtime::gpu::KernelHandle,
+    src: DevicePtr,
+    sink: DevicePtr,
+    blocks: u32,
+}
+
+impl L2Flush {
+    fn new(g: &dyn GpuBackend) -> Result<Self> {
+        let func = g
+            .kernel(MLA_PREFILL_TC2_MODULE, MLA_PREFILL_TC2_L2_FLUSH_ENTRY)
+            .context("L2 flush kernel")?;
+        let src = g.alloc(FLUSH_BYTES)?;
+        g.memset(src, 0x5A, FLUSH_BYTES)?;
+        let sink = g.alloc(4)?;
+        let blocks = 8 * g.sm_count().unwrap_or(48);
+        g.synchronize(0)?;
+        Ok(Self {
+            func,
+            src,
+            sink,
+            blocks,
+        })
+    }
+
+    /// 2026-10-08: Enqueue one pass over the source on stream 0.
+    fn run(&self, g: &dyn GpuBackend) -> Result<()> {
+        KernelLaunch::new(g, self.func)
+            .grid([self.blocks, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(self.src)
+            .arg_u64((FLUSH_BYTES / 16) as u64)
+            .arg_ptr(self.sink)
+            .launch(0)
+    }
+
+    fn free(&self, g: &dyn GpuBackend) {
+        g.free(self.src).ok();
+        g.free(self.sink).ok();
+    }
+}
+
+/// 2026-10-08: One arm's launch with its arguments packed once, so the timed window holds only
+/// `cuLaunchKernel`. The checked launcher has validated the same launch before
+/// (`raw_launch_matches`), and the shared-memory attribute is set at construction.
+struct RawLaunch {
+    func: u64,
+    grid: [u32; 2],
+    smem: u32,
+    ptrs: [u64; 6],
+    u32s: [u32; 4],
+    f32s: [f32; 2],
+    stride: u64,
+}
+
+impl RawLaunch {
+    fn new(kernel: Glm5NextDsaDecodeKernel, case: &Case, arm: Arm) -> Result<Self> {
+        let (func, smem) = match arm {
+            Arm::Tc => (kernel.prefill_tc_handle(), MLA_PREFILL_TC_SMEM_BYTES),
+            Arm::Tc2 => (kernel.prefill_tc2_handle(false), MLA_PREFILL_TC2_SMEM_BYTES),
+            Arm::Tc2Hw => (kernel.prefill_tc2_handle(true), MLA_PREFILL_TC2_SMEM_BYTES),
+            Arm::Decode => anyhow::bail!("no raw launch for the decode kernel"),
+        };
+        if func.0 == 0 {
+            anyhow::bail!("raw launch: entry point absent");
+        }
+        // 2026-10-08: CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, as the registry sets it.
+        let rc = unsafe { cuFuncSetAttribute(func.0, 8, smem as i32) };
+        if rc != 0 {
+            anyhow::bail!("cuFuncSetAttribute failed: status {rc}");
+        }
+        let (p, i) = (&case.paging, &case.inputs);
+        Ok(Self {
+            func: func.0,
+            grid: [(HEADS / 32) as u32, case.rows as u32],
+            smem,
+            ptrs: [
+                i.q.0,
+                i.k_cache.0,
+                i.out.0,
+                i.block_tables.0,
+                i.seq_lens.0,
+                i.sel_indices.0,
+            ],
+            u32s: [
+                case.width as u32,
+                p.max_blocks_per_seq as u32,
+                p.num_q_heads as u32,
+                p.block_size as u32,
+            ],
+            f32s: [mla_scale(&cfg()), i.k_scale],
+            stride: p.cache_stride_bytes,
+        })
+    }
+
+    /// 2026-10-08: `cuLaunchKernel` on stream 0; returns the CUDA status.
+    fn launch(&mut self) -> i32 {
+        use std::ffi::c_void;
+        let mut params: [*mut c_void; 13] = [std::ptr::null_mut(); 13];
+        for (k, v) in self.ptrs.iter_mut().enumerate() {
+            params[k] = v as *mut u64 as *mut c_void;
+        }
+        for (k, v) in self.u32s.iter_mut().enumerate() {
+            params[6 + k] = v as *mut u32 as *mut c_void;
+        }
+        for (k, v) in self.f32s.iter_mut().enumerate() {
+            params[10 + k] = v as *mut f32 as *mut c_void;
+        }
+        params[12] = &mut self.stride as *mut u64 as *mut c_void;
+        let [gx, gy] = self.grid;
+        unsafe {
+            cuLaunchKernel(
+                self.func,
+                gx,
+                gy,
+                1,
+                256,
+                1,
+                1,
+                self.smem,
+                0,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        }
+    }
+}
+
+/// 2026-10-08: The raw launch of `arm` writes the same bytes as its checked launcher (so the
+/// timed launches are the gated ones). Returns whether it does.
+fn raw_launch_matches(
+    g: &dyn GpuBackend,
+    kernel: Glm5NextDsaDecodeKernel,
+    case: &Case,
+    arm: Arm,
+) -> Result<bool> {
+    let want = run_arm(g, kernel, case, arm, POISON_TC)?;
+    let bytes = case.rows * HEADS * KVL * 2;
+    g.memset(case.inputs.out, POISON_TC, bytes)?;
+    let rc = RawLaunch::new(kernel, case, arm)?.launch();
+    if rc != 0 {
+        anyhow::bail!("raw cuLaunchKernel failed: status {rc}");
+    }
+    let got = down(g, case.inputs.out, bytes)?;
+    Ok(bitwise(case, "raw launch vs checked", &want, &got))
+}
+
+/// 2026-10-08: Kernel milliseconds of one launch of each arm by CUDA events: one checked warm
+/// call of each, then `EVENT_ITERS` rounds alternating the arms; the median per arm. With
+/// `flush`, an L2 eviction pass runs before each sample, outside the event window. Only the raw
+/// `cuLaunchKernel` is between the events.
 fn event_times(
     g: &dyn GpuBackend,
     kernel: Glm5NextDsaDecodeKernel,
     case: &Case,
     arms: &[Arm],
+    flush: Option<&L2Flush>,
 ) -> Result<Vec<f64>> {
     let (mut e0, mut e1) = (0u64, 0u64);
     let rc = unsafe { cuEventCreate(&mut e0, 0) } | unsafe { cuEventCreate(&mut e1, 0) };
     if rc != 0 {
         anyhow::bail!("cuEventCreate failed: status {rc}");
     }
+    let mut raws = Vec::with_capacity(arms.len());
     for &arm in arms {
         launch_arm(g, kernel, case, arm, 0)?;
+        raws.push(RawLaunch::new(kernel, case, arm)?);
     }
     g.synchronize(0)?;
     let mut samples = vec![Vec::with_capacity(EVENT_ITERS); arms.len()];
@@ -715,9 +894,12 @@ fn event_times(
         for k in 0..arms.len() {
             // 2026-10-08: Alternate which arm goes first, so neither always follows the other.
             let a = if it % 2 == 0 { k } else { arms.len() - 1 - k };
+            if let Some(f) = flush {
+                f.run(g)?;
+            }
             let mut ms = 0f32;
             let rc = unsafe { cuEventRecord(e0, 0) };
-            launch_arm(g, kernel, case, arms[a], 0)?;
+            let rc = rc | raws[a].launch();
             let rc = rc
                 | unsafe { cuEventRecord(e1, 0) }
                 | unsafe { cuEventSynchronize(e1) }
@@ -898,6 +1080,7 @@ fn main() -> Result<()> {
 
     // 2026-10-08: The long-context sub-chunks: bitwise, the poisoned control (on 32K), timing.
     let mut gate = Vec::new();
+    let flush = L2Flush::new(g)?;
     for (seq, seed) in [(131_072usize, 0xC7C_0131u64), (32_768, 0xC7C_0032)] {
         let case = ctx_case(g, seq, seed)?;
         bit_failed += tc2_bitwise(g, kernel, &case)?;
@@ -908,15 +1091,24 @@ fn main() -> Result<()> {
         if kernel.has_prefill_tc2_hwcvt() {
             arms.push(Arm::Tc2Hw);
         }
-        let ms = event_times(g, kernel, &case, &arms)?;
-        println!(
-            "TIMING {:<24} CUDA events, median of {EVENT_ITERS}: tc {:.4} ms  tc2 {:.4} ms{}",
-            case.name,
-            ms[0],
-            ms[1],
-            ms.get(2)
-                .map_or(String::new(), |h| format!("  tc2hw {h:.4} ms"))
-        );
+        for &arm in &arms {
+            if !raw_launch_matches(g, kernel, &case, arm)? {
+                bit_failed += 1;
+            }
+        }
+        let warm = event_times(g, kernel, &case, &arms, None)?;
+        let ms = event_times(g, kernel, &case, &arms, Some(&flush))?;
+        for (label, t) in [("cold-L2", &ms), ("warm-L2", &warm)] {
+            println!(
+                "TIMING {:<24} {label} CUDA events, median of {EVENT_ITERS}: tc {:.4} ms  tc2 \
+                 {:.4} ms{}",
+                case.name,
+                t[0],
+                t[1],
+                t.get(2)
+                    .map_or(String::new(), |h| format!("  tc2hw {h:.4} ms"))
+            );
+        }
         gate.push((seq / 1024, ms[0], ms[1]));
         for p in &case.owned {
             g.free(*p).ok();
@@ -929,7 +1121,8 @@ fn main() -> Result<()> {
         )
     };
     println!("GATE timing tc2 {}; {}", part(&gate[0]), part(&gate[1]));
-    println!("(ratio = new / old; below 1 is faster)");
+    println!("(GATE is cold-L2; ratio = new / old; below 1 is faster)");
+    flush.free(g);
 
     for (rows, seed) in [(4096usize, 0x7135_4096u64), (8192, 0x7135_8192)] {
         let case = prefill_case(g, rows, seed)?;

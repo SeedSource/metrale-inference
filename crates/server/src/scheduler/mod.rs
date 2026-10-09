@@ -21,6 +21,7 @@ mod dflash_batch_rows;
 #[cfg(test)]
 mod dflash_batch_rows_tests;
 pub(crate) mod dflash_conf_tau;
+pub(crate) mod dflash_ksel;
 #[cfg(test)]
 mod emit_eos_thinking_tests;
 #[cfg(test)]

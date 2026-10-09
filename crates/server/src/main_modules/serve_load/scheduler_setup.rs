@@ -104,6 +104,8 @@ pub(super) fn resolve_speculation(
         }
         // 2026-10-09: `METRALE_DFLASH_CONF_TAU`: read once here (rank 0) and log ENGAGED.
         scheduler::dflash_conf_tau::init();
+        // 2026-10-09: `METRALE_GLM_DFLASH_KSEL`: read once here (rank 0) and log ENGAGED.
+        scheduler::dflash_ksel::init();
     }
 
     if args.dflash {

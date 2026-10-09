@@ -12,6 +12,8 @@
 //!   (`decode_verify_batched` sent the abort words) and finishes the batch, since a worker may
 //!   have advanced. The verify width `k` is whatever the caller's drafts carry (2..=4 across
 //!   ranks); nothing here assumes 4.
+//! - 2026-10-09: `METRALE_GLM_DFLASH_KSEL` (`dflash_ksel`) may cut every row to one narrower
+//!   width before the rows are built; the worker learns it from the `ks` meta only.
 //! - 2026-10-09: Under the batched GLM pin (`DflashRung::multi_batched`) each sequence's
 //!   verdict is picked on `step_verify_dflash`'s basis (`dflash_batch_rows::verdict_uses_pipeline`,
 //!   the logits pipeline at rows `i * k..`), before the verdict words; otherwise on the raw argmax.
@@ -35,6 +37,11 @@ pub fn step_verify_dflash_batched(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
 ) {
+    // 2026-10-09: `METRALE_GLM_DFLASH_KSEL`: under the batched GLM pin, one width for this batch
+    // from the drafter p and the measured cost table (`dflash_ksel`); the rows' drafts are cut
+    // to it here, so `ks` below (and the `EP_CMD_VERIFY_BATCH` meta the worker reads) carry it.
+    let drafts_per_seq =
+        super::dflash_ksel::select_and_truncate(model, batch, sched, drafts_per_seq);
     let n = batch.len();
     let k = drafts_per_seq + 1;
     debug_assert!(n >= 2 && drafts_per_seq >= 1);

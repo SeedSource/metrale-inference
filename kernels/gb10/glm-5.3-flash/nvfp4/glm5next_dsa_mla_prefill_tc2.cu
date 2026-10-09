@@ -37,6 +37,11 @@
 //      rewritten, and QK(t)'s S partials before softmax(t) reads them; B2 orders softmax(t)'s
 //      reads of the partials before QK(t+1) rewrites them, and publishes P, alpha and tile t+1.
 //      The last tile's QK(t+1) runs on a stale or zero buffer and its partials are never read.
+//   A5 (2026-10-09) the block-table reads for tile t+3 are issued at tile t and their pages kept in
+//      registers; the byte offsets are formed at tile t+1, where the key loads use them. The old
+//      schedule used each page right after its load, so each tile waited for four block-table
+//      round trips in a row behind B1 (cuobjdump -sass of the _fp8 entry). The offsets are
+//      the same expression (tc2_page_off = tc2_key_off's arithmetic), so the loads are unchanged.
 //   A4 (persistent grid) is not used: at 99 KB of shared memory one CTA fits per SM, and rows past
 //      2,051 tokens all run 65 tiles, so a pull scheduler runs the same ceil(rows / SMs) rounds.
 //
@@ -156,6 +161,34 @@ __device__ __forceinline__ unsigned long long tc2_key_off(
     const unsigned physical_block = (unsigned)block_table[t / block_size];
     return (unsigned long long)physical_block * cache_stride_bytes
          + (unsigned long long)(t % block_size) * TC2_D;
+}
+
+// 2026-10-09: A5: tc2_key_off in two steps. tc2_key_page reads the block table (no use of the
+// page), tc2_page_off forms the same offset later; `tin` TC2_NO_TIN (never a t % block_size)
+// marks a key past the list.
+#define TC2_NO_TIN (~0u)
+__device__ __forceinline__ void tc2_key_page(
+    const int* sel_s,
+    unsigned j,
+    unsigned n_valid,
+    const int* __restrict__ block_table,
+    unsigned block_size,
+    unsigned& page,
+    unsigned& tin
+) {
+    page = 0u;
+    tin = TC2_NO_TIN;
+    if (j < n_valid) {
+        const unsigned t = (unsigned)sel_s[j];
+        page = (unsigned)block_table[t / block_size];
+        tin = t % block_size;
+    }
+}
+
+__device__ __forceinline__ unsigned long long tc2_page_off(unsigned page, unsigned tin,
+                                                           unsigned long long cache_stride_bytes) {
+    if (tin == TC2_NO_TIN) return TC2_NO_KEY;
+    return (unsigned long long)page * cache_stride_bytes + (unsigned long long)tin * TC2_D;
 }
 
 __device__ __forceinline__ uint4 tc2_load_key(const unsigned char* __restrict__ kv,
@@ -362,6 +395,7 @@ __device__ __forceinline__ void tc2_body(
     // 2026-10-08: Tile 0's bytes and tile 1's offsets, verbatim.
     uint4 raw[4];
     unsigned long long off_nxt[4];
+    unsigned pg_nxt[4], tin_nxt[4];
     #pragma unroll
     for (int i = 0; i < 4; i++) {
         const unsigned kk = warp + 8u * (unsigned)i;
@@ -411,8 +445,8 @@ __device__ __forceinline__ void tc2_body(
     for (int i = 0; i < 4; i++) raw[i] = tc2_load_key(KV_cache, off_nxt[i], lane);
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        off_nxt[i] = tc2_key_off(sel_s, 2u * TC2_NK + warp + 8u * (unsigned)i, n_valid,
-                                 my_block_table, block_size, cache_stride_bytes);
+        tc2_key_page(sel_s, 2u * TC2_NK + warp + 8u * (unsigned)i, n_valid, my_block_table,
+                     block_size, pg_nxt[i], tin_nxt[i]);
     }
     // 2026-10-08: Publishes buffer 0; every warp has read its Q fragments out of buffer 1.
     __syncthreads();
@@ -434,11 +468,14 @@ __device__ __forceinline__ void tc2_body(
         // are TC2_NO_KEY and the loads return zeros without touching memory.
         tc2_store_tile<kBitCvt>(tc2_smem + (nbuf << 15), raw, warp, lane);
         #pragma unroll
-        for (int i = 0; i < 4; i++) raw[i] = tc2_load_key(KV_cache, off_nxt[i], lane);
+        for (int i = 0; i < 4; i++) {
+            raw[i] = tc2_load_key(KV_cache, tc2_page_off(pg_nxt[i], tin_nxt[i], cache_stride_bytes),
+                                  lane);
+        }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            off_nxt[i] = tc2_key_off(sel_s, (tile + 3u) * TC2_NK + warp + 8u * (unsigned)i,
-                                     n_valid, my_block_table, block_size, cache_stride_bytes);
+            tc2_key_page(sel_s, (tile + 3u) * TC2_NK + warp + 8u * (unsigned)i, n_valid,
+                         my_block_table, block_size, pg_nxt[i], tin_nxt[i]);
         }
 
         // 2026-10-08: Online softmax, verbatim (old step 4).

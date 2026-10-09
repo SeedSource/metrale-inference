@@ -16,6 +16,11 @@
 //! its down launch is timed too (`down_fast_us`, `down_fast_GBs`) and its bytes are compared to
 //! the car `_c8` down on every routing of every U, on the check routing with holes and on a
 //! ragged one (odd rows all -1, holes in the rest); any mismatch prints a FAIL line.
+//! 2026-10-09: When the image has `w4a16_gemv_sw_moe_batchm_gateup_m<R>`
+//! (METRALE_GLM_MOE_GATEUP_FAST), its one gate+up launch is timed too (`gateup_fast_us`, the
+//! combined time to compare with gate_us + up_us; `gateup_fast_GBs` counts both weight sets) and
+//! its gate and up bytes are compared to the car `_c8` gate and up launches on every routing of
+//! every U, on the check routing with holes and on a ragged one; any mismatch prints a FAIL line.
 //!
 //! Env: MOE_MT_ROWS (R, 2..=8, default 8), MOE_MT_UNIONS (comma list, clamped to R * 8).
 //! Run (GPU):
@@ -169,10 +174,43 @@ fn launch(
 }
 
 #[rustfmt::skip]
-struct Kerns { core: KernelHandle, car: KernelHandle, union: KernelHandle, fast: Option<KernelHandle> }
+struct Kerns { core: KernelHandle, car: KernelHandle, union: KernelHandle, fast: Option<KernelHandle>, gu: Option<KernelHandle> }
 const CORE_COLS: usize = 8;
 const CAR_COLS: usize = 64;
 const FAST_COLS: usize = 128;
+const GU_FAST_COLS: usize = 64;
+
+/// 2026-10-09: One `w4a16_gemv_sw_moe_batchm_gateup_m<R>` launch: gate (`tg`) into `cg` and up
+/// (`tu`) into `cu`, gate/up shape (N = MI, K = HIDDEN), x shared by every slot.
+#[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
+fn launch_gu(g: &dyn GpuBackend, h: KernelHandle, x: DevicePtr, tg: &Table, tu: &Table, cg: DevicePtr, cu: DevicePtr, rt: &Routing, rows: usize, s: u64) -> Result<()> {
+    KernelLaunch::new(g, h)
+        .grid([MI.div_ceil(GU_FAST_COLS) as u32, (rows * TOP_K) as u32, 1]).block([256, 1, 1])
+        .arg_ptr(x).arg_ptr(tg.packed).arg_ptr(tg.scale).arg_ptr(tg.scale2)
+        .arg_ptr(tu.packed).arg_ptr(tu.scale).arg_ptr(tu.scale2).arg_ptr(cg).arg_ptr(cu)
+        .arg_ptr(rt.ueid).arg_ptr(rt.uslot)
+        .arg_u32(MI as u32).arg_u32(HIDDEN as u32).arg_u32(NUM_EXPERTS as u32)
+        .arg_u32(HIDDEN as u32).arg_u32(0).arg_u32((TOP_K * MI) as u32)
+        .launch(s)
+}
+
+/// 2026-10-09: Car `_c8` gate and up vs one `gateup_m<R>` launch on `rt`: all four outputs
+/// poisoned first; true when gate bytes and up bytes are equal (and, for a non-empty union,
+/// some byte was written).
+#[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
+fn gateup_fast_same(g: &dyn GpuBackend, kz: &Kerns, gu: KernelHandle, x: DevicePtr, tg: &Table, tu: &Table, c: [DevicePtr; 4], rt: &Routing, rows: usize) -> Result<bool> {
+    let bytes = rows * TOP_K * MI * 2;
+    for d_c in c { g.memset_async(d_c, POISON, bytes, 0)?; }
+    launch(g, kz.car, CAR_COLS, x, tg, c[0], rt, rows, MI, HIDDEN, false, 0)?;
+    launch(g, kz.car, CAR_COLS, x, tu, c[1], rt, rows, MI, HIDDEN, false, 0)?;
+    launch_gu(g, gu, x, tg, tu, c[2], c[3], rt, rows, 0)?;
+    g.synchronize(0)?;
+    let y: Vec<Vec<u8>> = c.iter().map(|&p| dn(g, p, bytes)).collect::<Result<_>>()?;
+    let wrote = rt.union == 0 || (y[0].iter().any(|&b| b != POISON) && y[1].iter().any(|&b| b != POISON));
+    Ok(y[0] == y[2] && y[1] == y[3] && wrote)
+}
 
 /// 2026-10-08: Car `_c8` down vs `down_m<R>` on `rt`: both outputs poisoned first; true when the
 /// bytes are equal (and, for a non-empty union, some byte was written).
@@ -193,7 +231,7 @@ fn down_fast_same(g: &dyn GpuBackend, kz: &Kerns, fast: KernelHandle, a: DeviceP
 #[rustfmt::skip]
 struct LayerTabs { gate: Table, up: Table, down: Table }
 #[rustfmt::skip]
-struct Bufs { x: DevicePtr, act: DevicePtr, c_gu: DevicePtr, c_dn: DevicePtr }
+struct Bufs { x: DevicePtr, act: DevicePtr, c_gu: DevicePtr, c_up: DevicePtr, c_dn: DevicePtr }
 
 /// Median ms of one replay of the captured `f` (REPLAYS back to back per sample).
 #[rustfmt::skip]
@@ -218,14 +256,14 @@ fn time_graph(g: &dyn GpuBackend, s: u64, f: &mut dyn FnMut() -> Result<()>) -> 
     Ok(v[SAMPLES / 2])
 }
 
-/// us per layer of [gate, up, down, seq, down_fast]; seq is the three car launches back to
-/// back; down_fast is NaN without the entry.
+/// us per layer of [gate, up, down, seq, down_fast, gateup_fast]; seq is the three car launches
+/// back to back; down_fast / gateup_fast (one launch for both matrices) are NaN without the entry.
 #[allow(clippy::too_many_arguments)]
 #[rustfmt::skip]
-fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &[Routing], b: &Bufs, rows: usize) -> Result<[f64; 5]> {
-    let mut out = [f64::NAN; 5];
+fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &[Routing], b: &Bufs, rows: usize) -> Result<[f64; 6]> {
+    let mut out = [f64::NAN; 6];
     for (mode, o) in out.iter_mut().enumerate() {
-        if mode == 4 && kz.fast.is_none() { continue; }
+        if (mode == 4 && kz.fast.is_none()) || (mode == 5 && kz.gu.is_none()) { continue; }
         let ms = time_graph(g, s, &mut || {
             for l in 0..STEP_LAYERS {
                 let (lt, rt) = (&layers[l % LAYERS], &routs[l % routs.len()]);
@@ -233,6 +271,7 @@ fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &
                 if mode == 1 || mode == 3 { launch(g, kz.car, CAR_COLS, b.x, &lt.up, b.c_gu, rt, rows, MI, HIDDEN, false, s)?; }
                 if mode == 2 || mode == 3 { launch(g, kz.car, CAR_COLS, b.act, &lt.down, b.c_dn, rt, rows, HIDDEN, MI, true, s)?; }
                 if let (4, Some(h)) = (mode, kz.fast) { launch(g, h, FAST_COLS, b.act, &lt.down, b.c_dn, rt, rows, HIDDEN, MI, true, s)?; }
+                if let (5, Some(h)) = (mode, kz.gu) { launch_gu(g, h, b.x, &lt.gate, &lt.up, b.c_gu, b.c_up, rt, rows, s)?; }
             }
             Ok(())
         })?;
@@ -275,6 +314,20 @@ fn check(g: &dyn GpuBackend, kz: &Kerns, rng: &mut Rng, rows: usize) -> Result<u
             }
             free_routing(g, &rt2)?;
         }
+        if let (false, Some(gh)) = (down, kz.gu) {
+            let tu = make_table(g, &gen_host(rng, n, k), 4)?;
+            let c4 = [g.alloc(bytes)?, g.alloc(bytes)?, g.alloc(bytes)?, g.alloc(bytes)?];
+            let mut rag = random_ids(rng, rows);
+            for (r, row) in rag.iter_mut().enumerate() { for (s, e) in row.iter_mut().enumerate() { if r % 2 == 1 || (r + s) % 3 == 0 { *e = -1; } } }
+            let rt2 = build_routing(g, kz.union, &rag)?;
+            for (name, r) in [("holes", &rt), ("ragged", &rt2)] {
+                let ok = gateup_fast_same(g, kz, gh, d_a, &t, &tu, c4, r, rows)?;
+                println!("CHECK gateup_fast {name} R={rows} union={} fast==car {ok}", r.union);
+                if !ok { println!("FAIL gateup_fast {name} R={rows}: gate or up bytes differ from car _c8"); fails += 1; }
+            }
+            free_routing(g, &rt2)?;
+            for p in c4.into_iter().chain([tu.packed, tu.scale, tu.scale2]) { g.free(p)?; }
+        }
         free_routing(g, &rt)?;
         for p in [d_a, d_core, d_car, t.packed, t.scale, t.scale2] { g.free(p)?; }
     }
@@ -309,11 +362,13 @@ fn run() -> Result<i32> {
     let names = [format!("w4a16_gemv_sw_moe_batchm_m{rows}"), format!("w4a16_gemv_sw_moe_batchm_m{rows}_c8"), "glm5next_moe_row_union".into()];
     let fast = g.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_down_m{rows}")).ok();
     if fast.is_none() { println!("NOTE no w4a16_gemv_sw_moe_batchm_down_m{rows}: down_fast columns and checks skipped"); }
+    let gu = g.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_gateup_m{rows}")).ok();
+    if gu.is_none() { println!("NOTE no w4a16_gemv_sw_moe_batchm_gateup_m{rows}: gateup_fast columns and checks skipped"); }
     let mut hs = Vec::new();
     for n in &names {
         match g.kernel("w4a16_gemv", n) { Ok(h) => hs.push(h), Err(_) => { println!("MISSING kernel entry {n}"); return Ok(2); } }
     }
-    let kz = Kerns { core: hs[0], car: hs[1], union: hs[2], fast };
+    let kz = Kerns { core: hs[0], car: hs[1], union: hs[2], fast, gu };
     let mut rng = Rng(0x006d_6f65_6669_7863);
     let mut bad = check(g, &kz, &mut rng, rows)?;
     // Cold pool: LAYERS layers x (gate, up, down) x 288 distinct experts.
@@ -328,9 +383,12 @@ fn run() -> Result<i32> {
         x: up(g, &bf16_bytes(&mut rng, rows * HIDDEN))?,
         act: up(g, &bf16_bytes(&mut rng, rows * TOP_K * MI))?,
         c_gu: g.alloc(rows * TOP_K * MI * 2)?,
+        c_up: g.alloc(rows * TOP_K * MI * 2)?,
         c_dn: g.alloc(rows * TOP_K * HIDDEN * 2)?,
     };
     let c_cmp = [g.alloc(rows * TOP_K * HIDDEN * 2)?, g.alloc(rows * TOP_K * HIDDEN * 2)?];
+    let gu_bytes = rows * TOP_K * MI * 2;
+    let c_gu_cmp = [g.alloc(gu_bytes)?, g.alloc(gu_bytes)?, g.alloc(gu_bytes)?, g.alloc(gu_bytes)?];
     let (mut us, mut ts) = (Vec::new(), Vec::new());
     for &u in &unions {
         let routs: Vec<Routing> = (0..ROUTINGS)
@@ -339,8 +397,8 @@ fn run() -> Result<i32> {
         let t = time_u(g, s, &kz, &layers, &routs, &b, rows)?;
         let mu = routs.iter().map(|r| r.union as f64).sum::<f64>() / ROUTINGS as f64;
         let gbs = |us: f64| mu * (MI * HIDDEN) as f64 * BYTES_PER_W / us / 1e3;
-        println!("U={u} R={rows} gate_us={:.2} up_us={:.2} down_us={:.2} seq_us={:.2} gate_GBs={:.0} up_GBs={:.0} down_GBs={:.0} down_fast_us={:.2} down_fast_GBs={:.0}",
-            t[0], t[1], t[2], t[3], gbs(t[0]), gbs(t[1]), gbs(t[2]), t[4], gbs(t[4]));
+        println!("U={u} R={rows} gate_us={:.2} up_us={:.2} down_us={:.2} seq_us={:.2} gate_GBs={:.0} up_GBs={:.0} down_GBs={:.0} down_fast_us={:.2} down_fast_GBs={:.0} gateup_fast_us={:.2} gateup_fast_GBs={:.0}",
+            t[0], t[1], t[2], t[3], gbs(t[0]), gbs(t[1]), gbs(t[2]), t[4], gbs(t[4]), t[5], 2.0 * gbs(t[5]));
         if let Some(fh) = kz.fast {
             let mut all = true;
             for (i, rt) in routs.iter().enumerate() {
@@ -352,6 +410,17 @@ fn run() -> Result<i32> {
             }
             println!("CHECK down_fast U={u} R={rows} fast==car {all} ({ROUTINGS} routings)");
         }
+        if let Some(gh) = kz.gu {
+            let mut all = true;
+            for (i, rt) in routs.iter().enumerate() {
+                if !gateup_fast_same(g, &kz, gh, b.x, &layers[0].gate, &layers[0].up, c_gu_cmp, rt, rows)? {
+                    println!("FAIL gateup_fast U={u} R={rows} routing {i} union={}: gate or up bytes differ from car _c8", rt.union);
+                    bad += 1;
+                    all = false;
+                }
+            }
+            println!("CHECK gateup_fast U={u} R={rows} fast==car {all} ({ROUTINGS} routings)");
+        }
         us.push(mu);
         ts.push(t);
         for r in &routs { free_routing(g, r)?; }
@@ -360,8 +429,8 @@ fn run() -> Result<i32> {
     let sel: Vec<usize> = (0..us.len()).filter(|&i| us[i] >= 8.0).collect();
     if sel.len() >= 2 {
         let x: Vec<f64> = sel.iter().map(|&i| us[i]).collect();
-        for (m, name) in ["gate", "up", "down", "seq", "down_fast"].iter().enumerate() {
-            if m == 4 && kz.fast.is_none() { continue; }
+        for (m, name) in ["gate", "up", "down", "seq", "down_fast", "gateup_fast"].iter().enumerate() {
+            if (m == 4 && kz.fast.is_none()) || (m == 5 && kz.gu.is_none()) { continue; }
             let y: Vec<f64> = sel.iter().map(|&i| ts[i][m]).collect();
             let (sl, ic, res) = fit(&x, &y);
             println!("FIT {name}: slope_us_per_expert={sl:.3} intercept_us={ic:.2} resid_max_us={res:.2} (n={})", x.len());
@@ -373,8 +442,9 @@ fn run() -> Result<i32> {
         let t = ts[i];
         println!("U0 gate_us={:.2} up_us={:.2} down_us={:.2} seq_us={:.2}", t[0], t[1], t[2], t[3]);
     }
-    let fp = if kz.fast.is_some() { format!("; down_m{rows} bytes equal car _c8 on every routing") } else { String::new() };
-    if bad == 0 { println!("PASS: car _m{rows}_c8 bytes equal _m{rows} on gate/up and down{fp}; sweep done"); Ok(0) } else { println!("FAIL: {bad} byte check(s) failed (car vs core, down_fast vs car)"); Ok(1) }
+    let mut fp = if kz.fast.is_some() { format!("; down_m{rows} bytes equal car _c8 on every routing") } else { String::new() };
+    if kz.gu.is_some() { fp.push_str(&format!("; gateup_m{rows} gate and up bytes equal car _c8 on every routing")); }
+    if bad == 0 { println!("PASS: car _m{rows}_c8 bytes equal _m{rows} on gate/up and down{fp}; sweep done"); Ok(0) } else { println!("FAIL: {bad} byte check(s) failed (car vs core, down_fast vs car, gateup_fast vs car)"); Ok(1) }
 }
 
 fn main() {

@@ -298,6 +298,99 @@ fn batchm_down_fast(gpu: &dyn GpuBackend, rows: usize, kk: usize) -> Option<Kern
     Some(h)
 }
 
+/// 2026-10-09: Output columns per block of `w4a16_gemv_sw_moe_batchm_gateup_m<R>` (8 warps x 8),
+/// per matrix.
+const MOE_GATEUP_FAST_COLS: u32 = 64;
+
+/// 2026-10-09: `METRALE_GLM_MOE_GATEUP_FAST=1`: the gate and up union sweeps of a `rows`-row
+/// group run as ONE launch of `w4a16_gemv_sw_moe_batchm_gateup_m<R>`
+/// (kernels/gb10/common/w4a16_gemv.cu), each output bit-identical to `_m<R>` / `_m<R>_c<J>`,
+/// when `rows` is 2..=8 and the image has all seven entries (resolved once, ENGAGED logged
+/// once). Otherwise `None` keeps the two car launches.
+fn batchm_gateup_fast(gpu: &dyn GpuBackend, rows: usize) -> Option<KernelHandle> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static H: OnceLock<Option<Vec<KernelHandle>>> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("METRALE_GLM_MOE_GATEUP_FAST").as_deref() == Ok("1"));
+    if !on || !(2..=8).contains(&rows) {
+        return None;
+    }
+    let hs = H.get_or_init(|| {
+        (2..=8)
+            .map(|r| {
+                gpu.kernel(
+                    "w4a16_gemv",
+                    &format!("w4a16_gemv_sw_moe_batchm_gateup_m{r}"),
+                )
+                .ok()
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let h = hs.as_ref()?[rows - 2];
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_MOE_GATEUP_FAST=1: ENGAGED - row-batched MoE gate+up sweeps run \
+             w4a16_gemv_sw_moe_batchm_gateup_m<R> (one launch, bit-identical)"
+        );
+    });
+    Some(h)
+}
+
+/// 2026-10-09: The gate and up union sweeps of [`w4a16_gemv_moe_batchm`] (same `n`, `kk`,
+/// strides and union tables for both) as one `w4a16_gemv_sw_moe_batchm_gateup_m<R>` launch
+/// (grid x ceil(n / 64)). Returns `false` without launching when [`batchm_gateup_fast`] does
+/// not engage; the caller then runs the two car launches.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn w4a16_gemv_moe_batchm_gateup(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    gate: &Glm5NextExpertPtrTable,
+    up: &Glm5NextExpertPtrTable,
+    c_gate: DevicePtr,
+    c_up: DevicePtr,
+    u_eid: DevicePtr,
+    u_slot: DevicePtr,
+    n: usize,
+    kk: usize,
+    rows: usize,
+    top_k: usize,
+    num_experts: usize,
+    a_row_stride: usize,
+    a_slot_stride: usize,
+    c_row_stride: usize,
+    stream: u64,
+) -> Result<bool> {
+    let Some(k) = batchm_gateup_fast(gpu, rows) else {
+        return Ok(false);
+    };
+    KernelLaunch::new(gpu, k)
+        .grid([
+            div_ceil(n as u32, MOE_GATEUP_FAST_COLS),
+            (rows * top_k) as u32,
+            1,
+        ])
+        .block([256, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(gate.packed_ptrs)
+        .arg_ptr(gate.scale_ptrs)
+        .arg_ptr(gate.scale2_vals)
+        .arg_ptr(up.packed_ptrs)
+        .arg_ptr(up.scale_ptrs)
+        .arg_ptr(up.scale2_vals)
+        .arg_ptr(c_gate)
+        .arg_ptr(c_up)
+        .arg_ptr(u_eid)
+        .arg_ptr(u_slot)
+        .arg_u32(n as u32)
+        .arg_u32(kk as u32)
+        .arg_u32(num_experts as u32)
+        .arg_u32(a_row_stride as u32)
+        .arg_u32(a_slot_stride as u32)
+        .arg_u32(c_row_stride as u32)
+        .launch(stream)?;
+    Ok(true)
+}
+
 /// 2026-10-08: The `_c<J>` entry for a `rows`-row sweep and its J, when [`moe_batchm_cols`] is
 /// above 1 and the image has all seven entries for that J (resolved once, ENGAGED logged once).
 fn batchm_cols(gpu: &dyn GpuBackend, rows: usize) -> Option<(KernelHandle, u32)> {

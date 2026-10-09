@@ -503,4 +503,6 @@ pub fn forward_moe_sliced(
 }
 
 #[cfg(test)]
+mod gateup_fast_emu_tests;
+#[cfg(test)]
 mod tests;

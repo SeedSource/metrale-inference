@@ -3114,3 +3114,252 @@ METRALE_MOE_BATCHM_DOWN_ENTRY(5)
 METRALE_MOE_BATCHM_DOWN_ENTRY(6)
 METRALE_MOE_BATCHM_DOWN_ENTRY(7)
 METRALE_MOE_BATCHM_DOWN_ENTRY(8)
+
+// 2026-10-09: METRALE_GLM_MOE_GATEUP_FAST. w4a16_gemv_sw_moe_batchm_gateup_m<R>: the gate AND up
+// union sweeps of one row group in ONE launch, each output byte-identical to
+// w4a16_gemv_sw_moe_batchm_m<R> (and so to _m<R>_c<J>) on that matrix. Arguments: A, the gate
+// table (packed, scale, scale2), the up table, C_gate, C_up, then u_eid .. c_row_stride as in
+// _m<R> (N, K and the strides are shared by both matrices). Grid (ceil(N / 64), rows * top_k),
+// block 256; warp w of block bx computes column n = bx * 64 + 8 j + w, j = 0..7, of BOTH
+// matrices.
+//
+// Work sharing. Per column, each (chunk, row) activation load (two uint4, the reference's own
+// global loads) feeds both the gate and the up chain, and each chunk's 16 weights per matrix
+// are dequantized once (LUT reads) and reused across the R rows. The car issues the row loads
+// once per matrix and 16 LUT reads per row per chunk per matrix.
+//
+// Bit-equality, any K (K16 = K / 16; GLM-5.3 gate/up: K = hidden = 4096, K16 = 256). In
+// w4a16_gemv_partial_rows<R>, orig lane o (chain a: o = lane, chain b: o = lane + 32) runs
+// chunks kk = 2o + 128 i + h for i = 0, 1, .. while kk < K16 (the loop's `K16 + 1` bound only
+// adds an iteration that breaks before any arithmetic), h = 0 into acc0 and h = 1 into acc1,
+// each acc = fmaf(scale, part, acc) from 0.0f in increasing i, with part the 16-step fmaf chain
+// from 0.0f over elements kk*16 + e (weight LUT[nibble e of the 8-byte word], activation the
+// exact BF16 -> FP32 value, element pairs from __bfloat1622float2) and scale = fp8 * scale2;
+// out = acc0 + acc1 (a lane with no chunk gives +0.0). acc_a and acc_b each go through the
+// 5-level shuffle-down tree and lane 0 stores bf16(acc_a + acc_b). This kernel runs, per lane,
+// per chain and per h, exactly those fmaf chains in increasing i with the same operands, then
+// acc0 + acc1. Each chain's tree is evaluated node by node like the down entry: V = 2 * RP
+// values per lane (index matrix * RP + row, RP = R padded to 2, 4 or 8), log2(V) transposed
+// levels (at offset o the lane with bit o clear keeps values [0, h), the other [h, 2h), each
+// adds its partner's copy, one __shfl_xor_sync per pair), then a plain xor butterfly over the
+// remaining offsets. Each tree node is the same two FP32 operands added once (addition
+// commutes). Both chains' trees leave value m on the same lane, which stores
+// bf16(t_a + t_b). --fmad=false (common/KERNEL.toml): no mul/add pair is contracted.
+#define MOE_GATEUP_FAST_COLS_PER_WARP 8
+
+// 2026-10-09: One chain's shuffle-down tree over V values, transposed then butterfly; returns
+// the node value this lane holds (meaningful on holder lanes, see the caller).
+template <int V, int LOGV>
+__device__ __forceinline__ float moe_gateup_tree(float (&v)[V], unsigned int lane)
+{
+    #pragma unroll
+    for (int s = 0; s < LOGV; s++) {
+        const unsigned int o = 16u >> s;
+        const int hh = V >> (s + 1);
+        const bool hi = (lane & o) != 0u;
+        #pragma unroll
+        for (int k = 0; k < hh; k++) {
+            const float keep = hi ? v[k + hh] : v[k];
+            const float send = hi ? v[k] : v[k + hh];
+            const float recv = __shfl_xor_sync(0xFFFFFFFF, send, o);
+            v[k] = __fadd_rn(keep, recv);
+        }
+    }
+    float t = v[0];
+    #pragma unroll
+    for (unsigned int o = 16u >> LOGV; o > 0u; o >>= 1) {
+        t = __fadd_rn(t, __shfl_xor_sync(0xFFFFFFFF, t, o));
+    }
+    return t;
+}
+
+template <int R>
+__device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ g_packed_ptrs,
+    const unsigned long long* __restrict__ g_scale_ptrs,
+    const float* __restrict__ g_scale2_vals,
+    const unsigned long long* __restrict__ u_packed_ptrs,
+    const unsigned long long* __restrict__ u_scale_ptrs,
+    const float* __restrict__ u_scale2_vals,
+    __nv_bfloat16* __restrict__ C_gate,
+    __nv_bfloat16* __restrict__ C_up,
+    const int* __restrict__ u_eid,
+    const int* __restrict__ u_slot,
+    unsigned int N, unsigned int K, unsigned int num_experts,
+    unsigned int a_row_stride,
+    unsigned int a_slot_stride,
+    unsigned int c_row_stride)
+{
+    constexpr int RP = (R <= 2) ? 2 : ((R <= 4) ? 4 : 8);
+    constexpr int V = 2 * RP;
+    constexpr int LOGV = (V == 4) ? 2 : ((V == 8) ? 3 : 4);
+    __shared__ float s_lut[16];
+
+    const unsigned int u = blockIdx.y;
+    const int eid = u_eid[u];
+    if (eid < 0 || (unsigned int)eid >= num_experts) return;
+    const unsigned char* Bp0 = (const unsigned char*)g_packed_ptrs[eid];
+    const unsigned char* Bp1 = (const unsigned char*)u_packed_ptrs[eid];
+    // 2026-10-09: The car's launch for a matrix returns on a null packed pointer; here that
+    // matrix's outputs stay unwritten and the other matrix still runs.
+    const bool ok0 = Bp0 != 0, ok1 = Bp1 != 0;
+    if (!ok0 && !ok1) return;
+    const unsigned char* Bs0 = ok0 ? (const unsigned char*)g_scale_ptrs[eid] : nullptr;
+    const unsigned char* Bs1 = ok1 ? (const unsigned char*)u_scale_ptrs[eid] : nullptr;
+    const float s20 = ok0 ? g_scale2_vals[eid] : 0.0f;
+    const float s21 = ok1 ? u_scale2_vals[eid] : 0.0f;
+
+    // 2026-10-09: Live rows as a bit mask and 32-bit element offsets into A.
+    unsigned int aoff[R];
+    unsigned int live = 0u;
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        const int sl = u_slot[u * R + r];
+        aoff[r] = 0u;
+        if (sl < 0) continue;
+        aoff[r] = (unsigned int)r * a_row_stride + (unsigned int)sl * a_slot_stride;
+        live |= 1u << r;
+    }
+    if (live == 0u) return;
+
+    const unsigned int tid = threadIdx.x;
+#if METRALE_WARP_LUT_STAGED
+    if (tid < 16u) s_lut[tid] = E2M1_LUT[tid];
+    __syncthreads();
+    const float* __restrict__ lut = s_lut;
+#else
+    const float* __restrict__ lut = E2M1_LUT;
+#endif
+    // 2026-10-09: No block barrier below; a warp past N leaves on its own.
+
+    const unsigned int w = tid / WARP_SIZE;
+    const unsigned int lane = tid % WARP_SIZE;
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    // 2026-10-09: The value this lane stores after the trees: m = lane / (32 / V) when
+    // lane % (32 / V) == 0; matrix m / RP (0 gate, 1 up), row m % RP.
+    const unsigned int m = lane >> (5 - LOGV);
+    const bool holder = (lane & ((32u >> LOGV) - 1u)) == 0u;
+    const unsigned int my_mat = m / RP, my_r = m % RP;
+    int my_slot = -1;
+    if (holder && my_r < (unsigned int)R && (my_mat ? ok1 : ok0)) my_slot = u_slot[u * R + my_r];
+    __nv_bfloat16* __restrict__ Cm = my_mat ? C_up : C_gate;
+
+    #pragma unroll 1
+    for (int j = 0; j < MOE_GATEUP_FAST_COLS_PER_WARP; j++) {
+        const unsigned int n =
+            blockIdx.x * (N_PER_BLOCK_SW * MOE_GATEUP_FAST_COLS_PER_WARP)
+            + (unsigned int)j * N_PER_BLOCK_SW + w;
+        if (n >= N) break;
+        const unsigned long long wo = (unsigned long long)n * half_K;
+        const unsigned long long so = (unsigned long long)n * num_groups;
+
+        float t[2];
+        #pragma unroll
+        for (int ch = 0; ch < 2; ch++) {
+            // 2026-10-09: v[mat * RP + r] = this chain's acc0 + acc1 for (mat, r).
+            float v[V];
+            #pragma unroll
+            for (int i = 0; i < V; i++) v[i] = 0.0f;
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                float acc0[R], acc1[R];
+                #pragma unroll
+                for (int r = 0; r < R; r++) { acc0[r] = 0.0f; acc1[r] = 0.0f; }
+                #pragma unroll 1
+                for (unsigned int kk = 2u * (lane + 32u * (unsigned int)ch) + (unsigned int)h;
+                     kk < K16; kk += 128u) {
+                    const unsigned long long q0 = ok0 ? *(const unsigned long long*)(Bp0 + wo + kk * 8) : 0ull;
+                    const unsigned long long q1 = ok1 ? *(const unsigned long long*)(Bp1 + wo + kk * 8) : 0ull;
+                    const unsigned char b0 = ok0 ? Bs0[so + kk] : (unsigned char)0;
+                    const unsigned char b1 = ok1 ? Bs1[so + kk] : (unsigned char)0;
+                    __nv_fp8_e4m3 f0, f1;
+                    *(unsigned char*)&f0 = b0;
+                    *(unsigned char*)&f1 = b1;
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+                    const float sc0 = scl_fp8(b0) * s20;
+                    const float sc1 = scl_fp8(b1) * s21;
+#else
+                    const float sc0 = (float)f0 * s20;
+                    const float sc1 = (float)f1 * s21;
+#endif
+                    float w0[16], w1[16];
+                    #pragma unroll
+                    for (int e = 0; e < 16; e++) {
+                        w0[e] = lut[(unsigned int)(q0 >> (4 * e)) & 0xFu];
+                        w1[e] = lut[(unsigned int)(q1 >> (4 * e)) & 0xFu];
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < R; r++) {
+                        if (!(live & (1u << r))) continue;
+                        const uint4* ar = (const uint4*)(A + aoff[r]);
+                        const uint4 a_lo = ar[kk * 2];
+                        const uint4 a_hi = ar[kk * 2 + 1];
+                        const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                                       a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+                        float pg = 0.0f, pu = 0.0f;
+                        #pragma unroll
+                        for (int b = 0; b < 8; b++) {
+                            const float2 af = __bfloat1622float2(*(const __nv_bfloat162*)&a_raw[b]);
+                            pg = fmaf(af.x, w0[2 * b], pg);
+                            pg = fmaf(af.y, w0[2 * b + 1], pg);
+                            pu = fmaf(af.x, w1[2 * b], pu);
+                            pu = fmaf(af.y, w1[2 * b + 1], pu);
+                        }
+                        acc0[r] = fmaf(sc0, pg, acc0[r]);
+                        acc1[r] = fmaf(sc1, pu, acc1[r]);
+                    }
+                }
+                // 2026-10-09: acc0/acc1 here are the gate/up accumulators of chunk parity h.
+                // h = 0 parks them in v; h = 1 adds: out = acc(h=0) + acc(h=1), as the car.
+                #pragma unroll
+                for (int r = 0; r < R; r++) {
+                    if (h == 0) { v[r] = acc0[r]; v[RP + r] = acc1[r]; }
+                    else {
+                        v[r] = __fadd_rn(v[r], acc0[r]);
+                        v[RP + r] = __fadd_rn(v[RP + r], acc1[r]);
+                    }
+                }
+            }
+            t[ch] = moe_gateup_tree<V, LOGV>(v, lane);
+        }
+
+        // 2026-10-09: result = acc_a + acc_b, both trees' lane-0 nodes for (mat, row).
+        if (my_slot >= 0) {
+            const float result = __fadd_rn(t[0], t[1]);
+            Cm[(unsigned long long)my_r * c_row_stride
+               + (unsigned long long)my_slot * N + n] = __float2bfloat16(result);
+        }
+    }
+}
+
+#define METRALE_MOE_BATCHM_GATEUP_ENTRY(R)                                           \
+extern "C" __global__ __launch_bounds__(256, 2) void w4a16_gemv_sw_moe_batchm_gateup_m##R( \
+    const __nv_bfloat16* __restrict__ A,                                           \
+    const unsigned long long* __restrict__ g_packed_ptrs,                          \
+    const unsigned long long* __restrict__ g_scale_ptrs,                           \
+    const float* __restrict__ g_scale2_vals,                                       \
+    const unsigned long long* __restrict__ u_packed_ptrs,                          \
+    const unsigned long long* __restrict__ u_scale_ptrs,                           \
+    const float* __restrict__ u_scale2_vals,                                       \
+    __nv_bfloat16* __restrict__ C_gate,                                            \
+    __nv_bfloat16* __restrict__ C_up,                                              \
+    const int* __restrict__ u_eid,                                                 \
+    const int* __restrict__ u_slot,                                                \
+    unsigned int N, unsigned int K, unsigned int num_experts,                      \
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
+{                                                                                  \
+    w4a16_gemv_sw_moe_batchm_gateup_body<R>(A, g_packed_ptrs, g_scale_ptrs,        \
+        g_scale2_vals, u_packed_ptrs, u_scale_ptrs, u_scale2_vals, C_gate, C_up,   \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+}
+METRALE_MOE_BATCHM_GATEUP_ENTRY(2)
+METRALE_MOE_BATCHM_GATEUP_ENTRY(3)
+METRALE_MOE_BATCHM_GATEUP_ENTRY(4)
+METRALE_MOE_BATCHM_GATEUP_ENTRY(5)
+METRALE_MOE_BATCHM_GATEUP_ENTRY(6)
+METRALE_MOE_BATCHM_GATEUP_ENTRY(7)
+METRALE_MOE_BATCHM_GATEUP_ENTRY(8)

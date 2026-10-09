@@ -12,7 +12,10 @@ use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
-use super::launch::{swiglu, union_kernel, w4a16_gemv, w4a16_gemv_moe, w4a16_gemv_moe_batchm};
+use super::launch::{
+    swiglu, union_kernel, w4a16_gemv, w4a16_gemv_moe, w4a16_gemv_moe_batchm,
+    w4a16_gemv_moe_batchm_gateup,
+};
 use super::{Glm5NextMlpWorkspace, announce_dispatch, host_dispatch_forced};
 use crate::glm5next_layer::profile;
 use crate::glm5next_mlp::weights::Glm5NextMoeWeights;
@@ -266,31 +269,14 @@ pub(super) fn row_batched_experts(site: &MoeSite<'_>, groups: &[(usize, usize)])
             .launch(stream)?;
 
         let kb = k.w4a16_gemv_sw_moe_batchm[w_rows - 2];
-        w4a16_gemv_moe_batchm(
+        // 2026-10-09: METRALE_GLM_MOE_GATEUP_FAST=1 runs gate and up as one launch
+        // (bit-identical); off or unavailable, the two launches below run as before.
+        let fused = w4a16_gemv_moe_batchm_gateup(
             gpu,
-            false,
-            kb,
             x.offset(r0 * cfg.hidden * 2),
             &w.ptrs.gate,
-            ws.a_gate.offset(r0 * cfg.top_k * mi * 2),
-            ws.u_eid,
-            ws.u_slot,
-            mi,
-            cfg.hidden,
-            w_rows,
-            cfg.top_k,
-            cfg.num_experts,
-            cfg.hidden,
-            0,
-            cfg.top_k * mi,
-            stream,
-        )?;
-        w4a16_gemv_moe_batchm(
-            gpu,
-            false,
-            kb,
-            x.offset(r0 * cfg.hidden * 2),
             &w.ptrs.up,
+            ws.a_gate.offset(r0 * cfg.top_k * mi * 2),
             ws.a_up.offset(r0 * cfg.top_k * mi * 2),
             ws.u_eid,
             ws.u_slot,
@@ -304,6 +290,46 @@ pub(super) fn row_batched_experts(site: &MoeSite<'_>, groups: &[(usize, usize)])
             cfg.top_k * mi,
             stream,
         )?;
+        if !fused {
+            w4a16_gemv_moe_batchm(
+                gpu,
+                false,
+                kb,
+                x.offset(r0 * cfg.hidden * 2),
+                &w.ptrs.gate,
+                ws.a_gate.offset(r0 * cfg.top_k * mi * 2),
+                ws.u_eid,
+                ws.u_slot,
+                mi,
+                cfg.hidden,
+                w_rows,
+                cfg.top_k,
+                cfg.num_experts,
+                cfg.hidden,
+                0,
+                cfg.top_k * mi,
+                stream,
+            )?;
+            w4a16_gemv_moe_batchm(
+                gpu,
+                false,
+                kb,
+                x.offset(r0 * cfg.hidden * 2),
+                &w.ptrs.up,
+                ws.a_up.offset(r0 * cfg.top_k * mi * 2),
+                ws.u_eid,
+                ws.u_slot,
+                mi,
+                cfg.hidden,
+                w_rows,
+                cfg.top_k,
+                cfg.num_experts,
+                cfg.hidden,
+                0,
+                cfg.top_k * mi,
+                stream,
+            )?;
+        }
         // 2026-09-25: Every (row, slot) at once. A remote slot's rows hold stale values; the
         // down projection skips that slot.
         swiglu(

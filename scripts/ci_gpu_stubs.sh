@@ -200,6 +200,8 @@ cat > /tmp/libcublaslt_stub.c <<'EOF'
 int cublasLtCreate(void){return 1;}
 int cublasLtDestroy(void){return 1;}
 int cublasLtMatmul(void){return 1;}
+int cublasLtMatmulAlgoCheck(void){return 1;}
+int cublasLtMatmulAlgoConfigGetAttribute(void){return 1;}
 int cublasLtMatmulAlgoGetHeuristic(void){return 1;}
 int cublasLtMatmulDescCreate(void){return 1;}
 int cublasLtMatmulDescDestroy(void){return 1;}

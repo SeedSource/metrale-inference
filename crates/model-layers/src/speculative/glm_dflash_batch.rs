@@ -69,7 +69,29 @@ pub fn glm_dflash_perseq_k4() -> bool {
 /// a GLM-5.3 target with either lever on.
 pub fn glm_dflash_multi_k(model_type: &str, batched: bool, perseq_k4: bool) -> Option<usize> {
     let glm = matches!(model_type, "glm5_next" | "glm5_next_text");
-    (glm && (batched || perseq_k4)).then_some(GLM_DFLASH_MULTI_K)
+    (glm && (batched || perseq_k4)).then_some(glm_dflash_multi_k_env())
+}
+
+/// 2026-10-09: `METRALE_GLM_DFLASH_MULTI_K=<2..=4>` (test lever, default [`GLM_DFLASH_MULTI_K`]):
+/// the C >= 2 width under either lever, for measuring the batched verify cost per width. A value
+/// outside 2..=4 keeps the default and warns once. Read once per process.
+pub fn glm_dflash_multi_k_env() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| match std::env::var("METRALE_GLM_DFLASH_MULTI_K") {
+        Err(_) => GLM_DFLASH_MULTI_K,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(k) if (2..=4).contains(&k) => {
+                tracing::warn!("METRALE_GLM_DFLASH_MULTI_K={k}: ENGAGED - GLM DFlash C>=2 width K={k}");
+                k
+            }
+            _ => {
+                tracing::warn!(
+                    "METRALE_GLM_DFLASH_MULTI_K={v:?} outside 2..=4; keeping K={GLM_DFLASH_MULTI_K}"
+                );
+                GLM_DFLASH_MULTI_K
+            }
+        },
+    })
 }
 
 /// 2026-10-09: Whether the batched verify may run with a comm backend: the multi-rank protocol

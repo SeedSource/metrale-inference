@@ -200,10 +200,11 @@ pub(super) fn w4a16_gemv_moe(
 /// 2026-09-25: The routed slots of `rows` rows, reading each selected expert's weights once:
 /// grid.y walks the `rows * top_k` union entries of `glm5next_moe_row_union` (`u_eid`,
 /// `u_slot`), and an unused entry (`u_eid < 0`) returns at once. The union tables stay on the
-/// device.
+/// device. `down` marks the down projection, which [`batchm_down_fast`] may take.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn w4a16_gemv_moe_batchm(
     gpu: &dyn GpuBackend,
+    down: bool,
     k: KernelHandle,
     a: DevicePtr,
     t: &Glm5NextExpertPtrTable,
@@ -220,9 +221,11 @@ pub(super) fn w4a16_gemv_moe_batchm(
     c_row_stride: usize,
     stream: u64,
 ) -> Result<()> {
-    let (k, grid_x) = match batchm_cols(gpu, rows) {
-        Some((h, j)) => (h, div_ceil(n as u32, 8 * j)),
-        None => (
+    let fast = if down { batchm_down_fast(gpu, rows, kk) } else { None };
+    let (k, grid_x) = match (fast, batchm_cols(gpu, rows)) {
+        (Some(h), _) => (h, div_ceil(n as u32, MOE_DOWN_FAST_COLS)),
+        (None, Some((h, j))) => (h, div_ceil(n as u32, 8 * j)),
+        (None, None) => (
             k,
             metrale_model_layers::layers::ops::w4a16_gemv_sw_grid_x(n as u32),
         ),
@@ -260,6 +263,39 @@ pub fn moe_batchm_cols() -> u32 {
             _ => 1,
         },
     )
+}
+
+/// 2026-10-08: Output columns per block of `w4a16_gemv_sw_moe_batchm_down_m<R>` (8 warps x 16).
+const MOE_DOWN_FAST_COLS: u32 = 128;
+
+/// 2026-10-08: `METRALE_GLM_MOE_DOWN_FAST=1`: the down projection's union sweep runs
+/// `w4a16_gemv_sw_moe_batchm_down_m<R>` (kernels/gb10/common/w4a16_gemv.cu), bit-identical to
+/// `_m<R>` / `_m<R>_c<J>`, when `rows` is 2..=8, K <= 1024 and the image has all seven entries
+/// (resolved once, ENGAGED logged once). Otherwise `None` keeps the car entry.
+fn batchm_down_fast(gpu: &dyn GpuBackend, rows: usize, kk: usize) -> Option<KernelHandle> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static H: OnceLock<Option<Vec<KernelHandle>>> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("METRALE_GLM_MOE_DOWN_FAST").as_deref() == Ok("1"));
+    if !on || !(2..=8).contains(&rows) || kk > 1024 {
+        return None;
+    }
+    let hs = H.get_or_init(|| {
+        (2..=8)
+            .map(|r| {
+                gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_down_m{r}"))
+                    .ok()
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let h = hs.as_ref()?[rows - 2];
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "METRALE_GLM_MOE_DOWN_FAST=1: ENGAGED - row-batched MoE down sweeps run \
+             w4a16_gemv_sw_moe_batchm_down_m<R> (bit-identical)"
+        );
+    });
+    Some(h)
 }
 
 /// 2026-10-08: The `_c<J>` entry for a `rows`-row sweep and its J, when [`moe_batchm_cols`] is

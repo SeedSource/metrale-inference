@@ -18,6 +18,15 @@
 //!   `b3plain` line), per-step weighted sums.
 //! - (d) `GATE` lines: invariance, accuracy, speed (GO: M=8 saves >= 3.0 ms and M=3 delta
 //!   <= +0.3 ms; KILL: M=8 saves < 1.5 ms).
+//! - (e) 2026-10-09, `METRALE_GLM_NV4_TC_GROUP`: the grouped persistent entries
+//!   (`w4a16_gemv_tc8_group` / `_tc16_group`). Bytes: for every `GROUPS` entry, every
+//!   production shape above as a one-member group and an edge group, at M = 1..=16, at the
+//!   production grid (`gemv_tc::tc_group_launch`: min(tiles, SMs x resident CTAs)) and at a
+//!   7-CTA grid, every output byte of every member (rows < M) equals the plain tc8/tc16 launch
+//!   and rows >= M stay unwritten; a mismatch is an invariance failure (GATE invariance FAIL).
+//!   Timing: per group at M = 2, 3, 4, 8, the plain per-projection tc launches against one
+//!   grouped launch over a cold pool, weighted by groups per step:
+//!   `TIMING SUMMARY GROUP M=.. per step: tc .. ms -> group .. ms, saves .. ms`.
 //!
 //! Prints `PASS: ...` and exits 0 iff invariance and accuracy pass, else `FAIL ...` (exit 1);
 //! exit 2 when the kernels are missing. Speed only prints its verdict.
@@ -32,6 +41,7 @@ use half::bf16;
 use metrale_gpu_runtime::cuda_backend::MetraleCudaBackend;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::{KernelLaunch, div_ceil};
+use metrale_model_layers::layers::ops::gemv_tc::{self, TcGroupMember};
 use metrale_model_layers::weight_map::{DenseWeight, QuantizedWeight, quantize_to_nvfp4};
 
 /// (N, K, label, launches per decode step per rank).
@@ -50,6 +60,21 @@ const SHAPES: &[(usize, usize, &str, usize)] = &[
     (4098, 2064, "K16=129", 0),
     (4096, 1040, "K16=65", 0),
 ];
+/// 2026-10-09: (label, N of each member, K, groups per decode step per rank), from `SHAPES`:
+/// `kda_qkvo` 136 = 34 KDA layers x q/k/v/o (o reads the attention output, so q/k/v group);
+/// `shexp_gate_up` 84 = 42 x gate/up; `dense_gate_up` 6 = 3 x gate/up; `dsa_q_a` and
+/// `dsa_kv_a` 11 each = 11 DSA layers x one q_a/kv_a pair.
+const GROUPS: &[(&str, &[usize], usize, usize)] = &[
+    ("kda_qkv", &[4096, 4096, 4096], 4096, 34),
+    ("shexp_gate_up", &[1024, 1024], 4096, 42),
+    ("dense_gate_up", &[6144, 6144], 4096, 3),
+    ("dsa_q_a_kv_a", &[1536, 512], 4096, 11),
+    // Edge group (no per-step weight): a partial last tile, an N below one tile, and N % 4 = 1.
+    ("edge", &[4097, 5, 1027], 1024, 0),
+];
+/// 2026-10-09: Rows timed for the grouped launch; the forced small grid of the byte check.
+const GROUP_TIME_M: &[usize] = &[2, 3, 4, 8];
+const GROUP_SMALL_GRID: u32 = 7;
 const POOL_NV4_BYTES: usize = 256 << 20;
 /// Rows timed (c) and checked against the CPU reference (b).
 const TIME_M: &[usize] = &[1, 2, 3, 4, 8, 12, 16];
@@ -124,6 +149,8 @@ struct Kq {
     quant: KernelHandle,
     tc8: KernelHandle,
     tc16: KernelHandle,
+    tc8g: KernelHandle,
+    tc16g: KernelHandle,
     cc: Vec<KernelHandle>,
 }
 
@@ -152,6 +179,8 @@ fn resolve(g: &dyn GpuBackend) -> Option<Kq> {
         quant: k("quantize_nvfp4", "quantize_bf16_to_nvfp4_mse")?,
         tc8: k("w4a16_gemv_tc", "w4a16_gemv_tc8")?,
         tc16: k("w4a16_gemv_tc", "w4a16_gemv_tc16")?,
+        tc8g: k("w4a16_gemv_tc", "w4a16_gemv_tc8_group")?,
+        tc16g: k("w4a16_gemv_tc", "w4a16_gemv_tc16_group")?,
         cc: cc.collect::<Option<Vec<_>>>()?,
     })
 }
@@ -253,6 +282,7 @@ fn to_u16(b: &[u8]) -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes([
 struct Stats {
     row_cmp: usize,
     tc_cmp: usize,
+    grp_cmp: usize,
     inv_fail: usize,
     acc_fail: usize,
 }
@@ -407,6 +437,144 @@ fn timing(g: &dyn GpuBackend, k: &Kq, rng: &mut Lcg, sums: &mut [[f64; 7]; 3], s
     g.free(c)
 }
 
+/// 2026-10-09: The production persistent CTA cap of a grouped entry (SMs x resident CTAs per
+/// SM at 256 threads; 0 when the backend cannot say).
+fn group_cap(g: &dyn GpuBackend, h: KernelHandle) -> u32 {
+    let sms = g.sm_count().unwrap_or(0);
+    sms.saturating_mul(g.max_active_blocks_per_sm(h, 256, 0).unwrap_or(0))
+}
+
+/// 2026-10-09: One grouped launch of `qs` / `outs` / `ns` on input `a` at `grid_x` CTAs (the
+/// entry's argument order: A, M, K, then three (B_packed, B_scale, scale2, C, N) slots).
+#[rustfmt::skip]
+#[allow(clippy::too_many_arguments)]
+fn launch_group(g: &dyn GpuBackend, k: &Kq, a: DevicePtr, qs: &[&QuantizedWeight], outs: &[DevicePtr], ns: &[usize], m: usize, kd: usize, grid_x: u32, s: u64) -> Result<()> {
+    let h = if m > 8 { k.tc16g } else { k.tc8g };
+    let mut l = KernelLaunch::new(g, h).grid([grid_x, 1, 1]).block([256, 1, 1])
+        .arg_ptr(a).arg_u32(m as u32).arg_u32(kd as u32);
+    for i in 0..3 {
+        l = match qs.get(i) {
+            Some(q) => l.arg_ptr(q.weight).arg_ptr(q.weight_scale).arg_f32(q.weight_scale_2)
+                .arg_ptr(outs[i]).arg_u32(ns[i] as u32),
+            None => l.arg_ptr(DevicePtr(0)).arg_ptr(DevicePtr(0)).arg_f32(0.0)
+                .arg_ptr(DevicePtr(0)).arg_u32(0),
+        };
+    }
+    l.launch(s)
+}
+
+/// 2026-10-09: (e) bytes of a group: for M = 1..=16, the production grid (through
+/// `gemv_tc::tc_group_launch`) and a `GROUP_SMALL_GRID` grid, every member's output against
+/// its plain tc8/tc16 launch, rows >= M poisoned and unwritten.
+#[rustfmt::skip]
+fn group_check(g: &dyn GpuBackend, k: &Kq, rng: &mut Lcg, st: &mut Stats, grp: (&str, &[usize], usize, usize)) -> Result<()> {
+    let (label, ns, kd, _) = grp;
+    let s = g.default_stream();
+    let mut qs = Vec::new();
+    for &n in ns {
+        qs.push(quantize(g, k, &gen_weight(rng, n, kd, true), n, kd)?);
+    }
+    let ad = up_bf16(g, &gen_act(rng, 16, kd, 2))?;
+    let refs: Vec<DevicePtr> = ns.iter().map(|&n| g.alloc(17 * n * 2)).collect::<Result<_>>()?;
+    let outs: Vec<DevicePtr> = ns.iter().map(|&n| g.alloc(17 * n * 2)).collect::<Result<_>>()?;
+    let qr: Vec<&QuantizedWeight> = qs.iter().collect();
+    for m in 1..=16usize {
+        for (i, &n) in ns.iter().enumerate() {
+            launch_tc(g, k, false, Job { a: ad, q: &qs[i], c: refs[i], m, n, kd }, s)?;
+        }
+        g.synchronize(s)?;
+        let want: Vec<Vec<u8>> = ns.iter().enumerate().map(|(i, &n)| dn_bytes(g, refs[i], m * n * 2)).collect::<Result<_>>()?;
+        for grid in [None, Some(GROUP_SMALL_GRID)] {
+            for (i, &n) in ns.iter().enumerate() {
+                g.copy_h2d(&vec![0xA5u8; 17 * n * 2], outs[i])?;
+            }
+            match grid {
+                None => {
+                    let mem: Vec<TcGroupMember> = (0..ns.len()).map(|i| TcGroupMember { weight: &qs[i], out: outs[i], n: ns[i] as u32 }).collect();
+                    if !gemv_tc::tc_group_launch(g, ad, &mem, m as u32, kd as u32, s)? {
+                        st.inv(format!("FAIL group {label} M={m}: tc_group_launch declined"));
+                        continue;
+                    }
+                }
+                Some(gx) => launch_group(g, k, ad, &qr, &outs, ns, m, kd, gx, s)?,
+            }
+            g.synchronize(s)?;
+            let gname = grid.map_or("production".to_string(), |x| format!("{x}"));
+            for (i, &n) in ns.iter().enumerate() {
+                st.grp_cmp += 1;
+                let y = dn_bytes(g, outs[i], 17 * n * 2)?;
+                if y[..m * n * 2] != want[i][..] {
+                    let col = (0..m * n).find(|&e| y[2 * e..2 * e + 2] != want[i][2 * e..2 * e + 2]).unwrap_or(0);
+                    st.inv(format!("FAIL group {label} N={n} K={kd} M={m} grid={gname} member={i} differs from plain tc (first row {} col {})", col / n, col % n));
+                }
+                if y[m * n * 2..].iter().any(|&b| b != 0xA5) {
+                    st.inv(format!("FAIL group {label} N={n} M={m} grid={gname} member={i} wrote rows >= M"));
+                }
+            }
+        }
+    }
+    for p in refs.into_iter().chain(outs) {
+        g.free(p)?;
+    }
+    for q in &qs {
+        free_q(g, q)?;
+    }
+    g.free(ad)
+}
+
+/// 2026-10-09: (e) timing of a group over a cold pool of distinct weight sets: per group, the
+/// plain per-projection tc launches against one grouped launch at the production grid; adds
+/// the per-step weighted ms to `sums[0]` (tc) and `sums[1]` (group), indexed like
+/// `GROUP_TIME_M`.
+#[rustfmt::skip]
+fn group_timing(g: &dyn GpuBackend, k: &Kq, rng: &mut Lcg, sums: &mut [[f64; 4]; 2], grp: (&str, &[usize], usize, usize)) -> Result<()> {
+    let (label, ns, kd, per_step) = grp;
+    let s = g.create_stream()?;
+    let set_bytes: usize = ns.iter().map(|&n| n * kd / 2 + n * kd / 16).sum();
+    let pool = POOL_NV4_BYTES.div_ceil(set_bytes).clamp(4, 1024);
+    let ws: Vec<Vec<bf16>> = ns.iter().map(|&n| gen_weight(rng, n, kd, false)).collect();
+    let mut sets: Vec<Vec<QuantizedWeight>> = Vec::with_capacity(pool);
+    for _ in 0..pool {
+        sets.push(ns.iter().zip(&ws).map(|(&n, w)| quantize(g, k, w, n, kd)).collect::<Result<_>>()?);
+    }
+    let ad = up_bf16(g, &gen_act(rng, 16, kd, 0))?;
+    let outs: Vec<DevicePtr> = ns.iter().map(|&n| g.alloc(16 * n * 2)).collect::<Result<_>>()?;
+    let (cap8, cap16) = (group_cap(g, k.tc8g), group_cap(g, k.tc16g));
+    for (i, &m) in GROUP_TIME_M.iter().enumerate() {
+        let tt = time_graph(g, s, &mut |s| {
+            sets.iter().try_for_each(|set| {
+                set.iter().enumerate().try_for_each(|(j, q)| launch_tc(g, k, false, Job { a: ad, q, c: outs[j], m, n: ns[j], kd }, s))
+            })
+        })? / pool as f64;
+        let kind = if m > 8 { gemv_tc::TcKind::M16 } else { gemv_tc::TcKind::M8 };
+        let ns32: Vec<u32> = ns.iter().map(|&n| n as u32).collect();
+        let tiles = gemv_tc::tc_group_tiles(kind, &ns32);
+        let grid = gemv_tc::tc_group_grid(tiles, if m > 8 { cap16 } else { cap8 });
+        let tg = time_graph(g, s, &mut |s| {
+            sets.iter().try_for_each(|set| {
+                let qr: Vec<&QuantizedWeight> = set.iter().collect();
+                launch_group(g, k, ad, &qr, &outs, ns, m, kd, grid, s)
+            })
+        })? / pool as f64;
+        let gbs = |ms: f64| set_bytes as f64 / (ms * 1e-3) / 1e9;
+        println!(
+            "TIMING GROUP {label} M={m} tc {:.1} us {:.1} GB/s ({} launches) group {:.1} us {:.1} GB/s (1 launch, grid {grid} of {tiles} tiles) speedup {:.2}x (pool {pool})",
+            tt * 1e3, gbs(tt), ns.len(), tg * 1e3, gbs(tg), tt / tg
+        );
+        sums[0][i] += tt * per_step as f64;
+        sums[1][i] += tg * per_step as f64;
+    }
+    for set in &sets {
+        for q in set {
+            free_q(g, q)?;
+        }
+    }
+    for p in outs {
+        g.free(p)?;
+    }
+    g.free(ad)
+}
+
 #[rustfmt::skip]
 fn run() -> Result<i32> {
     let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
@@ -427,6 +595,30 @@ fn run() -> Result<i32> {
         check(g, &k, &mut rng, &mut st, n, kd, label)?;
         timing(g, &k, &mut rng, &mut sums, shape)?;
     }
+    let mut gsums = [[0.0f64; 4]; 2];
+    let (mut before, mut after) = (0usize, 0usize);
+    for &grp in GROUPS {
+        if grp.2 % 128 != 0 {
+            println!("SKIP group {} K % 128 != 0", grp.0);
+            continue;
+        }
+        group_check(g, &k, &mut rng, &mut st, grp)?;
+        if grp.3 > 0 {
+            group_timing(g, &k, &mut rng, &mut gsums, grp)?;
+            before += grp.1.len() * grp.3;
+            after += grp.3;
+        }
+    }
+    for &shape in SHAPES {
+        let (n, kd, label, _) = shape;
+        if kd % 128 == 0 {
+            group_check(g, &k, &mut rng, &mut st, (label, &[n], kd, 0))?;
+        }
+    }
+    for (i, &m) in GROUP_TIME_M.iter().enumerate() {
+        let (t, gr) = (gsums[0][i], gsums[1][i]);
+        println!("TIMING SUMMARY GROUP M={m} per step: tc {t:.2} ms -> group {gr:.2} ms, saves {:.2} ms (grouped launches {before} -> {after} per rank per step)", t - gr);
+    }
     for (i, &m) in TIME_M.iter().enumerate() {
         let (b, t) = (sums[0][i], sums[1][i]);
         println!(
@@ -441,7 +633,7 @@ fn run() -> Result<i32> {
     let (saves8, delta3) = (sums[0][i8] - sums[1][i8], sums[1][i3] - sums[0][i3]);
     let (inv_ok, acc_ok) = (st.inv_fail == 0, st.acc_fail == 0);
     let word = |ok: bool| if ok { "PASS" } else { "FAIL" };
-    println!("GATE invariance {} ({} row compares, {} tc8/tc16 compares)", word(inv_ok), st.row_cmp, st.tc_cmp);
+    println!("GATE invariance {} ({} row compares, {} tc8/tc16 compares, {} group member compares)", word(inv_ok), st.row_cmp, st.tc_cmp, st.grp_cmp);
     println!("GATE accuracy {}", word(acc_ok));
     let verdict = if saves8 >= GO_SAVE_M8 && delta3 <= GO_DELTA_M3 {
         "GO"
@@ -452,7 +644,7 @@ fn run() -> Result<i32> {
     };
     println!("GATE speed M=8 saves {saves8:.2} ms, M=3 delta {delta3:+.2} ms (GO needs M=8 saves >= 3.0 and M=3 delta <= +0.3; KILL if M=8 saves < 1.5): {verdict}");
     if inv_ok && acc_ok {
-        println!("PASS: tc8/tc16 row-invariant (bitwise, M 1..=16) and within the accuracy bound on {ran} shapes x 2 weight sets x 3 activation sets");
+        println!("PASS: tc8/tc16 row-invariant (bitwise, M 1..=16) and within the accuracy bound on {ran} shapes x 2 weight sets x 3 activation sets; grouped entries byte-equal to plain tc on {} member compares", st.grp_cmp);
         Ok(0)
     } else {
         println!("FAIL invariance mismatches {} accuracy breaches {}", st.inv_fail, st.acc_fail);

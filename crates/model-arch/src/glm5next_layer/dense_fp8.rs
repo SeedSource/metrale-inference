@@ -1017,6 +1017,34 @@ pub fn nv4_gemv(
     Ok(())
 }
 
+/// 2026-10-09: The NVFP4 copy [`route`]'s first arm would run [`nv4_gemv`] on for this call
+/// (`METRALE_GLM_DENSE_NVFP4`, 1..=[`NV4_MAX_M`] rows, the BF16-out GEMV handle, a registered
+/// weight with an NVFP4 copy, the NVFP4 kernels present), else `None`. A registry error is
+/// `None` too, so the caller's own `route` call reports it. For `dense_nv4_group`.
+pub fn nv4_copy_routed(
+    gpu: &dyn GpuBackend,
+    gemv: KernelHandle,
+    b: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Option<QuantizedWeight> {
+    if !(dense_nvfp4().any()
+        && (1..=NV4_MAX_M).contains(&m)
+        && gemv.0 != 0
+        && gemv.0 == bf16_gemv_handle(gpu).0
+        && nv4_kernels(gpu).is_some())
+    {
+        return None;
+    }
+    find(b, n, k).ok().flatten().and_then(|e| e.nv)
+}
+
+/// 2026-10-09: Counts `calls` NVFP4 GEMVs a grouped launch ran in place of [`nv4_gemv`] calls.
+pub fn nv4_group_hits(calls: usize) {
+    NV4_HITS.fetch_add(calls as u64, Ordering::Relaxed);
+}
+
 /// 2026-10-06: [`nv4_gemv`] without the dense lever's hit counter and first-hit log, for an
 /// NVFP4 copy that is not in the dense registry (the MTP draft head,
 /// `METRALE_GLM_MTP_HEAD_NVFP4`). Same tiers, grid ceil(n / 4) (one block per 4 outputs; the

@@ -74,6 +74,16 @@ impl Drop for MultiSeqScope {
     }
 }
 
+/// 2026-10-09: Whether the lever takes an `m`-row launch on this thread now ([`Nv4Tc`]), before
+/// the shape route; [`try_launch`] and `dense_nv4_group` both ask it.
+pub fn takes(m: usize) -> bool {
+    match nv4_tc() {
+        None => false,
+        Some(Nv4Tc::Floor(min_m)) => m >= min_m,
+        Some(Nv4Tc::Multi) => IN_MULTI.with(Cell::get),
+    }
+}
+
 /// Launches `C[m, n] = A[m, k] @ dequant(q)^T` on the tensor-core kernel when the lever takes
 /// this launch ([`Nv4Tc`]) and the route takes the shape: `Ok(true)` when it launched,
 /// `Ok(false)` to keep the CUDA-core tier. No allocation or sync, so it is capture-safe.
@@ -88,12 +98,7 @@ pub fn try_launch(
     k: usize,
     stream: u64,
 ) -> Result<bool> {
-    let take = match nv4_tc() {
-        None => false,
-        Some(Nv4Tc::Floor(min_m)) => m >= min_m,
-        Some(Nv4Tc::Multi) => IN_MULTI.with(Cell::get),
-    };
-    if !take {
+    if !takes(m) {
         return Ok(false);
     }
     let Some((h, grid_x)) = gemv_tc::tc_kernel(gpu, m as u32, n as u32, k as u32) else {

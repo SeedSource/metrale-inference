@@ -323,6 +323,19 @@ pub trait GpuBackend: Send + Sync {
     /// Resolve it once at construction, not per launch.
     fn sm_count(&self) -> Result<u32>;
 
+    /// 2026-10-09: Most CTAs of `kernel` resident on one SM at `block` threads and `dyn_smem`
+    /// bytes of dynamic shared memory (the CUDA driver's occupancy calculator), or 0 when the
+    /// backend cannot say. Not a stream operation, so it is safe during capture; callers cache
+    /// it. The default returns 0.
+    fn max_active_blocks_per_sm(
+        &self,
+        _kernel: KernelHandle,
+        _block: u32,
+        _dyn_smem: u32,
+    ) -> Result<u32> {
+        Ok(0)
+    }
+
     /// 2026-09-25: Create a stream. The default returns 0, the default stream.
     fn create_stream(&self) -> Result<u64> {
         Ok(0)

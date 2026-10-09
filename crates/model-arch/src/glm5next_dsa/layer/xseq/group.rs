@@ -79,19 +79,26 @@ impl Glm5NextDsaLayer {
         let kn = &self.kernels;
         let wt = &self.weights;
         let t_proj = profile::start();
-        gemm(
-            gpu,
-            kn.gemm,
-            kn.gemv,
-            kn.gemv_batchm,
-            hidden,
-            wt.q_a_proj,
-            a.q_a,
-            r,
-            ql,
-            hid,
-            stream,
-        )?;
+        // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: q_a and kv_a both read `hidden`, and the q
+        // chain below neither reads `a.kv_a` nor writes `hidden`, so kv_a may run with q_a as
+        // one grouped launch here (`dense_nv4_group`, same bytes) and is then skipped below.
+        let grouped = crate::glm5next_layer::dense_nv4_group::enabled()
+            && self.try_group_q_a_kv_a(gpu, hidden, a.q_a, a.kv_a, r, stream)?;
+        if !grouped {
+            gemm(
+                gpu,
+                kn.gemm,
+                kn.gemv,
+                kn.gemv_batchm,
+                hidden,
+                wt.q_a_proj,
+                a.q_a,
+                r,
+                ql,
+                hid,
+                stream,
+            )?;
+        }
         // 2026-10-03: One block per row, as in `decode_k`.
         KernelLaunch::new(gpu, kn.rms_norm)
             .grid([r as u32, 1, 1])
@@ -115,19 +122,21 @@ impl Glm5NextDsaLayer {
             ql,
             stream,
         )?;
-        gemm(
-            gpu,
-            kn.gemm,
-            kn.gemv,
-            kn.gemv_batchm,
-            hidden,
-            wt.kv_a_proj,
-            a.kv_a,
-            r,
-            kvl,
-            hid,
-            stream,
-        )?;
+        if !grouped {
+            gemm(
+                gpu,
+                kn.gemm,
+                kn.gemv,
+                kn.gemv_batchm,
+                hidden,
+                wt.kv_a_proj,
+                a.kv_a,
+                r,
+                kvl,
+                hid,
+                stream,
+            )?;
+        }
         profile::end(profile::DSA_PROJ, t_proj, gpu, stream);
 
         // 2026-10-03: The indexer projections of every row, as `indexer_rows_batched` and

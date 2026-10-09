@@ -181,6 +181,133 @@ pub fn tc_fixed_m(
     Ok(true)
 }
 
+/// 2026-10-09: Most projections one grouped launch takes (`w4a16_gemv_tc{8,16}_group` have
+/// three weight slots).
+pub const TC_GROUP_MAX: usize = 3;
+
+/// 2026-10-09: One projection of a grouped launch: `out[m, n] = A[m, k] @ dequant(weight)^T`.
+#[derive(Clone, Copy)]
+pub struct TcGroupMember<'a> {
+    pub weight: &'a QuantizedWeight,
+    pub out: DevicePtr,
+    pub n: u32,
+}
+
+/// 2026-10-09: Tiles of a grouped launch: the sum of each member's `ceil(n / cols_per_cta)`,
+/// the grid the per-projection launches would use together.
+pub fn tc_group_tiles(kind: TcKind, ns: &[u32]) -> u32 {
+    ns.iter().map(|&n| n.div_ceil(kind.cols_per_cta())).sum()
+}
+
+/// 2026-10-09: Persistent grid of a grouped launch: `min(tiles, sm_count * resident)`, where
+/// `resident` is the occupancy calculator's CTAs per SM for the kernel at `TC_BLOCK` threads.
+/// `cap == 0` (backend cannot say) launches one CTA per tile.
+pub fn tc_group_grid(tiles: u32, cap: u32) -> u32 {
+    if cap == 0 { tiles } else { tiles.min(cap) }
+}
+
+/// 2026-10-09: Resolved grouped handles and their persistent CTA caps (`sm_count *` resident
+/// CTAs per SM, 0 when unknown), cached per backend like [`TcHandles`].
+#[derive(Clone, Copy)]
+struct TcGroupHandles {
+    tc8: (KernelHandle, u32),
+    tc16: (KernelHandle, u32),
+}
+
+fn tc_group_handles(gpu: &dyn GpuBackend) -> TcGroupHandles {
+    static CACHE: OnceLock<Mutex<Vec<(usize, TcGroupHandles)>>> = OnceLock::new();
+    let key = gpu as *const dyn GpuBackend as *const () as usize;
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, h)) = guard.iter().find(|(k, _)| *k == key) {
+        return *h;
+    }
+    let sms = gpu.sm_count().unwrap_or(0);
+    let resolve = |name: &str| {
+        let h = crate::layers::try_kernel(gpu, "w4a16_gemv_tc", name);
+        let per_sm = if h.0 == 0 {
+            0
+        } else {
+            gpu.max_active_blocks_per_sm(h, TC_BLOCK, 0).unwrap_or(0)
+        };
+        (h, sms.saturating_mul(per_sm))
+    };
+    let h = TcGroupHandles {
+        tc8: resolve("w4a16_gemv_tc8_group"),
+        tc16: resolve("w4a16_gemv_tc16_group"),
+    };
+    tracing::info!(
+        "w4a16_gemv_tc group: {sms} SMs, persistent CTA cap tc8 {} tc16 {}",
+        h.tc8.1,
+        h.tc16.1
+    );
+    guard.push((key, h));
+    h
+}
+
+/// 2026-10-09: The grouped persistent launch of up to [`TC_GROUP_MAX`] projections that read
+/// the same `input` `[m, k]`, each member's bytes equal to its own [`tc_kernel`] launch (the
+/// kernel runs the same per-tile body; see `w4a16_gemv_tc_group_impl`). `Ok(false)` launches
+/// nothing: tensor cores off, a member the route would not send to the same entry as the
+/// others, an empty or too-large group, or the grouped entry missing from the image.
+pub fn tc_group_launch(
+    gpu: &dyn GpuBackend,
+    input: DevicePtr,
+    members: &[TcGroupMember],
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<bool> {
+    if !tc_enabled() || members.is_empty() || members.len() > TC_GROUP_MAX {
+        return Ok(false);
+    }
+    let h = tc_handles(gpu);
+    let (have8, have16) = (h.tc8.0 != 0, h.tc16.0 != 0);
+    let Some(kind) = tc_route(m, members[0].n, k, true, have8, have16) else {
+        return Ok(false);
+    };
+    if members
+        .iter()
+        .any(|g| tc_route(m, g.n, k, true, have8, have16) != Some(kind))
+    {
+        return Ok(false);
+    }
+    let gh = tc_group_handles(gpu);
+    let (handle, cap) = match kind {
+        TcKind::M8 => gh.tc8,
+        TcKind::M16 => gh.tc16,
+    };
+    if handle.0 == 0 {
+        return Ok(false);
+    }
+    let ns: Vec<u32> = members.iter().map(|g| g.n).collect();
+    let grid_x = tc_group_grid(tc_group_tiles(kind, &ns), cap);
+    let mut l = KernelLaunch::new(gpu, handle)
+        .grid([grid_x, 1, 1])
+        .block([TC_BLOCK, 1, 1])
+        .arg_ptr(input)
+        .arg_u32(m)
+        .arg_u32(k);
+    for i in 0..TC_GROUP_MAX {
+        l = match members.get(i) {
+            Some(g) => l
+                .arg_ptr(g.weight.weight)
+                .arg_ptr(g.weight.weight_scale)
+                .arg_f32(g.weight.weight_scale_2)
+                .arg_ptr(g.out)
+                .arg_u32(g.n),
+            None => l
+                .arg_ptr(DevicePtr(0))
+                .arg_ptr(DevicePtr(0))
+                .arg_f32(0.0)
+                .arg_ptr(DevicePtr(0))
+                .arg_u32(0),
+        };
+    }
+    l.launch(stream)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 #[path = "gemv_tc_tests.rs"]
 mod gemv_tc_tests;

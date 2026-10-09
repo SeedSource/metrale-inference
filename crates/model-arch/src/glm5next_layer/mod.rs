@@ -76,6 +76,8 @@ pub mod dense_fp8_gw;
 pub mod dense_fp8_min_rows;
 pub mod dense_nv4_b3;
 pub mod dense_nv4_bm;
+// 2026-10-09: `METRALE_GLM_NV4_TC_GROUP` (grouped persistent tensor-core NVFP4 projections).
+pub mod dense_nv4_group;
 pub mod dense_nv4_tc;
 // 2026-10-07: `METRALE_GLM_MS_DECODE_GRAPHS` (graphed batched multi-sequence decode).
 pub mod ms_graphs;

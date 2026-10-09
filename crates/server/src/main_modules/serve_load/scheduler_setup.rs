@@ -97,6 +97,8 @@ pub(super) fn resolve_speculation(
         ) {
             dflash_rung.pin_multi(k);
         }
+        // 2026-10-09: `METRALE_DFLASH_CONF_TAU`: read once here (rank 0) and log ENGAGED.
+        scheduler::dflash_conf_tau::init();
     }
 
     if args.dflash {

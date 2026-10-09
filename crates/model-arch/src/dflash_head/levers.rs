@@ -91,6 +91,11 @@ pub struct DFlashLevers {
     /// the selector's top-16 logits back (one blocking D2H) for the verify step's
     /// `DFLASH CONF` line. Log-only; does not suppress CUDA graphs.
     pub conf_log: bool,
+    /// 2026-10-09: `METRALE_DFLASH_CONF_TAU=<t>`, `t` in (0, 1): the scheduler keeps a C=1
+    /// DFlash2 block's drafts while their top-1 probability (the `conf_log` p) is at least
+    /// `t`. Here it only makes a single-sequence propose compute p even with `conf_log` off.
+    /// Unset, unparseable or outside (0, 1) is `0.0` (off); see [`parse_conf_tau`].
+    pub dflash_conf_tau: f32,
     /// 2026-09-25: `METRALE_DFLASH_VERIFY_TRACE=1`: log every propose's drafts
     /// before the row-0 drop and the cap.
     pub verify_trace: bool,
@@ -186,6 +191,7 @@ fn from_values(
         draft_gemv: opt_in(value("METRALE_DFLASH_DRAFT_GEMV").as_deref()),
 
         conf_log: opt_in(value("METRALE_DFLASH_CONF_LOG").as_deref()),
+        dflash_conf_tau: parse_conf_tau(value("METRALE_DFLASH_CONF_TAU").as_deref()),
         verify_trace: opt_in(value("METRALE_DFLASH_VERIFY_TRACE").as_deref()),
         precompute_dump: opt_in(value("METRALE_DFLASH_PRECOMPUTE_DUMP").as_deref()),
         ctx_parity_dump: opt_in(value("METRALE_DFLASH_CTX_PARITY_DUMP").as_deref()),
@@ -206,6 +212,14 @@ fn from_values(
         dspark_anchor_bias: value("METRALE_DSPARK_ANCHOR_BIAS").as_deref() != Some("0"),
         dspark_conf_trace: opt_in(value("METRALE_DSPARK_CONF_TRACE").as_deref()),
     }
+}
+
+/// 2026-10-09: `METRALE_DFLASH_CONF_TAU`: a finite `t` with `0 < t < 1`, else `0.0` (off).
+pub fn parse_conf_tau(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|t| t.is_finite() && *t > 0.0 && *t < 1.0)
+        .unwrap_or(0.0)
 }
 
 impl DFlashLevers {

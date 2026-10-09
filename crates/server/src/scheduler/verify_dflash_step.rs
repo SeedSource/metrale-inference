@@ -246,11 +246,14 @@ pub fn step_verify_dflash(
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        // 2026-10-09: `kept` (appended; earlier fields unchanged) is the verified draft count
+        // (verify width - 1), so a `METRALE_DFLASH_CONF_TAU` run yields its width histogram.
         tracing::info!(
-            "DFLASH CONF: a={} p={} m={}",
+            "DFLASH CONF: a={} p={} m={} kept={}",
             num_accepted,
             join(|c| c.0),
             join(|c| c.1),
+            drafts.len(),
         );
     }
 

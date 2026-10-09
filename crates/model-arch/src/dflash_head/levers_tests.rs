@@ -127,6 +127,25 @@ fn conf_tau_is_off_until_a_positive_threshold_is_given() {
 }
 
 #[test]
+fn dflash_conf_tau_is_off_outside_the_open_unit_interval() {
+    // 2026-10-09: Only a finite `t` with 0 < t < 1 engages; everything else is 0.0 (off).
+    assert_eq!(resolve(&[]).dflash_conf_tau, 0.0);
+    for bad in ["junk", "0", "1", "1.5", "-0.2", "NaN", "inf", ""] {
+        assert_eq!(
+            resolve(&[("METRALE_DFLASH_CONF_TAU", bad)]).dflash_conf_tau,
+            0.0,
+            "{bad:?} must leave the lever off"
+        );
+    }
+    assert_eq!(
+        resolve(&[("METRALE_DFLASH_CONF_TAU", "0.4")]).dflash_conf_tau,
+        0.4
+    );
+    // 2026-10-09: Independent of the log lever.
+    assert!(!resolve(&[("METRALE_DFLASH_CONF_TAU", "0.4")]).conf_log);
+}
+
+#[test]
 fn dspark_shift_defers_to_the_checkpoint_unless_spelled() {
     assert_eq!(resolve(&[]).dspark_shift, None);
     assert_eq!(

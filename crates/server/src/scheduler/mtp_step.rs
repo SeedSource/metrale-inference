@@ -344,6 +344,10 @@ pub fn step_mtp(
             serial_idxs.extend_from_slice(chunk);
         }
     }
+    // 2026-10-09: `METRALE_DFLASH_CONF_TAU` (`dflash_conf_tau`): C=1 only in v1, so decided on
+    // `active.len()` (bootstrapping sequences count) before the loop borrows `active`.
+    let conf_tau_step =
+        super::dflash_conf_tau::step_applies(sched, active.len(), dflash_verify_raw_argmax);
     for &idx in &serial_idxs {
         let a = &mut active[idx];
         let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
@@ -365,6 +369,13 @@ pub fn step_mtp(
             if drafts.is_empty() {
                 continue;
             }
+        }
+
+        // 2026-10-09: `METRALE_DFLASH_CONF_TAU`: keep the drafts before the first drafter
+        // top-1 prob below tau (at least 1). Grammar rows are left as they were.
+        let conf_tau_applies = conf_tau_step && a.grammar_state.is_none();
+        if conf_tau_applies {
+            super::dflash_conf_tau::truncate(&mut drafts);
         }
 
         // 2026-09-25: Verify arm from `spec_capacity::serial_verify_plan`:
@@ -389,10 +400,15 @@ pub fn step_mtp(
         // block (a lone verifier at C>=2, or the first C=1 step after one) keeps the K=gamma
         // arm at its own width, so its drafter ctx is committed as on every other step. A
         // grammar-truncated block keeps the arm it took before.
-        let arm = if dflash_verify_raw_argmax
-            && sched.dflash_rung.multi_pinned()
-            && a.grammar_state.is_none()
-        {
+        // 2026-10-09: The same holds when `METRALE_DFLASH_CONF_TAU` applied this step: a
+        // block it cut below 4 drafts must not fall to the K2..K4 arms, which never commit
+        // the drafter ctx (acceptance collapses).
+        let arm = if super::dflash_conf_tau::keeps_dflash_arm(
+            dflash_verify_raw_argmax,
+            sched.dflash_rung.multi_pinned(),
+            conf_tau_applies,
+            a.grammar_state.is_none(),
+        ) {
             metrale_speculative::spec_capacity::SerialArm::DFlash
         } else {
             arm

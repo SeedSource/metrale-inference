@@ -183,6 +183,28 @@ pub(super) fn select_tokens_with(
         if !tc {
             log_scores_tiled(requested, tiled, kernels, ceiling.is_some(), geom);
         }
+        // 2026-10-08: `METRALE_GLM_DSA_SCORES_DECODE=1` swaps `dsa_index_scores_decode` (same
+        // arguments, same bytes) in for the plain `dsa_index_scores` on a ceiling launch, the
+        // only launch the tiled and tensor-core scorers never take; see `scores_decode_for`.
+        // Its grid is fixed by the ceiling and the SM count, as the plain stride grid is.
+        let dec_requested = scores_decode::dsa_scores_decode();
+        let dec_on = !tc
+            && !tiled
+            && scores_decode::scores_decode_for(
+                dec_requested,
+                kernels.index_scores_decode.0 != 0,
+                ceiling.is_some(),
+                d,
+                geom.index_heads,
+                pool_keys.0 % 16 == 0,
+            );
+        scores_decode::log_scores_decode(
+            dec_requested,
+            dec_on,
+            ceiling.is_some(),
+            kernels,
+            geom,
+        );
         let (handle, grid, block, smem) = if tc2_on {
             (
                 kernels.index_scores_tc2,
@@ -203,6 +225,18 @@ pub(super) fn select_tokens_with(
                 scores_tiled_grid(geom.q_rows, geom.n_pools),
                 SCORES_TILED_BLOCK,
                 scores_tiled_smem(d) as u32,
+            )
+        } else if let (true, Some(m)) = (dec_on, ceiling) {
+            (
+                kernels.index_scores_decode,
+                [
+                    scores_decode::scores_decode_grid_x(m, super::grid_stride::device_sms(gpu))
+                        as u32,
+                    geom.q_rows as u32,
+                    1,
+                ],
+                scores_decode::SCORES_DECODE_BLOCK,
+                scores_decode::scores_decode_smem(geom.index_heads) as u32,
             )
         } else {
             (

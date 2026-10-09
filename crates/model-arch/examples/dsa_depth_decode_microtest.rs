@@ -42,6 +42,10 @@
 //! `STAGE <name> S=<s> ms_per_step=<x> impl=<which>`. With the cache on, the sanity pass also
 //! compares its tokens with the cache-less production `select_tokens`.
 //!
+//! 2026-10-08: With `METRALE_GLM_DSA_SCORES_DECODE=1` the scores stage launches
+//! `dsa_index_scores_decode` on the grid `select_tokens` gives it (`impl=decode(...)`), and the
+//! `full` line follows the same production dispatch.
+//!
 //! Owner: model-arch examples.
 //! Invariants: none beyond the types.
 //!

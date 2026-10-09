@@ -17,6 +17,7 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_arch::glm5next_dsa::pool_cache::dsa_pool_cache;
 use metrale_model_arch::glm5next_dsa::select::grid_stride::{ceiling_grids, dsa_grid_stride};
 use metrale_model_arch::glm5next_dsa::select::radix::{self, RadixMode, RadixTopk};
+use metrale_model_arch::glm5next_dsa::select::scores_decode;
 use metrale_model_arch::glm5next_dsa::select::{
     DsaSelectGeometry, DsaSelectInputs, DsaSelectLaunch, DsaSelectScratch, select_tokens,
     topk_smem_for_tile, topk_tile,
@@ -398,14 +399,33 @@ impl Fixture {
 
     /// 2026-10-06: `dsa_index_scores` alone (the plain kernel: a ceiling launch never takes the
     /// tiled or tensor-core scorer, `select/launch.rs` lines 118-137), as lines 138-185.
+    /// 2026-10-08: With `METRALE_GLM_DSA_SCORES_DECODE=1` (and the entry point resolved),
+    /// `dsa_index_scores_decode` instead, on the grid, block and shared memory `select_tokens`
+    /// gives it on a ceiling launch (`select/launch.rs`, the `dec_on` arm; `scores_decode`).
     pub(crate) fn scores(&self, g: &dyn GpuBackend, l: usize, r: usize, stream: u64) -> Result<()> {
         let (layer, row, st) = (self.layers[l], self.rows[r], &self.st);
         let (seq_a, npools_a, ..) = self.scalars();
         let (pk, pidx, pvalid) = self.pools(l);
-        KernelLaunch::new(g, self.kernels.index_scores)
-            .grid([self.grids.1 as u32, 1, 1])
-            .block([SCORES_BLOCK, 1, 1])
-            .shared_mem(SCORES_BLOCK.max((H * 4) as u32))
+        let (handle, grid_x, block, smem) = if self.scores_decode_on(pk) {
+            let sms = g.sm_count().map_or(48, |n| n as usize).max(1);
+            (
+                self.kernels.index_scores_decode,
+                scores_decode::scores_decode_grid_x(MAX_POOLS, sms),
+                scores_decode::SCORES_DECODE_BLOCK,
+                scores_decode::scores_decode_smem(H) as u32,
+            )
+        } else {
+            (
+                self.kernels.index_scores,
+                self.grids.1,
+                SCORES_BLOCK,
+                SCORES_BLOCK.max((H * 4) as u32),
+            )
+        };
+        KernelLaunch::new(g, handle)
+            .grid([grid_x as u32, 1, 1])
+            .block([block, 1, 1])
+            .shared_mem(smem)
             .arg_ptr(self.q)
             .arg_ptr(pk)
             .arg_ptr(self.weights)
@@ -424,6 +444,19 @@ impl Fixture {
             .arg_f32((D as f32).powf(-0.5))
             .arg_ptr(row.geom)
             .launch(stream)
+    }
+
+    /// 2026-10-08: Whether the scores stage takes `dsa_index_scores_decode`: the production
+    /// dispatch (`scores_decode_for`) for a ceiling launch over the pool keys at `pk`.
+    pub(crate) fn scores_decode_on(&self, pk: DevicePtr) -> bool {
+        scores_decode::scores_decode_for(
+            scores_decode::dsa_scores_decode(),
+            self.kernels.index_scores_decode.0 != 0,
+            true,
+            D,
+            H,
+            pk.0 % 16 == 0,
+        )
     }
 
     /// 2026-10-06: `dsa_topk_pools` alone, as `select/launch.rs` lines 189-200.

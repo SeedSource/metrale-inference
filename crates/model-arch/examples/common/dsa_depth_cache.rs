@@ -147,12 +147,17 @@ impl Fixture {
             } else {
                 "dsa_kpool_compress(full,POOL_CACHE off)".into()
             },
-            format!(
-                "dsa_index_scores(plain; ceiling launch never engages TC/TC2: SCORES_TC={} \
-                 SCORES_TC2={})",
-                env("METRALE_GLM_DSA_SCORES_TC"),
-                env("METRALE_GLM_DSA_SCORES_TC2")
-            ),
+            if self.scores_decode_on(self.pools(0).0) {
+                "decode(dsa_index_scores_decode; METRALE_GLM_DSA_SCORES_DECODE=1)".into()
+            } else {
+                format!(
+                    "dsa_index_scores(plain; ceiling launch never engages TC/TC2: SCORES_TC={} \
+                     SCORES_TC2={} SCORES_DECODE={})",
+                    env("METRALE_GLM_DSA_SCORES_TC"),
+                    env("METRALE_GLM_DSA_SCORES_TC2"),
+                    env("METRALE_GLM_DSA_SCORES_DECODE")
+                )
+            },
             if self.radix {
                 "dsa_topk_radix(9 launches)".into()
             } else {

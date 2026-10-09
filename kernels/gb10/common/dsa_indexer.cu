@@ -23,6 +23,8 @@
 //   dsa_kpool_compress unchanged. The later stages read the persistent arrays. The kernels
 //   above it (dsa_write_geom, dsa_indexer_store, dsa_kpool_compress) are untouched; the
 //   lever-off path launches only them.
+// - 2026-10-08: dsa_index_scores_decode (2e, METRALE_GLM_DSA_SCORES_DECODE=1) writes the same
+//   out / valid_cand bytes as dsa_index_scores on the ceiling (decode) launch.
 
 
 
@@ -1255,6 +1257,203 @@ extern "C" __global__ void __launch_bounds__(DSA_TC2_THREADS, 2) dsa_index_score
         __trap();
     }
 #undef DSA_TC2_CASE
+}
+
+// 2026-10-08: 2e. dsa_index_scores_decode: the scores and candidacy of dsa_index_scores,
+// byte-identical by construction, for the decode (ceiling, graph-replay) launch, which the
+// tiled and tensor-core scorers do not serve. Opt-in (METRALE_GLM_DSA_SCORES_DECODE=1, host
+// side crates/model-arch/src/glm5next_dsa/select/scores_decode.rs); resolved with try_kernel;
+// gated on a GPU by crates/model-arch/examples/dsa_scores_decode_bitparity_microtest.rs.
+//
+// Why: under a ceiling launch dsa_index_scores runs one pool per block iteration, one warp
+// per head, and re-reads the row's whole q (H x D FP32, 16 KB at H 32, D 128) from global
+// for every pool, so it measured 20.2 / 41.9 ms a decode step (11 layers x 3 rows) at 131K /
+// 262K against a ~4.4 ms key-byte floor at 262K (2026-10-08, one GB10).
+//
+// Geometry: the same arguments as dsa_index_scores. With `geom` non-null (the ceiling path)
+// S and P come from geom[DSA_GEOM_S] / geom[DSA_GEOM_NPOOLS] exactly as dsa_index_scores
+// reads them, and the live pool count is that P; the grid is fixed (the host sizes it from
+// the SM count, never from the context) and the warps walk the live pools with a grid
+// stride, so a captured graph replays over any live context. With `geom` null the scalars
+// are used and every one of the P pools is scored. `P` is the row stride of out /
+// valid_cand, as in dsa_index_scores, so a ceiling launch must have Q == 1 (the launcher
+// refuses Q > 1 there).
+//
+// Layout: DSA_DEC_THREADS threads (4 warps), blockIdx.y = row r. Shared memory (dynamic,
+// (H * D + H + DSA_DEC_WARPS * 32 * DSA_DEC_LD) * 4 bytes, 33,408 at H 32): the row's q
+// [H][D] and weights [H], staged once per block, and per warp a [32][DSA_DEC_LD] key
+// transpose buffer. Warp-tile t covers pools [32 t, 32 t + 32), lane l owns pool 32 t + l;
+// a block's warps take tiles blockIdx.x * 4 + w, then + gridDim.x * 4, ... below the live
+// count. Keys reach the lane's registers (k[0..D)) through the transpose buffer in four
+// 32-dim chunks: each warp load instruction is 8 lanes x 16 B over 4 pools' contiguous
+// 128-byte chunks (whole sectors, coalesced), stored at row * 33 + col (conflict-free), then
+// lane l reads row l (bank (l + j) % 32, conflict-free). q is read from shared memory as
+// float4 broadcasts (all lanes read the same address).
+//
+// Why the bits match (the common build passes --fmad=false, KERNEL.toml, so in
+// dsa_index_scores a * b + c is a rounded multiply then a rounded add; here every multiply
+// and add is written __fmul_rn / __fadd_rn, which are never contracted, so this kernel
+// computes that same sequence whatever the fmad setting):
+// - In dsa_index_scores, lane l of head h's warp sums qh[d] * pk[d] over d = l, l + 32, ...
+//   (d < D), ascending, from 0.0f: x0[l]. Here the owning thread forms the same chain for
+//   every l (dsa_dec_x0: 0.0f + q[l] k[l], then + q[l + 32] k[l + 32], ...), from the same
+//   values (shared/register copies of q and the pool key, not recomputed).
+// - The shuffle_down tree with offsets 16, 8, 4, 2, 1 leaves at lane 0
+//   x1[i] = x0[i] + x0[i + 16], x2[i] = x1[i] + x1[i + 8], x3[i] = x2[i] + x2[i + 4],
+//   x4[i] = x3[i] + x3[i + 2], x5 = x4[0] + x4[1], lower lane on the left (as the 2b argument
+//   above); dsa_dec_tree evaluates exactly those nodes in place, left operand first.
+// - The head term is weights[r * H + h] * fmaxf(scale * x5, 0.0f) (the same fmaxf operand
+//   order), and the score is 0.0f + term(0) + term(1) + ... in ascending h, as thread 0 of
+//   dsa_index_scores sums sh[] there; one thread owns a pool's whole sum, so nothing is split.
+// - Candidacy, valid_cand and the -FLT_MAX store are dsa_index_scores' code, per pool.
+//   Keys of a non-candidate pool are loaded (all below the live count, so in bounds) but its
+//   score is never stored.
+//
+// Registers (estimate, not a ptxas report): 128 key floats, 32 chain/tree floats, 16 q
+// floats in flight and addressing, about 190, under the 255 that __launch_bounds__(128, 2)
+// allows. Not supported: D != 128 or blockDim.x != DSA_DEC_THREADS; the host never selects
+// this kernel there, and a launch that does traps instead of computing anything.
+
+#define DSA_DEC_THREADS 128u
+#define DSA_DEC_WARPS (DSA_DEC_THREADS / 32u)
+#define DSA_DEC_D 128u
+#define DSA_DEC_NJ (DSA_DEC_D / 32u)
+#define DSA_DEC_LD 33u
+
+// 2026-10-08: x0[l0 .. l0 + 3] (see 2e) for one head: d = l + 32 j, j ascending, from 0.0f,
+// each product rounded before its add. qh is the head's [D] q in shared memory (16-byte
+// aligned), k the lane's pool key.
+__device__ __forceinline__ void dsa_dec_x0x4(
+    const float* __restrict__ qh, const float (&k)[DSA_DEC_D], unsigned int l0, float (&x)[32]
+) {
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+    for (unsigned int j = 0; j < DSA_DEC_NJ; ++j) {
+        const float4 qv = *reinterpret_cast<const float4*>(qh + l0 + 32u * j);
+        a0 = __fadd_rn(a0, __fmul_rn(qv.x, k[l0 + 32u * j + 0u]));
+        a1 = __fadd_rn(a1, __fmul_rn(qv.y, k[l0 + 32u * j + 1u]));
+        a2 = __fadd_rn(a2, __fmul_rn(qv.z, k[l0 + 32u * j + 2u]));
+        a3 = __fadd_rn(a3, __fmul_rn(qv.w, k[l0 + 32u * j + 3u]));
+    }
+    x[l0 + 0u] = a0;
+    x[l0 + 1u] = a1;
+    x[l0 + 2u] = a2;
+    x[l0 + 3u] = a3;
+}
+
+// 2026-10-08: x5 from x0[0..32): the shuffle_down(16, 8, 4, 2, 1) tree's lane-0 value (2e).
+__device__ __forceinline__ float dsa_dec_tree(float (&x)[32]) {
+#pragma unroll
+    for (unsigned int i = 0; i < 16u; ++i) x[i] = __fadd_rn(x[i], x[i + 16u]);
+#pragma unroll
+    for (unsigned int i = 0; i < 8u; ++i) x[i] = __fadd_rn(x[i], x[i + 8u]);
+#pragma unroll
+    for (unsigned int i = 0; i < 4u; ++i) x[i] = __fadd_rn(x[i], x[i + 4u]);
+#pragma unroll
+    for (unsigned int i = 0; i < 2u; ++i) x[i] = __fadd_rn(x[i], x[i + 2u]);
+    return __fadd_rn(x[0], x[1]);
+}
+
+extern "C" __global__ void __launch_bounds__(DSA_DEC_THREADS, 2) dsa_index_scores_decode(
+    const float* __restrict__ q,
+    const float* __restrict__ pool_keys,
+    const float* __restrict__ weights,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ pool_valid,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    float* __restrict__ out,
+    unsigned char* __restrict__ valid_cand,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int H,
+    unsigned int D,
+    unsigned int KP,
+    unsigned int S,
+    float scale,
+    const int* __restrict__ geom
+) {
+    if (D != DSA_DEC_D || blockDim.x != DSA_DEC_THREADS) __trap();
+    (void)Q;
+    const unsigned int r = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    if (geom) {
+        S = (unsigned int)geom[DSA_GEOM_S];
+        P = (unsigned int)geom[DSA_GEOM_NPOOLS];
+    }
+    const unsigned int live = P;
+
+    extern __shared__ __align__(16) float dsa_dec_sh[];
+    float* qs = dsa_dec_sh;
+    float* ws = qs + (size_t)H * DSA_DEC_D;
+    float* st = ws + H + warp * 32u * DSA_DEC_LD;
+
+    // 2026-10-08: The row's q and weights, once per block. The only block-wide barrier: after
+    // it every warp runs on its own (warp-uniform loop, __syncwarp only).
+    const float* __restrict__ qrow = q + (size_t)r * H * DSA_DEC_D;
+    for (unsigned int i = tid; i < H * DSA_DEC_D; i += DSA_DEC_THREADS) qs[i] = qrow[i];
+    for (unsigned int i = tid; i < H; i += DSA_DEC_THREADS) ws[i] = weights[(size_t)r * H + i];
+    __syncthreads();
+
+    const unsigned int step = gridDim.x * DSA_DEC_WARPS;
+    for (unsigned int t = blockIdx.x * DSA_DEC_WARPS + warp; (size_t)t * 32u < (size_t)live;
+         t += step) {
+        const unsigned int p0 = t * 32u;
+        const unsigned int p = p0 + lane;
+        const bool in = p < live;
+
+        // 2026-10-08: dsa_index_scores' candidacy and stores, per pool.
+        bool cand = false;
+        if (in) {
+            int end = pool_indices[p * KP + KP - 1];
+            int end_c = end < 0 ? 0 : (end >= (int)S ? (int)S - 1 : end);
+            bool vis = (end_c <= q_pos[r]) && (valid_keys[end_c] != 0);
+            cand = (pool_valid[p] != 0) && vis;
+            valid_cand[(size_t)r * P + p] = cand ? 1 : 0;
+            if (!cand) out[(size_t)r * P + p] = -FLT_MAX;
+        }
+
+        // 2026-10-08: The tile's keys into registers, chunk c = dims [32 c, 32 c + 32).
+        float k[DSA_DEC_D];
+#pragma unroll
+        for (unsigned int c = 0; c < DSA_DEC_NJ; ++c) {
+#pragma unroll
+            for (unsigned int i = 0; i < 8u; ++i) {
+                const unsigned int row = i * 4u + (lane >> 3);
+                const unsigned int col = (lane & 7u) * 4u;
+                float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (p0 + row < live) {
+                    v = *reinterpret_cast<const float4*>(
+                        pool_keys + (size_t)(p0 + row) * DSA_DEC_D + c * 32u + col);
+                }
+                float* s = st + row * DSA_DEC_LD + col;
+                s[0] = v.x;
+                s[1] = v.y;
+                s[2] = v.z;
+                s[3] = v.w;
+            }
+            __syncwarp();
+#pragma unroll
+            for (unsigned int j = 0; j < 32u; ++j) k[c * 32u + j] = st[lane * DSA_DEC_LD + j];
+            __syncwarp();
+        }
+
+        // 2026-10-08: The score, every head in ascending order (see 2e). Lanes past the live
+        // count or not candidates compute on zero / unused keys and store nothing.
+        float acc = 0.0f;
+        for (unsigned int h = 0; h < H; ++h) {
+            const float* qh = qs + (size_t)h * DSA_DEC_D;
+            float x[32];
+#pragma unroll
+            for (unsigned int l0 = 0; l0 < 32u; l0 += 4u) dsa_dec_x0x4(qh, k, l0, x);
+            const float dot = dsa_dec_tree(x);
+            const float term = __fmul_rn(ws[h], fmaxf(__fmul_rn(scale, dot), 0.0f));
+            acc = __fadd_rn(acc, term);
+        }
+        if (in && cand) out[(size_t)r * P + p] = acc;
+    }
 }
 
 // 2026-09-25: 3. Deterministic top-k over pools, one block per query. A tiled bitonic

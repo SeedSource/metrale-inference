@@ -80,6 +80,7 @@ pub const KERNEL_MAX_KPOOL: usize = 8;
 /// 2026-10-05: So does `grid_stride_marker`.
 /// 2026-10-06: So do the five `topk_radix_*` handles.
 /// 2026-10-07: So does `index_scores_tc2`.
+/// 2026-10-08: So does `index_scores_decode`.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
@@ -100,6 +101,12 @@ pub struct Glm5NextDsaKernels {
     /// `METRALE_GLM_DSA_SCORES_TC2=1` (`select::tc2::scores_tc2_for`); `KernelHandle(0)` when
     /// the target lacks it, and `index_scores_tc` runs.
     pub index_scores_tc2: KernelHandle,
+    /// 2026-10-08: `dsa_index_scores_decode`: the bytes of `index_scores` for the ceiling
+    /// (graph-replay decode) launch, q staged once per block and one pool per lane.
+    /// `select_tokens` launches it in place of `index_scores` on a ceiling launch under
+    /// `METRALE_GLM_DSA_SCORES_DECODE=1` (`select::scores_decode::scores_decode_for`);
+    /// `KernelHandle(0)` when the target lacks it (the b300 copy), and `index_scores` runs.
+    pub index_scores_decode: KernelHandle,
     /// 2026-10-05: `dsa_indexer_grid_stride_v1`, a no-op kernel that `dsa_indexer.cu` defines
     /// iff `dsa_kpool_compress` and `dsa_index_scores` both walk the live pools with a grid
     /// stride. A ceiling `select_tokens` launches the capped stride grid only when this
@@ -179,6 +186,11 @@ impl Glm5NextDsaKernels {
                 gpu,
                 DSA_MODULE,
                 "dsa_index_scores_tc2",
+            ),
+            index_scores_decode: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_index_scores_decode",
             ),
             grid_stride_marker: metrale_model_layers::layers::try_kernel(
                 gpu,

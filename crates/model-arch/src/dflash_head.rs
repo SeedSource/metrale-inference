@@ -246,6 +246,9 @@ pub struct BlockDiffusionDraftHead {
     pub selector_pred: Option<DenseWeight>,
     pub selector_succ: Option<DenseWeight>,
     pub selector_hidden_proj: Option<DenseWeight>,
+    /// 2026-10-09: Two-rank tensor parallelism (`METRALE_DFLASH_DRAFT_TP2`, `tp.rs`); `None`
+    /// runs the drafter on one rank. With `Some`, the geometry fields above are this rank's.
+    pub tp: Option<tp::DraftTp>,
 }
 
 mod dflash2;
@@ -285,8 +288,10 @@ mod markov;
 mod precompute_ctx_kv;
 mod precompute_ctx_kv_batched;
 mod propose;
+mod propose_prep;
 mod proposer;
 mod state;
+pub mod tp;
 
 /// 2026-09-25: Read once: false only when `METRALE_NO_DFLASH_FP8_RT=1`, so the
 /// kernel choice stays fixed across CUDA-graph captures.

@@ -86,6 +86,9 @@ pub struct DFlashLevers {
     /// at most 16 rows run on `dense_gemv_bf16_batchm` instead of the 128x128-tile
     /// pipelined GEMM (`draft_gemm.rs`, SeedHQ/seed-skills#71 S1a).
     pub draft_gemv: bool,
+    /// 2026-10-09: `METRALE_DFLASH_DRAFT_TP2=1`: on a two-rank serve, split the drafter
+    /// across both ranks (`tp.rs`). Off: rank 0 proposes alone.
+    pub draft_tp2: bool,
 
     /// 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: after a single-sequence DFlash2 propose, read
     /// the selector's top-16 logits back (one blocking D2H) for the verify step's
@@ -189,6 +192,7 @@ fn from_values(
             .unwrap_or(usize::MAX),
         draft_cap: parsed(value("METRALE_DFLASH_DRAFT_CAP").as_deref()),
         draft_gemv: opt_in(value("METRALE_DFLASH_DRAFT_GEMV").as_deref()),
+        draft_tp2: opt_in(value("METRALE_DFLASH_DRAFT_TP2").as_deref()),
 
         conf_log: opt_in(value("METRALE_DFLASH_CONF_LOG").as_deref()),
         dflash_conf_tau: parse_conf_tau(value("METRALE_DFLASH_CONF_TAU").as_deref()),

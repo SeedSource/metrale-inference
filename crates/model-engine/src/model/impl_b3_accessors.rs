@@ -21,6 +21,21 @@ impl TransformerModel {
         self.gpu.as_ref()
     }
 
+    /// 2026-10-09: `(rank, world)` when this model has a communicator and runs the head-worker
+    /// protocol, for the two-rank DFlash drafter (`METRALE_DFLASH_DRAFT_TP2`).
+    pub fn dflash_tp_rank(&self) -> Option<(usize, usize)> {
+        let c = self.comm.as_ref()?;
+        self.multi_rank_protocol_active()
+            .then(|| (c.rank(), c.world_size()))
+    }
+
+    /// 2026-10-09: Whether a rank other than 0 captures the DFlash prompt rows: only when the
+    /// proposer joins every propose on all ranks (`needs_comm`, the two-rank drafter), so
+    /// rank 1 holds the prompt rows its propose reads (`dflash_head/tp.rs`).
+    pub(super) fn dflash_capture_on_every_rank(&self) -> bool {
+        self.proposer.as_ref().is_some_and(|p| p.needs_comm())
+    }
+
     /// 2026-09-25: Borrow the model config, for building the proposers that
     /// are installed after construction.
     pub fn config_ref(&self) -> &ModelConfig {

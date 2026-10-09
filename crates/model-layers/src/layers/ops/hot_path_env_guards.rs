@@ -14,7 +14,7 @@
 /// 2026-09-25: Files on a per-token, per-layer or per-forward path, each with the functions in it
 /// that may read the environment. An empty list means the file may not read it at all. Paths are
 /// relative to `crates/model-layers/src`.
-const GUARDED: [(&str, &[&str]); 49] = [
+const GUARDED: [(&str, &[&str]); 53] = [
     ("layers/dense_ffn_weights.rs", &[]),
     ("layers/dense_ffn_init.rs", &[]),
     ("layers/dense_ffn_load.rs", &[]),
@@ -148,6 +148,11 @@ const GUARDED: [(&str, &[&str]); 49] = [
     ("../../model-arch/src/dflash_head/markov.rs", &[]),
     ("../../model-arch/src/dflash_head/dflash2.rs", &[]),
     ("../../model-arch/src/dflash_head/precompute_ctx_kv.rs", &[]),
+    // 2026-10-09: The two-rank drafter's propose path (METRALE_DFLASH_DRAFT_TP2).
+    ("../../model-arch/src/dflash_head/propose_prep.rs", &[]),
+    ("../../model-arch/src/dflash_head/tp/collectives.rs", &[]),
+    ("../../model-arch/src/dflash_head/tp/follower.rs", &[]),
+    ("../../model-arch/src/dflash_head/tp/leader.rs", &[]),
 ];
 
 fn src_root() -> std::path::PathBuf {

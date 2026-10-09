@@ -112,6 +112,7 @@ pub(super) fn install_dflash_drafter(
                 model.gpu_backend(),
                 max_seq_len,
                 max_batch_size,
+                model.dflash_tp_rank(),
             )?;
             model.set_dflash_proposer(std::sync::Arc::new(head));
             tracing::info!(target: "metrale_model_engine::factory::build", "DFlash drafter installed as the active proposer");

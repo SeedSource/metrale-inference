@@ -96,6 +96,11 @@ fn quantize_drafter_fp8(
     let h = head.hidden_size;
     let inter = head.intermediate_size;
     let quant_k = head.kernels.quantize_bf16_to_fp8;
+    // 2026-10-09: METRALE_DFLASH_DRAFT_TP2: o/down are row-parallel, so each rank keeps
+    // a column slice of the full quantization (`tp/shard_weights.rs`).
+    let o_cols = head.tp.as_ref().map(|t| t.plan.o_cols());
+    let down_cols = head.tp.as_ref().map(|t| t.plan.down_cols());
+    let quantize_cols = crate::dflash_head::tp::shard_weights::quantize_cols;
     for (layer_idx, layer) in head.layers.iter_mut().enumerate() {
         layer.q_proj_fp8 =
             Some(
@@ -115,12 +120,12 @@ fn quantize_drafter_fp8(
                     .v_proj
                     .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
             );
-        layer.o_proj_fp8 =
-            Some(
-                layer
-                    .o_proj
-                    .quantize_to_fp8(gpu, quant_k, h, q_dim_local, stream)?,
-            );
+        layer.o_proj_fp8 = Some(match o_cols {
+            Some((k_full, cols)) => quantize_cols(gpu, quant_k, &layer.o_proj, h, k_full, cols)?,
+            None => layer
+                .o_proj
+                .quantize_to_fp8(gpu, quant_k, h, q_dim_local, stream)?,
+        });
         layer.gate_proj_fp8 = Some(
             layer
                 .gate_proj
@@ -131,11 +136,12 @@ fn quantize_drafter_fp8(
                 .up_proj
                 .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
         );
-        layer.down_proj_fp8 = Some(
-            layer
+        layer.down_proj_fp8 = Some(match down_cols {
+            Some((k_full, cols)) => quantize_cols(gpu, quant_k, &layer.down_proj, h, k_full, cols)?,
+            None => layer
                 .down_proj
                 .quantize_to_fp8(gpu, quant_k, h, inter, stream)?,
-        );
+        });
         tracing::debug!(
             target: "metrale_model_arch::dflash_head::from_weights",
             "DFlash Phase G: layer {} quantized", layer_idx
@@ -147,11 +153,20 @@ fn quantize_drafter_fp8(
     // quantization of the shared BF16 lm_head in its own buffer, which leaves the
     // target's weight untouched.
     if let Some((shared, rows)) = lm_head_native_fp8 {
+        // 2026-10-09: Under TP the share is the full head and this rank takes its rows.
+        let full_vocab = head
+            .tp
+            .as_ref()
+            .map_or(head.vocab_size, |t| t.plan.geom.vocab);
+        let shared = head
+            .tp
+            .as_ref()
+            .map_or(shared, |t| t.plan.lm_head_fp8_rows(&shared));
         anyhow::ensure!(
-            rows == head.vocab_size,
+            rows == full_vocab,
             "native FP8 lm_head share rows ({rows}) != drafter vocab ({}) — \
                      the drafter's tail GEMM iterates head.vocab_size rows",
-            head.vocab_size
+            full_vocab
         );
         tracing::info!(
             target: "metrale_model_arch::dflash_head::from_weights",

@@ -36,7 +36,13 @@ impl TransformerModel {
     /// verify (`ep_worker_verify_batch`). Skipped under the DFlash batched lever when the
     /// proposer runs on rank 0 alone (`gdb::worker_skips_verify_stash`).
     pub(super) fn ep_worker_stash_verify_rows(&self, rows: &[usize]) -> Result<()> {
-        let needs_comm = self.proposer.as_ref().map(|p| p.needs_comm());
+        // 2026-10-09: A block-diffusion drafter (`block_gamma` is `Some`) never reads the
+        // stash, including its two-rank form (METRALE_DFLASH_DRAFT_TP2), which reports
+        // `needs_comm` but takes its ctx rows from rank 0's propose header.
+        let needs_comm = self
+            .proposer
+            .as_ref()
+            .map(|p| p.needs_comm() && p.block_gamma().is_none());
         if gdb::worker_skips_verify_stash(gdb::glm_dflash_batched_verify(), needs_comm) {
             return Ok(());
         }

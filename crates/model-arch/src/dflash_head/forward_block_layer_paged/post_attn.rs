@@ -107,6 +107,8 @@ impl BlockDiffusionDraftHead {
             h,
             q_dim,
         )?;
+        // 2026-10-09: Two-rank drafter: o_proj is row-parallel, so sum the partials.
+        self.tp_reduce_rows(ctx, self.scratch.stream_acc, g, stream)?;
 
         // 2026-09-25: DFlash2 attention conv finish on the o_proj output, with the
         // dynamic slice computed in pre_attn.
@@ -190,6 +192,8 @@ impl BlockDiffusionDraftHead {
             h,
             inter,
         )?;
+        // 2026-10-09: Two-rank drafter: down_proj is row-parallel.
+        self.tp_reduce_rows(ctx, self.scratch.stream_acc, g, stream)?;
 
         // 2026-09-25: DFlash2 MLP conv finish on the down_proj output.
         let mlp_res_src = self.conv_finish(

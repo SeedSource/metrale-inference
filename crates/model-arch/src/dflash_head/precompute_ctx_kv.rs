@@ -93,18 +93,10 @@ impl BlockDiffusionDraftHead {
             Ok(())
         };
 
-        // 2026-09-25: Step 1: `fc` maps `[n, L_t * h_t]` to `[n, h]`.
+        // 2026-09-25: Step 1: `fc` maps `[n, L_t * h_t]` to `[n, h]` (2026-10-09: split
+        // across ranks under `METRALE_DFLASH_DRAFT_TP2`, see `tp/collectives.rs`).
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        self.draft_gemm_bf16(
-            gpu,
-            src,
-            &self.fc,
-            self.scratch.fc_proj,
-            n,
-            h,
-            target_hidden_dim as u32,
-            stream,
-        )?;
+        self.fc_project(ctx, src, n, target_hidden_dim as u32, stream)?;
         dump_buf(
             "fc_proj",
             self.scratch.fc_proj,

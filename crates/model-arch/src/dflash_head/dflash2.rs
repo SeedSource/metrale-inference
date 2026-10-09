@@ -233,6 +233,9 @@ impl BlockDiffusionDraftHead {
             .arg_ptr(self.scratch.sel_idx)
             .arg_u32(vocab)
             .launch(stream)?;
+        // 2026-10-09: Two-rank drafter: `vocab` is this rank's shard; merge every rank's
+        // top-16 into the global one before the walk reads it (`tp/collectives.rs`).
+        self.tp_merge_top16(ctx, rows as usize, stream)?;
 
         // 2026-09-25: H(h_t): [rows, hidden] → [rows, rank].
         self.draft_gemm_bf16(

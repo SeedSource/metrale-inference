@@ -457,25 +457,10 @@ impl BlockDiffusionDraftHead {
             head.target_layer_ids,
         );
 
-        // 2026-09-25: FP8 drafter weights, on unless METRALE_DFLASH_DRAFTER_FP8=0:
-        // quantize each layer's seven dense GEMM weights (q/k/v/o/gate/up/down) to FP8
-        // E4M3 with one f32 scale per row, give the lm_head an FP8 copy, and set
-        // `quant = Fp8Weights`. Needs the row-scaled FP8 GEMM and its m16 variant;
-        // without them the drafter stays on BF16 with a warning.
-        let fp8_requested =
-            std::env::var("METRALE_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("0");
-        let fp8_kernels_present = head.kernels.fp8_gemm_n128_row_scaled.0 != 0
-            && head.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0;
-        if fp8_requested && !fp8_kernels_present {
-            tracing::warn!(
-                "METRALE_DFLASH_DRAFTER_FP8=1 but fp8_gemm_t_row_scaled(_m16) kernels are \
-                 not in this target's w4a16 PTX module — staying on the BF16 drafter path. \
-                 Port the Phase G kernels from kernels/gb10/qwen3.6-27b/nvfp4/w4a16_gemm.cu."
-            );
-        }
-        if fp8_requested && fp8_kernels_present {
-            fp8_weights::quantize_drafter_fp8(&mut head, gpu, q_dim, kv_dim, lm_head_native_fp8)?;
-        }
+        // 2026-09-25: FP8 drafter weights (METRALE_DFLASH_DRAFTER_FP8), see
+        // `fp8_weights::arm_drafter_fp8`. 2026-10-08: then the S1a batchm GEMV lever.
+        fp8_weights::arm_drafter_fp8(&mut head, gpu, q_dim, kv_dim, lm_head_native_fp8)?;
+        head.arm_draft_gemv(gpu);
 
         Ok(head)
     }

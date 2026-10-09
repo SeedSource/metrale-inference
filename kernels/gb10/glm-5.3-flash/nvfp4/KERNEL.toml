@@ -4,6 +4,8 @@
 # aliases. This directory holds the kernels only GLM uses: glm5next_dsa_mla_decode,
 # glm5next_mla_latent_write and glm_vit. glm5next_dsa_mla_decode.cu fixes the latent width
 # at GLM_KV_LORA_DIM 512 and Glm5NextDsaConfig::validate refuses any other kv_lora_rank.
+# 2026-10-08: dflash_fp8_gemm.cu holds the DFlash drafter's row-scaled FP8 GEMMs (module
+# `dflash_fp8_gemm`, taken under METRALE_DFLASH_DRAFTER_FP8=1; SeedHQ/seed-skills#71 S1b).
 
 
 

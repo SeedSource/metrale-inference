@@ -82,6 +82,10 @@ pub struct DFlashLevers {
     /// 2026-09-25: `METRALE_DFLASH_DRAFT_CAP=<n>`: return at most n drafts per
     /// propose. `None` caps at the block width in flight (`block_g`).
     pub draft_cap: Option<usize>,
+    /// 2026-10-08: `METRALE_DFLASH_DRAFT_GEMV=1`: the drafter's BF16 projections of
+    /// at most 16 rows run on `dense_gemv_bf16_batchm` instead of the 128x128-tile
+    /// pipelined GEMM (`draft_gemm.rs`, SeedHQ/seed-skills#71 S1a).
+    pub draft_gemv: bool,
 
     /// 2026-09-25: `METRALE_DFLASH_VERIFY_TRACE=1`: log every propose's drafts
     /// before the row-0 drop and the cap.
@@ -175,6 +179,7 @@ fn from_values(
         batch_propose_width: parsed(value("METRALE_DFLASH_BATCH_PROPOSE").as_deref())
             .unwrap_or(usize::MAX),
         draft_cap: parsed(value("METRALE_DFLASH_DRAFT_CAP").as_deref()),
+        draft_gemv: opt_in(value("METRALE_DFLASH_DRAFT_GEMV").as_deref()),
 
         verify_trace: opt_in(value("METRALE_DFLASH_VERIFY_TRACE").as_deref()),
         precompute_dump: opt_in(value("METRALE_DFLASH_PRECOMPUTE_DUMP").as_deref()),

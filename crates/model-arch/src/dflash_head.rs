@@ -249,6 +249,7 @@ pub struct BlockDiffusionDraftHead {
 }
 
 mod dflash2;
+mod draft_gemm;
 /// 2026-09-25: Rows the batched ctx precompute staging holds per step.
 pub(super) const PRECOMPUTE_BATCH_ROWS: usize = 256;
 

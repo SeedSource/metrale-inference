@@ -44,7 +44,7 @@ fn defaults_are_spelled_out_not_derived() {
 fn every_opt_in_is_off_until_it_is_exactly_one() {
     // 2026-09-25: `=1` arms and no other spelling does. One row per field, so
     // a field read from the wrong variable fails its own row.
-    let cases: [(&str, fn(&DFlashLevers) -> bool); 14] = [
+    let cases: [(&str, fn(&DFlashLevers) -> bool); 15] = [
         ("METRALE_DFLASH_DEBUG_DUMP", |l| l.debug_dump),
         ("METRALE_DFLASH_DEBUG_DUMP_FULL", |l| l.debug_dump_full),
         ("METRALE_DFLASH_LOG_DRAFTS", |l| l.log_drafts),
@@ -61,6 +61,7 @@ fn every_opt_in_is_off_until_it_is_exactly_one() {
             l.full_precompute
         }),
         ("METRALE_DFLASH_CTXLEN_PROBE", |l| l.ctxlen_probe),
+        ("METRALE_DFLASH_DRAFT_GEMV", |l| l.draft_gemv),
     ];
     for (var, read) in cases {
         assert!(!read(&resolve(&[])), "{var} armed with nothing set");

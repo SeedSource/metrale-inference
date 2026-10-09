@@ -277,6 +277,47 @@ fn prefill_tc_names_and_mirrors_are_consistent() {
     const _: () = assert!(MLA_PREFILL_TC_HEADS == 32);
 }
 
+/// 2026-10-08: `METRALE_GLM_MLA_PREFILL_TC2` takes a launch only where the tensor-core kernel
+/// would (lever on, launch not refused) and its own entry point resolved; every other case is
+/// ignored with a reason naming the cause.
+#[test]
+fn prefill_tc2_replaces_only_tensor_core_launches() {
+    use super::prefill_tc::prefill_tc2_ignored;
+    assert_eq!(prefill_tc2_ignored(true, None, true), None);
+    let off = prefill_tc2_ignored(false, None, true).unwrap();
+    assert!(off.contains("METRALE_GLM_MLA_PREFILL_TC is off"), "{off}");
+    // 2026-10-08: TC off wins over everything else: nothing the TC2 kernel could replace.
+    assert_eq!(prefill_tc2_ignored(false, Some("x"), false), Some(off));
+    let refused = prefill_tc2_ignored(true, Some("selection width 4000 > 2560"), true).unwrap();
+    assert!(
+        refused.contains(MLA_PREFILL_TC_ENTRY) && refused.contains("selection width 4000"),
+        "{refused}"
+    );
+    let unresolved = prefill_tc2_ignored(true, None, false).unwrap();
+    assert!(
+        unresolved.contains(MLA_PREFILL_TC2_ENTRY) && unresolved.contains("did not resolve"),
+        "{unresolved}"
+    );
+}
+
+/// 2026-10-08: The rewrite launches with the tensor-core kernel's geometry: same heads per block
+/// and the same shared-memory size (the Q tile's 32 KB became the second key buffer), and its
+/// entry names carry the module name (the `.cu` file stem).
+#[test]
+fn prefill_tc2_names_and_mirrors_match_the_tensor_core_kernel() {
+    assert_eq!(MLA_PREFILL_TC2_MODULE, "glm5next_dsa_mla_prefill_tc2");
+    for e in [
+        MLA_PREFILL_TC2_ENTRY,
+        MLA_PREFILL_TC2_HWCVT_ENTRY,
+        MLA_PREFILL_TC2_CVT_CHECK_ENTRY,
+    ] {
+        assert!(e.starts_with(MLA_PREFILL_TC2_MODULE), "{e}");
+    }
+    assert_eq!(MLA_PREFILL_TC2_HEADS, MLA_PREFILL_TC_HEADS);
+    assert_eq!(MLA_PREFILL_TC2_SMEM_BYTES, MLA_PREFILL_TC_SMEM_BYTES);
+    assert!(prefill_tc::MLA_PREFILL_TC2_ENGAGED_LINE.starts_with("METRALE_GLM_MLA_PREFILL_TC2"));
+}
+
 /// 2026-10-05: `METRALE_GLM_DSA_MLA_SPLIT`: `1` is auto, an integer of 2 or more forces S (at
 /// most 16), anything else is off.
 #[test]

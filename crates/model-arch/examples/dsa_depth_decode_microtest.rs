@@ -32,6 +32,16 @@
 //!   layer), 11 layers a step. Random cache data; timing only, no correctness check (the output
 //!   is only checked to be non-zero, printed as `out_nonzero`).
 //!
+//! 2026-10-08: Production dispatch of the car (c26). Contexts default to 131,072 and 262,144
+//! (`DEPTH_MT_CONTEXTS=a,b,c` overrides; 532,480 is available). With `METRALE_GLM_DSA_POOL_CACHE=1`
+//! the fixture keeps per-layer persistent pool arrays warmed to S, the `full` line is
+//! `dsa_write_geom_pk` + `select_tokens` with the cache (only the new pools compress), and the
+//! compress stage is `dsa_write_geom_pk` + `dsa_kpool_compress_incr` at the ceiling grid. The
+//! topk stage follows `METRALE_GLM_DSA_TOPK_RADIX`; the scores stage is the plain scorer a
+//! ceiling launch always takes (TC/TC2 need exact host geometry). One line per stage and S:
+//! `STAGE <name> S=<s> ms_per_step=<x> impl=<which>`. With the cache on, the sanity pass also
+//! compares its tokens with the cache-less production `select_tokens`.
+//!
 //! Owner: model-arch examples.
 //! Invariants: none beyond the types.
 //!
@@ -52,6 +62,7 @@ use metrale_model_arch::glm5next_dsa::Glm5NextDsaKernels;
 use metrale_model_arch::glm5next_dsa::attend::{
     DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, decode_attention,
 };
+use metrale_model_arch::glm5next_dsa::pool_cache::dsa_pool_cache;
 use metrale_model_arch::glm5next_dsa::select::DsaSelectGeometry;
 
 #[path = "common/dsa_depth_rig.rs"]
@@ -67,8 +78,14 @@ unsafe extern "C" {
     fn cuEventDestroy_v2(event: u64) -> i32;
 }
 
-/// 2026-10-06: Live contexts timed (tokens).
-const CONTEXTS: &[usize] = &[131_072, 262_144, 532_480];
+/// 2026-10-08: Live contexts timed (tokens): `DEPTH_MT_CONTEXTS` (comma list), default the
+/// car's 131,072 and 262,144; 532,480 is available through the variable.
+fn contexts() -> Vec<usize> {
+    let raw = std::env::var("DEPTH_MT_CONTEXTS").unwrap_or_else(|_| "131072,262144".into());
+    raw.split(',')
+        .map(|t| t.trim().parse().expect("DEPTH_MT_CONTEXTS: comma list of token counts"))
+        .collect()
+}
 /// 2026-10-06: Selector calls in a K = 3 decode step: one per layer per verify row.
 const CALLS: usize = LAYERS * ROWS;
 const REPLAYS: usize = 51;
@@ -129,6 +146,7 @@ fn time_graph(g: &dyn GpuBackend, s: u64, f: &mut dyn FnMut(u64) -> Result<()>) 
 /// of the last layer, i.e. entries that are neither `-1` nor the poison).
 fn sanity(g: &dyn GpuBackend, f: &Fixture, s: usize) -> Result<(usize, usize, usize)> {
     let (mut legs, mut equal, mut live) = (0, 0, 0);
+    let mut nc_diff = 0;
     for l in 0..LAYERS {
         f.poison_tokens(g)?;
         for r in 0..ROWS {
@@ -141,12 +159,28 @@ fn sanity(g: &dyn GpuBackend, f: &Fixture, s: usize) -> Result<(usize, usize, us
         );
         legs += 1;
         equal += usize::from(a == b);
+        if f.pool_cache {
+            // 2026-10-08: The pool-cache selection against the production cache-less
+            // `select_tokens` (full compress into a scratch) on the same geometry.
+            for r in 0..ROWS {
+                f.full(g, s, l, r, 0)?;
+                f.select(g, s, l, r, false, 0)?;
+            }
+            let c = down(g, f.scratch_nc.tokens(), f.token_bytes())?;
+            let a2 = down(g, f.scratch.tokens(), f.token_bytes())?;
+            legs += 1;
+            equal += usize::from(a2 == c);
+            nc_diff += usize::from(a2 != c);
+        }
         let poison = i32::from_le_bytes([POISON; 4]);
         live += a
             .chunks_exact(4)
             .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             .filter(|&t| t >= 0 && t != poison)
             .count();
+    }
+    if nc_diff > 0 {
+        println!("pool-cache select_tokens differs from cache-less select_tokens in {nc_diff} layers");
     }
     Ok((legs, equal, live))
 }
@@ -237,19 +271,25 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    if dsa_pool_cache() && (kernels.kpool_compress_incr.0 == 0 || kernels.write_geom_pk.0 == 0) {
+        println!("METRALE_GLM_DSA_POOL_CACHE=1 but dsa_kpool_compress_incr / dsa_write_geom_pk are absent - SKIP");
+        std::process::exit(2);
+    }
     let f = Fixture::new(g, kernels)?;
+    let (ic, isc, itk) = f.impls();
     println!(
-        "capacity {MAX_POOLS} pools ({MAX_SEQ} tokens); grids compress {} scores {} blocks; \
-         {LAYERS} layers x {ROWS} rows = {CALLS} calls a step",
-        f.grids.0, f.grids.1
+        "pool_cache={} radix_topk={} capacity {MAX_POOLS} pools ({MAX_SEQ} tokens); grids compress \
+         {} scores {} blocks; {LAYERS} layers x {ROWS} rows = {CALLS} calls a step",
+        f.pool_cache, f.radix, f.grids.0, f.grids.1
     );
     let attend_kernel = Glm5NextDsaDecodeKernel::resolve_for(g, &f.cfg).ok();
     if attend_kernel.is_none() {
         println!("glm5next_dsa_mla_decode_fp8 absent from this target - ATTEND arm skipped");
     }
     let st = g.create_stream()?;
+    let ctxs = contexts();
     let (mut legs, mut equal, mut live) = (0, 0, 0);
-    for &s in CONTEXTS {
+    for &s in &ctxs {
         f.set_context(g, s)?;
         let (l, e, n) = sanity(g, &f, s)?;
         (legs, equal, live) = (legs + l, equal + e, live + n);
@@ -264,13 +304,20 @@ fn main() -> Result<()> {
         let scores = each(g, &|l, r, sm| f.scores(g, l, r, sm))?;
         let topk = each(g, &|_, r, sm| f.topk(g, r, sm))?;
         let expand = each(g, &|l, r, sm| f.expand(g, l, r, sm))?;
-        println!(
-            "DEPTH S={s} full={full:.3} compress={compress:.3} scores={scores:.3} topk={topk:.3} \
-             expand={expand:.3} (ms per decode step, {CALLS} calls)"
-        );
+        let cname = if f.pool_cache { "compress_incr" } else { "compress" };
+        let lines = [
+            (cname, compress, ic.as_str()),
+            ("scores", scores, isc.as_str()),
+            ("topk", topk, itk.as_str()),
+            ("expand", expand, "dsa_expand_selection"),
+            ("full", full, "select_tokens(Ceiling), production dispatch"),
+        ];
+        for (name, ms, imp) in lines {
+            println!("STAGE {name} S={s} ms_per_step={ms:.3} impl={imp}");
+        }
         let sum = compress + scores + topk + expand;
         println!(
-            "SUM S={s} sum_of_stages={sum:.3} full={full:.3} sum/full={:.3}",
+            "SUM S={s} sum_of_stages={sum:.3} full={full:.3} sum/full={:.3} ({CALLS} calls a step)",
             sum / full
         );
         if let Some(k) = attend_kernel {
@@ -280,9 +327,12 @@ fn main() -> Result<()> {
             }
             g.synchronize(0)?;
             let (ms, nonzero) = attend(g, &f, k, s, st)?;
+            let env = |k: &str| std::env::var(k).unwrap_or_else(|_| "unset".into());
             println!(
-                "ATTEND S={s} mla_decode={ms:.3} (ms per decode step, {LAYERS} launches x {ROWS} \
-                 rows; out_nonzero={nonzero})"
+                "STAGE attend S={s} ms_per_step={ms:.3} impl=decode_attention(MLA_SPLIT={} \
+                 MLA_HEADGROUP={}; {LAYERS} launches x {ROWS} rows; out_nonzero={nonzero})",
+                env("METRALE_GLM_DSA_MLA_SPLIT"),
+                env("METRALE_GLM_DSA_MLA_HEADGROUP")
             );
         }
     }
@@ -299,7 +349,7 @@ fn main() -> Result<()> {
     println!(
         "PASS - select_tokens tokens are byte-equal to the stage launches at {} contexts x \
          {LAYERS} layers x {ROWS} rows.",
-        CONTEXTS.len()
+        ctxs.len()
     );
     Ok(())
 }

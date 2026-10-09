@@ -14,7 +14,9 @@ use anyhow::{Result, bail};
 use half::bf16;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
+use metrale_model_arch::glm5next_dsa::pool_cache::dsa_pool_cache;
 use metrale_model_arch::glm5next_dsa::select::grid_stride::{ceiling_grids, dsa_grid_stride};
+use metrale_model_arch::glm5next_dsa::select::radix::{self, RadixMode, RadixTopk};
 use metrale_model_arch::glm5next_dsa::select::{
     DsaSelectGeometry, DsaSelectInputs, DsaSelectLaunch, DsaSelectScratch, select_tokens,
     topk_smem_for_tile, topk_tile,
@@ -41,6 +43,9 @@ pub(crate) const ROWS: usize = 3;
 const SCORES_BLOCK: u32 = 128;
 const ROW_BLOCK: u32 = 256;
 pub(crate) const POISON: u8 = 0xA5;
+
+#[path = "dsa_depth_cache.rs"]
+mod cache;
 
 struct Lcg(u64);
 impl Lcg {
@@ -71,7 +76,7 @@ pub(crate) fn i32_bytes(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
@@ -115,6 +120,19 @@ pub(crate) struct Layer {
     pub(crate) k: DevicePtr,
     pub(crate) gate: DevicePtr,
     pub(crate) valid: DevicePtr,
+    /// 2026-10-08: The persistent pool arrays with `METRALE_GLM_DSA_POOL_CACHE=1` (see
+    /// `dsa_depth_cache.rs`); all NULL with the lever off.
+    pub(crate) pc: PoolArrays,
+}
+
+/// 2026-10-08: One layer's pool-cache arrays: `pk` `[pools + 1, D]` f32, `pidx` `[pools + 1, KP]`
+/// i32, `pvalid` `[pools + 1]` u8, `pk_len` one i32 (the state's `pk_len_dev`).
+#[derive(Clone, Copy)]
+pub(crate) struct PoolArrays {
+    pub(crate) pk: DevicePtr,
+    pub(crate) pidx: DevicePtr,
+    pub(crate) pvalid: DevicePtr,
+    pub(crate) pk_len: DevicePtr,
 }
 
 /// 2026-10-06: One verify row's device vectors: `seq_len` (one i32, the input of
@@ -137,6 +155,8 @@ pub(crate) struct Stage {
     selected: DevicePtr,
     /// 2026-10-06: `[ROWS, out_width]` i32 token ids, row `r` at `r * out_width`.
     pub(crate) tokens: DevicePtr,
+    /// 2026-10-08: Radix top-k work buffer for one row (`METRALE_GLM_DSA_TOPK_RADIX=1`).
+    work: DevicePtr,
 }
 
 pub(crate) struct Fixture {
@@ -149,7 +169,14 @@ pub(crate) struct Fixture {
     q_mask: DevicePtr,
     rows: Vec<Row>,
     pub(crate) scratch: DsaSelectScratch,
+    /// 2026-10-08: A second scratch planned without pool regions, for the cache-less
+    /// `select_tokens` the pool-cache run is compared with.
+    pub(crate) scratch_nc: DsaSelectScratch,
     pub(crate) st: Stage,
+    /// 2026-10-08: `METRALE_GLM_DSA_POOL_CACHE=1` is on (production `dsa_pool_cache()`), and the
+    /// radix top-k engages at the ceiling pool count.
+    pub(crate) pool_cache: bool,
+    pub(crate) radix: bool,
     /// 2026-10-06: Grids `(compress, scores)` a ceiling launch gets, as `select_tokens` computes
     /// them (`select/launch.rs` lines 85-88, `grid_stride::ceiling_launch_grids_for`).
     pub(crate) grids: (usize, usize),
@@ -159,6 +186,7 @@ impl Fixture {
     pub(crate) fn new(g: &dyn GpuBackend, kernels: Glm5NextDsaKernels) -> Result<Self> {
         let cfg = cfg();
         cfg.validate()?;
+        let pool_cache = dsa_pool_cache();
         let mut rng = Lcg(0x0DE9_7D5A);
         let tokens = MAX_POOLS * KP + 3;
         let k_host = rng.bf16_bytes(tokens * D, -1.0, 1.0);
@@ -171,6 +199,11 @@ impl Fixture {
                 k: up(g, &k_host)?,
                 gate: up(g, &gate)?,
                 valid: up(g, &valid)?,
+                pc: if pool_cache {
+                    PoolArrays::alloc(g)?
+                } else {
+                    PoolArrays::null()
+                },
             });
         }
         let q: Vec<f32> = (0..H * D).map(|_| rng.r(-1.0, 1.0)).collect();
@@ -181,7 +214,7 @@ impl Fixture {
         for _ in 0..ROWS {
             rows.push(Row {
                 seq_len: g.alloc(4)?,
-                geom: g.alloc(5 * 4)?,
+                geom: g.alloc(6 * 4)?,
                 q_pos: g.alloc(4)?,
             });
         }
@@ -189,6 +222,21 @@ impl Fixture {
         // workspace plans it (`Glm5NextDsaWorkspace::new`).
         let plan_geom = DsaSelectGeometry::plan(&cfg, MAX_SEQ, ROWS)?;
         let scratch = DsaSelectScratch::alloc(g, &cfg, &plan_geom)?;
+        let scratch_nc = DsaSelectScratch::alloc_sized(
+            g,
+            DsaSelectScratch::plan_bytes_levers(
+                &cfg,
+                &[plan_geom],
+                radix::dsa_topk_radix(),
+                false,
+            ),
+        )?;
+        let radix_on = radix::radix_mode(
+            radix::dsa_topk_radix(),
+            radix::radix_resolved(&kernels),
+            true,
+            MAX_POOLS,
+        ) == RadixMode::Engaged;
         let m = MAX_POOLS;
         let st = Stage {
             pool_keys: g.alloc((m + 1) * D * 4)?,
@@ -198,6 +246,7 @@ impl Fixture {
             valid_cand: g.alloc(m)?,
             selected: g.alloc(cfg.select_k(m) * 4)?,
             tokens: g.alloc(ROWS * cfg.out_width() * 4)?,
+            work: g.alloc(radix::radix_work_bytes(&cfg, 1).max(1))?,
         };
         let sms = g.sm_count().map_or(48, |n| n as usize).max(1);
         let stride = dsa_grid_stride() && kernels.grid_stride_marker.0 != 0;
@@ -212,7 +261,10 @@ impl Fixture {
             q_mask,
             rows,
             scratch,
+            scratch_nc,
             st,
+            pool_cache,
+            radix: radix_on,
         })
     }
 
@@ -225,6 +277,9 @@ impl Fixture {
         for (r, row) in self.rows.iter().enumerate() {
             g.copy_h2d(&i32_bytes(&[(s + r) as i32]), row.seq_len)?;
             g.copy_h2d(&i32_bytes(&[(s + r) as i32 - 1]), row.q_pos)?;
+            if self.pool_cache {
+                continue; // `geom_pk` writes the geometry per call, from each layer's pk_len
+            }
             KernelLaunch::new(g, self.kernels.write_geom)
                 .grid([1, 1, 1])
                 .block([1, 1, 1])
@@ -234,6 +289,9 @@ impl Fixture {
                 .arg_u32(TOPK as u32)
                 .arg_u32(topk_tile() as u32)
                 .launch(0)?;
+        }
+        if self.pool_cache {
+            self.warm(g, s)?;
         }
         g.synchronize(0)
     }
@@ -255,6 +313,25 @@ impl Fixture {
         r: usize,
         stream: u64,
     ) -> Result<()> {
+        if self.pool_cache {
+            // 2026-10-08: `decode_k_rows` writes the geometry per layer and row first.
+            self.geom_pk(g, l, r, stream)?;
+        }
+        self.select(g, s, l, r, self.pool_cache, stream)
+    }
+
+    /// 2026-10-08: `select_tokens` for layer `l`, row `r`, with the layer's pool arrays
+    /// (`cached`) or without (full compress into the scratch). The cache-less call needs the
+    /// geometry `write_geom` / `write_geom_pk` left in the row's `geom`.
+    pub(crate) fn select(
+        &self,
+        g: &dyn GpuBackend,
+        s: usize,
+        l: usize,
+        r: usize,
+        cached: bool,
+        stream: u64,
+    ) -> Result<()> {
         let (layer, row) = (self.layers[l], self.rows[r]);
         let inputs = DsaSelectInputs {
             k_normed: layer.k,
@@ -267,7 +344,7 @@ impl Fixture {
             q_mask: self.q_mask.offset(r),
             first_key: 0,
             geom_dev: row.geom,
-            pool_cache: None,
+            pool_cache: cached.then(|| self.pc_args(l)),
         };
         select_tokens(
             g,
@@ -275,7 +352,7 @@ impl Fixture {
             &self.cfg,
             &self.geometry(s, r)?,
             &inputs,
-            &self.scratch.row(r, &self.cfg),
+            &if cached { &self.scratch } else { &self.scratch_nc }.row(r, &self.cfg),
             DsaSelectLaunch::Ceiling { max_pools: MAX_POOLS },
             stream,
         )
@@ -283,7 +360,7 @@ impl Fixture {
 
     /// 2026-10-06: Ceiling-launch scalars `select_tokens` derives (`select/launch.rs` lines
     /// 58-66): `(seq_a, npools_a, np2_a, selk_a)`.
-    fn scalars(&self) -> (usize, usize, usize, usize) {
+    pub(super) fn scalars(&self) -> (usize, usize, usize, usize) {
         let m = MAX_POOLS;
         (
             m * KP,
@@ -295,6 +372,10 @@ impl Fixture {
 
     /// 2026-10-06: `dsa_kpool_compress` alone, as `select/launch.rs` lines 92-107.
     pub(crate) fn compress(&self, g: &dyn GpuBackend, l: usize, r: usize, stream: u64) -> Result<()> {
+        if self.pool_cache {
+            self.geom_pk(g, l, r, stream)?;
+            return self.compress_incr(g, l, r, stream);
+        }
         let (layer, row, st) = (self.layers[l], self.rows[r], &self.st);
         let (seq_a, ..) = self.scalars();
         KernelLaunch::new(g, self.kernels.kpool_compress)
@@ -320,15 +401,16 @@ impl Fixture {
     pub(crate) fn scores(&self, g: &dyn GpuBackend, l: usize, r: usize, stream: u64) -> Result<()> {
         let (layer, row, st) = (self.layers[l], self.rows[r], &self.st);
         let (seq_a, npools_a, ..) = self.scalars();
+        let (pk, pidx, pvalid) = self.pools(l);
         KernelLaunch::new(g, self.kernels.index_scores)
             .grid([self.grids.1 as u32, 1, 1])
             .block([SCORES_BLOCK, 1, 1])
             .shared_mem(SCORES_BLOCK.max((H * 4) as u32))
             .arg_ptr(self.q)
-            .arg_ptr(st.pool_keys)
+            .arg_ptr(pk)
             .arg_ptr(self.weights)
-            .arg_ptr(st.pool_indices)
-            .arg_ptr(st.pool_valid)
+            .arg_ptr(pidx)
+            .arg_ptr(pvalid)
             .arg_ptr(layer.valid)
             .arg_ptr(row.q_pos)
             .arg_ptr(st.scores)
@@ -348,6 +430,20 @@ impl Fixture {
     pub(crate) fn topk(&self, g: &dyn GpuBackend, r: usize, stream: u64) -> Result<()> {
         let (row, st) = (self.rows[r], &self.st);
         let (_, npools_a, np2_a, selk_a) = self.scalars();
+        if self.radix {
+            // 2026-10-08: `select/launch.rs` lines 213-228: the radix select at the ceiling.
+            let t = RadixTopk {
+                scores: st.scores,
+                selected: st.selected,
+                work: st.work,
+                q_rows: 1,
+                n_pools: npools_a,
+                select_k: selk_a,
+                kcap: radix::radix_kcap(&self.cfg),
+                geom_dev: row.geom,
+            };
+            return radix::launch_topk_radix(g, &self.kernels, &t, stream);
+        }
         KernelLaunch::new(g, self.kernels.topk_pools)
             .grid([1, 1, 1])
             .block([ROW_BLOCK, 1, 1])
@@ -367,12 +463,13 @@ impl Fixture {
     pub(crate) fn expand(&self, g: &dyn GpuBackend, l: usize, r: usize, stream: u64) -> Result<()> {
         let (layer, row, st) = (self.layers[l], self.rows[r], &self.st);
         let (seq_a, npools_a, _, selk_a) = self.scalars();
+        let (_, pidx, _) = self.pools(l);
         let w = self.cfg.out_width();
         KernelLaunch::new(g, self.kernels.expand_selection)
             .grid([1, 1, 1])
             .block([ROW_BLOCK, 1, 1])
             .arg_ptr(st.selected)
-            .arg_ptr(st.pool_indices)
+            .arg_ptr(pidx)
             .arg_ptr(st.valid_cand)
             .arg_ptr(layer.valid)
             .arg_ptr(row.q_pos)
@@ -388,25 +485,5 @@ impl Fixture {
             .arg_i32(i32::from(self.cfg.always_select_tail))
             .arg_ptr(row.geom)
             .launch(stream)
-    }
-
-    /// 2026-10-06: Stage-by-stage selection of layer `l`, row `r`, in `select_tokens` order.
-    pub(crate) fn staged(&self, g: &dyn GpuBackend, l: usize, r: usize, stream: u64) -> Result<()> {
-        self.compress(g, l, r, stream)?;
-        self.scores(g, l, r, stream)?;
-        self.topk(g, r, stream)?;
-        self.expand(g, l, r, stream)
-    }
-
-    /// 2026-10-06: Bytes of the `[ROWS, out_width]` token buffers.
-    pub(crate) fn token_bytes(&self) -> usize {
-        ROWS * self.cfg.out_width() * 4
-    }
-
-    /// 2026-10-06: Fill both token buffers with the poison byte, so a slot a path does not
-    /// write cannot match the other path's output.
-    pub(crate) fn poison_tokens(&self, g: &dyn GpuBackend) -> Result<()> {
-        g.memset(self.scratch.tokens(), POISON, self.token_bytes())?;
-        g.memset(self.st.tokens, POISON, self.token_bytes())
     }
 }

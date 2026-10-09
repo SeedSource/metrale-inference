@@ -36,7 +36,8 @@ pub mod prefill_tc;
 pub use prefill_tc::{
     MLA_PREFILL_TC_ENTRY, MLA_PREFILL_TC_HEADS, MLA_PREFILL_TC_MAX_SEL, MLA_PREFILL_TC_MODULE,
     MLA_PREFILL_TC_SMEM_BYTES, MLA_PREFILL_TC2_CVT_CHECK_ENTRY, MLA_PREFILL_TC2_ENTRY,
-    MLA_PREFILL_TC2_HEADS, MLA_PREFILL_TC2_HWCVT_ENTRY, MLA_PREFILL_TC2_MODULE,
+    MLA_PREFILL_TC2_HEADS, MLA_PREFILL_TC2_HWCVT_ENTRY, MLA_PREFILL_TC2_L2_FLUSH_ENTRY,
+    MLA_PREFILL_TC2_MODULE,
     MLA_PREFILL_TC2_SMEM_BYTES, attention, prefill_attention_tc, prefill_attention_tc2,
     prefill_attention_tc2_hwcvt,
 };
@@ -279,8 +280,14 @@ impl Glm5NextDsaDecodeKernel {
         self.prefill_tc2_hwcvt.0 != 0
     }
 
+    /// 2026-10-08: The tensor-core prefill handle (`KernelHandle(0)` when absent), for the
+    /// microtest's launch-only timing.
+    pub fn prefill_tc_handle(&self) -> KernelHandle {
+        self.prefill_tc
+    }
+
     /// 2026-10-08: The TC2 handle: the old-converter arm when `hwcvt`.
-    pub(crate) fn prefill_tc2_handle(&self, hwcvt: bool) -> KernelHandle {
+    pub fn prefill_tc2_handle(&self, hwcvt: bool) -> KernelHandle {
         if hwcvt {
             self.prefill_tc2_hwcvt
         } else {

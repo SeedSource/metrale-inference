@@ -610,3 +610,20 @@ extern "C" __global__ void glm5next_dsa_mla_prefill_tc2_cvt_check(unsigned* __re
         out[256u + 8u * i + k] = c[k];
     }
 }
+
+// 2026-10-08: L2 eviction for the microtest's cold-L2 timing: reads `n16` 16-byte chunks of `src`
+// grid-stride (plain loads, which allocate in L2) and folds them into one word, stored only when
+// it equals an arbitrary constant so the loads cannot be dropped. Read-only, so the lines it
+// leaves in L2 are clean and the next kernel pays no write-back for them.
+extern "C" __global__ void glm5next_dsa_mla_prefill_tc2_l2_flush(const uint4* __restrict__ src,
+                                                                 const unsigned long long n16,
+                                                                 unsigned* __restrict__ sink) {
+    unsigned acc = 0u;
+    const unsigned long long step = (unsigned long long)gridDim.x * blockDim.x;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n16;
+         i += step) {
+        const uint4 v = src[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x9E3779B9u) sink[0] = acc;
+}

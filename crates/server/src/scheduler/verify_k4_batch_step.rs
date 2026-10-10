@@ -187,6 +187,19 @@ pub(super) fn step_verify_k4_batched(
     if !broadcast_batch_verdict(model, batch, &accepted_all, ks) {
         return;
     }
+    // 2026-10-10: Hybrid serve: each sequence's accepted rows into its DFlash drafter context,
+    // from its capture band (`i * dflash_capture_band()`, written by the batched verify forward),
+    // before `k4_apply_verdict` rewinds `seq_len`.
+    if model.hybrid_dflash() {
+        let band = model.dflash_capture_band();
+        for (i, a) in batch.iter_mut().enumerate() {
+            let na = accepted_all[i].min(ks[i] - 1);
+            let pre_verify_len = a.seq.seq_len.saturating_sub(ks[i]);
+            if let Err(e) = model.commit_ctx(&mut a.seq, na + 1, pre_verify_len, i * band) {
+                tracing::error!("commit_ctx (hybrid batched MTP verify, row {i}): {e:#}");
+            }
+        }
+    }
     let t_stash = sched.io.clock.now();
     // 2026-09-25: stash each sequence's accepted-position hidden row
     // (`off[i] + num_accepted`) into stash slot i before any propose

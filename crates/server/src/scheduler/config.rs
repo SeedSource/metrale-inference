@@ -21,6 +21,9 @@ pub struct SchedulerConfig {
     pub max_batch_size: usize,
     pub use_speculative: bool,
     pub dflash_verify_raw_argmax: bool,
+    /// 2026-10-10: `Some` on a hybrid serve (`METRALE_HYBRID_DFLASH=1`): the decode lane then
+    /// picks the proposer per step (`hybrid_mode`) and `dflash_verify_raw_argmax` is unused.
+    pub hybrid: Option<crate::scheduler::hybrid_mode::HybridConfig>,
     /// 2026-09-29: A146: this model's MTP-lane spec-in-think default
     /// (`mtp_gate::mtp_spec_think_default(config.model_type)`, resolved once
     /// at serve load); `METRALE_MTP_SPEC_THINK` / `METRALE_DFLASH_SPEC_THINK`

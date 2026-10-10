@@ -55,7 +55,10 @@ pub fn step_verify_k3(
     // 2026-09-25: the fused forward is for DFlash on a single rank. Under EP
     // the workers run `decode_verify_graphed_k3` for the command above, so
     // the master runs it too and the collectives stay matched.
-    let result_vec: Vec<u32> = if dflash_verify_raw_argmax && !model.is_ep() {
+    // 2026-10-10: Not on a hybrid serve, whose verifies capture every row for `commit_ctx`
+    // (the fused forward captures row 0 only).
+    let fused = dflash_verify_raw_argmax && !model.is_ep() && !model.hybrid_dflash();
+    let result_vec: Vec<u32> = if fused {
         // 2026-09-25: one M=3 forward; it captures the DFlash hidden at
         // row 0 (`Model::decode_and_verify_fused`).
         match model.decode_and_verify_fused(&tokens_k3, &mut a.seq, 0) {
@@ -177,6 +180,8 @@ pub fn step_verify_k3(
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k3 result: {e:#}"));
         return;
     }
+    // 2026-10-10: Hybrid serve: the accepted rows into the DFlash drafter context.
+    super::hybrid_mode::commit_verify_ctx(model, &mut a.seq, num_accepted, 3);
 
     // 2026-09-25: debug level: this fires on every verify step.
     tracing::debug!(

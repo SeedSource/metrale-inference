@@ -274,7 +274,7 @@ pub(crate) fn load_model(
     let scheduler_eos = eos_tokens;
     let max_batch_size =
         scheduler_setup::resolve_max_batch_size(&args, world_size, scheduler_model.as_ref())?;
-    let (use_speculative, use_self_spec, use_ngram_spec, num_drafts, dflash_rung) =
+    let (use_speculative, use_self_spec, use_ngram_spec, num_drafts, dflash_rung, hybrid) =
         scheduler_setup::resolve_speculation(&args, scheduler_model.as_ref(), &config.model_type);
 
     let policy = scheduler_setup::scheduling_policy(&args)?;
@@ -301,7 +301,9 @@ pub(crate) fn load_model(
     // the pre-sample pipeline. The `dflash_masked_verify` lever
     // (`METRALE_DFLASH_MASKED_VERIFY`, on unless `0`) sends the picks back
     // through the masking at the pick sites; it does not change this bool.
-    let dflash_verify_raw_argmax = args.dflash;
+    // 2026-10-10: A hybrid serve picks it per step (`scheduler::hybrid_mode`); its serve-wide
+    // value is the MTP lane's.
+    let dflash_verify_raw_argmax = args.dflash && !crate::main_modules::hybrid_serve(&args);
     // 2026-09-29: A146: MTP-lane speculation inside `<think>`: default on only
     // for architectures that passed the spec-in-think quality and safety
     // gates (GLM-5.3); resolved from the model config once, here, so the
@@ -364,6 +366,7 @@ pub(crate) fn load_model(
                 max_batch_size,
                 use_speculative,
                 dflash_verify_raw_argmax,
+                hybrid,
                 mtp_spec_think_default,
                 num_drafts,
                 policy,

@@ -126,7 +126,10 @@ pub fn step_verify_k2(
     // 2026-09-25: the fused forward is for DFlash on a single rank. Under EP
     // the workers run `decode_verify_graphed` for the command above, so the
     // master runs it too and the collectives stay matched.
-    let result_vec: Vec<u32> = if dflash_verify_raw_argmax && !model.is_ep() {
+    // 2026-10-10: Not on a hybrid serve, whose verifies capture every row for `commit_ctx`
+    // (the fused forward captures row 0 only).
+    let fused = dflash_verify_raw_argmax && !model.is_ep() && !model.hybrid_dflash();
+    let result_vec: Vec<u32> = if fused {
         // 2026-09-25: one M=2 forward; it captures the DFlash hidden at
         // row 0 (`Model::decode_and_verify_fused`).
         match model.decode_and_verify_fused(&tokens_k2, &mut a.seq, 0) {
@@ -217,6 +220,8 @@ pub fn step_verify_k2(
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k2 result: {e:#}"));
         return;
     }
+    // 2026-10-10: Hybrid serve: the accepted rows into the DFlash drafter context.
+    super::hybrid_mode::commit_verify_ctx(model, &mut a.seq, usize::from(accepted), 2);
 
     sched
         .io

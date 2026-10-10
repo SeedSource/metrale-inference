@@ -53,7 +53,11 @@ pub(super) fn resolve_max_batch_size(
 }
 
 /// 2026-09-26: `(use_speculative, use_self_spec, use_ngram_spec, num_drafts,
-/// dflash_rung)`.
+/// dflash_rung, hybrid)`.
+///
+/// 2026-10-10: `hybrid` is `Some` on a hybrid serve (`METRALE_HYBRID_DFLASH=1` with both
+/// proposers installed): `num_drafts` is then the MTP depth and the DFlash count rides in it.
+#[allow(clippy::type_complexity)]
 pub(super) fn resolve_speculation(
     args: &cli::ServeArgs,
     scheduler_model: &dyn metrale_model_engine::traits::Model,
@@ -64,11 +68,12 @@ pub(super) fn resolve_speculation(
     bool,
     usize,
     metrale_speculative::dflash_rung::DflashRung,
+    Option<scheduler::hybrid_mode::HybridConfig>,
 ) {
     let use_speculative = (args.speculative || args.dflash) && scheduler_model.has_proposer();
     let use_self_spec = args.self_speculative && scheduler_model.has_self_speculative();
     let use_ngram_spec = args.ngram_speculative;
-    let num_drafts = if args.dflash {
+    let dflash_num_drafts = if args.dflash {
         // 2026-09-26: The drafter head's resolved gamma wins over the flag.
         let g = scheduler_model
             .dflash_gamma()
@@ -77,24 +82,49 @@ pub(super) fn resolve_speculation(
     } else {
         args.resolved_num_drafts()
     };
+    // 2026-10-10: Hybrid: the model reports both proposers (`hybrid_dflash`); the lever alone
+    // with a failed drafter install leaves a pure MTP serve.
+    let hybrid =
+        (crate::main_modules::hybrid_serve(args) && scheduler_model.hybrid_dflash()).then(|| {
+            scheduler::hybrid_mode::HybridConfig {
+                mtp_num_drafts: args.resolved_num_drafts(),
+                dflash_num_drafts,
+                dwell: std::time::Duration::from_millis(
+                    metrale_model_layers::speculative::hybrid::hybrid_dflash_dwell_ms(),
+                ),
+            }
+        });
+    if crate::main_modules::hybrid_serve(args) && hybrid.is_none() {
+        tracing::warn!(target: "met::main_modules::serve_load", "METRALE_HYBRID_DFLASH=1 but the model holds no DFlash drafter beside the MTP head: \
+             serving MTP only"
+        );
+    }
+    let num_drafts = match &hybrid {
+        Some(h) => h.mtp_num_drafts,
+        None if crate::main_modules::hybrid_serve(args) => args.resolved_num_drafts(),
+        None => dflash_num_drafts,
+    };
     let dflash_rung = metrale_speculative::dflash_rung::DflashRung::new();
     if args.dflash {
         // 2026-09-26: The head's gamma is the cap; `--dflash-gamma` pins it
         // unless `METRALE_DFLASH_GAMMA_RESOLVER` is set.
         dflash_rung.configure(
-            num_drafts + 1,
+            dflash_num_drafts + 1,
             args.dflash_gamma.is_some(),
             metrale_model_layers::layers::qwen3_ssm::gdn_flags::gdn_woa_enabled(),
         );
         // 2026-10-09: GLM DFlash C>=2 width (`METRALE_GLM_DFLASH_BATCHED_VERIFY`, or the
         // per-sequence control `METRALE_GLM_DFLASH_PERSEQ_K4`): pinned even under an explicit
         // `--dflash-gamma`, which still sets C=1 and the pools.
+        // 2026-10-10: Not on a hybrid serve, which runs DFlash only at C=1.
         use metrale_model_layers::speculative::glm_dflash_batch as gdb;
-        if let Some(k) = gdb::glm_dflash_multi_k(
-            model_type,
-            gdb::glm_dflash_batched_verify(),
-            gdb::glm_dflash_perseq_k4(),
-        ) {
+        if hybrid.is_none()
+            && let Some(k) = gdb::glm_dflash_multi_k(
+                model_type,
+                gdb::glm_dflash_batched_verify(),
+                gdb::glm_dflash_perseq_k4(),
+            )
+        {
             dflash_rung.pin_multi(k);
             // 2026-10-09: Only the batched lever batches every eligible row at that width
             // (thinking rows included); the per-sequence control keeps the old split.
@@ -108,7 +138,14 @@ pub(super) fn resolve_speculation(
         scheduler::dflash_ksel::init();
     }
 
-    if args.dflash {
+    if let Some(h) = &hybrid {
+        tracing::info!(target: "met::main_modules::serve_load", "HYBRID DFLASH speculative decoding: ENABLED (MTP {} drafts/step up to \
+             METRALE_MTP_MAX_SEQS; DFlash γ={} at one active sequence after a {} ms dwell)",
+            h.mtp_num_drafts,
+            h.dflash_num_drafts + 1,
+            h.dwell.as_millis(),
+        );
+    } else if args.dflash && !crate::main_modules::hybrid_serve(args) {
         tracing::info!(target: "met::main_modules::serve_load", "DFlash speculative decoding: ENABLED (γ={}, window={}, drafter installed)",
             num_drafts + 1,
             if args.dflash_window_size == 0 {
@@ -134,6 +171,7 @@ pub(super) fn resolve_speculation(
         use_ngram_spec,
         num_drafts,
         dflash_rung,
+        hybrid,
     )
 }
 

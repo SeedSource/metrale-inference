@@ -36,6 +36,8 @@ mod first_token_policy;
 #[cfg(test)]
 mod first_token_policy_tests;
 mod helpers;
+// 2026-10-10: Hybrid MTP + DFlash step-mode choice (`METRALE_HYBRID_DFLASH`).
+pub(crate) mod hybrid_mode;
 pub(crate) mod io;
 mod lifecycle;
 #[cfg(test)]

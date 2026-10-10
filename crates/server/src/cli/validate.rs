@@ -262,6 +262,14 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         }
     }
 
+    // 2026-10-10: `--dflash` with `--speculative` (clap's conflict until 2026-10-10) only on a
+    // hybrid serve, which needs both (`check_hybrid_dflash`).
+    check_hybrid_dflash(
+        &mut v,
+        args,
+        metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled(),
+    );
+
     // 2026-10-10: `METRALE_SSM_NO_CHECKPOINT=1` allocates no pre-verify SSM checkpoint; ngram
     // and self-speculative verify roll back to it (`num_accepted == 0`), MTP never does.
     if metrale_model_layers::ssm_reserve::ssm_no_checkpoint()
@@ -398,3 +406,49 @@ mod tests;
 #[cfg(test)]
 #[path = "validate_tests_b.rs"]
 mod validate_tests_b;
+
+/// 2026-10-10: The flag rules of the hybrid serve (`METRALE_HYBRID_DFLASH=1`, `hybrid`). Without
+/// the lever `--dflash` and `--speculative` stay mutually exclusive, as clap enforced before.
+/// With it both are required, and the SSM rollback mode must be the snapshot mode (the DFlash
+/// slot's verify pools are per-token intermediates).
+fn check_hybrid_dflash(v: &mut Vec<Violation>, args: &ServeArgs, hybrid: bool) {
+    if !hybrid {
+        if args.dflash && args.speculative {
+            v.push(Violation::new(
+                "--dflash is set together with --speculative.",
+                "a serve holds one proposer: the DFlash drafter or the MTP head.",
+                "drop one of the two, or set METRALE_HYBRID_DFLASH=1 (on every rank) to hold \
+                 both and pick per step.",
+            ));
+        }
+        return;
+    }
+    if !(args.dflash && args.speculative) {
+        v.push(Violation::new(
+            "METRALE_HYBRID_DFLASH=1 is set without both --dflash and --speculative.",
+            "the hybrid serve holds the MTP head (--speculative) and the DFlash drafter \
+             (--dflash) and picks one per step.",
+            "add --dflash --speculative, or unset METRALE_HYBRID_DFLASH.",
+        ));
+    }
+    if args
+        .ssm_rollback_mode
+        .parse::<metrale_model_layers::ssm_reserve::SsmRollbackMode>()
+        .is_ok_and(|m| m == metrale_model_layers::ssm_reserve::SsmRollbackMode::Replay)
+    {
+        v.push(Violation::new(
+            "METRALE_HYBRID_DFLASH=1 is set with a non-snapshot --ssm-rollback-mode.",
+            "the hybrid serve sizes the DFlash slot's per-token SSM intermediates, which only \
+             the snapshot rollback mode allocates.",
+            "drop --ssm-rollback-mode, or unset METRALE_HYBRID_DFLASH.",
+        ));
+    }
+    if std::env::var("METRALE_DFLASH_UNIFIED_CTX").as_deref() == Ok("0") {
+        v.push(Violation::new(
+            "METRALE_HYBRID_DFLASH=1 is set with METRALE_DFLASH_UNIFIED_CTX=0.",
+            "the hybrid serve appends the DFlash drafter context only through the unified \
+             commit (`commit_ctx`) on every step type; the older append paths are off on it.",
+            "unset METRALE_DFLASH_UNIFIED_CTX, or unset METRALE_HYBRID_DFLASH.",
+        ));
+    }
+}

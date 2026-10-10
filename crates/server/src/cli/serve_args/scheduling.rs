@@ -118,8 +118,9 @@ pub struct ServeSchedulingArgs {
     /// Pairs the target with a small drafter checkpoint (e.g.
     /// `z-lab/Qwen3.6-35B-A3B-DFlash`) that drafts a block of γ tokens per step
     /// from captured target hidden states. Mutually exclusive with
-    /// `--speculative`.
-    #[arg(long, default_value_t = false, conflicts_with = "speculative")]
+    /// `--speculative`, except on a hybrid serve (`METRALE_HYBRID_DFLASH=1`, which
+    /// needs both; checked in `validate_serve_args`).
+    #[arg(long, default_value_t = false)]
     pub dflash: bool,
 
     /// HuggingFace id (or local path) of the DFlash drafter checkpoint.

@@ -10,6 +10,8 @@
 
 mod end_tick;
 mod finish;
+// 2026-10-10: The decode lane's hybrid step mode (`METRALE_HYBRID_DFLASH`).
+mod hybrid_lane;
 mod lane_decode;
 mod lanes;
 pub(super) mod pipeline;
@@ -39,6 +41,8 @@ pub struct SchedulerCore {
     eos_tokens: Vec<u32>,
     max_batch_size: usize,
     dflash_verify_raw_argmax: bool,
+    /// 2026-10-10: See `SchedulerConfig::hybrid`.
+    hybrid: Option<crate::scheduler::hybrid_mode::HybridState>,
     /// 2026-09-29: A146: see `SchedulerConfig::mtp_spec_think_default`.
     mtp_spec_think_default: bool,
     num_drafts: usize,
@@ -96,6 +100,7 @@ impl SchedulerCore {
             max_batch_size,
             use_speculative,
             dflash_verify_raw_argmax,
+            hybrid,
             mtp_spec_think_default,
             num_drafts,
             policy,
@@ -262,6 +267,7 @@ impl SchedulerCore {
             eos_tokens,
             max_batch_size,
             dflash_verify_raw_argmax,
+            hybrid: hybrid.map(crate::scheduler::hybrid_mode::HybridState::new),
             mtp_spec_think_default,
             num_drafts,
             policy,

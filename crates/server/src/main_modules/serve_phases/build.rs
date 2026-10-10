@@ -106,7 +106,9 @@ pub(crate) fn build_model(
         args.mtp_vocab,
         comm,
         args.self_speculative || args.ngram_speculative,
-        if args.dflash {
+        // 2026-10-10: A hybrid serve's `num_drafts` is the MTP head's depth; the model sizes the
+        // DFlash verify from the drafter's gamma itself (`ssm_setup::size_rollback_pools`).
+        if args.dflash && !crate::main_modules::hybrid_serve(args) {
             // 2026-09-26: The drafter head is not built yet: `--dflash-gamma`
             // (else 16) minus one. `serve_load` takes the scheduler's
             // `num_drafts` from the built head's gamma.

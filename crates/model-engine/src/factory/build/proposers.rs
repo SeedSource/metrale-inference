@@ -8,6 +8,8 @@
 //! Invariants:
 //! - A DeepSeek-V4 or GLM-5.3 proposer build error is logged and not returned;
 //!   a DFlash drafter error is returned.
+//! - Under `METRALE_HYBRID_DFLASH` (2026-10-10) a drafter that does not install on this rank is
+//!   a startup error.
 
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::DevicePtr;
@@ -130,11 +132,23 @@ pub(super) fn install_dflash_drafter(
                 model.set_dflash_proposer(std::sync::Arc::new(head));
                 tracing::info!(target: "metrale_model_engine::factory::build", "DFlash drafter installed as the active proposer");
             }
+        } else if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
+            // 2026-10-10: Under the hybrid serve a rank without the drafter would answer DFlash
+            // steps with the MTP head while the other rank drafts: a startup error, not a warn.
+            anyhow::bail!(
+                "METRALE_HYBRID_DFLASH=1 but the DFlash drafter store has no fc.weight: the \
+                 drafter did not install on this rank, and a hybrid serve needs it on every rank"
+            );
         } else {
             tracing::warn!(target: "metrale_model_engine::factory::build", "DFlash drafter store had no fc.weight — proposer not installed; \
                  falling back to whatever proposer (if any) the target's MTP path built"
             );
         }
+    } else if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
+        anyhow::bail!(
+            "METRALE_HYBRID_DFLASH=1 but this rank has no DFlash drafter (--dflash): a hybrid \
+             serve needs the drafter installed on every rank"
+        );
     }
     Ok(())
 }

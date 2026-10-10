@@ -296,7 +296,8 @@ pub(crate) fn maybe_run_ep_worker(
                     );
                 }
                 // 2026-09-26: Any other error came from the receive: the link to
-                // the head is gone.
+                // the head is gone. 2026-10-10: or a hybrid step-mode switch failed
+                // after rank 0 switched; this rank must not keep serving.
                 Err(e) => {
                     tracing::error!("EP worker error: {e:#}");
                     break;

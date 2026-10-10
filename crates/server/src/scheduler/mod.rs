@@ -17,6 +17,11 @@ mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
+mod dflash_batch_rows;
+#[cfg(test)]
+mod dflash_batch_rows_tests;
+pub(crate) mod dflash_conf_tau;
+pub(crate) mod dflash_ksel;
 #[cfg(test)]
 mod emit_eos_thinking_tests;
 #[cfg(test)]
@@ -86,6 +91,9 @@ mod think_skip_tests;
 #[cfg(test)]
 mod trace_harness;
 mod types;
+mod verify_batch_ep;
+#[cfg(test)]
+mod verify_dflash_batch_ep_tests;
 mod verify_dflash_batch_step;
 mod verify_dflash_step;
 mod verify_k2_step;
@@ -123,6 +131,7 @@ use sample_step::*;
 use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;
 use types::*;
+use verify_batch_ep::*;
 use verify_dflash_batch_step::*;
 use verify_dflash_step::*;
 use verify_k2_step::*;

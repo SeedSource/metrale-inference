@@ -142,17 +142,8 @@ impl BlockDiffusionDraftHead {
                     stream,
                 );
             }
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.kernels.dense_gemm_pipelined,
-                src,
-                w_bf16,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            )
+            // 2026-10-08: BF16: `draft_gemm_bf16` (METRALE_DFLASH_DRAFT_GEMV).
+            self.draft_gemm_bf16(gpu, src, w_bf16, dst, g, n_out, k_in, stream)
         };
 
         // 2026-09-25: Q is `[g, q_dim]`, one row per token; q_norm treats it as

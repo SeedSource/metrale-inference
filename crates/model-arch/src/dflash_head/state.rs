@@ -126,6 +126,10 @@ pub struct DflashProposerState {
     /// when the row is appended and kept when the window slides. Model-engine's
     /// `update_dflash_ctx_len_after_prefill` seeds prefill row i with i.
     pub ctx_positions: Vec<i32>,
+    /// 2026-10-09: Two-rank drafter, rank 0 only: the position of the newest ctx row rank 1
+    /// holds (`tp/leader.rs`). Prefill capture sets it; `None` makes the next propose
+    /// resend every row.
+    pub tp_synced_pos: Option<i32>,
 }
 
 impl ProposerState for DflashProposerState {

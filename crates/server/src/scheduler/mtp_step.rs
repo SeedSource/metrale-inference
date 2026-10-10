@@ -118,9 +118,9 @@ pub fn step_mtp(
     // 2026-09-25: DFlash batched verify. It needs at least two sequences
     // with drafts, `dflash_batch_verify` (off with
     // `METRALE_DFLASH_BATCH_VERIFY=0`) and `mtp_batch_verify` (off with
-    // `METRALE_NO_MTP_BATCH_VERIFY`). The batch is every sequence without a
-    // grammar whose draft count equals the first such sequence's; the rest
-    // take the per-sequence step. The debug line logs the gate inputs once.
+    // `METRALE_NO_MTP_BATCH_VERIFY`). Which rows batch is
+    // `dflash_batch_rows::split_verify_rows`; the rest take the per-sequence
+    // step. The debug line logs the gate inputs once.
     if sched.io.tel.stats().once("log:dflash_batch_verify_gate") {
         tracing::debug!(
             raw_argmax = dflash_verify_raw_argmax,
@@ -135,31 +135,13 @@ pub fn step_mtp(
         && sched.levers.dflash_batch_verify
         && sched.levers.mtp_batch_verify
     {
-        let mut gamma = 0usize;
-        for &idx in &verify_idxs {
-            let a = &active[idx];
-            let g = a.pending_drafts.len();
-            // 2026-09-29: A144: the batched DFlash verdict is raw argmax
-            // only (no pipeline, no `logit_bias`); a row whose
-            // decode-effective bias is non-empty (the tools-active
-            // `<tool_call>` nudge) takes the per-sequence step, which routes
-            // it through the masked pipeline.
-            if a.grammar_state.is_some()
-                || g < 1
-                // 2026-09-29: A146: a thinking row needs the host pipeline too.
-                || crate::scheduler::sample_step::speculative_raw_argmax_forbidden(
-                    a,
-                    sched.levers.think_ended_gpu_argmax,
-                )
-            {
-                serial_idxs.push(idx);
-            } else if gamma == 0 || g == gamma {
-                gamma = g;
-                batchable_idxs.push(idx);
-            } else {
-                serial_idxs.push(idx);
-            }
-        }
+        // 2026-10-09: The row split (`dflash_batch_rows`): unchanged without the batched GLM
+        // pin; under it every grammarless row with the rung's draft count is batched.
+        let split =
+            super::dflash_batch_rows::split_verify_rows(active, &verify_idxs, sched, num_drafts);
+        let gamma = split.gamma;
+        batchable_idxs = split.batchable;
+        serial_idxs = split.serial;
         // 2026-09-25: `m_max` is the widest group `can_batch_verify` accepts
         // at `gamma + 1` rows, found by shrinking from the whole group. The
         // group is verified in chunks of `m_max` instead of being refused
@@ -206,7 +188,10 @@ pub fn step_mtp(
             }
         } else {
             // 2026-09-25: The first decline is logged once, at info level.
-            if !batchable_idxs.is_empty() && sched.io.tel.stats().once("log:dflash_batch_decline") {
+            // 2026-10-09: A lone batchable row is not a decline (the model was never asked); the
+            // c26dbv run's only "DECLINED: n=1" line was one row past `</think>` beside a thinking
+            // row.
+            if batchable_idxs.len() >= 2 && sched.io.tel.stats().once("log:dflash_batch_decline") {
                 tracing::info!(
                     "DFlash batched verify DECLINED: n={} k={} (model.can_batch_verify said no) \
                      — running the per-sequence loop",
@@ -344,6 +329,10 @@ pub fn step_mtp(
             serial_idxs.extend_from_slice(chunk);
         }
     }
+    // 2026-10-09: `METRALE_DFLASH_CONF_TAU` (`dflash_conf_tau`): C=1 only in v1, so decided on
+    // `active.len()` (bootstrapping sequences count) before the loop borrows `active`.
+    let conf_tau_step =
+        super::dflash_conf_tau::step_applies(sched, active.len(), dflash_verify_raw_argmax);
     for &idx in &serial_idxs {
         let a = &mut active[idx];
         let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
@@ -367,6 +356,13 @@ pub fn step_mtp(
             }
         }
 
+        // 2026-10-09: `METRALE_DFLASH_CONF_TAU`: keep the drafts before the first drafter
+        // top-1 prob below tau (at least 1). Grammar rows are left as they were.
+        let conf_tau_applies = conf_tau_step && a.grammar_state.is_none();
+        if conf_tau_applies {
+            super::dflash_conf_tau::truncate(&mut drafts);
+        }
+
         // 2026-09-25: Verify arm from `spec_capacity::serial_verify_plan`:
         // 4 or more drafts take `step_verify_dflash`, fewer take K4/K3/K2.
         // MTP drafts beyond this step's `ladder_nd` are truncated first;
@@ -385,6 +381,23 @@ pub fn step_mtp(
         if drafts.is_empty() {
             continue;
         }
+        // 2026-10-09: Under the GLM DFlash C>=2 pin (`METRALE_GLM_DFLASH_*`), a short DFlash
+        // block (a lone verifier at C>=2, or the first C=1 step after one) keeps the K=gamma
+        // arm at its own width, so its drafter ctx is committed as on every other step. A
+        // grammar-truncated block keeps the arm it took before.
+        // 2026-10-09: The same holds when `METRALE_DFLASH_CONF_TAU` applied this step: a
+        // block it cut below 4 drafts must not fall to the K2..K4 arms, which never commit
+        // the drafter ctx (acceptance collapses).
+        let arm = if super::dflash_conf_tau::keeps_dflash_arm(
+            dflash_verify_raw_argmax,
+            sched.dflash_rung.multi_pinned(),
+            conf_tau_applies,
+            a.grammar_state.is_none(),
+        ) {
+            metrale_speculative::spec_capacity::SerialArm::DFlash
+        } else {
+            arm
+        };
         let verify = match arm {
             metrale_speculative::spec_capacity::SerialArm::DFlash => step_verify_dflash,
             metrale_speculative::spec_capacity::SerialArm::K4 => step_verify_k4,

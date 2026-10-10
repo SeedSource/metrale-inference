@@ -273,7 +273,7 @@ impl TransformerModel {
     ///
     /// No-op when there are no DFlash capture layers, `layer_idx` is not one
     /// of them, the sequence has no `DflashProposerState`, or this is a comm
-    /// rank other than 0.
+    /// rank other than 0 (2026-10-09: unless `dflash_capture_on_every_rank`).
     pub(super) fn try_dflash_prefill_capture_layer(
         &self,
         seq: &mut crate::traits::SequenceState,
@@ -295,6 +295,7 @@ impl TransformerModel {
         };
         if let Some(ref c) = self.comm
             && c.rank() != 0
+            && !self.dflash_capture_on_every_rank()
         {
             return Ok(());
         }
@@ -330,7 +331,8 @@ impl TransformerModel {
     /// 2026-09-25: After a prefill chunk, set the sequence's DFlash `ctx_len`
     /// to `chunk_start + proc_count` (capped at `max_ctx_len`) so the first
     /// propose sees every captured prompt position. No-op without capture
-    /// layers or a `DflashProposerState`, and on comm ranks other than 0.
+    /// layers or a `DflashProposerState`, and on comm ranks other than 0 (2026-10-09: unless
+    /// `dflash_capture_on_every_rank`).
     pub(super) fn update_dflash_ctx_len_after_prefill(
         &self,
         seq: &mut crate::traits::SequenceState,
@@ -342,6 +344,7 @@ impl TransformerModel {
         }
         if let Some(ref c) = self.comm
             && c.rank() != 0
+            && !self.dflash_capture_on_every_rank()
         {
             return Ok(());
         }
@@ -356,6 +359,8 @@ impl TransformerModel {
             // slot's fixed RoPE position is its index. `ctx_positions` is
             // rebuilt to the same length as `ctx_len` on every chunk.
             dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
+            // 2026-10-09: Two-rank drafter: rank 1 captured the same prompt rows.
+            dstate.tp_synced_pos = new_len.checked_sub(1).map(|p| p as i32);
         }
         Ok(())
     }

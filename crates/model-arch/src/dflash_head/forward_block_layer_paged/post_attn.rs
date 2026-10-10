@@ -93,17 +93,8 @@ impl BlockDiffusionDraftHead {
                     stream,
                 );
             }
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.kernels.dense_gemm_pipelined,
-                src,
-                w_bf16,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            )
+            // 2026-10-08: BF16: `draft_gemm_bf16` (METRALE_DFLASH_DRAFT_GEMV).
+            self.draft_gemm_bf16(gpu, src, w_bf16, dst, g, n_out, k_in, stream)
         };
 
         // 2026-09-25: stream_acc = o_proj(attn_out). stream_buf still holds the layer
@@ -116,6 +107,8 @@ impl BlockDiffusionDraftHead {
             h,
             q_dim,
         )?;
+        // 2026-10-09: Two-rank drafter: o_proj is row-parallel, so sum the partials.
+        self.tp_reduce_rows(ctx, self.scratch.stream_acc, g, stream)?;
 
         // 2026-09-25: DFlash2 attention conv finish on the o_proj output, with the
         // dynamic slice computed in pre_attn.
@@ -199,6 +192,8 @@ impl BlockDiffusionDraftHead {
             h,
             inter,
         )?;
+        // 2026-10-09: Two-rank drafter: down_proj is row-parallel.
+        self.tp_reduce_rows(ctx, self.scratch.stream_acc, g, stream)?;
 
         // 2026-09-25: DFlash2 MLP conv finish on the down_proj output.
         let mlp_res_src = self.conv_finish(

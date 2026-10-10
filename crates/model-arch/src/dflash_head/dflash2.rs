@@ -35,7 +35,6 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
 use super::{BlockDiffusionDraftHead, DflashLayer};
 use metrale_model_layers::layer::ForwardContext;
-use metrale_model_layers::layers::ops;
 
 /// 2026-09-25: Which sublayer a conv application wraps.
 #[derive(Clone, Copy)]
@@ -142,9 +141,8 @@ impl BlockDiffusionDraftHead {
         let groups = h / self.conv_group_size as u32;
         let dyn_cols = 2 * self.conv_kernel_size as u32 * groups;
         // 2026-09-25: Dynamic kernels for both applications, from the pre-conv hidden.
-        ops::dense_gemm_bf16_pipelined(
+        self.draft_gemm_bf16(
             ctx.gpu,
-            self.kernels.dense_gemm_pipelined,
             hidden_in,
             &metrale_model_layers::weight_map::DenseWeight { weight: proj },
             self.scratch.conv_dyn,
@@ -235,11 +233,13 @@ impl BlockDiffusionDraftHead {
             .arg_ptr(self.scratch.sel_idx)
             .arg_u32(vocab)
             .launch(stream)?;
+        // 2026-10-09: Two-rank drafter: `vocab` is this rank's shard; merge every rank's
+        // top-16 into the global one before the walk reads it (`tp/collectives.rs`).
+        self.tp_merge_top16(ctx, rows as usize, stream)?;
 
         // 2026-09-25: H(h_t): [rows, hidden] → [rows, rank].
-        ops::dense_gemm_bf16_pipelined(
+        self.draft_gemm_bf16(
             gpu,
-            self.kernels.dense_gemm_pipelined,
             norm_noise,
             hproj,
             self.scratch.sel_hproj,

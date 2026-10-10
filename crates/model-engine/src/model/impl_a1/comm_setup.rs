@@ -100,6 +100,15 @@ pub(super) fn assert_rank_levers_agree(
                 "METRALE_GLM_BATCHED_VERIFY",
                 u64::from(metrale_model_arch::glm5next_layer::batched_verify()),
             ),
+            // 2026-10-09: The DFlash batched verify sends `EP_CMD_VERIFY_BATCH` where the
+            // per-sequence path sends `EP_CMD_VERIFY_KGAMMA`, and the worker skips its stash; the
+            // read here also logs `ENGAGED` once on every rank.
+            (
+                "METRALE_GLM_DFLASH_BATCHED_VERIFY",
+                u64::from(
+                    metrale_model_layers::speculative::glm_dflash_batch::glm_dflash_batched_verify(),
+                ),
+            ),
             // 2026-09-25: The EP command protocol (`ep_protocol_v2`), which
             // both ranks must share.
             (

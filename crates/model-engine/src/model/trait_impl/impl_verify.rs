@@ -141,11 +141,20 @@ impl TransformerModel {
             .filter(|l| l.decode_verify_multi_own_states())
             .map(|l| l.decode_verify_multi_max_rows())
             .min();
+        // 2026-10-09: With a DFlash drafter the route is the batched DFlash verify
+        // (`METRALE_GLM_DFLASH_BATCHED_VERIFY` across ranks).
+        let (kind, admits) = match (self.dflash_hidden_save.is_some(), ok) {
+            (true, true) => ("DFlash", "ADMITS: batched DFlash verify admitted (route engaged)"),
+            (false, true) => ("MTP", "ADMITS (route engaged)"),
+            (_, false) => (
+                if self.dflash_hidden_save.is_some() { "DFlash" } else { "MTP" },
+                "REFUSES (per-sequence verify)",
+            ),
+        };
         tracing::info!(
-            "batched MTP verify gate {}: ks={ks:?} rows={rows} comm={} ep_ok={} v2={} dflash_save={} \
-             stash={} layers_declining={} layers_own_states={}/{} min_row_cap={min_cap:?} \
-             lora={} hss={}",
-            if ok { "ADMITS (route engaged)" } else { "REFUSES (per-sequence verify)" },
+            "batched {kind} verify gate {admits}: ks={ks:?} rows={rows} comm={} ep_ok={} v2={} \
+             dflash_save={} stash={} layers_declining={} layers_own_states={}/{} \
+             min_row_cap={min_cap:?} lora={} hss={}",
             self.comm.is_some(),
             self.batched_verify_ep_ok(),
             self.ep_protocol_v2,

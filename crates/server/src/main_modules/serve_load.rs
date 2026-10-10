@@ -275,7 +275,7 @@ pub(crate) fn load_model(
     let max_batch_size =
         scheduler_setup::resolve_max_batch_size(&args, world_size, scheduler_model.as_ref())?;
     let (use_speculative, use_self_spec, use_ngram_spec, num_drafts, dflash_rung) =
-        scheduler_setup::resolve_speculation(&args, scheduler_model.as_ref());
+        scheduler_setup::resolve_speculation(&args, scheduler_model.as_ref(), &config.model_type);
 
     let policy = scheduler_setup::scheduling_policy(&args)?;
 

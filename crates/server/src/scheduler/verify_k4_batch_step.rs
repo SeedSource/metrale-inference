@@ -182,15 +182,10 @@ pub(super) fn step_verify_k4_batched(
     // 2026-10-02: Multi-rank (`METRALE_GLM_BATCHED_VERIFY`, model-engine `verify_ep.rs`): the
     // worker ranks wait for every sequence's accepted count, in batch order, then stash and roll
     // back as this rank does below. It goes out before anything else this step sends.
-    if model.is_ep() {
-        let words: Vec<u32> = verdicts.iter().map(|&(_, na, _)| na as u32).collect();
-        if let Err(e) = model.ep_broadcast_tokens(&words) {
-            tracing::error!("EP broadcast batched-verify verdict (n={n}): {e:#}");
-            for a in batch.iter_mut() {
-                a.finished = true;
-            }
-            return;
-        }
+    // 2026-10-09: Clamped to `ks[i] - 1`, which the walk above already holds.
+    let accepted_all: Vec<usize> = verdicts.iter().map(|&(_, na, _)| na).collect();
+    if !broadcast_batch_verdict(model, batch, &accepted_all, ks) {
+        return;
     }
     let t_stash = sched.io.clock.now();
     // 2026-09-25: stash each sequence's accepted-position hidden row
@@ -427,30 +422,4 @@ pub(super) fn step_verify_k4_batched(
         .tel
         .mark(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
     // 2026-09-25: `_step_timer` records the step on drop.
-}
-
-/// 2026-10-02: Multi-rank batched verify: join the workers' commit-failure gather
-/// (`Model::ep_agree_verify_failures`, a no-op without EP) with `local_mask`, and finish every
-/// sequence whose bit (batch order) any rank set. Must run on every path that follows the
-/// verdict broadcast, since the workers block on the gather.
-fn retire_failed_on_workers(model: &dyn Model, batch: &mut [&mut ActiveSeq], local_mask: u32) {
-    if !model.is_ep() {
-        return;
-    }
-    match model.ep_agree_verify_failures(local_mask) {
-        Ok(mask) => {
-            for (i, a) in batch.iter_mut().enumerate().take(32) {
-                if (mask >> i) & 1 == 1 {
-                    tracing::error!("batched verify: worker commit failed, retiring seq {i}");
-                    a.finished = true;
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("EP batched-verify failure gather: {e:#}");
-            for a in batch.iter_mut() {
-                a.finished = true;
-            }
-        }
-    }
 }

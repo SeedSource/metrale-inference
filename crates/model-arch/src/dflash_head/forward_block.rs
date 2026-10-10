@@ -190,7 +190,9 @@ impl BlockDiffusionDraftHead {
             && !debug_dump
             // 2026-09-25: Presence, not value: `METRALE_DFLASH_BLOCK_DUMP=0` also keeps
             // capture off (`GRAPH_SUPPRESSING_DIAGNOSTICS` in levers.rs).
-            && !levers.any_diagnostic_armed;
+            && !levers.any_diagnostic_armed
+            // 2026-10-09: The two-rank drafter's collectives run eagerly.
+            && self.tp.is_none();
 
         let warmup_target = levers.propose_warmup_n;
 

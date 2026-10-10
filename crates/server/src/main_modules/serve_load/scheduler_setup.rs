@@ -57,6 +57,7 @@ pub(super) fn resolve_max_batch_size(
 pub(super) fn resolve_speculation(
     args: &cli::ServeArgs,
     scheduler_model: &dyn metrale_model_engine::traits::Model,
+    model_type: &str,
 ) -> (
     bool,
     bool,
@@ -85,6 +86,26 @@ pub(super) fn resolve_speculation(
             args.dflash_gamma.is_some(),
             metrale_model_layers::layers::qwen3_ssm::gdn_flags::gdn_woa_enabled(),
         );
+        // 2026-10-09: GLM DFlash C>=2 width (`METRALE_GLM_DFLASH_BATCHED_VERIFY`, or the
+        // per-sequence control `METRALE_GLM_DFLASH_PERSEQ_K4`): pinned even under an explicit
+        // `--dflash-gamma`, which still sets C=1 and the pools.
+        use metrale_model_layers::speculative::glm_dflash_batch as gdb;
+        if let Some(k) = gdb::glm_dflash_multi_k(
+            model_type,
+            gdb::glm_dflash_batched_verify(),
+            gdb::glm_dflash_perseq_k4(),
+        ) {
+            dflash_rung.pin_multi(k);
+            // 2026-10-09: Only the batched lever batches every eligible row at that width
+            // (thinking rows included); the per-sequence control keeps the old split.
+            if gdb::glm_dflash_batched_verify() {
+                dflash_rung.mark_multi_batched();
+            }
+        }
+        // 2026-10-09: `METRALE_DFLASH_CONF_TAU`: read once here (rank 0) and log ENGAGED.
+        scheduler::dflash_conf_tau::init();
+        // 2026-10-09: `METRALE_GLM_DFLASH_KSEL`: read once here (rank 0) and log ENGAGED.
+        scheduler::dflash_ksel::init();
     }
 
     if args.dflash {

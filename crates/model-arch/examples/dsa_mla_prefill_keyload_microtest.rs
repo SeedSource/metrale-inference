@@ -24,6 +24,14 @@
 //! then `KEYLOAD_GAP <case> l1/real <r> l2/real <r> dram/real <r>`. The final line starts `PASS`
 //! when every launch succeeded and every time is finite; otherwise `FAIL` lines name the cause.
 //!
+//! 2026-10-09 (A6 follow-up, #68): two more arms timed in the same rounds: the tensor-core kernel
+//! the car runs (`tc`, `glm5next_dsa_mla_prefill_tc_fp8`) and A7 (`pf3`,
+//! `glm5next_dsa_mla_prefill_tc2_pf3_fp8`: key loads three tiles ahead instead of two), printed as
+//! `KEYLOAD_ARMS <case> <layout> tc <ms> tc2 <ms> pf3 <ms> tc2/tc <r> pf3/tc <r> pf3/tc2 <r>`. The
+//! question: in the no-reuse `dram` layout A6 ran slower than A5; is it slower than the car's
+//! kernel, and does a deeper prefetch recover it? Per layout, TC2 and pf3 outputs are also checked
+//! BITWISE against TC (raw u16; a mismatch or an absent entry is a FAIL).
+//!
 //! Owner: model-arch examples.
 //! Invariants: none beyond the types.
 //!
@@ -41,8 +49,9 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_arch::glm5next_dsa::Glm5NextDsaConfig;
 use metrale_model_arch::glm5next_dsa::attend::{
-    DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, MLA_PREFILL_TC2_L2_FLUSH_ENTRY,
-    MLA_PREFILL_TC2_MODULE, MLA_PREFILL_TC2_SMEM_BYTES, mla_scale, prefill_attention_tc2,
+    DsaDecodeInputs, DsaDecodePaging, Glm5NextDsaDecodeKernel, MLA_PREFILL_TC_SMEM_BYTES,
+    MLA_PREFILL_TC2_L2_FLUSH_ENTRY, MLA_PREFILL_TC2_MODULE, MLA_PREFILL_TC2_SMEM_BYTES, mla_scale,
+    prefill_attention_tc2,
 };
 use metrale_model_arch::glm5next_dsa::select::DsaSelectGeometry;
 
@@ -142,6 +151,17 @@ fn up(g: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
     g.copy_h2d(bytes, p)?;
     Ok(p)
 }
+
+/// 2026-10-09: `n_bytes` of device memory at `p`, after a device synchronise.
+fn down(g: &dyn GpuBackend, p: DevicePtr, n_bytes: usize) -> Result<Vec<u8>> {
+    g.synchronize(0)?;
+    let mut b = vec![0u8; n_bytes];
+    g.copy_d2h(p, &mut b)?;
+    Ok(b)
+}
+
+/// 2026-10-09: A7's entry in the TC2 module (`kPf3`), resolved by name here only.
+const PF3_ENTRY: &str = "glm5next_dsa_mla_prefill_tc2_pf3_fp8";
 
 fn i32_bytes(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -510,6 +530,10 @@ fn main() -> Result<()> {
     let nogather = g
         .kernel(AB_MODULE, &entry)
         .with_context(|| format!("{entry} did not resolve"))?;
+    let tc = kernel.prefill_tc_handle();
+    let pf3 = g
+        .kernel(MLA_PREFILL_TC2_MODULE, PF3_ENTRY)
+        .with_context(|| format!("{PF3_ENTRY} did not resolve"))?;
     let flush = L2Flush::new(g)?;
     let mut fails = 0usize;
 
@@ -519,7 +543,8 @@ fn main() -> Result<()> {
             let case = ctx_case(g, seq, seed, layout)?;
             launch_tc2(g, kernel, &case)?;
             g.synchronize(0)?;
-            // 2026-10-09: Index 0 is TC2 (A5, the production entry), 1 the nogather floor.
+            // 2026-10-09: Index 0 is TC2 (the production entry), 1 the nogather floor, 2 the
+            // car's TC kernel, 3 A7 (pf3).
             let mut raws = vec![
                 RawLaunch::new(
                     kernel.prefill_tc2_handle(false),
@@ -527,16 +552,21 @@ fn main() -> Result<()> {
                     &case,
                 )?,
                 RawLaunch::new(nogather, AB_SMEM_NK32, &case)?,
+                RawLaunch::new(tc, MLA_PREFILL_TC_SMEM_BYTES, &case)?,
+                RawLaunch::new(pf3, MLA_PREFILL_TC2_SMEM_BYTES, &case)?,
             ];
-            let mut failed = vec![false; 2];
+            let mut failed = vec![false; 4];
             let ms = event_times(g, &flush, &mut raws, &mut failed)?;
             if failed.iter().any(|f| *f) || ms.iter().any(|m| !m.is_finite()) {
                 println!(
-                    "FAIL {} {}: launch failed or no time (tc2 {:.4}, nogather {:.4})",
+                    "FAIL {} {}: launch failed or no time (tc2 {:.4}, nogather {:.4}, tc {:.4}, \
+                     pf3 {:.4})",
                     case.name,
                     layout.name(),
                     ms[0],
-                    ms[1]
+                    ms[1],
+                    ms[2],
+                    ms[3]
                 );
                 fails += 1;
             }
@@ -549,6 +579,58 @@ fn main() -> Result<()> {
                 ms[1]
             );
             gaps.push(gap);
+            println!(
+                "KEYLOAD_ARMS {} {} tc {:.4} ms tc2 {:.4} ms pf3 {:.4} ms tc2/tc {:.3} pf3/tc {:.3} \
+                 pf3/tc2 {:.3}",
+                case.name,
+                layout.name(),
+                ms[2],
+                ms[0],
+                ms[3],
+                ms[0] / ms[2],
+                ms[3] / ms[2],
+                ms[3] / ms[0]
+            );
+            // 2026-10-09: Bitwise: TC, then TC2, then pf3 into the same output buffer.
+            let n_out = case.rows * HEADS * KVL * 2;
+            let mut outs = Vec::with_capacity(3);
+            for k in [2usize, 0, 3] {
+                if raws[k].launch() != 0 {
+                    anyhow::bail!("{} {}: bitwise launch {k} failed", case.name, layout.name());
+                }
+                outs.push(down(g, case.inputs.out, n_out)?);
+            }
+            for (label, got) in [("tc2", &outs[1]), ("pf3", &outs[2])] {
+                let differ = got
+                    .chunks_exact(2)
+                    .zip(outs[0].chunks_exact(2))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                println!(
+                    "BITWISE {} {} {label} vs tc: {}",
+                    case.name,
+                    layout.name(),
+                    if differ == 0 {
+                        format!("identical ({} u16) -> ok", n_out / 2)
+                    } else {
+                        format!("{differ} u16 differ")
+                    }
+                );
+                if differ != 0 {
+                    println!(
+                        "FAIL {} {}: {label} is not bitwise TC",
+                        case.name,
+                        layout.name()
+                    );
+                    fails += 1;
+                }
+            }
+            let (r3, l3, c3) = raws[3].resources();
+            println!(
+                "INFO {} {} pf3 regs={r3} local_bytes={l3} ctas_per_sm={c3}",
+                case.name,
+                layout.name()
+            );
             let ((r0, l0, c0), (r1, l1, c1)) = (raws[0].resources(), raws[1].resources());
             println!(
                 "INFO {} {} tc2 regs={r0} local_bytes={l0} ctas_per_sm={c0} nogather regs={r1} \
@@ -576,8 +658,8 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     println!(
-        "PASS - TC2 and the nogather floor launched and timed in every case and layout (cold L2, \
-         median of {EVENT_ITERS})."
+        "PASS - TC2, pf3, TC and the nogather floor launched and timed in every case and layout \
+         (cold L2, median of {EVENT_ITERS}); TC2 and pf3 bitwise TC in every layout."
     );
     Ok(())
 }

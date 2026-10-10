@@ -50,6 +50,9 @@
 //      fits 32 bits while the cache is below 2 TiB. Before A6 every lane of a warp ran the
 //      runtime-divisor division and the block-table load for each of its 4 keys per tile
 //      (~130 of the loop's 910 SASS instructions, cuobjdump -sass of the _fp8 entry, nvcc 13.2).
+//   A7 (2026-10-09, microtest arm `_tc2_pf3_fp8` only, not launched by the lever) key loads three
+//      tiles ahead instead of two, for no-reuse long selections where A6's shorter tile hides less
+//      DRAM latency (keyload `dram` 131K: A6 0.893 ms vs A5 0.819 ms). 225 vs 213 registers.
 //   A4 (persistent grid) is not used: at 99 KB of shared memory one CTA fits per SM, and rows past
 //      2,051 tokens all run 65 tiles, so a pull scheduler runs the same ceil(rows / SMs) rounds.
 //
@@ -327,7 +330,10 @@ __device__ __forceinline__ void tc2_qk_tile(const unsigned (&qf)[8][4], unsigned
     }
 }
 
-template <bool kBitCvt>
+// 2026-10-09: kPf3 (A7, microtest arm `_tc2_pf3_fp8`): key loads issued three tiles ahead instead
+// of two (a second register set raw1); the same bytes reach the same stores, so the output bits
+// are unchanged.
+template <bool kBitCvt, bool kPf3 = false>
 __device__ __forceinline__ void tc2_body(
     unsigned char* tc2_smem,
     const __nv_bfloat16* __restrict__ Q,
@@ -456,13 +462,22 @@ __device__ __forceinline__ void tc2_body(
         for (int e = 0; e < 4; e++) o_acc[nt][e] = 0.0f;
     }
 
-    // 2026-10-08: Tile 0 into buffer 0, tile 1's loads, tile 2's offsets.
+    // 2026-10-08: Tile 0 into buffer 0, tile 1's loads, tile 2's offsets (A7: tile 2's loads
+    // into raw1 and tile 3's rows).
     tc2_store_tile<kBitCvt>(k0_s, raw, warp, lane);
     #pragma unroll
     for (int i = 0; i < 4; i++) raw[i] = tc2_load_key(KV_cache, off_nxt[i], lane);
+    uint4 raw1[4];
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        row_nxt[i] = tc2_key_row(sel_s, 2u * TC2_NK + warp + 8u * (unsigned)i, n_valid);
+        const unsigned kk = warp + 8u * (unsigned)i;
+        if (kPf3) {
+            raw1[i] = tc2_load_key(KV_cache, tc2_row_off(tc2_key_row(sel_s, 2u * TC2_NK + kk,
+                                                                     n_valid)), lane);
+            row_nxt[i] = tc2_key_row(sel_s, 3u * TC2_NK + kk, n_valid);
+        } else {
+            row_nxt[i] = tc2_key_row(sel_s, 2u * TC2_NK + kk, n_valid);
+        }
     }
     // 2026-10-08: Publishes buffer 0; every warp has read its Q fragments out of buffer 1.
     __syncthreads();
@@ -483,14 +498,23 @@ __device__ __forceinline__ void tc2_body(
         // loads for tile + 2 and the row reads for tile + 3 (A6). Past the list the offsets
         // are TC2_NO_KEY and the loads return zeros without touching memory.
         tc2_store_tile<kBitCvt>(tc2_smem + (nbuf << 15), raw, warp, lane);
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            raw[i] = tc2_load_key(KV_cache, tc2_row_off(row_nxt[i]), lane);
+        if (kPf3) {
+            // 2026-10-09: A7: tile + 2's bytes move up, tile + 3's loads, tile + 4's rows.
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                raw[i] = raw1[i];
+                raw1[i] = tc2_load_key(KV_cache, tc2_row_off(row_nxt[i]), lane);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                raw[i] = tc2_load_key(KV_cache, tc2_row_off(row_nxt[i]), lane);
+            }
         }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            row_nxt[i] =
-                tc2_key_row(sel_s, (tile + 3u) * TC2_NK + warp + 8u * (unsigned)i, n_valid);
+            row_nxt[i] = tc2_key_row(sel_s, (tile + (kPf3 ? 4u : 3u)) * TC2_NK + warp
+                                                + 8u * (unsigned)i, n_valid);
         }
 
         // 2026-10-08: Online softmax, verbatim (old step 4).
@@ -636,6 +660,28 @@ extern "C" __global__ void __launch_bounds__(TC2_THREADS, 1) glm5next_dsa_mla_pr
     tc2_body<false>(tc2_smem_b, Q, KV_cache, O, block_tables, seq_lens, sel_indices, sel_width,
                     max_blocks_per_seq, num_q_heads, block_size, inv_sqrt_d, kv_scale,
                     cache_stride_bytes);
+}
+
+// 2026-10-09: A7 microtest arm: the production entry with key loads three tiles ahead (kPf3).
+extern "C" __global__ void __launch_bounds__(TC2_THREADS, 1) glm5next_dsa_mla_prefill_tc2_pf3_fp8(
+    const __nv_bfloat16* __restrict__ Q,
+    const unsigned char* __restrict__ KV_cache,
+    __nv_bfloat16* __restrict__ O,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ sel_indices,
+    const unsigned int sel_width,
+    const unsigned int max_blocks_per_seq,
+    const unsigned int num_q_heads,
+    const unsigned int block_size,
+    const float inv_sqrt_d,
+    const float kv_scale,
+    const unsigned long long cache_stride_bytes
+) {
+    extern __shared__ __align__(16) unsigned char tc2_smem_c[];
+    tc2_body<true, true>(tc2_smem_c, Q, KV_cache, O, block_tables, seq_lens, sel_indices,
+                         sel_width, max_blocks_per_seq, num_q_heads, block_size, inv_sqrt_d,
+                         kv_scale, cache_stride_bytes);
 }
 
 // 2026-10-08: Converter check for the microtest, one block of 16 threads: thread i converts the

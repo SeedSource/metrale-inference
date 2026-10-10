@@ -15,7 +15,8 @@ use super::{ToolCall, ToolDefinition};
 ///
 /// The [`ToolDefinition`] is found by name. String values of top-level
 /// properties typed `integer`, `number`, `boolean`, `array`, `object` or `null`
-/// are parsed into that type, and an empty `""` key is relabelled by
+/// are parsed into that type, a non-string, non-null value of a property typed
+/// `string` becomes its JSON text, and an empty `""` key is relabelled by
 /// `repair_empty_keys`. A value that does not parse is left as it is.
 pub fn coerce_all(calls: &mut [ToolCall], tools: &[ToolDefinition]) {
     for call in calls.iter_mut() {
@@ -97,6 +98,20 @@ fn coerce_call_args(call: &mut ToolCall, tool_def: Option<&ToolDefinition>) {
                     && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
                 {
                     *val = parsed;
+                    changed = true;
+                }
+            }
+            "string" => {
+                // 2026-10-10: A wire format without types (poolside_v1 reads each
+                // `<arg_value>` as JSON when it parses) turns a bare `123123` or
+                // `true` into a number or bool. The schema says string, so the
+                // client gets the value's JSON text: numbers and bools verbatim,
+                // objects and arrays as compact JSON. `null` is left as it is.
+                if !val.is_string()
+                    && !val.is_null()
+                    && let Ok(text) = serde_json::to_string(val)
+                {
+                    *val = serde_json::Value::String(text);
                     changed = true;
                 }
             }

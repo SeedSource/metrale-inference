@@ -123,6 +123,23 @@ fn two_calls_in_one_turn_are_both_extracted() {
     assert_eq!(args_of(&calls[1])["location"], "Lyon");
 }
 
+/// 2026-10-10: A bare number on the wire for a `string` property (BFCL's
+/// `123123` ids) reaches the client as the string the schema declares.
+#[test]
+fn bare_number_for_a_string_property_stays_a_string() {
+    let text = "<tool_call>get_weather<arg_key>location</arg_key><arg_value>12345</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>";
+    let (_, mut calls) = parse_tool_calls_promoting_bare_names(text);
+    assert_eq!(calls.len(), 1);
+    coerce_all(&mut calls, &[weather_tool()]);
+    let args = args_of(&calls[0]);
+    assert_eq!(
+        args["location"],
+        serde_json::json!("12345"),
+        "string, not 12345"
+    );
+    assert_eq!(args["days"], serde_json::json!(3), "integer, not \"3\"");
+}
+
 /// 2026-09-26: `parse_poolside_v1_call` reads an `<arg_value>` as JSON when it
 /// parses (`3`, `true`) and as a string otherwise; after `coerce_all`, `days`
 /// is an integer and `verbose` a boolean, as the schema declares.

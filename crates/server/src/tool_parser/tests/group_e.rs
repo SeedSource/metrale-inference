@@ -386,3 +386,52 @@ fn repair_empty_key_in_stringified_nested_array() {
     assert_eq!(item["prompt"], "run cargo");
     assert!(item.get("").is_none(), "empty key must be removed");
 }
+
+/// 2026-10-10: A non-string value of a `string` property becomes its JSON
+/// text: numbers and bools verbatim, objects and arrays as compact JSON in
+/// key order. A string, a `null`, and an undeclared key are left as they are.
+#[test]
+fn coerce_non_string_to_declared_string() {
+    let tools = vec![make_tool(
+        "lookup",
+        serde_json::json!({
+            "id": { "type": "string" },
+            "ratio": { "type": "string" },
+            "flag": { "type": "string" },
+            "obj": { "type": "string" },
+            "list": { "type": "string" },
+            "name": { "type": "string" },
+            "none": { "type": "string" },
+        }),
+    )];
+    let args = r#"{"id":123123,"ratio":1.5,"flag":true,"obj":{"b":1,"a":[2]},"list":[1,"x"],"name":"kept","none":null,"extra":7}"#;
+    let mut calls = vec![make_call("lookup", args)];
+    coerce_all(&mut calls, &tools);
+    let got: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(got["id"], serde_json::json!("123123"));
+    assert_eq!(got["ratio"], serde_json::json!("1.5"));
+    assert_eq!(got["flag"], serde_json::json!("true"));
+    assert_eq!(got["obj"], serde_json::json!(r#"{"b":1,"a":[2]}"#));
+    assert_eq!(got["list"], serde_json::json!(r#"[1,"x"]"#));
+    assert_eq!(got["name"], serde_json::json!("kept"));
+    assert!(got["none"].is_null(), "null stays null");
+    assert_eq!(
+        got["extra"],
+        serde_json::json!(7),
+        "undeclared key untouched"
+    );
+}
+
+/// 2026-10-10: All-string arguments are not rewritten: `arguments` keeps its
+/// original text byte for byte.
+#[test]
+fn coerce_string_property_already_string_is_untouched() {
+    let tools = vec![make_tool(
+        "lookup",
+        serde_json::json!({ "id": { "type": "string" } }),
+    )];
+    let original = r#"{ "id" : "12345" }"#;
+    let mut calls = vec![make_call("lookup", original)];
+    coerce_all(&mut calls, &tools);
+    assert_eq!(calls[0].function.arguments, original);
+}

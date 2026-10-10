@@ -458,7 +458,7 @@ impl LayerCapabilities for Glm5NextLayer {
 }
 
 impl LayerWeightSetup for Glm5NextLayer {}
-impl LayerWriteOnAccept for Glm5NextLayer {}
+mod defer_commit; // 2026-10-09: `impl LayerWriteOnAccept` (METRALE_GLM_KDA_DEFER_COMMIT)
 
 impl LayerGraphHooks for Glm5NextLayer {
     /// 2026-09-25: A graph replay runs only kernels, so the host-side length of the DSA indexer

@@ -27,6 +27,9 @@
 
 use super::*;
 
+// 2026-10-09: The deferred commit's row-0 variant of this walk (`METRALE_GLM_KDA_DEFER_COMMIT`).
+mod defer;
+
 /// 2026-10-06: Whether a `METRALE_GLM_KDA_SNAP_FUSE` value asks for the fused snapshot: `1`
 /// only.
 pub(super) fn snap_fuse_requested(v: Option<&str>) -> bool {

@@ -63,6 +63,9 @@ impl Glm5NextLayer {
                 } else {
                     None
                 };
+                // 2026-10-09: `METRALE_GLM_KDA_DEFER_COMMIT=1`: the model sets `kda_defer` before
+                // a single-sequence verify; only a snapshot-taking walk reads it.
+                let defer = if take_snapshots { st.kda_defer } else { None };
                 Some((
                     KdaSeqState {
                         conv: st.conv_state,
@@ -70,13 +73,14 @@ impl Glm5NextLayer {
                     },
                     snaps,
                     capture,
+                    defer,
                 ))
             }
             Glm5NextMixer::Dsa(_) => None,
         };
         let t = profile::start();
         let attn_out = match (&self.mixer, &kda_ctx) {
-            (Glm5NextMixer::Kda { layer, ws, .. }, Some((kda, snaps, capture))) => {
+            (Glm5NextMixer::Kda { layer, ws, .. }, Some((kda, snaps, capture, defer))) => {
                 // 2026-09-25: The chunked scan runs only for a prefill sub-chunk of more than
                 // one row that asked for no intermediates: it never materialises the state
                 // after an interior row, and its order differs from `decode_k`'s, which a
@@ -114,6 +118,10 @@ impl Glm5NextLayer {
                     // above captures and counts itself.
                     layer.decode_k_capture(gpu, normed, k, kda, ws, cap, stream)?;
                     mc.captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else if let Some(d) = defer.as_ref().filter(|_| !snaps.is_empty()) {
+                    // 2026-10-09: The fused walk with row 0 reading the state the last commit
+                    // left in its verify intermediate (`glm5next_kda/snap_fuse/defer.rs`).
+                    layer.decode_k_defer(gpu, normed, k, kda, ws, snaps, d, stream)?;
                 } else {
                     layer.decode_k(gpu, normed, k, kda, ws, snaps, stream)?;
                 }

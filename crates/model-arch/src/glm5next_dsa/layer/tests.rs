@@ -338,6 +338,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
     let src = include_str!("../../glm5next_layer/mod.rs");
     let module = concat!(
         include_str!("../../glm5next_layer/comm_overlap.rs"),
+        include_str!("../../glm5next_layer/defer_commit.rs"),
         include_str!("../../glm5next_layer/dense_fp8.rs"),
         include_str!("../../glm5next_layer/dense_fp8/fused.rs"),
         include_str!("../../glm5next_layer/dense_fp8_gw.rs"),
@@ -372,6 +373,7 @@ fn forward_k_has_two_callers_and_the_verify_one_is_not_prefill() {
         glm5next_layer_files(),
         [
             "comm_overlap.rs",
+            "defer_commit.rs",
             "dense_fp8.rs",
             "dense_fp8/fused.rs",
             "dense_fp8_gw.rs",

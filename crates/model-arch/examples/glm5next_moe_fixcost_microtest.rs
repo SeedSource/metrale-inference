@@ -31,6 +31,17 @@
 //! REPLAY_SYNTH / REPLAY2 lines are per-call averages. FIXCOST_REPLAY_CHUNKS (default 24) = chunks of
 //! 42 consecutive calls, spread evenly over the file. Unset: behaviour unchanged.
 //!
+//! 2026-10-10: FIXCOST_SFA=1 (microtest-only falsifier for race #68 "SFB once", seed-skills#68
+//! 6096187630): every scale buffer also gets a copy with the same bytes permuted into the CUTLASS
+//! Sm1xx SFB atom layout (kernels `*_sfa*` twins in w4a16_gemv.cu, same arithmetic, only the scale
+//! address differs). Wherever an entry with a twin is timed (sweep per U, REPLAY/REPLAY_SYNTH/REPLAY2
+//! cells) the twin is timed right after with the same routings, graph and samples and printed as
+//! `SFA entry=.. R=.. routing=.. l2=.. off_us=.. on_us=.. ratio=..`; every routing that is byte-checked
+//! also runs the twin and compares bytes (`SFA BITWISE entry=.. identical|DIFF first_mismatch=..`, a
+//! DIFF prints FAIL). A sw_moe R1 cell (w4a16_gemv_sw_moe gate/up/down, one row, top_k 8 slots, as the
+//! forward launches it) is timed and compared too. Unset: behaviour and output unchanged.
+//! Run: FIXCOST_SFA=1 FIXCOST_REPLAY=1 (add MOE_MT_UNIONS=8,32 to shorten the sweep).
+//!
 //! Env: MOE_MT_ROWS (R, 2..=8, default 8), MOE_MT_UNIONS (comma list, clamped to R * 8).
 //! Run (GPU):
 //!   METRALE_TARGET_HW=gb10 METRALE_TARGET_MODEL=glm-5.3-flash METRALE_TARGET_QUANT=nvfp4 \
@@ -81,34 +92,58 @@ fn bf16_bytes(rng: &mut Rng, n: usize) -> Vec<u8> { le(&(0..n).map(|_| bf16::fro
 /// Host NVFP4 bytes for an [n, k] expert (random nibbles; E4M3 scales 1.0..1.875) with 64 spare
 /// bytes; buffer b of a table starts at offset (b * 17) % 64.
 #[rustfmt::skip]
-struct Host { w: Vec<u8>, s: Vec<u8>, wb: usize, sb: usize }
+struct Host { w: Vec<u8>, s: Vec<u8>, wb: usize, sb: usize, n: usize, k: usize }
 #[rustfmt::skip]
 fn gen_host(rng: &mut Rng, n: usize, k: usize) -> Host {
     let (wb, sb) = (n * k / 2, n * k / 16);
-    Host { w: (0..wb + 64).map(|_| rng.next() as u8).collect(), s: (0..sb + 64).map(|_| 0x38 | (rng.next() as u8 & 7)).collect(), wb, sb }
+    Host { w: (0..wb + 64).map(|_| rng.next() as u8).collect(), s: (0..sb + 64).map(|_| 0x38 | (rng.next() as u8 & 7)).collect(), wb, sb, n, k }
 }
 
 /// The 288-entry pointer table of one matrix; entries cycle through `distinct` real buffers.
+/// `sfa` (FIXCOST_SFA=1): the scale pointer table over copies of the same bytes in the SFB atom layout.
+#[derive(Clone, Copy)]
 #[rustfmt::skip]
-struct Table { packed: DevicePtr, scale: DevicePtr, scale2: DevicePtr }
+struct Table { packed: DevicePtr, scale: DevicePtr, scale2: DevicePtr, sfa: Option<DevicePtr> }
+#[rustfmt::skip]
+fn sfa_on() -> bool { std::env::var("FIXCOST_SFA").is_ok_and(|v| v.trim() == "1") }
+/// CUTLASS Sm1xx SFB atom byte offset of scale (row n, group g), gg = K / 16 groups per row.
+#[rustfmt::skip]
+fn sfa_off(n: usize, g: usize, gg: usize) -> usize { ((n >> 7) * (gg >> 2) + (g >> 2)) * 512 + (n & 31) * 16 + ((n >> 5) & 3) * 4 + (g & 3) }
+/// Row-major [n, k/16] scale bytes -> the same bytes in the atom layout.
+#[rustfmt::skip]
+fn to_atom(s: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let gg = k / 16;
+    assert!(n % 128 == 0 && gg % 4 == 0 && s.len() == n * gg, "SFA needs N % 128 == 0 and (K/16) % 4 == 0 (n {n} k {k})");
+    let mut o = vec![0u8; n * gg];
+    for r in 0..n { for c in 0..gg { o[sfa_off(r, c, gg)] = s[r * gg + c]; } }
+    o
+}
+/// The table a `_sfa` twin reads: same packed and scale2, scale pointers into the atom copies.
+#[rustfmt::skip]
+fn twin(t: &Table) -> Table { Table { scale: t.sfa.expect("table has no SFA copy"), sfa: t.sfa, ..*t } }
+#[rustfmt::skip]
+fn free_table(g: &dyn GpuBackend, t: &Table) -> Result<()> { for p in [t.packed, t.scale, t.scale2].into_iter().chain(t.sfa) { g.free(p)?; } Ok(()) }
 #[rustfmt::skip]
 fn make_table(g: &dyn GpuBackend, h: &Host, distinct: usize) -> Result<Table> {
-    let (mut pp, mut sp, mut s2) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut pp, mut sp, mut s2, mut sa) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut bufs = Vec::new();
     for e in 0..NUM_EXPERTS {
         if e < distinct {
             let off = (e * 17) % 64;
-            bufs.push((up(g, &h.w[off..off + h.wb])?.0, up(g, &h.s[off..off + h.sb])?.0));
+            let atom = if sfa_on() { Some(up(g, &to_atom(&h.s[off..off + h.sb], h.n, h.k))?.0) } else { None };
+            bufs.push((up(g, &h.w[off..off + h.wb])?.0, up(g, &h.s[off..off + h.sb])?.0, atom));
         }
-        let (p, s) = bufs[e % distinct];
+        let (p, s, a) = bufs[e % distinct];
         pp.push(p);
         sp.push(s);
+        if let Some(a) = a { sa.push(a); }
         s2.push(1.0f32 + e as f32 * 0.01);
     }
     Ok(Table {
         packed: up(g, &le(&pp, |x: u64| x.to_le_bytes()))?,
         scale: up(g, &le(&sp, |x: u64| x.to_le_bytes()))?,
         scale2: up(g, &le(&s2, |x: f32| x.to_le_bytes()))?,
+        sfa: if sfa_on() { Some(up(g, &le(&sa, |x: u64| x.to_le_bytes()))?) } else { None },
     })
 }
 
@@ -184,7 +219,7 @@ fn launch(
 }
 
 #[rustfmt::skip]
-struct Kerns { core: KernelHandle, car: KernelHandle, union: KernelHandle, fast: Option<KernelHandle>, gu: Option<KernelHandle> }
+struct Kerns { core: KernelHandle, car: KernelHandle, union: KernelHandle, fast: Option<KernelHandle>, gu: Option<KernelHandle>, car_s: Option<KernelHandle>, fast_s: Option<KernelHandle>, gu_s: Option<KernelHandle>, sw: Option<KernelHandle>, sw_s: Option<KernelHandle> }
 const CORE_COLS: usize = 8;
 const CAR_COLS: usize = 64;
 const FAST_COLS: usize = 128;
@@ -239,6 +274,7 @@ fn down_fast_same(g: &dyn GpuBackend, kz: &Kerns, fast: KernelHandle, a: DeviceP
 }
 
 #[rustfmt::skip]
+#[derive(Clone, Copy)]
 struct LayerTabs { gate: Table, up: Table, down: Table }
 #[rustfmt::skip]
 struct Bufs { x: DevicePtr, act: DevicePtr, c_gu: DevicePtr, c_up: DevicePtr, c_dn: DevicePtr }
@@ -277,7 +313,8 @@ fn time_dirty_base(g: &dyn GpuBackend, s: u64, d: DevicePtr, n: usize) -> Result
 /// back to back; down_fast / gateup_fast (one launch for both matrices) are NaN without the entry.
 #[allow(clippy::too_many_arguments)]
 #[rustfmt::skip]
-fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &[Routing], b: &Bufs, rows: usize, dirty: Option<(DevicePtr, usize)>, skip_seq: bool) -> Result<[f64; 6]> {
+fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &[Routing], b: &Bufs, rows: usize, dirty: Option<(DevicePtr, usize)>, skip_seq: bool, sfa: bool) -> Result<[f64; 6]> {
+    let (car, fast, gu) = if sfa { (kz.car_s.expect("car_s"), kz.fast_s, kz.gu_s) } else { (kz.car, kz.fast, kz.gu) };
     let mut out = [f64::NAN; 6];
     // Dirty L2: one memset before the (single) MoE launch of each layer; modes with 1 launch only.
     let base = match dirty { Some((d, n)) => time_dirty_base(g, s, d, n)?, None => 0.0 };
@@ -286,13 +323,13 @@ fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &
         if mode == 3 && (skip_seq || dirty.is_some()) { continue; }
         let ms = time_graph(g, s, &mut || {
             for l in 0..STEP_LAYERS {
-                let (lt, rt) = (&layers[l % LAYERS], &routs[l % routs.len()]);
+                let (lt, rt) = (&if sfa { LayerTabs { gate: twin(&layers[l % LAYERS].gate), up: twin(&layers[l % LAYERS].up), down: twin(&layers[l % LAYERS].down) } } else { layers[l % LAYERS] }, &routs[l % routs.len()]);
                 if let Some((d, n)) = dirty { g.memset_async(d, 0x5A, n, s)?; }
-                if mode == 0 || mode == 3 { launch(g, kz.car, CAR_COLS, b.x, &lt.gate, b.c_gu, rt, rows, MI, HIDDEN, false, s)?; }
-                if mode == 1 || mode == 3 { launch(g, kz.car, CAR_COLS, b.x, &lt.up, b.c_gu, rt, rows, MI, HIDDEN, false, s)?; }
-                if mode == 2 || mode == 3 { launch(g, kz.car, CAR_COLS, b.act, &lt.down, b.c_dn, rt, rows, HIDDEN, MI, true, s)?; }
-                if let (4, Some(h)) = (mode, kz.fast) { launch(g, h, FAST_COLS, b.act, &lt.down, b.c_dn, rt, rows, HIDDEN, MI, true, s)?; }
-                if let (5, Some(h)) = (mode, kz.gu) { launch_gu(g, h, b.x, &lt.gate, &lt.up, b.c_gu, b.c_up, rt, rows, s)?; }
+                if mode == 0 || mode == 3 { launch(g, car, CAR_COLS, b.x, &lt.gate, b.c_gu, rt, rows, MI, HIDDEN, false, s)?; }
+                if mode == 1 || mode == 3 { launch(g, car, CAR_COLS, b.x, &lt.up, b.c_gu, rt, rows, MI, HIDDEN, false, s)?; }
+                if mode == 2 || mode == 3 { launch(g, car, CAR_COLS, b.act, &lt.down, b.c_dn, rt, rows, HIDDEN, MI, true, s)?; }
+                if let (4, Some(h)) = (mode, fast) { launch(g, h, FAST_COLS, b.act, &lt.down, b.c_dn, rt, rows, HIDDEN, MI, true, s)?; }
+                if let (5, Some(h)) = (mode, gu) { launch_gu(g, h, b.x, &lt.gate, &lt.up, b.c_gu, b.c_up, rt, rows, s)?; }
             }
             Ok(())
         })?;
@@ -347,12 +384,157 @@ fn check(g: &dyn GpuBackend, kz: &Kerns, rng: &mut Rng, rows: usize) -> Result<u
                 if !ok { println!("FAIL gateup_fast {name} R={rows}: gate or up bytes differ from car _c8"); fails += 1; }
             }
             free_routing(g, &rt2)?;
-            for p in c4.into_iter().chain([tu.packed, tu.scale, tu.scale2]) { g.free(p)?; }
+            for p in c4 { g.free(p)?; }
+            free_table(g, &tu)?;
         }
         free_routing(g, &rt)?;
-        for p in [d_a, d_core, d_car, t.packed, t.scale, t.scale2] { g.free(p)?; }
+        for p in [d_a, d_core, d_car] { g.free(p)?; }
+        free_table(g, &t)?;
+    }
+    if kz.car_s.is_some() {
+        // 2026-10-10: twin vs original on 4-distinct-expert tables, a random routing with holes and a ragged one.
+        let lt = LayerTabs { gate: make_table(g, &gen_host(rng, MI, HIDDEN), 4)?, up: make_table(g, &gen_host(rng, MI, HIDDEN), 4)?, down: make_table(g, &gen_host(rng, HIDDEN, MI), 4)? };
+        let (x, act) = (up(g, &bf16_bytes(rng, rows * HIDDEN))?, up(g, &bf16_bytes(rng, rows * TOP_K * MI))?);
+        let mut ids = random_ids(rng, rows);
+        for (r, row) in ids.iter_mut().enumerate() { for (s, e) in row.iter_mut().enumerate() { if (r + s) % 5 == 0 { *e = -1; } } }
+        let mut rag = random_ids(rng, rows);
+        for (r, row) in rag.iter_mut().enumerate() { for (s, e) in row.iter_mut().enumerate() { if r % 2 == 1 || (r + s) % 3 == 0 { *e = -1; } } }
+        let (r1, r2) = (build_routing(g, kz.union, &ids)?, build_routing(g, kz.union, &rag)?);
+        fails += print_bits(rows, "check: holes + ragged routings", &sfa_bits(g, kz, &lt, x, act, &[&r1, &r2], rows)?);
+        free_routing(g, &r1)?;
+        free_routing(g, &r2)?;
+        for t in [&lt.gate, &lt.up, &lt.down] { free_table(g, t)?; }
+        g.free(x)?;
+        g.free(act)?;
     }
     Ok(fails)
+}
+
+/// 2026-10-10: FIXCOST_SFA. Runs `orig` into `nout` poisoned buffers and `twin` into `nout` more, same
+/// `bytes` each; None when all outputs are equal (and, if `expect_write`, written), else the first
+/// differing byte index over the concatenated outputs (0 when equal but nothing was written).
+#[rustfmt::skip]
+fn same_outs(g: &dyn GpuBackend, bytes: usize, nout: usize, expect_write: bool, orig: &mut dyn FnMut(&[DevicePtr]) -> Result<()>, twin_f: &mut dyn FnMut(&[DevicePtr]) -> Result<()>) -> Result<Option<usize>> {
+    let c: Vec<DevicePtr> = (0..2 * nout).map(|_| g.alloc(bytes)).collect::<Result<_>>()?;
+    for &p in &c { g.memset_async(p, POISON, bytes, 0)?; }
+    orig(&c[..nout])?;
+    twin_f(&c[nout..])?;
+    g.synchronize(0)?;
+    let y: Vec<Vec<u8>> = c.iter().map(|&p| dn(g, p, bytes)).collect::<Result<_>>()?;
+    for &p in &c { g.free(p)?; }
+    let (a, b): (Vec<u8>, Vec<u8>) = (y[..nout].concat(), y[nout..].concat());
+    if let Some(i) = a.iter().zip(&b).position(|(x, z)| x != z) { return Ok(Some(i)); }
+    Ok(if expect_write && a.iter().all(|&x| x == POISON) { Some(0) } else { None })
+}
+
+/// 2026-10-10: Twin vs original bytes of every entry that has a twin, on each routing of `rts`:
+/// [(entry, first mismatch)] with the first mismatch over the routings (None = identical on all).
+#[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
+fn sfa_bits(g: &dyn GpuBackend, kz: &Kerns, lt: &LayerTabs, x: DevicePtr, act: DevicePtr, rts: &[&Routing], rows: usize) -> Result<Vec<(&'static str, Option<usize>)>> {
+    let tw = LayerTabs { gate: twin(&lt.gate), up: twin(&lt.up), down: twin(&lt.down) };
+    let mut out = Vec::new();
+    for e in 0..5 {
+        let (name, nout, n) = [("batchm_c8_gate", 1, MI), ("batchm_c8_up", 1, MI), ("batchm_c8_down", 1, HIDDEN), ("down_fast", 1, HIDDEN), ("gateup_fast", 2, MI)][e];
+        if (e == 3 && kz.fast.is_none()) || (e == 4 && kz.gu.is_none()) { continue; }
+        let mut first = None;
+        for rt in rts {
+            let run = |sfa: bool, c: &[DevicePtr]| -> Result<()> {
+                let (t, car) = if sfa { (&tw, kz.car_s.unwrap()) } else { (lt, kz.car) };
+                match e {
+                    0 => launch(g, car, CAR_COLS, x, &t.gate, c[0], rt, rows, MI, HIDDEN, false, 0),
+                    1 => launch(g, car, CAR_COLS, x, &t.up, c[0], rt, rows, MI, HIDDEN, false, 0),
+                    2 => launch(g, car, CAR_COLS, act, &t.down, c[0], rt, rows, HIDDEN, MI, true, 0),
+                    3 => launch(g, if sfa { kz.fast_s.unwrap() } else { kz.fast.unwrap() }, FAST_COLS, act, &t.down, c[0], rt, rows, HIDDEN, MI, true, 0),
+                    _ => launch_gu(g, if sfa { kz.gu_s.unwrap() } else { kz.gu.unwrap() }, x, &t.gate, &t.up, c[0], c[1], rt, rows, 0),
+                }
+            };
+            let m = same_outs(g, rows * TOP_K * n * 2, nout, rt.union > 0, &mut |c| run(false, c), &mut |c| run(true, c))?;
+            if first.is_none() { first = m; }
+        }
+        out.push((name, first));
+    }
+    Ok(out)
+}
+
+/// Prints the SFA BITWISE lines of `res` (tag names the routings); returns the number of DIFFs.
+#[rustfmt::skip]
+fn print_bits(rows: usize, tag: &str, res: &[(&str, Option<usize>)]) -> usize {
+    let mut bad = 0;
+    for (name, m) in res {
+        match m {
+            None => println!("SFA BITWISE entry={name} R={rows} identical ({tag})"),
+            Some(i) => { println!("SFA BITWISE entry={name} R={rows} DIFF first_mismatch={i} ({tag})"); println!("FAIL SFA BITWISE entry={name} R={rows} ({tag}): twin bytes differ from original"); bad += 1; }
+        }
+    }
+    bad
+}
+
+/// SFA timing lines for the time_u modes (gate, up, down, seq, down_fast, gateup_fast).
+#[rustfmt::skip]
+fn print_sfa(rows: usize, routing: &str, l2: &str, off: &[f64; 6], on: &[f64; 6]) {
+    for (m, name) in ["batchm_c8_gate", "batchm_c8_up", "batchm_c8_down", "batchm_c8_seq", "down_fast", "gateup_fast"].iter().enumerate() {
+        if off[m].is_nan() || on[m].is_nan() { continue; }
+        println!("SFA entry={name} R={rows} routing={routing} l2={l2} off_us={:.2} on_us={:.2} ratio={:.4}", off[m], on[m], on[m] / off[m]);
+    }
+}
+
+/// `w4a16_gemv_sw_moe` (or its `_sfa` twin) over one row: grid (ceil(n / 8), TOP_K), the forward's launch.
+#[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
+fn launch_r1(g: &dyn GpuBackend, h: KernelHandle, a: DevicePtr, t: &Table, c: DevicePtr, ids: DevicePtr, n: usize, kk: usize, stride: usize, s: u64) -> Result<()> {
+    KernelLaunch::new(g, h)
+        .grid([n.div_ceil(8) as u32, TOP_K as u32, 1]).block([256, 1, 1])
+        .arg_ptr(a).arg_ptr(t.packed).arg_ptr(t.scale).arg_ptr(t.scale2).arg_ptr(c).arg_ptr(ids)
+        .arg_u32(n as u32).arg_u32(kk as u32).arg_u32(NUM_EXPERTS as u32).arg_u32(stride as u32)
+        .launch(s)
+}
+
+/// Sw_moe R1 cell: us per layer of [gate, up, down, seq], off then on, 42-layer graphs over the cold pool,
+/// ids cycling over 4 random top-8 rows; plus the bitwise compare on a plain and a holed row. Returns DIFFs.
+#[rustfmt::skip]
+fn sfa_r1(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], b: &Bufs, rng: &mut Rng) -> Result<usize> {
+    let (h, hs) = (kz.sw.unwrap(), kz.sw_s.unwrap());
+    let mut rows_ids: Vec<Vec<i32>> = (0..ROUTINGS).map(|_| random_ids(rng, 1).remove(0)).collect();
+    let mut holed = random_ids(rng, 1).remove(0);
+    holed[2] = -1; holed[5] = -1;
+    rows_ids.push(holed);
+    let d_ids: Vec<DevicePtr> = rows_ids.iter().map(|r| up(g, &le(r, |x: i32| x.to_le_bytes()))).collect::<Result<_>>()?;
+    let mut t = [[f64::NAN; 4]; 2];
+    for (sfa, tt) in t.iter_mut().enumerate() {
+        for (mode, o) in tt.iter_mut().enumerate() {
+            let ms = time_graph(g, s, &mut || {
+                for l in 0..STEP_LAYERS {
+                    let (lt, ids) = (&layers[l % LAYERS], d_ids[l % ROUTINGS]);
+                    let (hh, gt, ut, dt) = if sfa == 1 { (hs, twin(&lt.gate), twin(&lt.up), twin(&lt.down)) } else { (h, lt.gate, lt.up, lt.down) };
+                    if mode == 0 || mode == 3 { launch_r1(g, hh, b.x, &gt, b.c_gu, ids, MI, HIDDEN, 0, s)?; }
+                    if mode == 1 || mode == 3 { launch_r1(g, hh, b.x, &ut, b.c_gu, ids, MI, HIDDEN, 0, s)?; }
+                    if mode == 2 || mode == 3 { launch_r1(g, hh, b.act, &dt, b.c_dn, ids, HIDDEN, MI, MI, s)?; }
+                }
+                Ok(())
+            })?;
+            *o = ms * 1e3 / STEP_LAYERS as f64;
+        }
+    }
+    for (m, name) in ["sw_moe_r1_gate", "sw_moe_r1_up", "sw_moe_r1_down", "sw_moe_r1_seq"].iter().enumerate() {
+        println!("SFA entry={name} R=1 routing=U=8 l2=clean off_us={:.2} on_us={:.2} ratio={:.4}", t[0][m], t[1][m], t[1][m] / t[0][m]);
+    }
+    let mut bad = 0;
+    for (e, name) in ["sw_moe_r1_gate", "sw_moe_r1_up", "sw_moe_r1_down"].iter().enumerate() {
+        let mut first = None;
+        for ids in &d_ids {
+            let lt = &layers[0];
+            let (tb, a, n, kk, stride) = [(&lt.gate, b.x, MI, HIDDEN, 0), (&lt.up, b.x, MI, HIDDEN, 0), (&lt.down, b.act, HIDDEN, MI, MI)][e];
+            let tw = twin(tb);
+            let m = same_outs(g, TOP_K * n * 2, 1, true,
+                &mut |c| launch_r1(g, h, a, tb, c[0], *ids, n, kk, stride, 0),
+                &mut |c| launch_r1(g, hs, a, &tw, c[0], *ids, n, kk, stride, 0))?;
+            if first.is_none() { first = m; }
+        }
+        bad += print_bits(1, "sw_moe R1, 4 random rows + 1 holed row", &[(name, first)]);
+    }
+    for p in d_ids { g.free(p)?; }
+    Ok(bad)
 }
 
 /// Least squares y = a + b x; returns (slope, intercept, max |residual|).
@@ -404,6 +586,9 @@ fn replay(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], b: &Bufs
     let (mut bad, mut checked) = (0usize, 0usize);
     // acc[routing: 0 real, 1 synth][l2: 0 clean, 1 dirty] -> per-call mean of the 6 time_u modes; um[routing] = U_mean
     let mut acc = [[[0.0f64; 6]; 2]; 2];
+    let sfa = kz.car_s.is_some();
+    let mut acc_s = [[[0.0f64; 6]; 2]; 2];
+    let mut bits: Vec<(&'static str, Option<usize>)> = Vec::new();
     let mut um = [0.0f64; 2];
     let mut u_syn = 0usize;
     for pass in 0..2 {
@@ -415,12 +600,21 @@ fn replay(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], b: &Bufs
             };
             um[pass] += routs.iter().map(|r| r.union as f64).sum::<f64>() / (routs.len() * chunks) as f64;
             for (l2, d) in [None, Some((d_dirty, nbytes))].into_iter().enumerate() {
-                let t = time_u(g, s, kz, layers, &routs, b, rows, d, true)?;
+                let t = time_u(g, s, kz, layers, &routs, b, rows, d, true, false)?;
                 for m in 0..6 { acc[pass][l2][m] += t[m] / chunks as f64; }
+                if sfa {
+                    let t = time_u(g, s, kz, layers, &routs, b, rows, d, true, true)?;
+                    for m in 0..6 { acc_s[pass][l2][m] += t[m] / chunks as f64; }
+                }
             }
             if pass == 0 {
                 // Byte check on one real call per chunk: fast vs car.
                 let rt = &routs[c % routs.len()];
+                if sfa {
+                    for (i, (name, m)) in sfa_bits(g, kz, &layers[0], b.x, b.act, &[rt], rows)?.into_iter().enumerate() {
+                        if bits.len() <= i { bits.push((name, m)); } else if bits[i].1.is_none() { bits[i].1 = m; }
+                    }
+                }
                 if let Some(fh) = kz.fast {
                     checked += 1;
                     if !down_fast_same(g, kz, fh, b.act, &layers[0].down, c_cmp, rt, rows)? { println!("FAIL replay down_fast chunk {c} union={}: bytes differ from car _c8", rt.union); bad += 1; }
@@ -446,6 +640,12 @@ fn replay(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], b: &Bufs
             println!("{}", line(&format!("REPLAY2 routing={rname} l2={lname}"), um[pass], &acc[pass][l2]));
         }
     }
+    if sfa {
+        for (pass, rname) in ["real", "synth"].iter().enumerate() {
+            for (l2, lname) in ["clean", "dirty"].iter().enumerate() { print_sfa(rows, rname, lname, &acc[pass][l2], &acc_s[pass][l2]); }
+        }
+        bad += print_bits(rows, &format!("replay: one real routing per chunk, {chunks} chunks"), &bits);
+    }
     println!("CHECK replay fast==car sampled {checked} calls (bad {bad}); dirty_mb={dirty_mb} chunks={chunks}");
     Ok(bad)
 }
@@ -468,7 +668,25 @@ fn run() -> Result<i32> {
     for n in &names {
         match g.kernel("w4a16_gemv", n) { Ok(h) => hs.push(h), Err(_) => { println!("MISSING kernel entry {n}"); return Ok(2); } }
     }
-    let kz = Kerns { core: hs[0], car: hs[1], union: hs[2], fast, gu };
+    let (mut car_s, mut fast_s, mut gu_s, mut sw, mut sw_s) = (None, None, None, None, None);
+    if sfa_on() {
+        // 2026-10-10: FIXCOST_SFA: the _sfa twins of every entry timed here must exist.
+        let look = |n: String| -> Option<KernelHandle> { let h = g.kernel("w4a16_gemv", &n).ok(); if h.is_none() { println!("MISSING kernel entry {n}"); } h };
+        car_s = look(format!("w4a16_gemv_sw_moe_batchm_sfa_m{rows}_c8"));
+        if fast.is_some() { fast_s = look(format!("w4a16_gemv_sw_moe_batchm_down_sfa_m{rows}")); }
+        if gu.is_some() { gu_s = look(format!("w4a16_gemv_sw_moe_batchm_gateup_sfa_m{rows}")); }
+        sw = look("w4a16_gemv_sw_moe".into());
+        sw_s = look("w4a16_gemv_sw_moe_sfa".into());
+        if car_s.is_none() || sw.is_none() || sw_s.is_none() || (fast.is_some() && fast_s.is_none()) || (gu.is_some() && gu_s.is_none()) { return Ok(2); }
+        let probe: Vec<u8> = (0..128 * 64).map(|i| i as u8).collect();
+        let mut seen = to_atom(&probe, 128, 1024);
+        seen.sort_unstable();
+        let mut want = probe;
+        want.sort_unstable();
+        if seen != want { bail!("SFA atom permutation is not a bijection"); }
+        println!("SFA atom layout self-test ok (offset formula is a permutation of the 128x64 probe)");
+    }
+    let kz = Kerns { core: hs[0], car: hs[1], union: hs[2], fast, gu, car_s, fast_s, gu_s, sw, sw_s };
     let mut rng = Rng(0x006d_6f65_6669_7863);
     let mut bad = check(g, &kz, &mut rng, rows)?;
     // Cold pool: LAYERS layers x (gate, up, down) x 288 distinct experts.
@@ -494,7 +712,13 @@ fn run() -> Result<i32> {
         let routs: Vec<Routing> = (0..ROUTINGS)
             .map(|_| build_routing(g, kz.union, &union_ids(&mut rng, rows, u)))
             .collect::<Result<_>>()?;
-        let t = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false)?;
+        let t = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false, false)?;
+        if kz.car_s.is_some() {
+            let t2 = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false, true)?;
+            print_sfa(rows, &format!("U={u}"), "clean", &t, &t2);
+            let rr: Vec<&Routing> = routs.iter().collect();
+            bad += print_bits(rows, &format!("U={u}, {ROUTINGS} routings"), &sfa_bits(g, &kz, &layers[0], b.x, b.act, &rr, rows)?);
+        }
         let mu = routs.iter().map(|r| r.union as f64).sum::<f64>() / ROUTINGS as f64;
         let gbs = |us: f64| mu * (MI * HIDDEN) as f64 * BYTES_PER_W / us / 1e3;
         println!("U={u} R={rows} gate_us={:.2} up_us={:.2} down_us={:.2} seq_us={:.2} gate_GBs={:.0} up_GBs={:.0} down_GBs={:.0} down_fast_us={:.2} down_fast_GBs={:.0} gateup_fast_us={:.2} gateup_fast_GBs={:.0}",
@@ -535,6 +759,11 @@ fn run() -> Result<i32> {
             replay_note = format!("; replay: fast entries equal car _c8 on sampled real routings ({} calls in file)", calls.len());
         }
     }
+    let sfa_note = if kz.car_s.is_some() {
+        bad += sfa_r1(g, s, &kz, &layers, &b, &mut rng)?;
+        if bad == 0 { println!("PASS - SFA: every _sfa twin (batchm _c8 gate/up/down, down_fast, gateup_fast, sw_moe R1) bytes equal the original on every checked routing; timings in the SFA lines above"); }
+        "; _sfa twins bitwise equal"
+    } else { "" };
     println!("FIT least squares over U>=8 (us vs union experts)");
     let sel: Vec<usize> = (0..us.len()).filter(|&i| us[i] >= 8.0).collect();
     if sel.len() >= 2 {
@@ -555,6 +784,7 @@ fn run() -> Result<i32> {
     let mut fp = if kz.fast.is_some() { format!("; down_m{rows} bytes equal car _c8 on every routing") } else { String::new() };
     if kz.gu.is_some() { fp.push_str(&format!("; gateup_m{rows} gate and up bytes equal car _c8 on every routing")); }
     fp.push_str(&replay_note);
+    fp.push_str(sfa_note);
     if bad == 0 { println!("PASS: car _m{rows}_c8 bytes equal _m{rows} on gate/up and down{fp}; sweep done"); Ok(0) } else { println!("FAIL: {bad} byte check(s) failed (car vs core, down_fast vs car, gateup_fast vs car)"); Ok(1) }
 }
 

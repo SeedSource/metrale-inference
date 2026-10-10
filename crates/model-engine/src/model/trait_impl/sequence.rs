@@ -315,18 +315,21 @@ impl TransformerModel {
             }
         }
 
+        let mut proposer_free = Ok(());
         if let Some(ref proposer) = self.proposer
             && let Some(ref mut pstate) = seq.proposer_state
         {
-            proposer.free_state(self.gpu.as_ref(), pstate.as_mut())?;
+            proposer_free = proposer.free_state(self.gpu.as_ref(), pstate.as_mut());
         }
         // 2026-10-10: Hybrid serve: the DFlash drafter's state (its paged blocks and ctx
-        // accumulator).
+        // accumulator). Freed even when the MTP free failed; the first error is returned.
+        let mut drafter_free = Ok(());
         if let Some(ref drafter) = self.dflash_proposer
             && let Some(ref mut dstate) = seq.dflash_state
         {
-            drafter.free_state(self.gpu.as_ref(), dstate.as_mut())?;
+            drafter_free = drafter.free_state(self.gpu.as_ref(), dstate.as_mut());
         }
+        proposer_free.and(drafter_free)?;
 
         self.free_chunked_prefill_meta(seq)?;
 

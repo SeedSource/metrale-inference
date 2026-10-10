@@ -77,8 +77,9 @@ impl SpTapRecord {
 
 /// 2026-10-10: The rows of a chunk (absolute `[chunk_start, chunk_start + chunk_len)`) inside
 /// the absolute window `[lo, hi)`, as a chunk-local span. Empty (`(_, 0)`) when they do not
-/// meet. The DFlash prefill capture keeps positions `[0, max_ctx_len)` (`impl_b3.rs`), so the
-/// engine passes `(0, max_ctx_len)`; a last-W window would pass `(prompt_len - W, prompt_len)`.
+/// meet. The engine passes the window the DFlash prefill capture keeps,
+/// `PrefillCtxWindow::span` (the last `max_ctx_len` prompt positions), so these are the rows
+/// `PrefillCtxWindow::chunk_rows` captures.
 pub fn tap_window_rows(chunk_start: usize, chunk_len: usize, (lo, hi): Span) -> Span {
     let a = chunk_start.max(lo);
     let b = (chunk_start + chunk_len).min(hi);

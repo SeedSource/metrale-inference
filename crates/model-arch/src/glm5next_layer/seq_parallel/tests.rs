@@ -312,3 +312,28 @@ fn tap_swap_rows_are_the_owned_window_rows() {
         }
     }
 }
+
+/// 2026-10-10: The SP tap swap moves exactly the rows the non-SP capture keeps
+/// (`PrefillCtxWindow::chunk_rows`), for prompts shorter than, equal to and longer than the
+/// window, chunk by chunk, so rank 0 holds every row it captures.
+#[test]
+fn tap_swap_rows_match_the_non_sp_kept_rows() {
+    use crate::dflash_head::PrefillCtxWindow;
+    let w = 2048;
+    for p in [1000usize, 2048, 5000, 8193] {
+        for chunk in [256usize, 2048, 2952, 4096] {
+            let mut cs = 0;
+            while cs < p {
+                let n = chunk.min(p - cs);
+                let win = PrefillCtxWindow::new(p, cs + n, w);
+                let sp = tap_window_rows(cs, n, win.span());
+                assert_eq!(sp, win.chunk_rows(cs, n), "p={p} chunk={chunk} cs={cs}");
+                let plan = SpPlan::new(&owner_chunks(n, 256, 2048, true)).unwrap();
+                let mut both = rows_of_both(plan, sp);
+                both.sort_unstable();
+                assert_eq!(both, (sp.0..sp.0 + sp.1).collect::<Vec<_>>());
+                cs += n;
+            }
+        }
+    }
+}

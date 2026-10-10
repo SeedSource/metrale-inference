@@ -5,7 +5,8 @@
 //! Owner: model-engine.
 //! Invariants:
 //! - The DFlash capture and context-length methods do nothing on a comm rank other than 0.
-//! - DFlash prefill capture never writes at or past `max_ctx_len`, and
+//! - DFlash prefill capture keeps the last `max_ctx_len` prompt positions
+//!   (`PrefillCtxWindow`, 2026-10-10; the first ones before), never more, and
 //!   `try_dflash_capture_all_at` never writes past `dflash_hidden_save_rows`.
 
 #![allow(unused_imports, dead_code)]
@@ -278,9 +279,11 @@ impl TransformerModel {
     /// `hidden_states()` (the layer just run) into the sequence's DFlash
     /// context accumulator. The prefill layer loops call it after each layer.
     ///
-    /// Row `t` lands at element `((chunk_start + t) * n_capture + slot_idx) * h`
-    /// of the accumulator, one `copy_d2d_async` per row. Positions at or past
-    /// `max_ctx_len` are dropped.
+    /// Row `t` lands at element `((chunk_start + t - start) * n_capture + slot_idx) * h`
+    /// of the accumulator, one `copy_d2d_async` per row, for the positions of the window
+    /// `[start, prompt_len)` (`PrefillCtxWindow`, 2026-10-10: the last `max_ctx_len` prompt
+    /// positions; the rest are dropped). For a prompt within `max_ctx_len`, `start` is 0 and
+    /// the copies are the ones the first-W capture made.
     ///
     /// No-op when there are no DFlash capture layers, `layer_idx` is not one
     /// of them, the sequence has no `DflashProposerState`, or this is a comm
@@ -313,6 +316,7 @@ impl TransformerModel {
         {
             return Ok(());
         }
+        let prompt_len = seq.prompt_len;
         // 2026-10-10: `dflash_ctx_state`: the hybrid serve's DFlash state, else `proposer_state`.
         let dstate = match self.dflash_ctx_state(seq) {
             Some(ps) => match ps
@@ -328,15 +332,17 @@ impl TransformerModel {
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
+        let win = metrale_model_arch::dflash_head::PrefillCtxWindow::new(
+            prompt_len,
+            chunk_start + proc_count,
+            dstate.max_ctx_len,
+        );
         let src_base = self.buffers.hidden_states();
-        for t in 0..proc_count {
-            let abs_pos = chunk_start + t;
-            if abs_pos >= max_ctx {
-                break;
-            }
+        let (t0, rows) = win.chunk_rows(chunk_start, proc_count);
+        for t in t0..t0 + rows {
+            let slot_row = chunk_start + t - win.start;
             let src = src_base.offset(t * h * bf16);
-            let dst_offset = abs_pos * n_capture * h * bf16 + slot_idx * h * bf16;
+            let dst_offset = slot_row * n_capture * h * bf16 + slot_idx * h * bf16;
             self.gpu
                 .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
         }
@@ -344,7 +350,8 @@ impl TransformerModel {
     }
 
     /// 2026-09-25: After a prefill chunk, set the sequence's DFlash `ctx_len`
-    /// to `chunk_start + proc_count` (capped at `max_ctx_len`) so the first
+    /// to the rows captured so far (2026-10-10: of the window `PrefillCtxWindow`, the last
+    /// `max_ctx_len` prompt positions) so the first
     /// propose sees every captured prompt position. No-op without capture
     /// layers or a `DflashProposerState`, and on comm ranks other than 0 (2026-10-09: unless
     /// `dflash_capture_on_every_rank`).
@@ -363,19 +370,32 @@ impl TransformerModel {
         {
             return Ok(());
         }
+        let prompt_len = seq.prompt_len;
         if let Some(ps) = self.dflash_ctx_state(seq)
             && let Some(dstate) =
                 ps.as_any_mut()
                     .downcast_mut::<metrale_model_arch::dflash_head::DflashProposerState>()
         {
-            let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
+            let chunk_end = chunk_start + proc_count;
+            let win = metrale_model_arch::dflash_head::PrefillCtxWindow::new(
+                prompt_len,
+                chunk_end,
+                dstate.max_ctx_len,
+            );
+            dstate.ctx_len = win.len_after(chunk_end);
             // 2026-09-25: Prefill slot i holds prompt position i, so each
             // slot's fixed RoPE position is its index. `ctx_positions` is
             // rebuilt to the same length as `ctx_len` on every chunk.
-            dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
+            // 2026-10-10: Slot i holds absolute position `start + i` (`start` is 0 for a prompt
+            // within the window, as before).
+            dstate.ctx_positions = win.positions_after(chunk_end);
+            if win.start > 0 {
+                // 2026-10-10: No drafter K/V of an earlier window survives a tail window.
+                dstate.ctx_committed = 0;
+            }
             // 2026-10-09: Two-rank drafter: rank 1 captured the same prompt rows.
-            dstate.tp_synced_pos = new_len.checked_sub(1).map(|p| p as i32);
+            // 2026-10-10: Same window on both ranks (same prompt length and `max_ctx_len`).
+            dstate.tp_synced_pos = dstate.ctx_positions.last().copied();
         }
         Ok(())
     }

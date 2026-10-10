@@ -23,7 +23,7 @@ use metrale_model_layers::speculative::{DraftProposer, ProposerState};
 use metrale_model_layers::weight_map::{DenseWeight, QuantizedWeight};
 
 pub use kernels::DflashKernels;
-pub use state::{DflashProposerState, DflashScratch};
+pub use state::{DflashProposerState, DflashScratch, PrefillCtxWindow};
 
 /// 2026-09-25: Cross-sequence batch for one drafter forward: per sequence its
 /// last token, position, drafter block table (a device pointer) and filled

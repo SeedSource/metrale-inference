@@ -307,3 +307,16 @@ fn step_flags_hybrid_off_is_the_serve_wide_pair() {
         (false, 3)
     );
 }
+
+#[test]
+fn hybrid_ctx_state_reserve_counts_every_tap() {
+    // Review F1: the accumulator holds `taps` hidden rows per window row, not one.
+    assert_eq!(
+        hy::hybrid_ctx_state_bytes(5, 2057, 4096),
+        5 * 2057 * 4096 * 2
+    );
+    assert_eq!(
+        hy::hybrid_ctx_state_bytes(1, 16_384, 4096),
+        16_384 * 4096 * 2
+    );
+}

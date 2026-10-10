@@ -342,7 +342,7 @@ pub fn build_model(
         (max_seq_len, max_batch_size)
     };
     let dflash_reserve: usize =
-        kv_budget::dflash_reserve_bytes(&dflash_args, &config, dflash_seq_len, gib);
+        kv_budget::dflash_reserve_bytes(&dflash_args, &config, dflash_seq_len, hybrid_drafter, gib);
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
     let kv_budget = total_budget
         .saturating_sub(used_so_far)

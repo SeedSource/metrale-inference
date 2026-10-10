@@ -133,6 +133,7 @@ pub(super) fn dflash_reserve_bytes(
     dflash_args: &Option<DflashBuildArgs<'_>>,
     config: &ModelConfig,
     max_seq_len: usize,
+    hybrid: bool,
     gib: impl Fn(usize) -> f64,
 ) -> usize {
     let dflash_reserve: usize = dflash_args
@@ -142,7 +143,17 @@ pub(super) fn dflash_reserve_bytes(
             let kv_dim = c.num_key_value_heads * c.head_dim;
             let drafter_kv = max_seq_len * c.num_hidden_layers * 2 * kv_dim * 2;
             let fused_kv = c.num_hidden_layers * 2 * kv_dim * c.hidden_size * 2;
-            let capture = max_seq_len * config.hidden_size * 2;
+            // 2026-10-10: A hybrid serve's term is its one DFlash ctx accumulator, every tap row
+            // of the full window (`max_seq_len` is the window there; review F1).
+            let capture = if hybrid {
+                metrale_model_layers::speculative::hybrid::hybrid_ctx_state_bytes(
+                    config.dflash_capture_layers.len().max(1),
+                    max_seq_len,
+                    config.hidden_size,
+                )
+            } else {
+                max_seq_len * config.hidden_size * 2
+            };
             // 2026-09-25: The same test as the allocation in
             // dflash_head/from_weights.rs: on unless the variable is `0`.
             let fp8_mirrors =

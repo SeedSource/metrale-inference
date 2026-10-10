@@ -110,6 +110,13 @@ pub fn parse_dwell_ms(v: Option<&str>) -> u64 {
         .unwrap_or(HYBRID_DWELL_MS_DEFAULT)
 }
 
+/// 2026-10-10: Bytes of one hybrid DFlash ctx accumulator (`DflashProposerState::ctx_hidden_acc`):
+/// `window` rows of `taps` target hidden rows, BF16. A hybrid serve allocates exactly one, at the
+/// full window on every rank (review F1), and reserves it before KV sizing.
+pub fn hybrid_ctx_state_bytes(taps: usize, window: usize, hidden: usize) -> usize {
+    taps * window * hidden * 2
+}
+
 /// 2026-10-10: The token window a hybrid serve sizes the DFlash drafter's paged KV and its KV
 /// reserve by (design note (b)): `--max-seq-len` capped at `METRALE_DFLASH_CTX_CAP`
 /// (`ctx_cap`, `0` = uncapped). The drafter attends over at most its ctx window, which the same

@@ -242,7 +242,7 @@ impl TransformerModel {
         // intermediate pool must cover the ghost's depth (the closure in
         // `pick_verify_graph`).
         let graphs_on = self.verify_graphs_on(k4_diag, own_states);
-        let graph_key = if graphs_on {
+        let graph_key = if graphs_on && self.verify_graph_rows_ok(r_total) {
             self.verify_batched_graph_key(
                 &*seqs,
                 ks,

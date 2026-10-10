@@ -348,6 +348,13 @@ fn batched_verify_graphs_stays_behind_its_lever() {
     assert!(e.contains("self.replay_verify_graph(graph, seqs, ks, own_states, stream)?;"));
     let gr = include_str!("../../../model-engine/src/model/trait_impl/verify_e/graphs.rs");
     assert!(gr.contains(".all(|l| l.decode_verify_multi_graphable())"));
+    // 2026-10-10: A batched verify wider than the graph row cap runs eagerly (ladg2m crash).
+    assert!(e.contains("let graph_key = if graphs_on && self.verify_graph_rows_ok(r_total) {"));
+    assert!(gr.contains(".map(|l| l.decode_verify_multi_graph_max_rows())"));
+    let cap = m
+        .find("fn decode_verify_multi_graph_max_rows(&self) -> usize {")
+        .expect("graph row cap override present");
+    assert!(m[cap..cap + 120].contains("ms_graphs::bv_graph_max_rows()"));
     assert!(gr.contains("graph_borrow_enabled()\n                && !self.any_verify_own_states()"));
     assert!(gr.contains("layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;"));
     assert!(gr.contains("layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;"));

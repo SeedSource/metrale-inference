@@ -35,6 +35,29 @@ impl TransformerModel {
                     .all(|l| l.decode_verify_multi_graphable()))
     }
 
+    /// 2026-10-10: Whether a batched verify of `r` rows may capture or replay a graph: `r` within
+    /// every layer's `decode_verify_multi_graph_max_rows`. A wider batch runs eagerly (no key, so
+    /// no capture, replay or borrow; every captured key is then within the cap too); logged once.
+    pub(super) fn verify_graph_rows_ok(&self, r: usize) -> bool {
+        let max = self
+            .layers
+            .iter()
+            .map(|l| l.decode_verify_multi_graph_max_rows())
+            .min()
+            .unwrap_or(usize::MAX);
+        if r <= max {
+            return true;
+        }
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::warn!(
+                "batched verify of {r} rows runs eagerly: wider than the graph row cap {max} \
+                 (decode_verify_multi_graph_max_rows; further wide batches not logged)"
+            );
+        });
+        false
+    }
+
     /// 2026-10-07: Replay a batched-verify graph. With own-state layers, each sequence's
     /// `check_replay_room` runs before the launch (the graph writes the DSA indexer rows at device
     /// positions, so a step past the buffer is refused first) and `sync_replayed_step` after it

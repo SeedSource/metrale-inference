@@ -113,6 +113,13 @@ pub trait LayerCapabilities {
         false
     }
 
+    /// 2026-10-10: Most verify rows (`R = Σ ks`) a captured batched-verify graph may hold; a
+    /// wider batch runs eagerly (`verify_e/graphs.rs` `verify_graph_rows_ok`). Unbounded unless
+    /// a wider forward reaches an op a capture cannot hold.
+    fn decode_verify_multi_graph_max_rows(&self) -> usize {
+        usize::MAX
+    }
+
     /// 2026-10-02: Most verify rows (`R = Σ ks`) one `decode_verify_multi_seqs` call takes;
     /// `can_batch_verify_dispatch` refuses a wider batch, which the scheduler then verifies in
     /// narrower chunks. Unbounded unless the layer's scratch is sized for fewer rows.

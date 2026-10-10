@@ -411,6 +411,11 @@ impl LayerCapabilities for Glm5NextLayer {
         ms_graphs::bv_graphs()
     }
 
+    /// 2026-10-10: Wider batched verifies run eagerly ([`ms_graphs::bv_graph_max_rows`]).
+    fn decode_verify_multi_graph_max_rows(&self) -> usize {
+        ms_graphs::bv_graph_max_rows()
+    }
+
     /// 2026-10-02: The KDA and MLP workspace rows (`verify_rows_cap`).
     fn decode_verify_multi_max_rows(&self) -> usize {
         self.verify_rows_cap()

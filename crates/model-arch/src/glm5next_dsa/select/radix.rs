@@ -32,6 +32,7 @@
 //!   what it did before.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
@@ -173,13 +174,37 @@ pub(super) fn alloc_region(gpu: &dyn GpuBackend, bytes: usize) -> Result<DeviceP
     }
 }
 
-/// 2026-10-06: Chunks per row (grid x of the hist and gather launches) for `q_rows` rows:
-/// [`RADIX_TARGET_BLOCKS`] spread over the rows, between 1 and [`RADIX_MAX_CHUNKS`]. Depends on
-/// `q_rows` only, so every capture of a 1-row ceiling launch gets the same grid.
-pub fn radix_chunks(q_rows: usize) -> usize {
+/// 2026-10-10: TEST-ONLY chunk override (0 = none). Production never sets it; the gate-0
+/// microtest `dsa_topk_chain_prefill_microtest` does, to time the hist and gather launches at
+/// other chunk counts. Process-global; [`set_radix_chunks_override`] stores `Some(c)` clamped
+/// to `1..=RADIX_MAX_CHUNKS`, so 0 is never a live chunk count.
+static RADIX_CHUNKS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// 2026-10-10: Test-only: force [`radix_chunks`] to `v` (clamped to `1..=RADIX_MAX_CHUNKS`), or
+/// restore the production policy with `None`. Not called anywhere in the serve path.
+pub fn set_radix_chunks_override(v: Option<usize>) {
+    let raw = v.map_or(0, |c| c.clamp(1, RADIX_MAX_CHUNKS));
+    RADIX_CHUNKS_OVERRIDE.store(raw, Ordering::Relaxed);
+}
+
+/// 2026-10-10: The chunk policy with an explicit override word (0 = none): the production
+/// formula when `over` is 0, else `over`. Split out so a test can check both without touching
+/// the process-global.
+fn radix_chunks_with(over: usize, q_rows: usize) -> usize {
+    if over != 0 {
+        return over.clamp(1, RADIX_MAX_CHUNKS);
+    }
     RADIX_TARGET_BLOCKS
         .div_ceil(q_rows.max(1))
         .clamp(1, RADIX_MAX_CHUNKS)
+}
+
+/// 2026-10-06: Chunks per row (grid x of the hist and gather launches) for `q_rows` rows:
+/// [`RADIX_TARGET_BLOCKS`] spread over the rows, between 1 and [`RADIX_MAX_CHUNKS`]. Depends on
+/// `q_rows` only, so every capture of a 1-row ceiling launch gets the same grid.
+/// 2026-10-10: unless the test-only [`set_radix_chunks_override`] is set (never in production).
+pub fn radix_chunks(q_rows: usize) -> usize {
+    radix_chunks_with(RADIX_CHUNKS_OVERRIDE.load(Ordering::Relaxed), q_rows)
 }
 
 /// 2026-10-06: Whether all five radix entry points resolved.
@@ -368,6 +393,27 @@ pub fn launch_topk_radix(
         .arg_u32(kcap)
         .arg_ptr(gd)
         .launch(stream)
+}
+
+#[cfg(test)]
+mod chunk_override_tests {
+    use super::*;
+
+    /// 2026-10-10: With no override the policy is exactly the 2026-10-06 formula, for every
+    /// row count, and the override word clamps to 1..=RADIX_MAX_CHUNKS. Does not touch the
+    /// process-global (other tests read `radix_chunks`).
+    #[test]
+    fn radix_chunks_unchanged_when_override_none() {
+        for q in 0..=400usize {
+            let want = RADIX_TARGET_BLOCKS.div_ceil(q.max(1)).clamp(1, RADIX_MAX_CHUNKS);
+            assert_eq!(radix_chunks_with(0, q), want, "q={q}");
+            assert_eq!(radix_chunks(q), want, "q={q}");
+        }
+        assert_eq!(radix_chunks(128), 1);
+        assert_eq!(radix_chunks(1), RADIX_MAX_CHUNKS);
+        assert_eq!(radix_chunks_with(4, 128), 4);
+        assert_eq!(radix_chunks_with(99, 128), RADIX_MAX_CHUNKS);
+    }
 }
 
 #[cfg(test)]

@@ -79,7 +79,7 @@ pub fn dsa_radix_binstat_every() -> u64 {
 /// 2026-10-10: Whether the call numbered `n` (0-based, counted over eager radix calls) is
 /// sampled: calls 0, every, 2 * every, ...
 pub fn is_sampled(n: u64, every: u64) -> bool {
-    n % every.max(1) == 0
+    n.is_multiple_of(every.max(1))
 }
 
 /// 2026-10-10: Nearest-rank percentile of an ascending slice: the value at 1-based rank

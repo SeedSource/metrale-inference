@@ -83,6 +83,7 @@ pub const KERNEL_MAX_KPOOL: usize = 8;
 /// 2026-10-08: So does `index_scores_decode`.
 /// 2026-10-10: So do `expand_selection_cc` and `valid_chunk_counts`.
 /// 2026-10-10: So do `topk_radix_binstat` and `topk_radix_compact`.
+/// 2026-10-10: So do `topk_radix_select0` and `topk_radix_{hist,find,gather}_rc`.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
@@ -130,11 +131,18 @@ pub struct Glm5NextDsaKernels {
     pub topk_radix_find: KernelHandle,
     pub topk_radix_gather: KernelHandle,
     pub topk_radix_sort: KernelHandle,
-    /// 2026-10-10: `dsa_topk_radix_binstat` (METRALE_GLM_DSA_RADIX_BINSTAT=1, debug) and
-    /// `dsa_topk_radix_compact` (timing prototype, launched only by
-    /// `dsa_topk_chain_prefill_microtest`); `KernelHandle(0)` when the target lacks them.
+    /// 2026-10-10: `dsa_topk_radix_binstat` (METRALE_GLM_DSA_RADIX_BINSTAT=1, debug);
+    /// `KernelHandle(0)` when the target lacks it.
     pub topk_radix_binstat: KernelHandle,
+    /// 2026-10-10: METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1 (`select::radix_compact`):
+    /// `dsa_topk_radix_compact`, `dsa_topk_radix_select0` and the `_rc` entry points of hist,
+    /// find and gather (the same code, returning at once for a row select0 finished).
+    /// `KernelHandle(0)` when the target lacks one; the lever is then ignored, with one warning.
     pub topk_radix_compact: KernelHandle,
+    pub topk_radix_select0: KernelHandle,
+    pub topk_radix_hist_rc: KernelHandle,
+    pub topk_radix_find_rc: KernelHandle,
+    pub topk_radix_gather_rc: KernelHandle,
     pub expand_selection: KernelHandle,
     /// 2026-10-10: `dsa_expand_selection_cc` and `dsa_valid_chunk_counts`: `expand_selection`
     /// with each row's visible-key count taken from per-chunk counts of `valid_keys` instead of
@@ -246,6 +254,26 @@ impl Glm5NextDsaKernels {
                 gpu,
                 DSA_MODULE,
                 "dsa_topk_radix_compact",
+            ),
+            topk_radix_select0: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_select0",
+            ),
+            topk_radix_hist_rc: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_hist_rc",
+            ),
+            topk_radix_find_rc: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_find_rc",
+            ),
+            topk_radix_gather_rc: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_gather_rc",
             ),
             expand_selection: gpu.kernel(DSA_MODULE, "dsa_expand_selection")?,
             expand_selection_cc: metrale_model_layers::layers::try_kernel(

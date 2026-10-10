@@ -1628,6 +1628,10 @@ extern "C" __global__ void dsa_topk_pools(
 #define DSA_RS_NEED   1u
 #define DSA_RS_GT_CNT 2u
 #define DSA_RS_NGT    3u
+// 2026-10-10: METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1 only: 1 once dsa_topk_radix_select0 has
+// selected the row (COMPACT), 0 otherwise (init zeroes it). Read by the _rc entry points of
+// hist, find and gather; slots 4 to 6 are defined with the compaction kernels below.
+#define DSA_RS_MODE   7u
 
 // 2026-10-06: Monotone key: a > b as floats (with -0.0 == +0.0) iff key(a) > key(b).
 __device__ __forceinline__ unsigned int dsa_radix_key(float v) {
@@ -1768,6 +1772,77 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_h
     }
 }
 
+// 2026-10-10: METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1: dsa_topk_radix_hist's text plus one early
+// return for a COMPACT row. A copy, not a template like find and gather: the inlined template
+// rescheduled the lever-off hist's SASS (find's and gather's stayed byte-identical), so the
+// lever-off entry point keeps its own text. radix_compact_tests checks the two stay equal
+// but for the early return.
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_hist_rc(
+    const float* __restrict__ scores,
+    unsigned int* __restrict__ work,
+    unsigned int P,
+    unsigned int select_k,
+    unsigned int kcap,
+    unsigned int pass,
+    const int* __restrict__ geom
+) {
+    if (geom) {
+        P = (unsigned int)geom[DSA_GEOM_NPOOLS];
+        select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    }
+    if (select_k == 0u) return;
+    if (gridDim.x > DSA_RADIX_MAX_CHUNKS) __trap();
+    __shared__ unsigned int sh[DSA_RADIX_BINS];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int c = blockIdx.x;
+    const unsigned int r = blockIdx.y;
+    unsigned int* w = dsa_radix_row(work, r, kcap);
+    // 2026-10-10: A COMPACT row (dsa_topk_radix_select0 set its mode word) is already
+    // selected; every thread reads the same word, so the whole block returns.
+    if (w[DSA_RADIX_STATE + DSA_RS_MODE] != 0u) return;
+    const unsigned int nbins = (pass == 2u) ? DSA_RADIX_BINS_LAST : DSA_RADIX_BINS;
+    for (unsigned int b = tid; b < nbins; b += blockDim.x) sh[b] = 0u;
+    __syncthreads();
+
+    const unsigned int prefix = (pass == 0u) ? 0u : w[DSA_RADIX_STATE + DSA_RS_PREFIX];
+    const unsigned int chunk = (P + gridDim.x - 1u) / gridDim.x;
+    const unsigned int lo = min(c * chunk, P);
+    const unsigned int hi = min(lo + chunk, P);
+    const float* row = scores + (size_t)r * P;
+    const unsigned int lane = tid & 31u;
+    // 2026-10-06: The trip count depends on lo, hi and blockDim only, so every lane of every
+    // warp reaches the ballot; lanes past `hi` vote false.
+    for (unsigned int base = lo; base < hi; base += blockDim.x) {
+        const unsigned int i = base + tid;
+        bool live = i < hi;
+        unsigned int digit = 0u;
+        if (live) {
+            const unsigned int key = dsa_radix_key(row[i]);
+            live = dsa_radix_match(key, prefix, pass);
+            digit = dsa_radix_digit(key, pass);
+        }
+        const unsigned int active = __ballot_sync(0xffffffffu, live);
+        if (live) {
+            // 2026-10-06: One shared atomic per distinct bin in the warp (thousands of
+            // -FLT_MAX ties fall in one bin).
+            const unsigned int peers = __match_any_sync(active, digit);
+            if (lane == (unsigned int)(__ffs(peers) - 1))
+                atomicAdd(&sh[digit], (unsigned int)__popc(peers));
+        }
+    }
+    __syncthreads();
+
+    if (pass < 2u) {
+        unsigned int* g = w + pass * DSA_RADIX_BINS;
+        for (unsigned int b = tid; b < DSA_RADIX_BINS; b += blockDim.x)
+            if (sh[b] != 0u) atomicAdd(&g[b], sh[b]);
+    } else {
+        // 2026-10-06: Every chunk, empty or not, stores all its bins.
+        unsigned int* g = w + c * DSA_RADIX_BINS_LAST;
+        for (unsigned int b = tid; b < DSA_RADIX_BINS_LAST; b += blockDim.x) g[b] = sh[b];
+    }
+}
+
 // 2026-10-06: Count of bin `b` in `pass`: the global histogram, or (pass 2) the per-chunk
 // histograms summed over the `chunks` chunks.
 __device__ __forceinline__ unsigned int dsa_radix_bin_count(const unsigned int* w,
@@ -1779,13 +1854,17 @@ __device__ __forceinline__ unsigned int dsa_radix_bin_count(const unsigned int* 
     return s;
 }
 
+// 2026-10-10: find and gather are templates on RC: the lever-off entry points instantiate
+// RC = false (SASS byte-identical to the 2026-10-06 kernels), the _rc ones
+// (METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1) RC = true, which returns at once for a COMPACT row.
 // 2026-10-06: Find pass `pass` for row blockIdx.x: the bin where the count from the top reaches
 // `need`. Thread t owns bins [nbins - (t + 1) * per, nbins - t * per), walked from the top, so
 // the exclusive scan over t is the count above its bins. Exactly one thread has
 // excl < need <= excl + local (need >= 1 and the bins hold at least `need` keys); it extends the
 // prefix and, after pass 2, writes n_gt and the per-chunk tie bases. `chunks` is the grid x of
 // the hist launches.
-extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_find(
+template <bool RC>
+__device__ __forceinline__ void dsa_topk_radix_find_body(
     unsigned int* __restrict__ work,
     unsigned int select_k,
     unsigned int kcap,
@@ -1800,6 +1879,9 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_f
     __shared__ unsigned int ws[32];
     const unsigned int tid = threadIdx.x;
     unsigned int* w = dsa_radix_row(work, blockIdx.x, kcap);
+    // 2026-10-10: _rc entry point: a COMPACT row (dsa_topk_radix_select0 set its mode word)
+    // is already selected; every thread reads the same word, so the whole block returns.
+    if (RC && w[DSA_RADIX_STATE + DSA_RS_MODE] != 0u) return;
     const unsigned int nbins = (pass == 2u) ? DSA_RADIX_BINS_LAST : DSA_RADIX_BINS;
     const unsigned int per = nbins / blockDim.x;
     const unsigned int need = (pass == 0u) ? select_k : w[DSA_RADIX_STATE + DSA_RS_NEED];
@@ -1835,8 +1917,31 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_f
     }
 }
 
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_find(
+    unsigned int* __restrict__ work,
+    unsigned int select_k,
+    unsigned int kcap,
+    unsigned int pass,
+    unsigned int chunks,
+    const int* __restrict__ geom
+) {
+    dsa_topk_radix_find_body<false>(work, select_k, kcap, pass, chunks, geom);
+}
+
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_find_rc(
+    unsigned int* __restrict__ work,
+    unsigned int select_k,
+    unsigned int kcap,
+    unsigned int pass,
+    unsigned int chunks,
+    const int* __restrict__ geom
+) {
+    dsa_topk_radix_find_body<true>(work, select_k, kcap, pass, chunks, geom);
+}
+
 // 2026-10-06: Gather the select_k candidates of chunk blockIdx.x of row blockIdx.y (see 3b).
-extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_gather(
+template <bool RC>
+__device__ __forceinline__ void dsa_topk_radix_gather_body(
     const float* __restrict__ scores,
     unsigned int* __restrict__ work,
     unsigned int P,
@@ -1854,6 +1959,9 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_g
     const unsigned int c = blockIdx.x;
     const unsigned int r = blockIdx.y;
     unsigned int* w = dsa_radix_row(work, r, kcap);
+    // 2026-10-10: _rc entry point: a COMPACT row (dsa_topk_radix_select0 set its mode word)
+    // is already selected; every thread reads the same word, so the whole block returns.
+    if (RC && w[DSA_RADIX_STATE + DSA_RS_MODE] != 0u) return;
     const unsigned int tau = w[DSA_RADIX_STATE + DSA_RS_PREFIX];
     const unsigned int m = w[DSA_RADIX_STATE + DSA_RS_NEED];
     const unsigned int ngt = w[DSA_RADIX_STATE + DSA_RS_NGT];
@@ -1889,11 +1997,59 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_g
     }
 }
 
-// 2026-10-10: State word slots used by the gate-0 tools below; nothing in the production
-// sequence reads or writes them (init zeroes all DSA_RADIX_STATE_WORDS words each call).
-#define DSA_RS_B0CNT  4u   // binstat: hist0[b0], keys in the pass-0 threshold bin
-#define DSA_RS_BINP   5u   // binstat: the row's live P (0 when select_k is 0)
-#define DSA_RS_BINCNT 6u   // compact: keys seen in bin b0 (all counted, stored up to the cap)
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_gather(
+    const float* __restrict__ scores,
+    unsigned int* __restrict__ work,
+    unsigned int P,
+    unsigned int select_k,
+    unsigned int kcap,
+    const int* __restrict__ geom
+) {
+    dsa_topk_radix_gather_body<false>(scores, work, P, select_k, kcap, geom);
+}
+
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_gather_rc(
+    const float* __restrict__ scores,
+    unsigned int* __restrict__ work,
+    unsigned int P,
+    unsigned int select_k,
+    unsigned int kcap,
+    const int* __restrict__ geom
+) {
+    dsa_topk_radix_gather_body<true>(scores, work, P, select_k, kcap, geom);
+}
+
+// 2026-10-10: METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1 (default off; host
+// crates/model-arch/src/glm5next_dsa/select/radix_compact.rs): an exact shortcut of the radix
+// select for rows whose pass-0 threshold bin is small. After find pass 0, row r's state holds
+// b0 = prefix >> 20 (the bin of the select_k-th key) and need0 = NEED (keys still wanted inside
+// b0), and hist0[b0] (word b0, intact until pass 2 overwrites [0, C * 256)) is the bin's
+// population. A row is COMPACT when hist0[b0] <= DSA_COMPACT_CAP, else FALLBACK. Sequence:
+//   init, hist 0, find 0                           (unchanged entry points)
+//   compact     (grid C x Q) COMPACT rows only: a key with top 12 bits > b0 goes to candidate
+//                            slot atomicAdd(GT_CNT); there are exactly select_k - need0 of them
+//                            (find 0 stopped at b0 after counting them), so they fill
+//                            [0, select_k - need0) in some order. A key in b0 appends its
+//                            (key, index) pair to the row's `bins` buffer through BINCNT.
+//   select0     (grid Q)     COMPACT rows only: bitonic sort of the hist0[b0] pairs, key
+//                            descending then index ascending, and the first need0 written to
+//                            slots [select_k - need0, select_k); then the mode word set to 1.
+//   hist/find passes 1, 2 and gather, through their _rc entry points: the same code, which
+//                            returns at once for a row whose mode word is 1. FALLBACK rows
+//                            (mode 0) run exactly the lever-off sequence: compact and select0
+//                            wrote nothing of theirs, and GT_CNT is still 0 for gather.
+//   sort        (grid Q)     unchanged. It reads only the select_k candidate pairs.
+// Exact: the first select_k pools of the total order (key descending, index ascending) are the
+// select_k - need0 keys whose top 12 bits exceed b0 (each above every key of b0 or below),
+// then the first need0 keys of b0 in that same order, which is what select0 takes, since
+// (key, index) is a strict total order over distinct indices. That is the set gather builds
+// (keys > tau plus the m lowest-index ties at tau), and sort orders a set the same way whatever
+// slots it sits in, so `selected` is bit-identical to the lever-off path.
+//
+// State word slots after DSA_RS_NGT (init zeroes all DSA_RADIX_STATE_WORDS words each call):
+#define DSA_RS_B0CNT  4u   // binstat (debug): hist0[b0], keys in the pass-0 threshold bin
+#define DSA_RS_BINP   5u   // binstat (debug): the row's live P (0 when select_k is 0)
+#define DSA_RS_BINCNT 6u   // compact: keys of bin b0 appended to the row's pair buffer
 #define DSA_COMPACT_CAP 2048u
 
 // 2026-10-10: METRALE_GLM_DSA_RADIX_BINSTAT=1 (debug, default off): after find pass 0, record
@@ -1922,13 +2078,11 @@ extern "C" __global__ void __launch_bounds__(32) dsa_topk_radix_binstat(
     w[DSA_RADIX_STATE + DSA_RS_BINP] = P;
 }
 
-// 2026-10-10: PROTOTYPE, timing only, not wired into production: a single read of the row after
-// find pass 0 (state: init, hist0 and find0 done; DSA_RS_GT_CNT and DSA_RS_BINCNT zero). Same
-// grid as gather (C chunks x Q rows). A key whose top 12 bits exceed b0 goes to candidate slot
-// atomicAdd(GT_CNT) (fewer than select_k <= kcap of them, so always in range); a key in bin b0
-// is counted through DSA_RS_BINCNT and, below DSA_COMPACT_CAP, its (key, index) pair is stored
-// in the row's buffer `bins` (DSA_COMPACT_CAP keys, then DSA_COMPACT_CAP indices). The output
-// is not a valid selection (no tie handling, no sort); it exists to time the single read.
+// 2026-10-10: METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1: the compaction (see above the binstat
+// kernel). Same grid as gather (C chunks x Q rows); `bins` holds DSA_COMPACT_CAP keys then
+// DSA_COMPACT_CAP indices per row. Runs after find pass 0 (hist0, prefix and need final; GT_CNT
+// and BINCNT still 0 from init). A FALLBACK row returns in every block (each reads the same
+// hist0[b0]); nothing below has a barrier, so the return need not even be uniform.
 extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_compact(
     const float* __restrict__ scores,
     unsigned int* __restrict__ work,
@@ -1948,11 +2102,16 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_c
     const unsigned int r = blockIdx.y;
     unsigned int* w = dsa_radix_row(work, r, kcap);
     const unsigned int b0 = w[DSA_RADIX_STATE + DSA_RS_PREFIX] >> 20;
+    if (w[b0] > DSA_COMPACT_CAP) return;
+    // 2026-10-10: Keys above bin b0: exactly select_k - need0 (the count find 0 passed over).
+    const unsigned int ngt0 = select_k - w[DSA_RADIX_STATE + DSA_RS_NEED];
     unsigned int* cand_key = w + DSA_RADIX_CAND;
     unsigned int* cand_idx = w + DSA_RADIX_CAND + kcap;
     unsigned int* bin_key = bins + (size_t)r * (2u * DSA_COMPACT_CAP);
     unsigned int* bin_idx = bin_key + DSA_COMPACT_CAP;
 
+    // 2026-10-10: The chunk split of the hist and gather launches, so the keys counted here are
+    // exactly the ones hist pass 0 counted.
     const unsigned int chunk = (P + gridDim.x - 1u) / gridDim.x;
     const unsigned int lo = min(c * chunk, P);
     const unsigned int hi = min(lo + chunk, P);
@@ -1964,7 +2123,7 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_c
             const unsigned int top = key >> 20;
             if (top > b0) {
                 const unsigned int slot = atomicAdd(&w[DSA_RADIX_STATE + DSA_RS_GT_CNT], 1u);
-                if (slot < kcap) {
+                if (slot < ngt0) {
                     cand_key[slot] = key;
                     cand_idx[slot] = i;
                 }
@@ -1977,6 +2136,75 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_c
             }
         }
     }
+}
+
+// 2026-10-10: METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1: select row blockIdx.x's need0 winners of
+// bin b0 (grid Q, DSA_RADIX_THREADS threads). For a COMPACT row: bitonic-sort the n = hist0[b0]
+// <= DSA_COMPACT_CAP pairs compact appended (key descending, then index ascending), padded to a
+// power of two with (key 0, index 0xFFFFFFFF): dsa_radix_key of a finite float is at least
+// 0x00800000 (-FLT_MAX; -inf gives 0x007FFFFF, and only a NaN with every bit set maps to 0), and
+// a pool index is below P < 0xFFFFFFFF, so the pad sorts after every real pair and need0 <= n
+// takes none of it. The first need0 pairs go to candidate slots [select_k - need0, select_k);
+// then the mode word is set so the _rc kernels skip the row. A FALLBACK row returns at once in
+// every thread (all read the same hist0[b0]), before the first barrier.
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_select0(
+    unsigned int* __restrict__ work,
+    const unsigned int* __restrict__ bins,
+    unsigned int select_k,
+    unsigned int kcap,
+    const int* __restrict__ geom
+) {
+    if (geom) select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    if (select_k == 0u) return;
+    __shared__ unsigned int sk[DSA_COMPACT_CAP];
+    __shared__ unsigned int si[DSA_COMPACT_CAP];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int r = blockIdx.x;
+    unsigned int* w = dsa_radix_row(work, r, kcap);
+    const unsigned int b0 = w[DSA_RADIX_STATE + DSA_RS_PREFIX] >> 20;
+    const unsigned int n = w[b0];
+    if (n > DSA_COMPACT_CAP) return;
+    // 2026-10-10: compact counted the keys of b0 over the same chunks hist pass 0 did; a
+    // mismatch means the two saw different rows (P or geom), and the selection would be wrong.
+    if (w[DSA_RADIX_STATE + DSA_RS_BINCNT] != n) __trap();
+    const unsigned int need0 = w[DSA_RADIX_STATE + DSA_RS_NEED];
+    const unsigned int ngt0 = select_k - need0;
+    const unsigned int* bin_key = bins + (size_t)r * (2u * DSA_COMPACT_CAP);
+    const unsigned int* bin_idx = bin_key + DSA_COMPACT_CAP;
+    unsigned int n2 = 2u;
+    while (n2 < n) n2 <<= 1;
+    for (unsigned int i = tid; i < n2; i += blockDim.x) {
+        sk[i] = (i < n) ? bin_key[i] : 0u;
+        si[i] = (i < n) ? bin_idx[i] : 0xFFFFFFFFu;
+    }
+    __syncthreads();
+
+#define DSA_RADIX_GT(a, b) ((sk[(a)] > sk[(b)]) || (sk[(a)] == sk[(b)] && si[(a)] < si[(b)]))
+    for (unsigned int k = 2; k <= n2; k <<= 1) {
+        for (unsigned int j = k >> 1; j > 0; j >>= 1) {
+            for (unsigned int i = tid; i < n2; i += blockDim.x) {
+                const unsigned int l = i ^ j;
+                if (l > i) {
+                    const bool gt = DSA_RADIX_GT(i, l);
+                    const bool want_desc = ((i & k) == 0);
+                    if (want_desc != gt) {
+                        const unsigned int tk = sk[i]; sk[i] = sk[l]; sk[l] = tk;
+                        const unsigned int ti = si[i]; si[i] = si[l]; si[l] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+#undef DSA_RADIX_GT
+
+    unsigned int* cand_key = w + DSA_RADIX_CAND;
+    unsigned int* cand_idx = w + DSA_RADIX_CAND + kcap;
+    for (unsigned int i = tid; i < need0; i += blockDim.x) {
+        cand_key[ngt0 + i] = sk[i];
+        cand_idx[ngt0 + i] = si[i];
+    }
+    if (tid == 0u) w[DSA_RADIX_STATE + DSA_RS_MODE] = 1u;
 }
 
 // 2026-10-06: Sort row blockIdx.x's select_k candidates (key descending, then index ascending)

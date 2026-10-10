@@ -46,9 +46,32 @@
 //! as counted by the compact kernel. A `CHAIN COMPACT CHECK` line compares those counts with the
 //! `dsa_topk_radix_binstat` kernel's. Timing only: compact's output is not a selection.
 //!
+//! 2026-10-10: `dsa_topk_radix_compact` is now the production kernel of
+//! `METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1` (`select::radix_compact`): it only touches rows whose
+//! bin b0 holds at most 2,048 keys (COMPACT), so the CHECK line expects its count to equal
+//! binstat's on those rows and 0 on the others, and `b0_median` is binstat's median.
+//!
+//! 2026-10-10: RCOMPACT (the lever's gate). `launch_topk_radix` with the pair buffer set (lever
+//! on) against the same call without it (lever off), on the rig and on edge cases:
+//! - `RCOMPACT BITWISE S=<S> case=<name> identical=<bool>`: `selected` (raw i32 bits) of the
+//!   lever-on call equals the lever-off call's (rig: and the expand rows too); edge cases also
+//!   equal a host sort (`host_reference`, the `dsa_topk_pools` order; select_k 0: untouched
+//!   poison). Edge cases: heavy -FLT_MAX ties with the -FLT_MAX bin at or below and above the
+//!   cap, all-equal scores below and above the cap, select_k equal to the live pools (and
+//!   below 512), select_k 0, need0 equal to the bin's count, COMPACT and FALLBACK rows mixed in
+//!   one call, ragged P, and device-geometry (`geom`) launches with a larger scalar ceiling,
+//!   each at the production chunk count and at 5 chunks (`/c5`). S is 4 x P.
+//! - `RCOMPACT ROWS S=<S> case=<name> compact=<n> fallback=<m>`: rows select0 finished (mode
+//!   word 1) and rows left to the passes, so a case's coverage is visible.
+//! - `RCOMPACT TIME S=<S> off_us=<x> on_us=<y> ratio=<y/x>`: the full production chain (radix +
+//!   expand) of the rig, 11 layers in one graph, flushed, median of 9, per layer, lever off and
+//!   on (as `graph_us`).
+//! - `PASS - RCOMPACT` only when every BITWISE line is identical.
+//!
 //! Exit: 0 and `PASS - CHAIN gate0 ...` when every chunk output is bitwise identical to c = 1
 //! (and the staged chain matches production); 1 with `FAIL`; 2 when the radix entry points are
-//! absent from this target.
+//! absent from this target. 2026-10-10: also 1 when an RCOMPACT line differs, 2 when the
+//! compaction entry points are absent.
 //!
 //! Owner: model-arch examples.
 //! Invariants: none beyond the types. Needs about 0.6 GB of device memory at S = 262,144.
@@ -68,12 +91,15 @@ use metrale_model_arch::glm5next_dsa::select::radix::{
     radix_chunks, radix_resolved, radix_row_bytes, set_radix_chunks_override,
 };
 use metrale_model_arch::glm5next_dsa::select::binstat::launch_binstat;
+use metrale_model_arch::glm5next_dsa::select::radix_compact::{
+    COMPACT_CAP, RS_MODE, compact_bytes, radix_compact_resolved,
+};
 
-// 2026-10-10: this example uses only the score generator of the shared helpers.
+// 2026-10-10: this example uses the score generator and the host order of the shared helpers.
 #[allow(dead_code)]
 #[path = "common/dsa_topk_radix_common.rs"]
 mod dsa_topk_radix_common;
-use dsa_topk_radix_common::{SELECT_K, rig_scores};
+use dsa_topk_radix_common::{SELECT_K, host_reference, rig_scores};
 
 // 2026-10-10: CUDA driver event API, declared as in `dsa_topk_radix_common` (its copy is private).
 unsafe extern "C" {
@@ -223,7 +249,7 @@ impl<'a> Rig<'a> {
             pool_indices: up(g, &le_i32(&pool_idx))?,
             valid_keys: up(g, &valid_keys)?,
             q_pos: up(g, &le_i32(&q_pos))?,
-            q_mask: up(g, &vec![1u8; Q])?,
+            q_mask: up(g, &[1u8; Q])?,
             bins: g.alloc(Q * BIN_ROW_WORDS * 4)?,
         };
         g.memset(rig.work_all, POISON, LAYERS * work_bytes)?;
@@ -282,7 +308,9 @@ impl<'a> Rig<'a> {
     }
 
     /// 2026-10-10: The production chain of layer `l`: `launch_topk_radix` then the expand.
-    fn chain(&self, l: usize, stream: u64) -> Result<()> {
+    /// With `compact` (`METRALE_GLM_DSA_TOPK_RADIX_COMPACT` on) the rig's pair buffers (`bins`,
+    /// one per row, shared by the layers, which run in stream order) are passed to it.
+    fn chain_with(&self, l: usize, stream: u64, compact: bool) -> Result<()> {
         let b = &self.layers[l];
         let t = RadixTopk {
             scores: b.scores,
@@ -293,6 +321,7 @@ impl<'a> Rig<'a> {
             select_k: SELECT_K,
             kcap: KCAP,
             geom_dev: DevicePtr::NULL,
+            bins: if compact { self.bins } else { DevicePtr::NULL },
         };
         launch_topk_radix(self.g, self.k, &t, stream)?;
         self.expand(l, true, stream)
@@ -382,9 +411,14 @@ impl<'a> Rig<'a> {
     /// 2026-10-10: Production chain on every layer (outputs poisoned first), then both outputs
     /// downloaded.
     fn run_production(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        self.run_production_with(false)
+    }
+
+    /// 2026-10-10: [`Self::run_production`] with the compaction on or off.
+    fn run_production_with(&self, compact: bool) -> Result<(Vec<u8>, Vec<u8>)> {
         self.poison_outputs()?;
         for l in 0..LAYERS {
-            self.chain(l, self.st)?;
+            self.chain_with(l, self.st, compact)?;
         }
         self.dump()
     }
@@ -482,8 +516,13 @@ impl<'a> Rig<'a> {
     /// 2026-10-10: Whole production chain of 11 layers in one graph, flushed once before each
     /// replay: per-layer us.
     fn chain_us(&self) -> Result<f64> {
+        self.chain_us_with(false)
+    }
+
+    /// 2026-10-10: [`Self::chain_us`] with the compaction on or off.
+    fn chain_us_with(&self, compact: bool) -> Result<f64> {
         self.time_graph(false, &mut |sm| {
-            (0..LAYERS).try_for_each(|l| self.chain(l, sm))
+            (0..LAYERS).try_for_each(|l| self.chain_with(l, sm, compact))
         })
     }
 }
@@ -517,6 +556,8 @@ fn bin_occupancy(rig: &Rig<'_>) -> Result<(Vec<u32>, usize)> {
 /// 2026-10-10: State word offsets (`DSA_RS_*`) the compact and binstat kernels write.
 const RS_B0CNT: usize = 4;
 const RS_BINCNT: usize = 6;
+// 2026-10-10: the binstat slot is checked against the crate's constant.
+const _: () = assert!(RS_B0CNT == metrale_model_arch::glm5next_dsa::select::binstat::RS_B0CNT);
 
 /// 2026-10-10: The COMPACT arm for the rig's context: with every layer at the state after init,
 /// hist 0 and find 0 (and the binstat kernel run), time the compact prototype per layer, then
@@ -557,9 +598,263 @@ fn compact_arm(rig: &Rig<'_>) -> Result<(f64, u32, bool)> {
     };
     let compact: Vec<u32> = (0..Q).map(|r| word(r, RS_BINCNT)).collect();
     let stat: Vec<u32> = (0..Q).map(|r| word(r, RS_B0CNT)).collect();
-    let mut sorted = compact.clone();
+    // 2026-10-10: the production kernel counts only COMPACT rows (bin b0 <= cap).
+    let want: Vec<u32> = stat
+        .iter()
+        .map(|&c| if c as usize <= COMPACT_CAP { c } else { 0 })
+        .collect();
+    let mut sorted = stat.clone();
     sorted.sort_unstable();
-    Ok((us, sorted[sorted.len() / 2], compact == stat))
+    Ok((us, sorted[sorted.len() / 2], compact == want))
+}
+
+/// 2026-10-10: Mode words (`DSA_RS_MODE`) of the first `rows` rows of a work buffer: how many
+/// rows select0 finished.
+fn compact_rows(g: &dyn GpuBackend, work: DevicePtr, rows: usize) -> Result<usize> {
+    let row_bytes = radix_row_bytes(KCAP);
+    let mut n = 0;
+    for r in 0..rows {
+        let mut w = [0u8; 4];
+        g.copy_d2h(
+            work.offset(r * row_bytes + (RADIX_STATE + RS_MODE) * 4),
+            &mut w,
+        )?;
+        n += usize::from(u32::from_le_bytes(w) == 1);
+    }
+    Ok(n)
+}
+
+/// 2026-10-10: One RCOMPACT edge case: its rows (equal length P), select_k, and whether the
+/// launch reads P and select_k from a device `geom` (scalars then a larger ceiling).
+struct Edge {
+    name: String,
+    rows: Vec<Vec<f32>>,
+    select_k: usize,
+    geom: bool,
+}
+
+/// 2026-10-10: Run `e` lever off and on (work and `selected` poisoned before each, so init's
+/// re-zeroing is exercised) at chunk override `chunks`, print its BITWISE and ROWS lines and
+/// return whether it is identical (on == off == host order).
+fn run_edge(
+    g: &dyn GpuBackend,
+    k: &Glm5NextDsaKernels,
+    st: u64,
+    e: &Edge,
+    chunks: Option<usize>,
+) -> Result<bool> {
+    let (q, p) = (e.rows.len(), e.rows[0].len());
+    let flat: Vec<u8> = e
+        .rows
+        .iter()
+        .flat_map(|r| r.iter().flat_map(|x| x.to_le_bytes()))
+        .collect();
+    let scores = up(g, &flat)?;
+    let sel_bytes = (q * e.select_k * 4).max(4);
+    let selected = g.alloc(sel_bytes)?;
+    let work_bytes = q * radix_row_bytes(KCAP);
+    let work = g.alloc(work_bytes + compact_bytes(q))?;
+    let bins = work.offset(work_bytes);
+    // 2026-10-10: geom slots S, pools incl. partial, pools, select_k, np2 (as dsa_write_geom).
+    let (geom_dev, n_pools, select_k) = if e.geom {
+        let np2 = p.next_power_of_two().clamp(2, 2048) as i32;
+        let gv = [(p * KP) as i32, p as i32, p as i32, e.select_k as i32, np2];
+        (up(g, &le_i32(&gv))?, p + 4096, SELECT_K)
+    } else {
+        (DevicePtr::NULL, p, e.select_k)
+    };
+    set_radix_chunks_override(chunks);
+    let mut got = Vec::new();
+    for compact in [false, true] {
+        g.memset(selected, POISON, sel_bytes)?;
+        g.memset(work, POISON, work_bytes + compact_bytes(q))?;
+        let t = RadixTopk {
+            scores,
+            selected,
+            work,
+            q_rows: q,
+            n_pools,
+            select_k,
+            kcap: KCAP,
+            geom_dev,
+            bins: if compact { bins } else { DevicePtr::NULL },
+        };
+        launch_topk_radix(g, k, &t, st)?;
+        g.synchronize(st)?;
+        let mut v = vec![0u8; sel_bytes];
+        g.copy_d2h(selected, &mut v)?;
+        got.push(v);
+    }
+    set_radix_chunks_override(None);
+    let n_compact = if e.select_k == 0 {
+        0
+    } else {
+        compact_rows(g, work, q)?
+    };
+    let want: Vec<u8> = if e.select_k == 0 {
+        vec![POISON; sel_bytes]
+    } else {
+        e.rows
+            .iter()
+            .flat_map(|r| le_i32(&host_reference(r, e.select_k)))
+            .collect()
+    };
+    let identical = got[0] == got[1] && got[1] == want;
+    let suffix = chunks.map_or(String::new(), |c| format!("/c{c}"));
+    println!(
+        "RCOMPACT BITWISE S={} case={}{suffix} identical={identical}",
+        p * KP,
+        e.name
+    );
+    println!(
+        "RCOMPACT ROWS S={} case={}{suffix} compact={n_compact} fallback={}",
+        p * KP,
+        e.name,
+        q - n_compact
+    );
+    for b in [scores, selected, work] {
+        g.free(b)?;
+    }
+    if !geom_dev.is_null() {
+        g.free(geom_dev)?;
+    }
+    Ok(identical)
+}
+
+/// 2026-10-10: The RCOMPACT edge cases (see the header).
+fn edges() -> Vec<Edge> {
+    let m = -f32::MAX;
+    let rig = |seed: u64, p: usize| rig_scores(0xED6E_0000 ^ seed, p);
+    // 2026-10-10: `real` rig scores then `neg` -FLT_MAX, interleaved by a fixed stride.
+    let ties = |seed: u64, real: usize, neg: usize| -> Vec<f32> {
+        let mut v = vec![m; real + neg];
+        let src = rig_scores(seed, real * 2);
+        let mut placed = 0;
+        for (i, &x) in src.iter().filter(|&&x| x != m).take(real).enumerate() {
+            v[(i * 7 + 3) % (real + neg)] = x;
+            placed += 1;
+        }
+        // 2026-10-10: top up with distinct values if the generator gave too few.
+        let mut j = 0;
+        while placed < real {
+            if v[j] == m {
+                v[j] = 0.01 * j as f32 + 3.0;
+                placed += 1;
+            }
+            j += 1;
+        }
+        v
+    };
+    // 2026-10-10: need0 == hist0[b0]: 500 keys above [1.0, 1.125), 12 distinct keys in it,
+    // the rest 0.1.
+    let exact = |p: usize| -> Vec<f32> {
+        let mut v = vec![0.1f32; p];
+        for i in 0..500 {
+            v[(i * 17 + 5) % p] = 2.0 + i as f32 / 256.0;
+        }
+        let mut placed = 0;
+        for i in (0..p).rev() {
+            if v[i] == 0.1 && placed < 12 {
+                v[i] = 1.0 + placed as f32 / 128.0;
+                placed += 1;
+            }
+        }
+        v
+    };
+    let e = |name: &str, rows: Vec<Vec<f32>>, select_k: usize, geom: bool| Edge {
+        name: name.to_string(),
+        rows,
+        select_k,
+        geom,
+    };
+    vec![
+        e(
+            "neg_max_bin_le_cap",
+            (0..4).map(|r| ties(r, 300, 2_000)).collect(),
+            SELECT_K,
+            false,
+        ),
+        e(
+            "neg_max_bin_gt_cap",
+            (0..4).map(|r| ties(r, 300, 2_249)).collect(),
+            SELECT_K,
+            false,
+        ),
+        e(
+            "all_neg_max_p2048",
+            vec![vec![m; 2_048]; 2],
+            SELECT_K,
+            false,
+        ),
+        e(
+            "all_equal_le_cap",
+            vec![vec![0.75; 2_000]; 2],
+            SELECT_K,
+            false,
+        ),
+        e(
+            "all_equal_gt_cap",
+            vec![vec![0.75; 3_000]; 2],
+            SELECT_K,
+            false,
+        ),
+        e(
+            "selk_eq_pools_512",
+            (0..4).map(|r| rig(r, 512)).collect(),
+            SELECT_K,
+            false,
+        ),
+        e(
+            "selk_eq_pools_300",
+            (0..4).map(|r| rig(r, 300)).collect(),
+            300,
+            false,
+        ),
+        e(
+            "selk_zero",
+            (0..4).map(|r| rig(r, 4_096)).collect(),
+            0,
+            false,
+        ),
+        e(
+            "need0_eq_bin",
+            vec![exact(9_000), exact(9_001)],
+            SELECT_K,
+            false,
+        ),
+        e(
+            "mixed",
+            vec![
+                rig(1, 8_192),
+                ties(2, 300, 7_892),
+                vec![0.75; 8_192],
+                exact(8_192),
+                rig(3, 8_192),
+                (0..8_192).map(|i| [0.1, 0.2, 0.3, 0.4][i % 4]).collect(),
+            ],
+            SELECT_K,
+            false,
+        ),
+        e(
+            "ragged_p70001",
+            (0..4).map(|r| rig(r, 70_001)).collect(),
+            SELECT_K,
+            false,
+        ),
+        e(
+            "ragged_p9001",
+            (0..8).map(|r| rig(r, 9_001)).collect(),
+            SELECT_K,
+            false,
+        ),
+        e("geom_1row", vec![rig(9, 33_001)], SELECT_K, true),
+        e(
+            "geom_ties",
+            (0..4).map(|r| ties(r, 300, 2_000)).collect(),
+            SELECT_K,
+            true,
+        ),
+    ]
 }
 
 fn main() -> Result<()> {
@@ -584,6 +879,9 @@ fn main() -> Result<()> {
     let mut all_identical = true;
     let mut staged_ok = true;
     let mut binstat_ok = true;
+    // 2026-10-10: RCOMPACT verdict; the compaction needs five more entry points.
+    let rc_ok = radix_compact_resolved(&k);
+    let mut rcompact_ok = true;
 
     for &s in CONTEXTS {
         set_radix_chunks_override(None);
@@ -658,7 +956,45 @@ fn main() -> Result<()> {
         } else {
             println!("CHAIN COMPACT S={s} skipped: dsa_topk_radix_compact/binstat absent");
         }
+        // f) RCOMPACT on the rig: lever on vs the lever-off production outputs, and chain time.
+        if rc_ok {
+            set_radix_chunks_override(None);
+            let (sel_on, out_on) = rig.run_production_with(true)?;
+            let identical = sel_on == sel0 && out_on == out0;
+            rcompact_ok &= identical;
+            println!("RCOMPACT BITWISE S={s} case=rig identical={identical}");
+            let n = compact_rows(g, rig.layers[0].work, Q)?;
+            println!(
+                "RCOMPACT ROWS S={s} case=rig compact={n} fallback={}",
+                Q - n
+            );
+            let off_us = rig.chain_us_with(false)?;
+            let on_us = rig.chain_us_with(true)?;
+            println!(
+                "RCOMPACT TIME S={s} off_us={off_us:.2} on_us={on_us:.2} ratio={:.3}",
+                on_us / off_us.max(1e-9)
+            );
+        }
         rig.free()?;
+    }
+
+    // 2026-10-10: RCOMPACT edge cases, at the production chunk count and at 5 chunks.
+    if rc_ok {
+        for e in edges() {
+            for chunks in [None, Some(5)] {
+                rcompact_ok &= run_edge(g, &k, st, &e, chunks)?;
+            }
+        }
+        if rcompact_ok {
+            println!("PASS - RCOMPACT: every RCOMPACT BITWISE line identical");
+        } else {
+            println!("FAIL - RCOMPACT: an RCOMPACT BITWISE line differs");
+        }
+    } else {
+        println!(
+            "FAIL - RCOMPACT: the compaction entry points (dsa_topk_radix_compact, _select0, \
+             _hist_rc, _find_rc, _gather_rc) are absent from this target"
+        );
     }
 
     if !binstat_ok {
@@ -667,6 +1003,12 @@ fn main() -> Result<()> {
     }
     if all_identical && staged_ok {
         println!("PASS - CHAIN gate0: chunk outputs identical in every S and c");
+        if !rc_ok {
+            std::process::exit(2);
+        }
+        if !rcompact_ok {
+            std::process::exit(1);
+        }
         Ok(())
     } else {
         println!(

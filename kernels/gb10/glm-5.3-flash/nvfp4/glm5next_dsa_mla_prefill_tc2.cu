@@ -42,6 +42,14 @@
 //      schedule used each page right after its load, so each tile waited for four block-table
 //      round trips in a row behind B1 (cuobjdump -sass of the _fp8 entry). The offsets are
 //      the same expression (tc2_page_off = tc2_key_off's arithmetic), so the loads are unchanged.
+//   A6 (2026-10-09) after the compaction each compacted token index t is replaced in place by its
+//      cache row block_table[t / block_size] * block_size + t % block_size, once per CTA (one
+//      thread per index); the key loop forms each offset as row * TC2_D. The host takes this
+//      entry only where cache_stride_bytes == block_size * TC2_D, so row * TC2_D equals the old
+//      page * cache_stride_bytes + (t % block_size) * TC2_D, and the loads are unchanged. A row
+//      fits 32 bits while the cache is below 2 TiB. Before A6 every lane of a warp ran the
+//      runtime-divisor division and the block-table load for each of its 4 keys per tile
+//      (~130 of the loop's 910 SASS instructions, cuobjdump -sass of the _fp8 entry, nvcc 13.2).
 //   A4 (persistent grid) is not used: at 99 KB of shared memory one CTA fits per SM, and rows past
 //      2,051 tokens all run 65 tiles, so a pull scheduler runs the same ceil(rows / SMs) rounds.
 //
@@ -163,32 +171,41 @@ __device__ __forceinline__ unsigned long long tc2_key_off(
          + (unsigned long long)(t % block_size) * TC2_D;
 }
 
-// 2026-10-09: A5: tc2_key_off in two steps. tc2_key_page reads the block table (no use of the
-// page), tc2_page_off forms the same offset later; `tin` TC2_NO_TIN (never a t % block_size)
-// marks a key past the list.
-#define TC2_NO_TIN (~0u)
-__device__ __forceinline__ void tc2_key_page(
-    const int* sel_s,
-    unsigned j,
-    unsigned n_valid,
-    const int* __restrict__ block_table,
-    unsigned block_size,
-    unsigned& page,
-    unsigned& tin
-) {
-    page = 0u;
-    tin = TC2_NO_TIN;
-    if (j < n_valid) {
-        const unsigned t = (unsigned)sel_s[j];
-        page = (unsigned)block_table[t / block_size];
-        tin = t % block_size;
-    }
+// 2026-10-09: A6: sel_s holds cache rows (tc2_resolve_rows); a key past the list is TC2_NO_ROW
+// (no row: the cache is below 2 TiB) and loads zeros. tc2_row_off(r) == tc2_key_off for the
+// same key where cache_stride_bytes == block_size * TC2_D.
+#define TC2_NO_ROW (~0u)
+__device__ __forceinline__ unsigned tc2_key_row(const int* sel_s, unsigned j, unsigned n_valid) {
+    return j < n_valid ? (unsigned)sel_s[j] : TC2_NO_ROW;
 }
 
-__device__ __forceinline__ unsigned long long tc2_page_off(unsigned page, unsigned tin,
-                                                           unsigned long long cache_stride_bytes) {
-    if (tin == TC2_NO_TIN) return TC2_NO_KEY;
-    return (unsigned long long)page * cache_stride_bytes + (unsigned long long)tin * TC2_D;
+__device__ __forceinline__ unsigned long long tc2_row_off(unsigned row) {
+    if (row == TC2_NO_ROW) return TC2_NO_KEY;
+    return (unsigned long long)row * TC2_D;
+}
+
+// 2026-10-09: A6: sel_s[j] = t -> block_table[t / block_size] * block_size + t % block_size for
+// j < n_valid, one thread per index; all block-table loads are issued before any store.
+#define TC2_RESOLVE (TC2_MAX_SEL / TC2_THREADS)
+static_assert(TC2_MAX_SEL % TC2_THREADS == 0, "each thread resolves TC2_RESOLVE indices");
+__device__ __forceinline__ void tc2_resolve_rows(int* sel_s, unsigned n_valid, unsigned tid,
+                                                 const int* __restrict__ block_table,
+                                                 unsigned block_size) {
+    unsigned row[TC2_RESOLVE];
+    #pragma unroll
+    for (int i = 0; i < TC2_RESOLVE; i++) {
+        const unsigned j = tid + (unsigned)i * TC2_THREADS;
+        row[i] = 0u;
+        if (j < n_valid) {
+            const unsigned t = (unsigned)sel_s[j];
+            row[i] = (unsigned)block_table[t / block_size] * block_size + t % block_size;
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < TC2_RESOLVE; i++) {
+        const unsigned j = tid + (unsigned)i * TC2_THREADS;
+        if (j < n_valid) sel_s[j] = (int)row[i];
+    }
 }
 
 __device__ __forceinline__ uint4 tc2_load_key(const unsigned char* __restrict__ kv,
@@ -390,21 +407,21 @@ __device__ __forceinline__ void tc2_body(
     // width 0 runs no pass, so one more barrier keeps the staged Q published in that case too.
     if (sel_width == 0) __syncthreads();
 
+    // 2026-10-09: A6: token indices -> cache rows; the barrier publishes them.
+    tc2_resolve_rows(sel_s, n_valid, tid, my_block_table, block_size);
+    __syncthreads();
+
     const unsigned n_tiles = (n_valid + TC2_NK - 1) / TC2_NK;
 
-    // 2026-10-08: Tile 0's bytes and tile 1's offsets, verbatim.
+    // 2026-10-08: Tile 0's bytes and tile 1's offsets (A6: from the rows).
     uint4 raw[4];
     unsigned long long off_nxt[4];
-    unsigned pg_nxt[4], tin_nxt[4];
+    unsigned row_nxt[4];
     #pragma unroll
     for (int i = 0; i < 4; i++) {
         const unsigned kk = warp + 8u * (unsigned)i;
-        raw[i] = tc2_load_key(KV_cache,
-                              tc2_key_off(sel_s, kk, n_valid, my_block_table, block_size,
-                                          cache_stride_bytes),
-                              lane);
-        off_nxt[i] = tc2_key_off(sel_s, TC2_NK + kk, n_valid, my_block_table, block_size,
-                                 cache_stride_bytes);
+        raw[i] = tc2_load_key(KV_cache, tc2_row_off(tc2_key_row(sel_s, kk, n_valid)), lane);
+        off_nxt[i] = tc2_row_off(tc2_key_row(sel_s, TC2_NK + kk, n_valid));
     }
 
     const unsigned mt     = warp & 1u;
@@ -445,8 +462,7 @@ __device__ __forceinline__ void tc2_body(
     for (int i = 0; i < 4; i++) raw[i] = tc2_load_key(KV_cache, off_nxt[i], lane);
     #pragma unroll
     for (int i = 0; i < 4; i++) {
-        tc2_key_page(sel_s, 2u * TC2_NK + warp + 8u * (unsigned)i, n_valid, my_block_table,
-                     block_size, pg_nxt[i], tin_nxt[i]);
+        row_nxt[i] = tc2_key_row(sel_s, 2u * TC2_NK + warp + 8u * (unsigned)i, n_valid);
     }
     // 2026-10-08: Publishes buffer 0; every warp has read its Q fragments out of buffer 1.
     __syncthreads();
@@ -464,18 +480,17 @@ __device__ __forceinline__ void tc2_body(
         __syncthreads();
 
         // 2026-10-08: Tile + 1's bytes (loaded one tile ago) into the other buffer, then the
-        // loads for tile + 2 and the block-table reads for tile + 3. Past the list the offsets
+        // loads for tile + 2 and the row reads for tile + 3 (A6). Past the list the offsets
         // are TC2_NO_KEY and the loads return zeros without touching memory.
         tc2_store_tile<kBitCvt>(tc2_smem + (nbuf << 15), raw, warp, lane);
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            raw[i] = tc2_load_key(KV_cache, tc2_page_off(pg_nxt[i], tin_nxt[i], cache_stride_bytes),
-                                  lane);
+            raw[i] = tc2_load_key(KV_cache, tc2_row_off(row_nxt[i]), lane);
         }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            tc2_key_page(sel_s, (tile + 3u) * TC2_NK + warp + 8u * (unsigned)i, n_valid,
-                         my_block_table, block_size, pg_nxt[i], tin_nxt[i]);
+            row_nxt[i] =
+                tc2_key_row(sel_s, (tile + 3u) * TC2_NK + warp + 8u * (unsigned)i, n_valid);
         }
 
         // 2026-10-08: Online softmax, verbatim (old step 4).

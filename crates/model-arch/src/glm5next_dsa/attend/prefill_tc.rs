@@ -114,6 +114,7 @@ pub fn mla_prefill_tc2() -> bool {
 pub(crate) fn prefill_tc2_ignored(
     tc_on: bool,
     tc_refusal: Option<&str>,
+    tc2_refusal: Option<&str>,
     tc2_resolved: bool,
 ) -> Option<String> {
     if !tc_on {
@@ -127,8 +128,27 @@ pub(crate) fn prefill_tc2_ignored(
             "{MLA_PREFILL_TC_ENTRY} does not take this launch ({why})"
         ));
     }
+    if let Some(why) = tc2_refusal {
+        return Some(format!(
+            "{MLA_PREFILL_TC2_ENTRY} does not take this launch ({why})"
+        ));
+    }
     if !tc2_resolved {
         return Some(format!("{MLA_PREFILL_TC2_ENTRY} did not resolve"));
+    }
+    None
+}
+
+/// 2026-10-09: What the rewrite refuses beyond [`prefill_tc_refusal`] (A6): it addresses a key as
+/// its cache row times 512 bytes, which is the paged offset only when a page is `block_size`
+/// contiguous 512-byte rows (every GLM-5.3 cache: `cache_stride_bytes = block_size *
+/// kv_lora_rank`). Elsewhere the tensor-core kernel takes the launch.
+pub(crate) fn prefill_tc2_refusal(paging: &DsaDecodePaging) -> Option<String> {
+    if paging.cache_stride_bytes != (paging.block_size as u64) * 512 {
+        return Some(format!(
+            "page stride {} bytes is not block_size {} x 512",
+            paging.cache_stride_bytes, paging.block_size
+        ));
     }
     None
 }
@@ -238,7 +258,13 @@ pub fn attention(
     if is_prefill && mla_prefill_tc() {
         let refusal = prefill_tc_refusal(kernel.has_prefill_tc(), cfg, geom, paging, inputs);
         if tc2 {
-            match prefill_tc2_ignored(true, refusal.as_deref(), kernel.has_prefill_tc2()) {
+            let tc2_refusal = prefill_tc2_refusal(paging);
+            match prefill_tc2_ignored(
+                true,
+                refusal.as_deref(),
+                tc2_refusal.as_deref(),
+                kernel.has_prefill_tc2(),
+            ) {
                 None => {
                     static TC2_ENGAGED: std::sync::Once = std::sync::Once::new();
                     TC2_ENGAGED.call_once(|| {
@@ -271,7 +297,9 @@ pub fn attention(
                 });
             }
         }
-    } else if tc2 && let Some(why) = prefill_tc2_ignored(false, None, kernel.has_prefill_tc2()) {
+    } else if tc2
+        && let Some(why) = prefill_tc2_ignored(false, None, None, kernel.has_prefill_tc2())
+    {
         log_tc2_ignored(&why);
     }
     // 2026-10-05: `METRALE_GLM_DSA_MLA_SPLIT` applies to decode and verify rows only.
@@ -406,6 +434,9 @@ fn launch_tc2(
     // 2026-10-08: The rewrite takes exactly the launches the tensor-core kernel takes; its
     // resolution is not required for that check.
     if let Some(why) = prefill_tc_refusal(true, cfg, geom, paging, inputs) {
+        bail!("DSA MLA prefill TC2: {why}");
+    }
+    if let Some(why) = prefill_tc2_refusal(paging) {
         bail!("DSA MLA prefill TC2: {why}");
     }
 

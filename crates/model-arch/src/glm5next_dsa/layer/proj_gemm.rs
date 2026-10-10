@@ -61,3 +61,41 @@ pub(super) fn gemm(
         stream,
     )
 }
+
+impl super::Glm5NextDsaLayer {
+    /// 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: `q_a_proj` and `kv_a_proj` of the same `rows`
+    /// rows of `hidden` into `q_a` / `kv_a` as one grouped launch (`dense_nv4_group`), the
+    /// bytes [`gemm`] would write for each. `Ok(false)` launches nothing; the caller then runs
+    /// both through [`gemm`]. Both read only `hidden`, and neither reads the other's output.
+    pub(super) fn try_group_q_a_kv_a(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        q_a: DevicePtr,
+        kv_a: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        use crate::glm5next_layer::dense_nv4_group::{Proj, try_group};
+        let c = &self.cfg;
+        let q = Proj {
+            b: self.weights.q_a_proj,
+            c: q_a,
+            n: c.q_lora_rank,
+        };
+        let kv = Proj {
+            b: self.weights.kv_a_proj,
+            c: kv_a,
+            n: c.kv_lora_rank,
+        };
+        try_group(
+            gpu,
+            self.kernels.gemv,
+            hidden,
+            &[q, kv],
+            rows,
+            c.hidden,
+            stream,
+        )
+    }
+}

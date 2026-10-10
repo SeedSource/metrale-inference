@@ -568,6 +568,28 @@ impl Glm5NextKdaLayer {
         let _share = crate::glm5next_layer::dense_fp8::w8a8_share_input(hidden, t * hid * 2);
 
         // 2026-09-25: Three separate `[T, qkv]` projections, then one pack (see the module doc).
+        // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: all three read `hidden` and write their own
+        // part, so they may run as one grouped launch (`dense_nv4_group`, same bytes).
+        let ws_part = |i: usize| ws.qkv_parts.offset(i * t * qkv * 2);
+        let grouped = {
+            use crate::glm5next_layer::dense_nv4_group::{Proj, enabled, try_group};
+            let p = |b, i| Proj {
+                b,
+                c: ws_part(i),
+                n: qkv,
+            };
+            let w = &self.weights;
+            enabled()
+                && try_group(
+                    gpu,
+                    self.kernels.gemv,
+                    hidden,
+                    &[p(w.q_proj.weight, 0), p(w.k_proj.weight, 1), p(w.v_proj.weight, 2)],
+                    t,
+                    hid,
+                    stream,
+                )?
+        };
         for (i, w) in [
             &self.weights.q_proj,
             &self.weights.k_proj,
@@ -575,12 +597,13 @@ impl Glm5NextKdaLayer {
         ]
         .into_iter()
         .enumerate()
+        .filter(|_| !grouped)
         {
             self.gemm(
                 gpu,
                 hidden,
                 w,
-                ws.qkv_parts.offset(i * t * qkv * 2),
+                ws_part(i),
                 t,
                 qkv,
                 hid,

@@ -77,6 +77,24 @@ pub fn forward_dense_sliced(
     for (a, n) in row_slices(m, slice) {
         let xs = x.offset(a * cfg.hidden * 2);
         let act = a * inter * 2;
+        // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: gate and up read `xs` and write their own
+        // buffers, so they may run as one grouped launch (`dense_nv4_group`, same bytes).
+        if crate::glm5next_layer::dense_nv4_group::enabled() {
+            use crate::glm5next_layer::dense_nv4_group::{Proj, try_group};
+            let gate = Proj {
+                b: w.gate_proj,
+                c: ws.a_gate.offset(act),
+                n: inter,
+            };
+            let up = Proj {
+                b: w.up_proj,
+                c: ws.a_up.offset(act),
+                n: inter,
+            };
+            if try_group(gpu, k.gemv, xs, &[gate, up], n, cfg.hidden, stream)? {
+                continue;
+            }
+        }
         gemm(
             gpu,
             k.gemm,

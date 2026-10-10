@@ -93,32 +93,38 @@ impl Glm5NextDsaLayer {
             hidden,
             k * self.cfg.hidden * 2,
         );
-        gemm(
-            gpu,
-            self.kernels.gemm,
-            self.kernels.gemv,
-            self.kernels.gemv_batchm,
-            hidden,
-            self.weights.q_a_proj,
-            w.q_a,
-            k,
-            self.cfg.q_lora_rank,
-            self.cfg.hidden,
-            stream,
-        )?;
-        gemm(
-            gpu,
-            self.kernels.gemm,
-            self.kernels.gemv,
-            self.kernels.gemv_batchm,
-            hidden,
-            self.weights.kv_a_proj,
-            w.kv_a,
-            k,
-            self.cfg.kv_lora_rank,
-            self.cfg.hidden,
-            stream,
-        )?;
+        // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: the pair may run as one grouped launch
+        // (`dense_nv4_group`, same bytes).
+        let grouped = crate::glm5next_layer::dense_nv4_group::enabled()
+            && self.try_group_q_a_kv_a(gpu, hidden, w.q_a, w.kv_a, k, stream)?;
+        if !grouped {
+            gemm(
+                gpu,
+                self.kernels.gemm,
+                self.kernels.gemv,
+                self.kernels.gemv_batchm,
+                hidden,
+                self.weights.q_a_proj,
+                w.q_a,
+                k,
+                self.cfg.q_lora_rank,
+                self.cfg.hidden,
+                stream,
+            )?;
+            gemm(
+                gpu,
+                self.kernels.gemm,
+                self.kernels.gemv,
+                self.kernels.gemv_batchm,
+                hidden,
+                self.weights.kv_a_proj,
+                w.kv_a,
+                k,
+                self.cfg.kv_lora_rank,
+                self.cfg.hidden,
+                stream,
+            )?;
+        }
         drop(share);
         KernelLaunch::new(gpu, self.kernels.rms_norm)
             // 2026-09-25: `rms_norm_vanilla` runs one block per row, so one launch covers all

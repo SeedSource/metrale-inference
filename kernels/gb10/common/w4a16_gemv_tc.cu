@@ -11,7 +11,8 @@
 //   C [M, N] BF16. The caller guarantees K % 128 == 0 and 1 <= M <= MT (8 for tc8, 16 for
 //   tc16); gemv_tc::tc_route checks both. Any N: a weight row n >= N loads zeros.
 // - Grid (ceil(N / (8 * NT)), 1, 1), block TC_WARPS * 32 = 256. Only C[m, n] with m < M and
-//   n < N is written.
+//   n < N is written. The `_group` entries (2026-10-09) take any grid and loop tiles; see
+//   w4a16_gemv_tc_group_impl.
 // - The TC_WARPS warps of a CTA take interleaved 128-value K blocks for the same 8 * NT
 //   columns and are summed through shared memory in warp order, so a result does not depend on
 //   scheduling.
@@ -105,20 +106,22 @@ __device__ __forceinline__ void w4tc_store2(__nv_bfloat16* p, float a, float b, 
     }
 }
 
+// 2026-10-09: One 8 * NT column tile starting at column n0 of C. Nothing in it reads blockIdx or
+// gridDim, so the per-CTA entries (n0 = blockIdx.x * 8 * NT) and the grouped persistent entries
+// below run the same instructions on the same operands for a given tile: same bits.
 template <int MT, int NT, int KU>
-__device__ __forceinline__ void w4a16_gemv_tc_impl(
+__device__ __forceinline__ void w4a16_gemv_tc_tile(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,
     const unsigned char* __restrict__ B_scale,
     const float scale2,
     __nv_bfloat16* __restrict__ C,
-    unsigned int M, unsigned int N, unsigned int K)
+    unsigned int M, unsigned int N, unsigned int K, const unsigned int n0)
 {
     const unsigned int warp = threadIdx.x >> 5;
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int g = lane >> 2;
     const unsigned int t = lane & 3u;
-    const unsigned int n0 = blockIdx.x * (8u * NT);
     const unsigned int half_K = K >> 1;
     const unsigned int num_groups = K >> 4;
     const unsigned int num_kb = K >> 7;
@@ -238,6 +241,56 @@ __device__ __forceinline__ void w4a16_gemv_tc_impl(
     }
 }
 
+template <int MT, int NT, int KU>
+__device__ __forceinline__ void w4a16_gemv_tc_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K)
+{
+    w4a16_gemv_tc_tile<MT, NT, KU>(A, B_packed, B_scale, scale2, C, M, N, K,
+                                   blockIdx.x * (8u * NT));
+}
+
+// 2026-10-09: METRALE_GLM_NV4_TC_GROUP. Up to three projections that read the same A [M, K]
+// (weights g = 0..2 of N_g columns each; N_g = 0 drops entry g) in one persistent launch. The
+// tiles are numbered entry by entry: entry 0's ceil(N_0 / (8 * NT)) tiles, then entry 1's, then
+// entry 2's. CTA b runs tiles b, b + gridDim.x, ... with w4a16_gemv_tc_tile on the entry's own
+// weight, scale, scale2, output and N, at its local column, exactly the arguments the per-CTA
+// entry's block for that column gets, so every output byte equals the per-projection launch.
+// The barrier after a tile keeps its split-K reduction reads of `red` ahead of the next tile's
+// writes. Grid: any size >= 1 (the host passes min(tiles, SMs x resident CTAs per SM)).
+template <int MT, int NT, int KU>
+__device__ __forceinline__ void w4a16_gemv_tc_group_impl(
+    const __nv_bfloat16* __restrict__ A, unsigned int M, unsigned int K,
+    const unsigned char* Bp0, const unsigned char* Bs0, float s0, __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* Bp1, const unsigned char* Bs1, float s1, __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* Bp2, const unsigned char* Bs2, float s2, __nv_bfloat16* C2, unsigned int N2)
+{
+    const unsigned int cols = 8u * NT;
+    const unsigned int e0 = (N0 + cols - 1u) / cols;
+    const unsigned int e1 = e0 + (N1 + cols - 1u) / cols;
+    const unsigned int e2 = e1 + (N2 + cols - 1u) / cols;
+    for (unsigned int tile = blockIdx.x; tile < e2; tile += gridDim.x) {
+        const unsigned char* bp;
+        const unsigned char* bs;
+        float sc;
+        __nv_bfloat16* c;
+        unsigned int n, local;
+        if (tile < e0) {
+            bp = Bp0; bs = Bs0; sc = s0; c = C0; n = N0; local = tile;
+        } else if (tile < e1) {
+            bp = Bp1; bs = Bs1; sc = s1; c = C1; n = N1; local = tile - e0;
+        } else {
+            bp = Bp2; bs = Bs2; sc = s2; c = C2; n = N2; local = tile - e1;
+        }
+        w4a16_gemv_tc_tile<MT, NT, KU>(A, bp, bs, sc, c, M, n, K, local * cols);
+        __syncthreads();
+    }
+}
+
 #define W4TC_ENTRY(NAME, MT, NT, KU)                                                   \
     extern "C" __global__ __launch_bounds__(TC_WARPS * 32) void NAME(                    \
         const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,  \
@@ -254,3 +307,20 @@ __device__ __forceinline__ void w4a16_gemv_tc_impl(
 
 W4TC_ENTRY(w4a16_gemv_tc8, 8, 1, 8)
 W4TC_ENTRY(w4a16_gemv_tc16, 16, 2, 2)
+
+#define W4TC_GROUP_ENTRY(NAME, MT, NT, KU)                                              \
+    extern "C" __global__ __launch_bounds__(TC_WARPS * 32) void NAME(                    \
+        const __nv_bfloat16* __restrict__ A, unsigned int M, unsigned int K,              \
+        const unsigned char* Bp0, const unsigned char* Bs0, float s0,                     \
+        __nv_bfloat16* C0, unsigned int N0,                                               \
+        const unsigned char* Bp1, const unsigned char* Bs1, float s1,                     \
+        __nv_bfloat16* C1, unsigned int N1,                                               \
+        const unsigned char* Bp2, const unsigned char* Bs2, float s2,                     \
+        __nv_bfloat16* C2, unsigned int N2) {                                             \
+        w4a16_gemv_tc_group_impl<MT, NT, KU>(A, M, K, Bp0, Bs0, s0, C0, N0, Bp1, Bs1, s1, \
+                                             C1, N1, Bp2, Bs2, s2, C2, N2);              \
+    }
+
+// 2026-10-09: The grouped persistent twins of tc8 / tc16 (same MT, NT, KU).
+W4TC_GROUP_ENTRY(w4a16_gemv_tc8_group, 8, 1, 8)
+W4TC_GROUP_ENTRY(w4a16_gemv_tc16_group, 16, 2, 2)

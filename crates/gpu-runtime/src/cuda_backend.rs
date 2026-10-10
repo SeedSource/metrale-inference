@@ -66,6 +66,15 @@ unsafe extern "C" {
     /// that reason.
     pub(super) fn cuDeviceGet(device: *mut i32, ordinal: i32) -> i32;
     pub(super) fn cuDeviceGetAttribute(pi: *mut i32, attrib: u32, dev: i32) -> i32;
+    /// 2026-10-09: Not declared under `metrale_scale` (the HIP libcuda shim); there
+    /// `max_active_blocks_per_sm` reports 0.
+    #[cfg(not(metrale_scale))]
+    pub(super) fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        num_blocks: *mut i32,
+        func: *mut c_void,
+        block_size: i32,
+        dynamic_smem: usize,
+    ) -> i32;
     pub(super) fn cuMemsetD8Async(dst: u64, value: u8, n: usize, stream: u64) -> i32;
     /// 2026-09-25: Synchronous variants, used only by the red-zone diagnostic
     /// (`redzone.rs`).

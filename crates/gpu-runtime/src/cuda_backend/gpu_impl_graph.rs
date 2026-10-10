@@ -161,6 +161,35 @@ impl MetraleCudaBackend {
         Ok(count as u32)
     }
 
+    /// 2026-10-09: `cuOccupancyMaxActiveBlocksPerMultiprocessor` for `func`; 0 under
+    /// `metrale_scale`, where the shim does not declare it.
+    pub(super) fn max_active_blocks_cu(&self, func: u64, block: u32, dyn_smem: u32) -> Result<u32> {
+        #[cfg(not(metrale_scale))]
+        {
+            if func == 0 {
+                return Ok(0);
+            }
+            let mut n: i32 = 0;
+            let status = unsafe {
+                super::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &mut n,
+                    func as *mut c_void,
+                    block as i32,
+                    dyn_smem as usize,
+                )
+            };
+            if status != 0 {
+                bail!("cuOccupancyMaxActiveBlocksPerMultiprocessor failed: status {status}");
+            }
+            Ok(n.max(0) as u32)
+        }
+        #[cfg(metrale_scale)]
+        {
+            let _ = (func, block, dyn_smem);
+            Ok(0)
+        }
+    }
+
     /// 2026-09-25: The driver's free figure (`cuMemGetInfo_v2`) alone, without
     /// the host `MemAvailable` leg that `free_memory_cu` may take.
     pub(super) fn device_free_memory_cu(&self) -> Result<usize> {

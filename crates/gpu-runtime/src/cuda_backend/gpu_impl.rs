@@ -426,6 +426,14 @@ impl GpuBackend for MetraleCudaBackend {
     fn sm_count(&self) -> Result<u32> {
         self.sm_count_cu()
     }
+    fn max_active_blocks_per_sm(
+        &self,
+        kernel: KernelHandle,
+        block: u32,
+        dyn_smem: u32,
+    ) -> Result<u32> {
+        self.max_active_blocks_cu(kernel.0, block, dyn_smem)
+    }
     fn create_stream(&self) -> Result<u64> {
         self.create_stream_cu()
     }

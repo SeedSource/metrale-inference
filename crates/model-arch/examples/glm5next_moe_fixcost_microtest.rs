@@ -600,9 +600,16 @@ fn replay(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], b: &Bufs
             };
             um[pass] += routs.iter().map(|r| r.union as f64).sum::<f64>() / (routs.len() * chunks) as f64;
             for (l2, d) in [None, Some((d_dirty, nbytes))].into_iter().enumerate() {
+                // 2026-10-10: Under FIXCOST_SFA the twin runs first on odd chunks, so the off/on order
+                // alternates and an order bias cancels over the chunks.
+                let on_first = sfa && c % 2 == 1;
+                if on_first {
+                    let t = time_u(g, s, kz, layers, &routs, b, rows, d, true, true)?;
+                    for m in 0..6 { acc_s[pass][l2][m] += t[m] / chunks as f64; }
+                }
                 let t = time_u(g, s, kz, layers, &routs, b, rows, d, true, false)?;
                 for m in 0..6 { acc[pass][l2][m] += t[m] / chunks as f64; }
-                if sfa {
+                if sfa && !on_first {
                     let t = time_u(g, s, kz, layers, &routs, b, rows, d, true, true)?;
                     for m in 0..6 { acc_s[pass][l2][m] += t[m] / chunks as f64; }
                 }
@@ -714,8 +721,14 @@ fn run() -> Result<i32> {
             .collect::<Result<_>>()?;
         let t = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false, false)?;
         if kz.car_s.is_some() {
-            let t2 = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false, true)?;
-            print_sfa(rows, &format!("U={u}"), "clean", &t, &t2);
+            // 2026-10-10: ABBA (off, on, on, off), each arm the mean of its two runs.
+            let t2a = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false, true)?;
+            let t2b = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false, true)?;
+            let tb = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false, false)?;
+            let mut t1 = t;
+            let mut t2 = t2a;
+            for m in 0..6 { t1[m] = (t[m] + tb[m]) / 2.0; t2[m] = (t2a[m] + t2b[m]) / 2.0; }
+            print_sfa(rows, &format!("U={u}"), "clean", &t1, &t2);
             let rr: Vec<&Routing> = routs.iter().collect();
             bad += print_bits(rows, &format!("U={u}, {ROUTINGS} routings"), &sfa_bits(g, &kz, &layers[0], b.x, b.act, &rr, rows)?);
         }

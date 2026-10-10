@@ -145,6 +145,33 @@ fn hybrid_state_churn_1_2_1() {
 }
 
 #[test]
+fn hybrid_state_counts_sole_sequence_off_slot0() {
+    use SpecStepMode::*;
+    let t0 = Instant::now();
+    let mut h = HybridState::new(cfg());
+    let mut run = |active: usize, s: Option<SoleSeq>, ok: bool, executed: SpecStepMode| {
+        let m = h.decide(active, 8, s, ok, t0);
+        h.commit(m);
+        h.count_step(executed);
+    };
+    // Alone on slot 3: no DFlash state, so it runs MTP; counted.
+    run(1, sole(3, 10, 1), false, Mtp);
+    run(1, sole(3, 10, 2), false, Mtp);
+    // Alone on slot 3 but the gate took plain decode: not an MTP step.
+    run(1, sole(3, 10, 3), false, Plain);
+    // Alone on slot 0 (dwell not met yet): MTP, but not deviation 2.
+    run(1, sole(0, 10, 1), true, Mtp);
+    // Two active: `sole` is ignored.
+    run(2, sole(3, 10, 4), false, Mtp);
+    assert_eq!(h.counters.sole_off_slot0_mtp, 2);
+    assert!(
+        h.counters.summary().ends_with("; sole off slot 0 MTP=2"),
+        "{}",
+        h.counters.summary()
+    );
+}
+
+#[test]
 fn hybrid_state_commit_reports_changes_only() {
     let mut h = HybridState::new(cfg());
     assert!(
@@ -156,11 +183,11 @@ fn hybrid_state_commit_reports_changes_only() {
     assert!(!h.commit(SpecStepMode::Dflash));
     assert_eq!(
         h.counters.summary(),
-        "steps PLAIN=0 MTP=0 DFLASH=0; switches MTP->DFLASH=1"
+        "steps PLAIN=0 MTP=0 DFLASH=0; switches MTP->DFLASH=1; sole off slot 0 MTP=0"
     );
     assert_eq!(
         ModeCounters::default().summary(),
-        "steps PLAIN=0 MTP=0 DFLASH=0; switches none"
+        "steps PLAIN=0 MTP=0 DFLASH=0; switches none; sole off slot 0 MTP=0"
     );
 }
 

@@ -113,6 +113,10 @@ pub struct ModeCounters {
     pub steps: [u64; 3],
     /// 2026-10-10: `switches[from][to]`.
     pub switches: [[u64; 3]; 3],
+    /// 2026-10-10: MTP steps whose one active sequence was not on
+    /// `ssm_reserve::HYBRID_DFLASH_SLOT`, so it could not take DFlash (deviation 2: only slot 0
+    /// holds a DFlash state). Prices that deviation.
+    pub sole_off_slot0_mtp: u64,
 }
 
 impl ModeCounters {
@@ -124,8 +128,8 @@ impl ModeCounters {
         self.switches[from as usize][to as usize] += 1;
     }
 
-    /// 2026-10-10: One log line: `steps PLAIN=a MTP=b DFLASH=c; switches MTP->DFLASH=d ...` (only
-    /// the switches that happened).
+    /// 2026-10-10: One log line: `steps PLAIN=a MTP=b DFLASH=c; switches MTP->DFLASH=d ...; sole
+    /// off slot 0 MTP=e` (only the switches that happened).
     pub fn summary(&self) -> String {
         const MODES: [SpecStepMode; 3] =
             [SpecStepMode::Plain, SpecStepMode::Mtp, SpecStepMode::Dflash];
@@ -146,6 +150,7 @@ impl ModeCounters {
         if !any {
             s.push_str(" none");
         }
+        s.push_str(&format!("; sole off slot 0 MTP={}", self.sole_off_slot0_mtp));
         s
     }
 }
@@ -159,6 +164,9 @@ pub struct HybridState {
     pub cfg: HybridConfig,
     dwell: Dwell,
     last: Option<SpecStepMode>,
+    /// 2026-10-10: The slot of the sole active sequence at the last [`Self::decide`], if exactly
+    /// one was active.
+    sole_slot: Option<usize>,
     pub counters: ModeCounters,
 }
 
@@ -168,6 +176,7 @@ impl HybridState {
             dwell: Dwell::new(cfg.dwell),
             cfg,
             last: None,
+            sole_slot: None,
             counters: ModeCounters::default(),
         }
     }
@@ -184,6 +193,7 @@ impl HybridState {
         now: Instant,
     ) -> SpecStepMode {
         let sole = if active == 1 { sole } else { None };
+        self.sole_slot = sole.map(|s| s.slot);
         let dwell_met = self.dwell.observe(sole, now);
         decide_mode(&ModeInputs {
             active,
@@ -219,9 +229,17 @@ impl HybridState {
         }
     }
 
-    /// 2026-10-10: Count one executed step; every `SUMMARY_EVERY_STEPS` steps log the counters.
+    /// 2026-10-10: Count one executed step (of the last [`Self::decide`]); every
+    /// `SUMMARY_EVERY_STEPS` steps log the counters.
     pub fn count_step(&mut self, executed: SpecStepMode) {
         self.counters.count_step(executed);
+        if executed == SpecStepMode::Mtp
+            && self
+                .sole_slot
+                .is_some_and(|s| s != metrale_model_layers::ssm_reserve::HYBRID_DFLASH_SLOT)
+        {
+            self.counters.sole_off_slot0_mtp += 1;
+        }
         let total: u64 = self.counters.steps.iter().sum();
         if total.is_multiple_of(SUMMARY_EVERY_STEPS) {
             tracing::info!("HYBRID DFLASH counters: {}", self.counters.summary());

@@ -21,6 +21,7 @@ impl ModelForward for TransformerModel {
     // turns the eager consume off.
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         self.stamp_overlay_route(seq.adapter_slot);
         let logits = self.prefill_dispatch(tokens, seq, stream)?;
         self.try_eager_drafter_prefill(seq, true, stream);
@@ -37,6 +38,7 @@ impl ModelForward for TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         self.stamp_overlay_route(seq.adapter_slot);
         let logits = self.prefill_chunk_dispatch(
             tokens,
@@ -59,6 +61,7 @@ impl ModelForward for TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         self.stamp_overlay_route(seq.adapter_slot);
         let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
         self.try_eager_drafter_prefill(seq, true, stream);
@@ -67,6 +70,7 @@ impl ModelForward for TransformerModel {
 
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(_stream)?;
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
         self.decode_dispatch(token, seq, _stream)
@@ -79,6 +83,7 @@ impl ModelForward for TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         self.stamp_overlay_route_batch(seqs);
         self.stamp_decode_moe_batch(seqs);
         let r = self.decode_batch_dispatch(tokens, seqs, stream);
@@ -105,6 +110,7 @@ impl ModelForward for TransformerModel {
         stream: u64,
     ) -> Result<crate::traits::MixedForwardResult> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         // 2026-09-25: A mixed step always stamps `i32::MIN` (mixed adapters), so
         // the token-overlay hooks skip for the whole step.
         self.overlay_route_slot
@@ -139,6 +145,7 @@ impl ModelForward for TransformerModel {
         stream: u64,
     ) -> Result<Vec<DevicePtr>> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         self.prefill_batch_chunk_rows(streams, stream, 0)
     }
 
@@ -152,11 +159,13 @@ impl ModelForward for TransformerModel {
         row_base: usize,
     ) -> Result<Vec<DevicePtr>> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         self.prefill_batch_chunk_dispatch(streams, stream, row_base)
     }
 
     fn normalize_ssm_states(&self, seq: &SequenceState, stream: u64) -> Result<()> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         self.normalize_ssm_states_dispatch(seq, stream)
     }
 

@@ -271,6 +271,14 @@ impl TransformerModel {
             );
         }
 
+        // 2026-10-09: `METRALE_GLM_KDA_DEFER_COMMIT=1` (`kda_defer_hooks.rs`): after a consumer
+        // verify a partial accept records its intermediate instead of copying it; the next verify
+        // reads it there, or the next other entry point copies it. A no-op when not capable.
+        if self.kda_defer_commit(seq, num_accepted, k, h_folded)? {
+            self.gpu.record_event(self.secondary_event, self.secondary_stream)?;
+            return Ok(());
+        }
+
         if num_accepted == k {
             return Ok(());
         }

@@ -27,6 +27,7 @@ pub(crate) mod impl_b2;
 pub(crate) mod impl_b3;
 pub(crate) mod impl_b3_accessors;
 pub(crate) mod impl_lora;
+pub(crate) mod kda_defer;
 mod impl_lora_rotate;
 pub(crate) mod impl_lora_swap;
 mod impl_ngram;

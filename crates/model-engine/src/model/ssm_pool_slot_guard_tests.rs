@@ -33,6 +33,7 @@ fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
         rollback_mode: metrale_model_layers::ssm_reserve::SsmRollbackMode::Snapshot,
         replay_input_rings: Vec::new(),
         free_slots: Mutex::new((0..max_slots).rev().collect()),
+        kda_defer: super::super::kda_defer::KdaDeferSlots::new(0),
     })
 }
 

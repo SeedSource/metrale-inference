@@ -13,7 +13,8 @@
 //!   nothing was compared, when no verify consumed a deferred index `0` (the aliased in-place
 //!   case) and `>= 1`, or when the reference outputs are all zero or not finite.
 //! - Every arm-owned buffer (outputs, intermediates, snapshot) starts at its own poison byte
-//!   (0xAB copy arm, 0xCD deferred arm), so a byte either arm leaves unwritten cannot pass.
+//!   (0xAB copy arm, 0xCD deferred arm), so a byte either arm leaves unwritten cannot pass. The
+//!   one conv slot no verify uses (MAX_ROWS - 1) is checked to keep its poison instead.
 //!
 //! Arms, on one bound layer and workspace, one "pool slot": a live state, `MAX_ROWS - 1` h and
 //! `MAX_ROWS` conv intermediates at a fixed stride (the engine's layout), a snapshot buffer, and
@@ -359,9 +360,18 @@ impl Rig<'_> {
             "h_intermediates".into(),
             dn_bytes(g, s.h_inter, (MAX_ROWS - 1) * self.hb)?,
         ));
+        // 2026-10-09: The pool holds MAX_ROWS conv intermediates but a K-row verify pairs only
+        // rows 0..K-1 with h (mixer.rs / verify_multi.rs `(0..k - 1)`), and every reader takes
+        // index a - 1 < K - 1, so slot MAX_ROWS - 1 is never written or read. Compare the written
+        // slots; require the dead slot to keep this arm's own poison (neither arm may write it).
         out.push((
             "conv_intermediates".into(),
-            dn_bytes(g, s.conv_inter, MAX_ROWS * self.cb)?,
+            dn_bytes(g, s.conv_inter, (MAX_ROWS - 1) * self.cb)?,
+        ));
+        let dead = dn_bytes(g, s.conv_inter.offset((MAX_ROWS - 1) * self.cb), self.cb)?;
+        out.push((
+            "conv_dead_slot_untouched".into(),
+            vec![u8::from(dead.iter().all(|&b| b == poison))],
         ));
         for p in [
             s.live.conv,
@@ -439,6 +449,9 @@ fn main() -> Result<()> {
                 total += xa.len();
                 if let Some(p) = xa.iter().zip(xb).position(|(x, y)| x != y) {
                     bad.push(format!("{na}: first mismatch at byte {p}"));
+                }
+                if na == "conv_dead_slot_untouched" && (xa[0] != 1 || xb[0] != 1) {
+                    bad.push(format!("{na}: dead slot written ({} {})", xa[0], xb[0]));
                 }
                 if na.ends_with("final_out") {
                     live_outs &= live_bf16(xa);

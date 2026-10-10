@@ -300,6 +300,70 @@ pub fn ssm_pool_reserve_bytes_with(
     base + verify
 }
 
+/// 2026-10-10: The SSM-pool slot whose verify pools a hybrid serve (`METRALE_HYBRID_DFLASH=1`)
+/// sizes for the DFlash K=gamma verify. Only a sequence on this slot is DFlash-eligible; under
+/// the hybrid lever slots are claimed lowest index first, so a request that starts alone gets it.
+pub const HYBRID_DFLASH_SLOT: usize = 0;
+
+/// 2026-10-10: Hybrid serve: H intermediates of pool slot `slot_idx`. Every slot keeps its MTP
+/// capacity ([`verify_slot_drafts`] of `mtp_drafts`); [`HYBRID_DFLASH_SLOT`] alone is widened to
+/// `dflash_drafts` (gamma), so the K=gamma verify fits it and nowhere else.
+pub fn hybrid_slot_h_intermediates(
+    slot_idx: usize,
+    mtp_drafts: usize,
+    dflash_drafts: usize,
+) -> usize {
+    hybrid_slot_h_intermediates_with(
+        slot_idx,
+        verify_slot_drafts(slot_idx, mtp_drafts),
+        dflash_drafts,
+    )
+}
+
+/// 2026-10-10: Env-free core of [`hybrid_slot_h_intermediates`], given the slot's MTP capacity.
+pub fn hybrid_slot_h_intermediates_with(
+    slot_idx: usize,
+    mtp_capacity: usize,
+    dflash_drafts: usize,
+) -> usize {
+    if slot_idx == HYBRID_DFLASH_SLOT {
+        mtp_capacity.max(dflash_drafts)
+    } else {
+        mtp_capacity
+    }
+}
+
+/// 2026-10-10: [`ssm_pool_reserve_bytes_with`] for a hybrid serve (snapshot rollback only): per
+/// verify slot, [`hybrid_slot_h_intermediates_with`] h blobs, `max(mtp_drafts, dflash_drafts) + 1`
+/// conv blobs (the conv intermediates do not tier) and the checkpoint blob.
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_pool_reserve_bytes_hybrid_with(
+    max_batch_size: usize,
+    h_blob_bytes: usize,
+    conv_blob_bytes: usize,
+    mtp_drafts: usize,
+    dflash_drafts: usize,
+    mtp_state_slots: usize,
+    h_f16_pool: bool,
+    no_checkpoint: bool,
+    slot_capacity: impl Fn(usize) -> usize,
+) -> usize {
+    let h_blob_bytes = ssm_h_stored_bytes(h_blob_bytes, h_f16_pool);
+    let blob = h_blob_bytes + conv_blob_bytes;
+    let base = max_batch_size * blob;
+    let ckpt = ssm_checkpoint_bytes(1, blob, no_checkpoint);
+    let conv_k = mtp_drafts.max(dflash_drafts) + 1;
+    let verify: usize = (0..mtp_state_slots)
+        .map(|slot| {
+            hybrid_slot_h_intermediates_with(slot, slot_capacity(slot), dflash_drafts)
+                * h_blob_bytes
+                + conv_k * conv_blob_bytes
+                + ckpt
+        })
+        .sum();
+    base + verify
+}
+
 /// 2026-09-25: Outcome of the Marconi snapshot-slot decision. `skip_reason` is `Some`
 /// only when the slots are dropped because prefix caching is inactive, so the
 /// allocating call site can log the saving.

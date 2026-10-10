@@ -9,6 +9,7 @@
 
 pub mod glm_dflash;
 pub mod glm_dflash_batch;
+pub mod hybrid;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;

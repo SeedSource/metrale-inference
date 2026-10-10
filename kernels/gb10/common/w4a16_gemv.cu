@@ -118,6 +118,16 @@ __device__ __forceinline__ void stage_e2m1_lut_warp(float* s_lut, unsigned int l
 
 
 
+// 2026-10-10: CUTLASS Sm1xx SFB atom byte offset of scale (row n, group g), G = K / 16 groups per
+// row (n % 128 == 0 and G % 4 == 0 required). 128 rows x 4 groups per 512-byte atom; the k-tiles
+// of one 128-row block are consecutive. Used only by the _sfa twin entries (see below).
+__device__ __forceinline__ unsigned long long sfa_off(unsigned int n, unsigned int g, unsigned int G)
+{
+    return (unsigned long long)(((n >> 7) * (G >> 2) + (g >> 2)) * 512u
+                                + (n & 31u) * 16u + ((n >> 5) & 3u) * 4u + (g & 3u));
+}
+
+template <bool kSfa = false>
 __device__ __forceinline__ float w4a16_gemv_partial(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,
@@ -141,7 +151,7 @@ __device__ __forceinline__ float w4a16_gemv_partial(
                                             a_hi.x, a_hi.y, a_hi.z, a_hi.w};
             unsigned long long packed8 = *(const unsigned long long*)(
                 B_packed + (unsigned long long)n * half_K + kk * 8);
-            unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + kk];
+            unsigned char scale_byte = B_scale[kSfa ? sfa_off(n, kk, num_groups) : ((unsigned long long)n * num_groups + kk)];
             __nv_fp8_e4m3 fp8;
             *(unsigned char*)&fp8 = scale_byte;
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
@@ -297,7 +307,14 @@ extern "C" __global__ void w4a16_gemv_sw(
 
 
 
-extern "C" __global__ void w4a16_gemv_sw_moe(
+// 2026-10-10: _sfa twins (all routed-expert GEMV entries below): microtest-only falsifier for
+// race #68 "SFB once" (seed-skills#68 6096187630). Each w4a16_gemv_sw_moe*_sfa entry is the
+// original with kSfa = true: same arithmetic in the same order, only the scale byte address
+// differs (CUTLASS SFB atom layout, sfa_off, instead of row-major [N, K/16]). Fed the same scale
+// values permuted into the atom layout, outputs must be bitwise equal to the originals'.
+// The original entries instantiate kSfa = false and compile to the same code as before.
+template <bool kSfa = false>
+__device__ __forceinline__ void w4a16_gemv_sw_moe_body(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ packed_ptrs,
     const unsigned long long* __restrict__ scale_ptrs,
@@ -339,8 +356,8 @@ extern "C" __global__ void w4a16_gemv_sw_moe(
     const float* __restrict__ warp_lut = E2M1_LUT;
 #endif
 
-    float acc_a = w4a16_gemv_partial(Ain, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane, warp_lut);
-    float acc_b = w4a16_gemv_partial(Ain, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane + 32u, warp_lut);
+    float acc_a = w4a16_gemv_partial<kSfa>(Ain, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane, warp_lut);
+    float acc_b = w4a16_gemv_partial<kSfa>(Ain, B_packed, B_scale, scale2, n, half_K, num_groups, K16, lane + 32u, warp_lut);
 
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
@@ -352,6 +369,39 @@ extern "C" __global__ void w4a16_gemv_sw_moe(
         float result = acc_a + acc_b;
         Cout[n] = __float2bfloat16(result);
     }
+}
+
+
+extern "C" __global__ void w4a16_gemv_sw_moe(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ packed_ptrs,
+    const unsigned long long* __restrict__ scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_ids,
+    unsigned int N,
+    unsigned int K,
+    unsigned int num_experts,
+    unsigned int input_stride
+) {
+    w4a16_gemv_sw_moe_body<false>(A, packed_ptrs, scale_ptrs, scale2_vals, C, expert_ids, N, K,
+        num_experts, input_stride);
+}
+
+extern "C" __global__ void w4a16_gemv_sw_moe_sfa(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ packed_ptrs,
+    const unsigned long long* __restrict__ scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_ids,
+    unsigned int N,
+    unsigned int K,
+    unsigned int num_experts,
+    unsigned int input_stride
+) {
+    w4a16_gemv_sw_moe_body<true>(A, packed_ptrs, scale_ptrs, scale2_vals, C, expert_ids, N, K,
+        num_experts, input_stride);
 }
 
 // 2026-09-25: w4a16_gemv with an FP32 C, same grid. Its K walk differs: chunk k16 = lane +
@@ -2657,7 +2707,7 @@ extern "C" __global__ void glm5next_moe_row_union_scan(
 // 2026-09-25: w4a16_gemv_partial for R rows over one weight read. Aptr[r] == nullptr skips
 // row r (not read, contributes nothing); every other row gets w4a16_gemv_partial's result.
 
-template <int R>
+template <int R, bool kSfa = false>
 __device__ __forceinline__ void w4a16_gemv_partial_rows(
     const __nv_bfloat16* const* __restrict__ Aptr,
     const unsigned char* __restrict__ B_packed,
@@ -2682,7 +2732,7 @@ __device__ __forceinline__ void w4a16_gemv_partial_rows(
 
             unsigned long long packed8 = *(const unsigned long long*)(
                 B_packed + (unsigned long long)n * half_K + kk * 8);
-            unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + kk];
+            unsigned char scale_byte = B_scale[kSfa ? sfa_off(n, kk, num_groups) : ((unsigned long long)n * num_groups + kk)];
             __nv_fp8_e4m3 fp8;
             *(unsigned char*)&fp8 = scale_byte;
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
@@ -2720,7 +2770,7 @@ __device__ __forceinline__ void w4a16_gemv_partial_rows(
 // ceil(N / (8 J)) and warp w of block bx computes columns bx * 8J + 8j + w, j = 0..J-1, each with
 // the J = 1 arithmetic (same partial chains, shuffle tree and acc_a + acc_b), so every output
 // is bit-identical to the J = 1 entry; only the per-block setup is shared by J columns.
-template <int R, int J = 1>
+template <int R, int J = 1, bool kSfa = false>
 __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_body(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ packed_ptrs,
@@ -2777,9 +2827,9 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_body(
             blockIdx.x * (N_PER_BLOCK_SW * J) + (unsigned int)j * N_PER_BLOCK_SW + local_out;
         if (n >= N) break;
         float acc_a[R], acc_b[R];
-        w4a16_gemv_partial_rows<R>(Aptr, B_packed, B_scale, scale2, n, half_K,
+        w4a16_gemv_partial_rows<R, kSfa>(Aptr, B_packed, B_scale, scale2, n, half_K,
                                    num_groups, K16, lane, warp_lut, acc_a);
-        w4a16_gemv_partial_rows<R>(Aptr, B_packed, B_scale, scale2, n, half_K,
+        w4a16_gemv_partial_rows<R, kSfa>(Aptr, B_packed, B_scale, scale2, n, half_K,
                                    num_groups, K16, lane + 32u, warp_lut, acc_b);
 
         #pragma unroll
@@ -2832,6 +2882,31 @@ METRALE_MOE_BATCHM_ENTRY(6)
 METRALE_MOE_BATCHM_ENTRY(7)
 METRALE_MOE_BATCHM_ENTRY(8)
 
+// 2026-10-10: _sfa twins of the above (see the _sfa note at w4a16_gemv_sw_moe_body).
+#define METRALE_MOE_BATCHM_SFA_ENTRY(R)                                                  \
+extern "C" __global__ void w4a16_gemv_sw_moe_batchm_sfa_m##R(                          \
+    const __nv_bfloat16* __restrict__ A,                                           \
+    const unsigned long long* __restrict__ packed_ptrs,                            \
+    const unsigned long long* __restrict__ scale_ptrs,                             \
+    const float* __restrict__ scale2_vals,                                         \
+    __nv_bfloat16* __restrict__ C,                                                 \
+    const int* __restrict__ u_eid,                                                 \
+    const int* __restrict__ u_slot,                                                \
+    unsigned int N, unsigned int K, unsigned int num_experts,                      \
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
+{                                                                                  \
+    w4a16_gemv_sw_moe_batchm_body<R, 1, true>(A, packed_ptrs, scale_ptrs, scale2_vals, C,   \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+}
+
+METRALE_MOE_BATCHM_SFA_ENTRY(2)
+METRALE_MOE_BATCHM_SFA_ENTRY(3)
+METRALE_MOE_BATCHM_SFA_ENTRY(4)
+METRALE_MOE_BATCHM_SFA_ENTRY(5)
+METRALE_MOE_BATCHM_SFA_ENTRY(6)
+METRALE_MOE_BATCHM_SFA_ENTRY(7)
+METRALE_MOE_BATCHM_SFA_ENTRY(8)
+
 // 2026-10-08: METRALE_GLM_MOE_BATCHM_COLS entries: J columns per warp, grid x ceil(N / (8 J)),
 // same arguments as w4a16_gemv_sw_moe_batchm_m<R>, bit-identical outputs.
 #define METRALE_MOE_BATCHM_COLS_ENTRY(R, J)                                          \
@@ -2858,6 +2933,31 @@ METRALE_MOE_BATCHM_COLS_ENTRIES(2)
 METRALE_MOE_BATCHM_COLS_ENTRIES(4)
 METRALE_MOE_BATCHM_COLS_ENTRIES(8)
 
+// 2026-10-10: _sfa twins of the _c<J> entries.
+#define METRALE_MOE_BATCHM_COLS_SFA_ENTRY(R, J)                                          \
+extern "C" __global__ void w4a16_gemv_sw_moe_batchm_sfa_m##R##_c##J(                   \
+    const __nv_bfloat16* __restrict__ A,                                           \
+    const unsigned long long* __restrict__ packed_ptrs,                            \
+    const unsigned long long* __restrict__ scale_ptrs,                             \
+    const float* __restrict__ scale2_vals,                                         \
+    __nv_bfloat16* __restrict__ C,                                                 \
+    const int* __restrict__ u_eid,                                                 \
+    const int* __restrict__ u_slot,                                                \
+    unsigned int N, unsigned int K, unsigned int num_experts,                      \
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
+{                                                                                  \
+    w4a16_gemv_sw_moe_batchm_body<R, J, true>(A, packed_ptrs, scale_ptrs, scale2_vals, C, \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+}
+#define METRALE_MOE_BATCHM_COLS_SFA_ENTRIES(J)                                       \
+    METRALE_MOE_BATCHM_COLS_SFA_ENTRY(2, J) METRALE_MOE_BATCHM_COLS_SFA_ENTRY(3, J)  \
+    METRALE_MOE_BATCHM_COLS_SFA_ENTRY(4, J) METRALE_MOE_BATCHM_COLS_SFA_ENTRY(5, J)  \
+    METRALE_MOE_BATCHM_COLS_SFA_ENTRY(6, J) METRALE_MOE_BATCHM_COLS_SFA_ENTRY(7, J)  \
+    METRALE_MOE_BATCHM_COLS_SFA_ENTRY(8, J)
+METRALE_MOE_BATCHM_COLS_SFA_ENTRIES(2)
+METRALE_MOE_BATCHM_COLS_SFA_ENTRIES(4)
+METRALE_MOE_BATCHM_COLS_SFA_ENTRIES(8)
+
 // 2026-10-08: METRALE_GLM_MOE_DOWN_FAST. w4a16_gemv_sw_moe_batchm_down_m<R>: the down-projection
 // union sweep (K <= 1024, K16 = K / 16 <= 64) with output bytes identical to
 // w4a16_gemv_sw_moe_batchm_m<R>_c8 (and so to _m<R>). Same arguments; grid
@@ -2883,7 +2983,7 @@ METRALE_MOE_BATCHM_COLS_ENTRIES(8)
 #define MOE_DOWN_FAST_COLS_PER_WARP 16
 #define MOE_DOWN_FAST_LANE_STRIDE 36
 
-template <int R>
+template <int R, bool kSfa = false>
 __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ packed_ptrs,
@@ -2949,8 +3049,8 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
         const bool ok = n < N;
         q[c][0] = (ok && v0) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk0 * 8) : 0ull;
         q[c][1] = (ok && v1) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk1 * 8) : 0ull;
-        sb[c][0] = (ok && v0) ? B_scale[(unsigned long long)n * num_groups + kk0] : (unsigned char)0;
-        sb[c][1] = (ok && v1) ? B_scale[(unsigned long long)n * num_groups + kk1] : (unsigned char)0;
+        sb[c][0] = (ok && v0) ? B_scale[kSfa ? sfa_off(n, kk0, num_groups) : ((unsigned long long)n * num_groups + kk0)] : (unsigned char)0;
+        sb[c][1] = (ok && v1) ? B_scale[kSfa ? sfa_off(n, kk1, num_groups) : ((unsigned long long)n * num_groups + kk1)] : (unsigned char)0;
     }
 
     // 2026-10-08: Stage the live rows' activations as FP32 (exact) and the E2M1 table.
@@ -3023,8 +3123,8 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
                 const bool ok = (p + 1 < MOE_DOWN_FAST_COLS_PER_WARP / 2) && n < N;
                 q[c][0] = (ok && v0) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk0 * 8) : 0ull;
                 q[c][1] = (ok && v1) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk1 * 8) : 0ull;
-                sb[c][0] = (ok && v0) ? B_scale[(unsigned long long)n * num_groups + kk0] : (unsigned char)0;
-                sb[c][1] = (ok && v1) ? B_scale[(unsigned long long)n * num_groups + kk1] : (unsigned char)0;
+                sb[c][0] = (ok && v0) ? B_scale[kSfa ? sfa_off(n, kk0, num_groups) : ((unsigned long long)n * num_groups + kk0)] : (unsigned char)0;
+                sb[c][1] = (ok && v1) ? B_scale[kSfa ? sfa_off(n, kk1, num_groups) : ((unsigned long long)n * num_groups + kk1)] : (unsigned char)0;
             }
         }
 
@@ -3115,6 +3215,30 @@ METRALE_MOE_BATCHM_DOWN_ENTRY(6)
 METRALE_MOE_BATCHM_DOWN_ENTRY(7)
 METRALE_MOE_BATCHM_DOWN_ENTRY(8)
 
+// 2026-10-10: _sfa twins of the down entries.
+#define METRALE_MOE_BATCHM_DOWN_SFA_ENTRY(R)                                             \
+extern "C" __global__ __launch_bounds__(256, 2) void w4a16_gemv_sw_moe_batchm_down_sfa_m##R( \
+    const __nv_bfloat16* __restrict__ A,                                           \
+    const unsigned long long* __restrict__ packed_ptrs,                            \
+    const unsigned long long* __restrict__ scale_ptrs,                             \
+    const float* __restrict__ scale2_vals,                                         \
+    __nv_bfloat16* __restrict__ C,                                                 \
+    const int* __restrict__ u_eid,                                                 \
+    const int* __restrict__ u_slot,                                                \
+    unsigned int N, unsigned int K, unsigned int num_experts,                      \
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
+{                                                                                  \
+    w4a16_gemv_sw_moe_batchm_down_body<R, true>(A, packed_ptrs, scale_ptrs, scale2_vals, C, \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+}
+METRALE_MOE_BATCHM_DOWN_SFA_ENTRY(2)
+METRALE_MOE_BATCHM_DOWN_SFA_ENTRY(3)
+METRALE_MOE_BATCHM_DOWN_SFA_ENTRY(4)
+METRALE_MOE_BATCHM_DOWN_SFA_ENTRY(5)
+METRALE_MOE_BATCHM_DOWN_SFA_ENTRY(6)
+METRALE_MOE_BATCHM_DOWN_SFA_ENTRY(7)
+METRALE_MOE_BATCHM_DOWN_SFA_ENTRY(8)
+
 // 2026-10-09: METRALE_GLM_MOE_GATEUP_FAST. w4a16_gemv_sw_moe_batchm_gateup_m<R>: the gate AND up
 // union sweeps of one row group in ONE launch, each output byte-identical to
 // w4a16_gemv_sw_moe_batchm_m<R> (and so to _m<R>_c<J>) on that matrix. Arguments: A, the gate
@@ -3173,7 +3297,7 @@ __device__ __forceinline__ float moe_gateup_tree(float (&v)[V], unsigned int lan
     return t;
 }
 
-template <int R>
+template <int R, bool kSfa = false>
 __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ g_packed_ptrs,
@@ -3255,7 +3379,7 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
             + (unsigned int)j * N_PER_BLOCK_SW + w;
         if (n >= N) break;
         const unsigned long long wo = (unsigned long long)n * half_K;
-        const unsigned long long so = (unsigned long long)n * num_groups;
+        const unsigned long long so = kSfa ? 0ull : (unsigned long long)n * num_groups;
 
         float t[2];
         #pragma unroll
@@ -3274,8 +3398,8 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
                      kk < K16; kk += 128u) {
                     const unsigned long long q0 = ok0 ? *(const unsigned long long*)(Bp0 + wo + kk * 8) : 0ull;
                     const unsigned long long q1 = ok1 ? *(const unsigned long long*)(Bp1 + wo + kk * 8) : 0ull;
-                    const unsigned char b0 = ok0 ? Bs0[so + kk] : (unsigned char)0;
-                    const unsigned char b1 = ok1 ? Bs1[so + kk] : (unsigned char)0;
+                    const unsigned char b0 = ok0 ? Bs0[kSfa ? sfa_off(n, kk, num_groups) : (so + kk)] : (unsigned char)0;
+                    const unsigned char b1 = ok1 ? Bs1[kSfa ? sfa_off(n, kk, num_groups) : (so + kk)] : (unsigned char)0;
                     __nv_fp8_e4m3 f0, f1;
                     *(unsigned char*)&f0 = b0;
                     *(unsigned char*)&f1 = b1;
@@ -3363,3 +3487,32 @@ METRALE_MOE_BATCHM_GATEUP_ENTRY(5)
 METRALE_MOE_BATCHM_GATEUP_ENTRY(6)
 METRALE_MOE_BATCHM_GATEUP_ENTRY(7)
 METRALE_MOE_BATCHM_GATEUP_ENTRY(8)
+
+// 2026-10-10: _sfa twins of the gateup entries.
+#define METRALE_MOE_BATCHM_GATEUP_SFA_ENTRY(R)                                           \
+extern "C" __global__ __launch_bounds__(256, 2) void w4a16_gemv_sw_moe_batchm_gateup_sfa_m##R( \
+    const __nv_bfloat16* __restrict__ A,                                           \
+    const unsigned long long* __restrict__ g_packed_ptrs,                          \
+    const unsigned long long* __restrict__ g_scale_ptrs,                           \
+    const float* __restrict__ g_scale2_vals,                                       \
+    const unsigned long long* __restrict__ u_packed_ptrs,                          \
+    const unsigned long long* __restrict__ u_scale_ptrs,                           \
+    const float* __restrict__ u_scale2_vals,                                       \
+    __nv_bfloat16* __restrict__ C_gate,                                            \
+    __nv_bfloat16* __restrict__ C_up,                                              \
+    const int* __restrict__ u_eid,                                                 \
+    const int* __restrict__ u_slot,                                                \
+    unsigned int N, unsigned int K, unsigned int num_experts,                      \
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
+{                                                                                  \
+    w4a16_gemv_sw_moe_batchm_gateup_body<R, true>(A, g_packed_ptrs, g_scale_ptrs,        \
+        g_scale2_vals, u_packed_ptrs, u_scale_ptrs, u_scale2_vals, C_gate, C_up,   \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+}
+METRALE_MOE_BATCHM_GATEUP_SFA_ENTRY(2)
+METRALE_MOE_BATCHM_GATEUP_SFA_ENTRY(3)
+METRALE_MOE_BATCHM_GATEUP_SFA_ENTRY(4)
+METRALE_MOE_BATCHM_GATEUP_SFA_ENTRY(5)
+METRALE_MOE_BATCHM_GATEUP_SFA_ENTRY(6)
+METRALE_MOE_BATCHM_GATEUP_SFA_ENTRY(7)
+METRALE_MOE_BATCHM_GATEUP_SFA_ENTRY(8)

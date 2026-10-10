@@ -751,6 +751,7 @@ impl Glm5NextWeightLoader {
                     next_attn_head: Vec::new(),
                 },
                 premix: Default::default(),
+                sp_tap: Default::default(),
             };
             // 2026-10-02: Layer `idx` is built: every binder above read its own layer's store
             // tensors (host copy in `src`, or the routed experts via `bind_expert`), and

@@ -185,4 +185,50 @@ impl TransformerModel {
             .store(SpecStepMode::Mtp as u8, Ordering::Relaxed);
         Ok(())
     }
+
+    /// 2026-10-10: The SP half of the hybrid prefill capture (`try_dflash_prefill_capture_layer`,
+    /// `impl_b3.rs`): the chunk rows the capture keeps, positions `[0, max_ctx_len)`
+    /// (`tap_window_rows`), swapped between the ranks by the layer when its SP prefill split
+    /// them. A no-op off a hybrid multi-rank serve and for a sequence without a DFlash state.
+    /// Every input is the same on both ranks: slot 0 holds a DFlash state of the same window on
+    /// both (`meta.rs`), and both see the same chunk.
+    pub(in crate::model) fn hybrid_sp_tap_gather(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        layer_idx: usize,
+        chunk_start: usize,
+        proc_count: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if !self.hybrid_on() {
+            return Ok(());
+        }
+        let Some(comm) = self.comm.as_deref() else {
+            return Ok(());
+        };
+        let Some(max_ctx) = self.dflash_ctx_state(seq).and_then(|ps| {
+            ps.as_any_mut()
+                .downcast_mut::<metrale_model_arch::dflash_head::DflashProposerState>()
+                .map(|d| d.max_ctx_len)
+        }) else {
+            return Ok(());
+        };
+        let rows = metrale_model_arch::glm5next_layer::seq_parallel::tap_window_rows(
+            chunk_start,
+            proc_count,
+            (0, max_ctx),
+        );
+        if rows.1 == 0 {
+            return Ok(());
+        }
+        self.layers[layer_idx].prefill_tap_gather(
+            comm,
+            self.buffers.hidden_states(),
+            chunk_start,
+            proc_count,
+            rows,
+            stream,
+        )?;
+        Ok(())
+    }
 }

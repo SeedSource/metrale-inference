@@ -109,6 +109,9 @@ pub fn prefill_comm_overlap() -> bool {
 /// to `1`; read once. Off under `METRALE_GLM_DFLASH=1` (startup warning): rank 0's DFlash
 /// capture reads every row of a tap layer's `hidden`, and `SpRows::back` collapses only the
 /// rank's own rows.
+/// 2026-10-10: Except on a hybrid MTP + DFlash serve (`METRALE_HYBRID_DFLASH=1`), which keeps it:
+/// a tap layer's back collapses its own rows, and the engine has the ranks swap the tap rows the
+/// DFlash capture keeps before it reads them (`seq_parallel/tap.rs`).
 /// 2026-10-04: Composes with `METRALE_GLM_PREFILL_FULLWIDTH_GEMM=1` (before, inert under it):
 /// the attention pass then runs per `rows_ffn` window and the MLP's dense GEMMs per window,
 /// exactly the full-width arm's calls; only the row-local mHC / norm work is split (ownership
@@ -119,11 +122,14 @@ pub fn prefill_seq_parallel() -> bool {
     *E.get_or_init(|| {
         let on = std::env::var("METRALE_GLM_PREFILL_SEQ_PARALLEL").as_deref() == Ok("1")
             && std::env::var("METRALE_GLM_PREFILL_STAGED").as_deref() == Ok("1");
-        if on && metrale_model_layers::speculative::glm_dflash::glm_dflash_enabled() {
+        if on
+            && metrale_model_layers::speculative::glm_dflash::glm_dflash_enabled()
+            && !metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled()
+        {
             tracing::warn!(
                 "METRALE_GLM_PREFILL_SEQ_PARALLEL=1 IGNORED: METRALE_GLM_DFLASH=1 is set and \
                  the DFlash tap capture needs every row of a tap layer on rank 0 (mutually \
-                 exclusive)"
+                 exclusive; METRALE_HYBRID_DFLASH=1 keeps it, with the SP tap capture)"
             );
             return false;
         }

@@ -304,6 +304,9 @@ impl TransformerModel {
             Some(s) => s,
             None => return Ok(()),
         };
+        // 2026-10-10: Hybrid serve under SP prefill: every rank, before the rank-0 check, has the
+        // layer swap the tap rows this capture keeps (`hybrid_spec.rs`).
+        self.hybrid_sp_tap_gather(seq, layer_idx, chunk_start, proc_count, stream)?;
         if let Some(ref c) = self.comm
             && c.rank() != 0
             && !self.dflash_capture_on_every_rank()

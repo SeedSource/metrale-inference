@@ -280,6 +280,24 @@ pub trait TransformerLayer:
     /// uses the SSM pool, which gets pool addresses instead.
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>>;
 
+    /// 2026-10-10: Hybrid MTP + DFlash serve (`METRALE_HYBRID_DFLASH=1`): after this layer's
+    /// prefill of `num_tokens` rows from `seq_len_start` into `hidden`, make the chunk-local rows
+    /// `rows` of `hidden` whole on every rank when that prefill left each rank only its own rows
+    /// (a GLM-5.3 sequence-parallel prefill of a DFlash tap layer). Every rank must call it with
+    /// the same arguments, since it may run a collective. Returns whether it exchanged rows.
+    /// Default: nothing to exchange.
+    fn prefill_tap_gather(
+        &self,
+        _comm: &dyn metrale_comm::CommBackend,
+        _hidden: DevicePtr,
+        _seq_len_start: usize,
+        _num_tokens: usize,
+        _rows: (usize, usize),
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// 2026-09-25: Free the device memory this layer allocated for one sequence, in
     /// `alloc_state` or attached to the state later. `LayerState` holds bare `DevicePtr`s,
     /// so dropping it frees only the host struct.

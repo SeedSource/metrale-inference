@@ -514,6 +514,10 @@ pub fn reduce_item(
 mod premix;
 pub use premix::{CrossLayerPremix, PremixTicket};
 
+// 2026-10-10: The hybrid serve's DFlash tap capture under SP, in `seq_parallel/tap.rs`.
+mod tap;
+pub use tap::{SpTapRecord, SpTapTicket, gather_tap_rows, tap_window_rows};
+
 // 2026-10-04: In `seq_parallel/tests.rs` (500-line cap).
 #[cfg(test)]
 mod tests;

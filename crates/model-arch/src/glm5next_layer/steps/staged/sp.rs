@@ -265,13 +265,16 @@ impl Glm5NextLayer {
 
         // 2026-10-01: FFN pass, over the windows `prefill_staged_run` uses.
         let ffn_out = ctx.buffers.moe_output();
-        let ffn_finish = next_attn.is_some_and(finish_usable);
+        // 2026-10-10: A DFlash tap layer (hybrid serve) collapses its own rows into `hidden`
+        // for the capture (`seq_parallel/tap.rs`), so its back cannot also write the next
+        // front's `y` there: no fused finish (the next front recomputes it).
+        let ffn_finish = next_attn.is_some_and(finish_usable) && !self.dflash_tap;
         let wins = ffn_windows(subs, rows_ffn, prefill_tail_merge(), |k| self.ffn_mergeable(k));
         let ffn = SpSite {
             weights: &mhc.ffn,
             norm: self.post_attn_norm,
             expand: false,
-            last: self.is_last,
+            last: self.is_last || self.dflash_tap,
             reduce: self.mlp_cfg.needs_all_reduce(),
             attn: false,
             post_mix: next_attn,
@@ -292,6 +295,17 @@ impl Glm5NextLayer {
                 finished: ffn_finish,
                 ..ticket(self.layer_idx + 1)
             });
+        }
+        if self.dflash_tap && !self.is_last {
+            // 2026-10-10: This rank holds only its own tap rows; the engine's capture asks for
+            // the rows it keeps (`prefill_tap_gather`).
+            self.sp_tap
+                .set(Some(crate::glm5next_layer::seq_parallel::SpTapTicket {
+                    seq_len_start,
+                    total: num_tokens,
+                    hidden: hidden.0,
+                    plan,
+                }));
         }
         if self.is_last {
             // 2026-10-01: Both ranks leave with every final row, as `prefill_staged_run` does.

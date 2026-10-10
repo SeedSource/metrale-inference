@@ -500,9 +500,10 @@ fn sfa_r1(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], b: &Bufs
     holed[2] = -1; holed[5] = -1;
     rows_ids.push(holed);
     let d_ids: Vec<DevicePtr> = rows_ids.iter().map(|r| up(g, &le(r, |x: i32| x.to_le_bytes()))).collect::<Result<_>>()?;
-    let mut t = [[f64::NAN; 4]; 2];
-    for (sfa, tt) in t.iter_mut().enumerate() {
-        for (mode, o) in tt.iter_mut().enumerate() {
+    // 2026-10-10: ABBA (off, on, on, off); each arm is the mean of its two passes.
+    let mut t = [[0.0f64; 4]; 2];
+    for sfa in [0usize, 1, 1, 0] {
+        for mode in 0..4 {
             let ms = time_graph(g, s, &mut || {
                 for l in 0..STEP_LAYERS {
                     let (lt, ids) = (&layers[l % LAYERS], d_ids[l % ROUTINGS]);
@@ -513,7 +514,7 @@ fn sfa_r1(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], b: &Bufs
                 }
                 Ok(())
             })?;
-            *o = ms * 1e3 / STEP_LAYERS as f64;
+            t[sfa][mode] += ms * 1e3 / STEP_LAYERS as f64 / 2.0;
         }
     }
     for (m, name) in ["sw_moe_r1_gate", "sw_moe_r1_up", "sw_moe_r1_down", "sw_moe_r1_seq"].iter().enumerate() {

@@ -312,3 +312,24 @@ fn deepseek_style_stop_marker_detected() {
     let info = TokenizerInfo::new(&vocab, VocabType::Raw, None, None, false);
     assert_eq!(info.stop_token_ids(), &[1]);
 }
+
+/// 2026-10-10: A177 — `clone()` shares the per-token storage.
+#[test]
+fn clone_shares_vocab_storage() {
+    let vocab = vec!["+".to_string(), "regular".to_string(), "x".to_string()];
+    let info = TokenizerInfo::new(&vocab, VocabType::Raw, None, None, false);
+    let c = info.clone();
+    assert!(std::ptr::eq(
+        info.decoded_vocab().as_ptr(),
+        c.decoded_vocab().as_ptr()
+    ));
+    assert!(std::ptr::eq(
+        info.sorted_decoded_vocab().as_ptr(),
+        c.sorted_decoded_vocab().as_ptr()
+    ));
+    assert!(std::ptr::eq(
+        info.trie_subtree_nodes_range().as_ptr(),
+        c.trie_subtree_nodes_range().as_ptr()
+    ));
+    assert_eq!(info, c);
+}

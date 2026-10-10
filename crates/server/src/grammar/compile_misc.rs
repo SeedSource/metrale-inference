@@ -35,9 +35,12 @@ impl GrammarEngine {
 
         let grammar = metrale_grammar::Grammar::from_structural_tag(&structural_tag_json)
             .map_err(GrammarError::Compilation)?;
-        self.compiler
+        let compiled = self
+            .compiler
             .compile_grammar(&grammar)
-            .map_err(GrammarError::Compilation)
+            .map_err(GrammarError::Compilation);
+        self.note_compile();
+        compiled
     }
 
     /// 2026-09-26: Most space, newline and tab characters allowed in a row between JSON
@@ -48,7 +51,8 @@ impl GrammarEngine {
 
     /// 2026-09-26: Compile a grammar that enforces a JSON schema.
     pub fn compile_json_schema(&mut self, schema: &str) -> Result<CompiledGrammar, GrammarError> {
-        self.compiler
+        let compiled = self
+            .compiler
             .compile_json_schema(
                 schema,
                 true,
@@ -57,7 +61,9 @@ impl GrammarEngine {
                 true,
                 Some(Self::MAX_JSON_SCHEMA_WHITESPACE),
             )
-            .map_err(GrammarError::Compilation)
+            .map_err(GrammarError::Compilation);
+        self.note_compile();
+        compiled
     }
 
     /// 2026-09-26: Compile the built-in JSON grammar (any valid JSON).
@@ -73,8 +79,11 @@ impl GrammarEngine {
         ebnf: &str,
         root_rule: &str,
     ) -> Result<CompiledGrammar, GrammarError> {
-        self.compiler
+        let compiled = self
+            .compiler
             .compile_grammar_from_ebnf(ebnf, root_rule)
-            .map_err(GrammarError::Compilation)
+            .map_err(GrammarError::Compilation);
+        self.note_compile();
+        compiled
     }
 }

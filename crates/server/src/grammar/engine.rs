@@ -28,6 +28,8 @@ pub struct GrammarEngine {
     /// `None` until [`Self::attach_mask_cache`] runs, and when that finds
     /// persistence off or the rule cache absent. See [`super::mask_cache`].
     pub(super) snapshot: Option<super::mask_cache::MaskSnapshot>,
+    /// 2026-10-10: Compile calls so far; drives the periodic cache-stats log.
+    compiles: std::sync::atomic::AtomicU64,
 }
 
 // 2026-09-26: SAFETY: every field is already `Send` (`GrammarCompiler`,
@@ -141,7 +143,26 @@ impl GrammarEngine {
             compiler,
             vocab_size,
             snapshot: None,
+            compiles: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// 2026-10-10: A177: count a compile call and, every 50th, log what the
+    /// grammar cache accounts for, so a rank-0 host-memory climb can be
+    /// compared with the accounted bytes.
+    pub(super) fn note_compile(&self) {
+        let n = self
+            .compiles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n % 50 == 0 {
+            tracing::info!(
+                "Grammar cache: compiles={n} accounted_bytes={} vocab_shared_bytes={} entries={}",
+                self.compiler.get_cache_size_bytes(),
+                self.compiler.vocab_shared_bytes(),
+                self.compiler.cache_len(),
+            );
+        }
     }
 
     /// 2026-09-26: Vocabulary size the grammar was compiled against; a

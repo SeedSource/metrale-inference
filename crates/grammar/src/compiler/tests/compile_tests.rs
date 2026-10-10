@@ -123,6 +123,24 @@ fn cache_size_grows_after_compile() {
     assert!(c.cache_size_bytes() > 0);
 }
 
+/// 2026-10-10: A177 — compiled grammars from one compiler share one vocab.
+#[test]
+fn compiled_grammars_share_tokenizer_storage() {
+    let c = compiler(1);
+    let a = c.compile_builtin_json_grammar().unwrap();
+    let b = c
+        .compile_grammar_from_ebnf("root ::= \"a\" | \"b\"", "root")
+        .unwrap();
+    assert!(std::ptr::eq(
+        a.tokenizer_info().sorted_decoded_vocab().as_ptr(),
+        b.tokenizer_info().sorted_decoded_vocab().as_ptr()
+    ));
+    assert!(std::ptr::eq(
+        a.tokenizer_info().decoded_vocab().as_ptr(),
+        c.tokenizer_info().decoded_vocab().as_ptr()
+    ));
+}
+
 // ----- multi-threaded compilation determinism ----------------------
 
 #[test]

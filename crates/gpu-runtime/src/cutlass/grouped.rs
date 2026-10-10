@@ -606,6 +606,122 @@ pub fn set_w4a4_pack_once_fault(on: bool) {
     let _ = on;
 }
 
+/// 2026-10-10: Test hook for `METRALE_CUTLASS_W4A4_PACK_COMPACT`: `None` follows the lever,
+/// `Some(false)` / `Some(true)` force the original / compact pack grid for every later W4A4
+/// call in this process. Both write the same bytes (`glm_moe_w4a4_pack_once_microtest`).
+pub fn set_w4a4_pack_compact_override(force: Option<bool>) {
+    #[cfg(metrale_cutlass)]
+    unsafe {
+        metrale_cutlass_set_w4a4_pack_compact_override(force.map_or(-1, i32::from));
+    }
+    #[cfg(not(metrale_cutlass))]
+    let _ = force;
+}
+
+/// 2026-10-10: Whether the last W4A4 activation pack ran on the compact grid.
+pub fn w4a4_last_pack_compact() -> bool {
+    #[cfg(metrale_cutlass)]
+    {
+        unsafe { metrale_cutlass_w4a4_last_pack_compact() != 0 }
+    }
+    #[cfg(not(metrale_cutlass))]
+    false
+}
+
+/// 2026-10-10: Test-only (`glm_moe_w4a4_pack_once_microtest`): the activation pack of a W4A4
+/// grouped call without its GEMMs, so [`w4a4_last_prep`] reads the packed A and SFA it wrote and
+/// [`w4a4_pack_replay`] can relaunch it. `sorted_token_ids` 0 = row-ordered A (the down call).
+/// `valid_ptrs` is the per-expert B pointer table (a 0 entry drops that expert), `act_gscale_vals`
+/// the per-expert gs (<= 0 dynamic), `n` the projection's N. Returns whether PACK_ONCE engaged.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a4_pack_only(
+    a: u64,
+    sorted_token_ids: u64,
+    valid_ptrs: &[u64],
+    act_gscale_vals: &[f32],
+    expert_offsets_host: &[i32],
+    n: u32,
+    k: u32,
+    num_tokens: usize,
+    pack_once: bool,
+    stream: u64,
+) -> Result<bool> {
+    let num_experts = valid_ptrs.len();
+    if num_tokens > i32::MAX as usize {
+        bail!("w4a4_pack_only: {num_tokens} tokens overflow the C ABI's int");
+    }
+    ensure_group_arrays(
+        "w4a4_pack_only",
+        num_experts,
+        &[("act_gscale_vals", act_gscale_vals.len())],
+        expert_offsets_host,
+    )?;
+    #[cfg(metrale_cutlass)]
+    {
+        let ctx = ctx()?;
+        let mut engaged = 0i32;
+        let status = unsafe {
+            metrale_cutlass_w4a4_pack_only(
+                a as *const c_void,
+                sorted_token_ids as *const i32,
+                valid_ptrs.as_ptr(),
+                act_gscale_vals.as_ptr(),
+                expert_offsets_host.as_ptr(),
+                num_experts as i32,
+                n as i32,
+                k as i32,
+                num_tokens as i32,
+                i32::from(pack_once),
+                &mut engaged,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("w4a4_pack_only failed: status {status}");
+        }
+        Ok(engaged != 0)
+    }
+    #[cfg(not(metrale_cutlass))]
+    {
+        let _ = (
+            a,
+            sorted_token_ids,
+            valid_ptrs,
+            act_gscale_vals,
+            expert_offsets_host,
+            n,
+            k,
+            pack_once,
+            stream,
+        );
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+/// 2026-10-10: Test-only: relaunch the pack kernels of the last [`w4a4_pack_only`] (or W4A4)
+/// call `reps` times on `stream`, with the compact grid or the original one. Kernel launches
+/// only, so a CUDA graph can capture them. Errors when the last call could not use the compact
+/// grid and `compact` is set.
+pub fn w4a4_pack_replay(compact: bool, reps: usize, stream: u64) -> Result<()> {
+    #[cfg(metrale_cutlass)]
+    {
+        let rc = unsafe {
+            metrale_cutlass_w4a4_pack_replay(i32::from(compact), reps as i32, stream as *mut c_void)
+        };
+        if rc != 0 {
+            bail!("w4a4_pack_replay(compact={compact}) failed: status {rc}");
+        }
+        Ok(())
+    }
+    #[cfg(not(metrale_cutlass))]
+    {
+        let _ = (compact, reps, stream);
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
 /// 2026-10-06: Where the last W4A4 grouped call (gate/up or down) left its quantized A in the
 /// CUTLASS workspace, and what it engaged. Diagnostic (microtests): concurrent callers may
 /// interleave.

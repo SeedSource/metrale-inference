@@ -40,8 +40,9 @@ pub use gemm::{bf16_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t};
 pub use grouped::{
     W4a4LastPrep, nvfp4_grouped_down, nvfp4_grouped_down_w4a4, nvfp4_grouped_down_w4a4_ex,
     nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused, nvfp4_grouped_gate_up_w4a4,
-    nvfp4_grouped_gate_up_w4a4_ex, set_w4a4_amax_dedup_override, set_w4a4_pack_once_fault,
-    w4a4_last_prep, workspace,
+    nvfp4_grouped_gate_up_w4a4_ex, set_w4a4_amax_dedup_override, set_w4a4_pack_compact_override,
+    set_w4a4_pack_once_fault, w4a4_last_pack_compact, w4a4_last_prep, w4a4_pack_only,
+    w4a4_pack_replay, workspace,
 };
 pub use pack::{
     pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched, pack_weight_sfb_batched_mode,
@@ -219,6 +220,29 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn metrale_cutlass_set_w4a4_amax_dedup_override(v: i32);
     pub(crate) fn metrale_cutlass_set_w4a4_pack_once_fault(v: i32);
+    pub(crate) fn metrale_cutlass_set_w4a4_pack_compact_override(v: i32);
+    pub(crate) fn metrale_cutlass_w4a4_last_pack_compact() -> i32;
+    pub(crate) fn metrale_cutlass_w4a4_pack_only(
+        a_bf16: *const c_void,
+        sorted_token_ids: *const i32,
+        valid_ptrs: *const u64,
+        act_gscale_vals: *const f32,
+        expert_offsets_host: *const i32,
+        num_experts: i32,
+        n: i32,
+        k: i32,
+        num_tokens: i32,
+        pack_once: i32,
+        engaged: *mut i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn metrale_cutlass_w4a4_pack_replay(
+        compact: i32,
+        reps: i32,
+        stream: *mut c_void,
+    ) -> i32;
     pub(crate) fn metrale_cutlass_w4a4_last_prep(out: *mut u64, n: i32);
     pub(crate) fn metrale_cutlass_pack_weight_sfb_batched_mode(
         scale_ptrs_dev: *const u64,

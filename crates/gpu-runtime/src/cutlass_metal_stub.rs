@@ -229,6 +229,34 @@ pub fn nvfp4_grouped_down_w4a4_ex(
     unreachable!("cutlass::nvfp4_grouped_down_w4a4_ex is cuda-only (not built for metal)")
 }
 
+pub fn set_w4a4_pack_compact_override(_force: Option<bool>) {
+    unreachable!("cutlass::set_w4a4_pack_compact_override is cuda-only (not built for metal)")
+}
+
+pub fn w4a4_last_pack_compact() -> bool {
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn w4a4_pack_only(
+    _a: u64,
+    _sorted_token_ids: u64,
+    _valid_ptrs: &[u64],
+    _act_gscale_vals: &[f32],
+    _expert_offsets_host: &[i32],
+    _n: u32,
+    _k: u32,
+    _num_tokens: usize,
+    _pack_once: bool,
+    _stream: u64,
+) -> Result<bool> {
+    unreachable!("cutlass::w4a4_pack_only is cuda-only (not built for metal)")
+}
+
+pub fn w4a4_pack_replay(_compact: bool, _reps: usize, _stream: u64) -> Result<()> {
+    unreachable!("cutlass::w4a4_pack_replay is cuda-only (not built for metal)")
+}
+
 pub fn set_w4a4_pack_once_fault(_on: bool) {
     unreachable!("cutlass::set_w4a4_pack_once_fault is cuda-only (not built for metal)")
 }

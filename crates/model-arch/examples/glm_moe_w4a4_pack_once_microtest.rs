@@ -24,9 +24,13 @@
 //! - Ends with one line starting `PASS` when everything holds, else a `FAIL:` line and a
 //!   nonzero exit. TIMING lines: gate/up call (prep + GEMMs) and the whole `run`, off vs on.
 //!
+//! - 2026-10-10: `PACK_COMPACT_MT=1` runs ONLY the `METRALE_CUTLASS_W4A4_PACK_COMPACT` gate
+//!   instead (see [`compact_mt`]); unset leaves everything above unchanged.
+//!
 //!   cargo run -p metrale-model-arch --release --example glm_moe_w4a4_pack_once_microtest \
 //!       --features cuda,gpu-examples      (CUTLASS_HOME set at build time)
-//!   Env: GLM_W4A4_MT_ITERS (timed iterations, 10), GLM_MT_MI, GLM_MT_LOCAL.
+//!   Env: GLM_W4A4_MT_ITERS (timed iterations, 10), GLM_MT_MI, GLM_MT_LOCAL, PACK_COMPACT_MT=1
+//!   (compact-pack gate only; needs GLM_MT_LOCAL unset or 288).
 
 use std::time::Instant;
 
@@ -167,6 +171,270 @@ fn last_pack(g: &dyn GpuBackend) -> Result<(Vec<u8>, Vec<u8>, cutlass::W4a4LastP
     Ok((a, gs, p))
 }
 
+const COMPACT_ROWS: usize = 65_536;
+const COMPACT_TOKENS: usize = 8192;
+const COMPACT_REPLAYS: usize = 42;
+const COMPACT_SAMPLES: usize = 9;
+
+/// 2026-10-10: Row counts per expert (len `E`, exact sum 65,536) and the case's sorted token ids
+/// (each expert's rows are distinct tokens `< COMPACT_TOKENS`). (a) skewed: 19 experts empty
+/// (269 non-empty), one hot expert with 3570 rows, a deterministic Zipf-like tail; (b) uniform:
+/// 8192 tokens x 8 distinct experts drawn uniformly; (c) one hot expert with 7,983 rows, the
+/// rest spread evenly over the other 287.
+fn compact_case(name: &str, r: &mut Rng) -> (Vec<i32>, Vec<i32>) {
+    let mut counts = vec![0usize; E];
+    let mut sorted: Vec<i32> = Vec::with_capacity(COMPACT_ROWS);
+    match name {
+        "uniform" => {
+            let mut lists: Vec<Vec<i32>> = vec![Vec::new(); E];
+            for t in 0..COMPACT_TOKENS {
+                let mut picked: Vec<usize> = Vec::with_capacity(TOP_K);
+                while picked.len() < TOP_K {
+                    let e = (r.bits() % E as u64) as usize;
+                    if !picked.contains(&e) {
+                        picked.push(e);
+                    }
+                }
+                for e in picked {
+                    lists[e].push(t as i32);
+                }
+            }
+            for (e, l) in lists.iter().enumerate() {
+                counts[e] = l.len();
+                sorted.extend_from_slice(l);
+            }
+        }
+        _ => {
+            let hot_rows = if name == "skewed" { 3570 } else { 7983 };
+            let live: Vec<usize> = (0..E).filter(|e| name != "skewed" || e % 15 != 7).collect();
+            let hot = 5usize;
+            counts[hot] = hot_rows;
+            let rest: Vec<usize> = live.iter().copied().filter(|&e| e != hot).collect();
+            let remain = COMPACT_ROWS - hot_rows;
+            let mut order = rest.clone();
+            for i in (1..order.len()).rev() {
+                order.swap(i, (r.bits() % (i as u64 + 1)) as usize);
+            }
+            if name == "skewed" {
+                let w: Vec<f64> = (0..order.len())
+                    .map(|i| ((i + 1) as f64).powf(-0.7))
+                    .collect();
+                let wsum: f64 = w.iter().sum();
+                let spare = (remain - order.len()) as f64;
+                let mut used = 0usize;
+                for (i, &e) in order.iter().enumerate() {
+                    counts[e] = 1 + (spare * w[i] / wsum) as usize;
+                    used += counts[e];
+                }
+                let mut i = 0;
+                while used < remain {
+                    counts[order[i % order.len()]] += 1;
+                    used += 1;
+                    i += 1;
+                }
+            } else {
+                for (i, &e) in order.iter().enumerate() {
+                    counts[e] = remain / order.len() + usize::from(i < remain % order.len());
+                }
+            }
+            for (e, &c) in counts.iter().enumerate() {
+                for j in 0..c {
+                    sorted.push(((j * 4099 + e * 7) % COMPACT_TOKENS) as i32);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        COMPACT_ROWS,
+        "{name}: row sum"
+    );
+    assert_eq!(sorted.len(), COMPACT_ROWS, "{name}: sorted len");
+    assert!(
+        counts.iter().all(|&c| c <= COMPACT_TOKENS),
+        "{name}: per-expert tokens distinct"
+    );
+    let mut off = vec![0i32; E + 1];
+    for e in 0..E {
+        off[e + 1] = off[e] + counts[e] as i32;
+    }
+    (off, sorted)
+}
+
+/// 2026-10-10: Median ms of one replay of the captured `f` on `s` (a graph of
+/// `COMPACT_REPLAYS` back-to-back pack calls), after a 64 MiB memset to evict L2.
+fn compact_time_graph(
+    g: &dyn GpuBackend,
+    s: u64,
+    flush: DevicePtr,
+    f: &mut dyn FnMut() -> Result<()>,
+) -> Result<f64> {
+    g.begin_capture(s)?;
+    if let Err(e) = f() {
+        g.abort_capture_if_active(s);
+        return Err(e);
+    }
+    let graph = g.end_capture(s)?;
+    for _ in 0..3 {
+        g.launch_graph(graph, s)?;
+    }
+    g.synchronize(s)?;
+    let mut v = Vec::new();
+    for _ in 0..COMPACT_SAMPLES {
+        g.memset_async(flush, 0x5A, 64 << 20, s)?;
+        g.synchronize(s)?;
+        let t0 = Instant::now();
+        g.launch_graph(graph, s)?;
+        g.synchronize(s)?;
+        v.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    g.destroy_graph(graph)?;
+    v.sort_by(f64::total_cmp);
+    Ok(v[COMPACT_SAMPLES / 2])
+}
+
+/// 2026-10-10: `PACK_COMPACT_MT=1`. For three routings (skewed / uniform / one hot expert), at
+/// k = 4096 (gate/up: PACK_ONCE gather path, gathered A) and k = 1024 (down: row-ordered A,
+/// `pack_act_grouped_gs`): the W4A4 activation pack (prep_grouped_a without the GEMMs) with the
+/// original grid and with the compact grid (`set_w4a4_pack_compact_override`), each into a
+/// workspace first filled with 0xA5; the whole packed-A + SFA + gs regions must be identical.
+/// Then the pack kernels alone replayed as 42-call CUDA graphs, order-balanced ABBA.
+fn compact_mt(
+    g: &dyn GpuBackend,
+    tables: &MoeTables,
+    r: &mut Rng,
+    chan: &[f32],
+    mi: usize,
+) -> Result<()> {
+    let (ws_base, ws_size) = cutlass::workspace()?;
+    let fill_ws = || g.memset_async(DevicePtr(ws_base), SENTINEL, ws_size, 0);
+    let s = g.create_stream()?;
+    let flush = g.alloc(64 << 20)?;
+    let x: Vec<u8> = (0..COMPACT_TOKENS * H)
+        .flat_map(|i| bf16::from_f32(r.normal() as f32 * 0.5 * chan[i % H]).to_le_bytes())
+        .collect();
+    let d_x = up(g, &x)?;
+    let act: Vec<u8> = (0..COMPACT_ROWS * mi)
+        .flat_map(|_| bf16::from_f32(r.normal() as f32 * 0.7).to_le_bytes())
+        .collect();
+    let d_act = up(g, &act)?;
+    let mut problems: Vec<String> = Vec::new();
+    for case in ["skewed", "uniform", "hotexpert"] {
+        let (off, sorted) = compact_case(case, r);
+        let max_me = off.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+        let nonempty = off.windows(2).filter(|w| w[1] > w[0]).count();
+        println!("case={case} rows={COMPACT_ROWS} nonempty_experts={nonempty} max_me={max_me}");
+        let d_sorted = up(
+            g,
+            &sorted
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )?;
+        for k in [H, mi] {
+            // 2026-10-10: k = 4096 is the gate/up call (gathered A, PACK_ONCE), k = 1024 the down.
+            let gate_up = k == H;
+            let (a, sort, valid, n) = if gate_up {
+                (d_x, d_sorted.0, &tables.gate.packed, mi)
+            } else {
+                (d_act, 0u64, &tables.down.packed, H)
+            };
+            let gs = &tables.gate_up_gs;
+            let pack = |compact: bool| -> Result<(Vec<u8>, Vec<u8>, bool)> {
+                cutlass::set_w4a4_pack_compact_override(Some(compact));
+                fill_ws()?;
+                let po = cutlass::w4a4_pack_only(
+                    a.0,
+                    sort,
+                    valid,
+                    gs,
+                    &off,
+                    n as u32,
+                    k as u32,
+                    if gate_up { COMPACT_TOKENS } else { 0 },
+                    gate_up,
+                    0,
+                )?;
+                g.synchronize(0)?;
+                let (bytes, gsb, _) = last_pack(g)?;
+                if cutlass::w4a4_last_pack_compact() != compact {
+                    bail!("case={case} k={k}: compact engaged != {compact}");
+                }
+                Ok((bytes, gsb, po))
+            };
+            let (a0, g0, po0) = pack(false)?;
+            let (a1, g1, po1) = pack(true)?;
+            let first = a0.iter().zip(&a1).position(|(x, y)| x != y);
+            if first.is_none() && g0 == g1 && a0.len() == a1.len() && po0 == po1 {
+                println!(
+                    "COMPACT BITWISE case={case} k={k} identical ({} bytes, pack_once={po1})",
+                    a0.len()
+                );
+            } else {
+                println!(
+                    "COMPACT BITWISE case={case} k={k} DIFF first={} ndiff={} gs_diff={}",
+                    first.map_or("len".into(), |i| i.to_string()),
+                    ndiff(&a0, &a1),
+                    ndiff(&g0, &g1)
+                );
+                println!("FAIL case={case} k={k}: compact pack differs from the original");
+                problems.push(format!("{case}/k{k}"));
+                continue;
+            }
+            if gate_up != po1 {
+                println!("FAIL case={case} k={k}: pack_once engaged={po1}, want {gate_up}");
+                problems.push(format!("{case}/k{k}/po"));
+            }
+            // 2026-10-10: Timing from the compact call's record (original kernels replay from
+            // it too): ABBA = old, compact, compact, old.
+            cutlass::set_w4a4_pack_compact_override(Some(true));
+            fill_ws()?;
+            cutlass::w4a4_pack_only(
+                a.0,
+                sort,
+                valid,
+                gs,
+                &off,
+                n as u32,
+                k as u32,
+                if gate_up { COMPACT_TOKENS } else { 0 },
+                gate_up,
+                0,
+            )?;
+            g.synchronize(0)?;
+            let mut t = Vec::new();
+            for compact in [false, true, true, false] {
+                let ms = compact_time_graph(g, s, flush, &mut || {
+                    cutlass::w4a4_pack_replay(compact, COMPACT_REPLAYS, s)
+                })?;
+                t.push(ms * 1e3 / COMPACT_REPLAYS as f64);
+            }
+            let (old_us, new_us) = ((t[0] + t[3]) / 2.0, (t[1] + t[2]) / 2.0);
+            println!(
+                "COMPACT TIME case={case} k={k} old_us={old_us:.1} compact_us={new_us:.1} \
+                 ratio={:.3} (ABBA old={:.1},{:.1} compact={:.1},{:.1})",
+                new_us / old_us,
+                t[0],
+                t[3],
+                t[1],
+                t[2]
+            );
+        }
+        g.free(d_sorted)?;
+    }
+    cutlass::set_w4a4_pack_compact_override(None);
+    g.free(d_x)?;
+    g.free(d_act)?;
+    g.free(flush)?;
+    if problems.is_empty() {
+        println!("PASS - COMPACT: compact pack bytes identical to the original in every case");
+        Ok(())
+    } else {
+        println!("FAIL: {}", problems.join("; "));
+        bail!("glm_moe_w4a4_pack_once_microtest: PACK_COMPACT_MT failed")
+    }
+}
+
 fn main() -> Result<()> {
     if !cutlass::available() {
         println!("FAIL: this build has no CUTLASS objects (build with CUTLASS_HOME set)");
@@ -217,6 +485,14 @@ fn main() -> Result<()> {
     for _ in 0..8 {
         let c = (r.bits() % H as u64) as usize;
         chan[c] *= 12.0 + 8.0 * r.unit() as f32;
+    }
+
+    // 2026-10-10: PACK_COMPACT_MT=1 runs only the compact-pack gate (every expert local).
+    if std::env::var("PACK_COMPACT_MT").is_ok_and(|v| v.trim() == "1") {
+        if local != E {
+            bail!("PACK_COMPACT_MT=1 needs GLM_MT_LOCAL unset or {E} (got {local})");
+        }
+        return compact_mt(g, &tables, &mut r, &chan, mi);
     }
 
     let mut problems: Vec<String> = Vec::new();

@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <vector>
@@ -311,36 +312,23 @@ __global__ void pack_weight_sfb_group(
 // E2M1_rne(v / (sf * gs)); the GEMM epilogue multiplies by alpha = weight_scale_2 * gs. The
 // two-level recipe of the ModelOpt/TensorRT NVFP4 activation quantizer (vLLM passes
 // 1 / input_scale as its `a1_gscale`). layout_sfa_dummy is unused.
-template <class LayoutSFA_t>
-__global__ void pack_act_grouped_gs(
+// 2026-10-10: The body of pack_act_grouped_gs for one (row, group) of one expert, shared
+// verbatim with pack_act_grouped_gs_compact (METRALE_CUTLASS_W4A4_PACK_COMPACT): the caller has
+// checked row < m_e and group < k / 16. ms is the expert's first row in sorted order, m_e its
+// row count, gs its global scale; packed / scales its packed-A and SFA bases.
+__device__ __forceinline__ void pack_act_gs_one(
     const __nv_bfloat16* __restrict__ act_global,
     const int* __restrict__ sorted_token_ids,
-    const int* __restrict__ ms_arr,
-    const int* __restrict__ m_arr,
-    unsigned char* const* __restrict__ packed_arr,
-    unsigned char* const* __restrict__ scales_arr,
-    const float* __restrict__ gs_arr,
+    int ms,
+    int m_e,
+    float gs,
+    unsigned char* packed,
+    unsigned char* scales,
     int k,
-    LayoutSFA_t layout_sfa_dummy) {
-  const int e = blockIdx.z;
-  const int m_e = m_arr[e];
-  int row = blockIdx.x;
-  if (row >= m_e) {
-    return;
-  }
-  int group = blockIdx.y * blockDim.x + threadIdx.x;
-  const int groups = k / 16;
-  if (group >= groups) {
-    return;
-  }
+    int row,
+    int group) {
   auto layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
       cute::make_shape(m_e, 1, k, 1));
-  (void)layout_sfa_dummy;
-
-  unsigned char* packed = packed_arr[e];
-  unsigned char* scales = scales_arr[e];
-  const int ms = ms_arr[e];
-  const float gs = gs_arr[e];
   const float inv_gs = 1.0f / gs;
 
   int gid = ms + row;
@@ -364,6 +352,115 @@ __global__ void pack_act_grouped_gs(
     packed[(unsigned long long)row * (k / 2) + base / 2 + i / 2] = static_cast<unsigned char>(
         float_to_e2m1_rne(v[i] * out_scale) | (float_to_e2m1_rne(v[i + 1] * out_scale) << 4));
   }
+}
+
+template <class LayoutSFA_t>
+__global__ void pack_act_grouped_gs(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ ms_arr,
+    const int* __restrict__ m_arr,
+    unsigned char* const* __restrict__ packed_arr,
+    unsigned char* const* __restrict__ scales_arr,
+    const float* __restrict__ gs_arr,
+    int k,
+    LayoutSFA_t layout_sfa_dummy) {
+  const int e = blockIdx.z;
+  const int m_e = m_arr[e];
+  int row = blockIdx.x;
+  if (row >= m_e) {
+    return;
+  }
+  int group = blockIdx.y * blockDim.x + threadIdx.x;
+  const int groups = k / 16;
+  if (group >= groups) {
+    return;
+  }
+  (void)layout_sfa_dummy;
+  // 2026-10-10: The arithmetic moved unchanged into pack_act_gs_one.
+  pack_act_gs_one(act_global, sorted_token_ids, ms_arr[e], m_e, gs_arr[e], packed_arr[e],
+                  scales_arr[e], k, row, group);
+}
+
+// 2026-10-10: METRALE_CUTLASS_W4A4_PACK_COMPACT. The (max m_e, k/16 / 256, G) grid above spends
+// most of its blocks on rows >= m_e (real routing is skewed: ~93% empty at max m_e 3570, G 269,
+// 65,536 routed rows), and at k = 1024 three quarters of each live block's threads are idle.
+// The compact kernels run a flat 1-D grid over the T = sum m_e routed rows x k/16 groups:
+// thread -> (gid, group), gid the row in sorted order, gid -> expert by binary search over the
+// ms prefix staged in shared memory. The host engages them only when ms is the dense exclusive
+// prefix of m (ms[e] = sum of m[0..e)) and G <= kCompactMaxG, so every (e, row, group) the
+// original grid writes is written exactly once, by the same *_one body: identical bytes.
+constexpr int kCompactMaxG = 1024;
+
+// 2026-10-10: Stage ms_arr[0..G) (+ T as the end sentinel) and m_arr into shared memory and
+// resolve this thread's (e, row, group). Returns false for a thread past T * groups (after the
+// barrier, so every thread of the block reaches it).
+__device__ __forceinline__ bool compact_resolve(
+    const int* __restrict__ ms_arr,
+    const int* __restrict__ m_arr,
+    int G,
+    int total_rows,
+    int groups,
+    int (&s_ms)[kCompactMaxG + 1],
+    int (&s_m)[kCompactMaxG],
+    int& e,
+    int& row,
+    int& group) {
+  for (int i = threadIdx.x; i < G; i += blockDim.x) {
+    s_ms[i] = ms_arr[i];
+    s_m[i] = m_arr[i];
+  }
+  if (threadIdx.x == 0) {
+    s_ms[G] = total_rows;
+  }
+  __syncthreads();
+  const long long item = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (item >= (long long)total_rows * groups) {
+    return false;
+  }
+  const int gid = (int)(item / groups);
+  group = (int)(item - (long long)gid * groups);
+  // Largest e in [0, G) with s_ms[e] <= gid (ms strictly increasing: every group has rows).
+  int lo = 0;
+  int hi = G - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) >> 1;
+    if (s_ms[mid] <= gid) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  e = lo;
+  row = gid - s_ms[e];
+  return row < s_m[e];
+}
+
+// 2026-10-10: pack_act_grouped_gs over the flat compact grid: ceil(T * k/16 / 256) blocks of 256.
+template <class LayoutSFA_t>
+__global__ void pack_act_grouped_gs_compact(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ ms_arr,
+    const int* __restrict__ m_arr,
+    unsigned char* const* __restrict__ packed_arr,
+    unsigned char* const* __restrict__ scales_arr,
+    const float* __restrict__ gs_arr,
+    int k,
+    int G,
+    int total_rows,
+    LayoutSFA_t layout_sfa_dummy) {
+  __shared__ int s_ms[kCompactMaxG + 1];
+  __shared__ int s_m[kCompactMaxG];
+  int e = 0;
+  int row = 0;
+  int group = 0;
+  if (!compact_resolve(ms_arr, m_arr, G, total_rows, k / 16, s_ms, s_m, e, row, group)) {
+    return;
+  }
+  (void)layout_sfa_dummy;
+  pack_act_gs_one(act_global, sorted_token_ids, s_ms[e], s_m[e], gs_arr[e], packed_arr[e],
+                  scales_arr[e], k, row, group);
 }
 
 // 2026-10-03: Dynamic per-tensor amax for the groups without a static scale (gs_arr[g] not
@@ -553,6 +650,44 @@ __global__ void pack_once_stage_k(
 // quantized here exactly as pack_act_grouped_gs does, so every byte that kernel writes is
 // written with the same value and nothing else is written. 8-byte copies: a_e is 256-aligned
 // and row * (k/2) + group * 8 is a multiple of 8 (k % 16 == 0).
+// 2026-10-10: The body of pack_once_gather_k for one (row, group) of one expert, shared
+// verbatim with pack_once_gather_compact_k; the caller has checked row < m_e and group < k / 16.
+__device__ __forceinline__ void pack_once_gather_one(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ sorted_token_ids,
+    int ms,
+    int m_e,
+    float gs,
+    unsigned char* packed,
+    unsigned char* scales,
+    int k,
+    const unsigned char* __restrict__ st_codes,
+    const unsigned char* __restrict__ st_sf,
+    const unsigned char* __restrict__ flags,
+    int stage_len,
+    int row,
+    int group) {
+  const int groups = k / 16;
+  auto layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(m_e, 1, k, 1));
+  const int base = group * 16;
+  const int tok = sorted_token_ids[ms + row];
+  unsigned char* dst = packed + (unsigned long long)row * (k / 2) + base / 2;
+  unsigned char* sdst = scales + layout_sfa(row, base, 0);
+  if (tok >= 0 && tok < stage_len && (flags == nullptr || flags[tok] != 0)) {
+    *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(
+        st_codes + (unsigned long long)tok * (k / 2) + base / 2);
+    *sdst = st_sf[(unsigned long long)tok * groups + group];
+  } else {
+    unsigned char c[8];
+    quant16_gs(act_global + (unsigned long long)tok * k, base, gs, c, sdst);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      dst[i] = c[i];
+    }
+  }
+}
+
 template <class LayoutSFA_t>
 __global__ void pack_once_gather_k(
     const __nv_bfloat16* __restrict__ act_global,
@@ -579,25 +714,41 @@ __global__ void pack_once_gather_k(
   if (group >= groups) {
     return;
   }
-  auto layout_sfa = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
-      cute::make_shape(m_e, 1, k, 1));
   (void)layout_sfa_dummy;
-  const int base = group * 16;
-  const int tok = sorted_token_ids[ms_arr[e] + row];
-  unsigned char* dst = packed_arr[e] + (unsigned long long)row * (k / 2) + base / 2;
-  unsigned char* sdst = scales_arr[e] + layout_sfa(row, base, 0);
-  if (tok >= 0 && tok < stage_len && (flags == nullptr || flags[tok] != 0)) {
-    *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(
-        st_codes + (unsigned long long)tok * (k / 2) + base / 2);
-    *sdst = st_sf[(unsigned long long)tok * groups + group];
-  } else {
-    unsigned char c[8];
-    quant16_gs(act_global + (unsigned long long)tok * k, base, gs_arr[e], c, sdst);
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      dst[i] = c[i];
-    }
+  // 2026-10-10: The body moved unchanged into pack_once_gather_one.
+  pack_once_gather_one(act_global, sorted_token_ids, ms_arr[e], m_e, gs_arr[e], packed_arr[e],
+                       scales_arr[e], k, st_codes, st_sf, flags, stage_len, row, group);
+}
+
+// 2026-10-10: pack_once_gather_k over the flat compact grid (see pack_act_grouped_gs_compact).
+template <class LayoutSFA_t>
+__global__ void pack_once_gather_compact_k(
+    const __nv_bfloat16* __restrict__ act_global,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ ms_arr,
+    const int* __restrict__ m_arr,
+    unsigned char* const* __restrict__ packed_arr,
+    unsigned char* const* __restrict__ scales_arr,
+    const float* __restrict__ gs_arr,
+    int k,
+    const unsigned char* __restrict__ st_codes,
+    const unsigned char* __restrict__ st_sf,
+    const unsigned char* __restrict__ flags,
+    int stage_len,
+    int G,
+    int total_rows,
+    LayoutSFA_t layout_sfa_dummy) {
+  __shared__ int s_ms[kCompactMaxG + 1];
+  __shared__ int s_m[kCompactMaxG];
+  int e = 0;
+  int row = 0;
+  int group = 0;
+  if (!compact_resolve(ms_arr, m_arr, G, total_rows, k / 16, s_ms, s_m, e, row, group)) {
+    return;
   }
+  (void)layout_sfa_dummy;
+  pack_once_gather_one(act_global, sorted_token_ids, s_ms[e], s_m[e], gs_arr[e], packed_arr[e],
+                       scales_arr[e], k, st_codes, st_sf, flags, stage_len, row, group);
 }
 
 // 2026-10-06: PACK_ONCE known-bad hook (glm_moe_w4a4_pack_once_microtest): flips bit 0 of the
@@ -782,6 +933,65 @@ extern "C" void metrale_cutlass_w4a4_last_prep(unsigned long long* out, int n) {
     out[i] = g_last_prep[i].load(std::memory_order_relaxed);
   }
 }
+
+// 2026-10-10: `METRALE_CUTLASS_W4A4_PACK_COMPACT=1` packs the W4A4 MoE prefill activations
+// (pack_act_grouped_gs, pack_once_gather_k) with the flat compact grid over the routed rows
+// (pack_act_grouped_gs_compact, pack_once_gather_compact_k) instead of the (max m_e, k/16 / 256,
+// G) grid of mostly empty blocks. Exact (same bytes; prep_grouped_a engages it only for a dense
+// ms prefix and G <= kCompactMaxG). Default off; only `1` turns it on. Read once.
+static bool pack_compact_lever() {
+  static const bool on = [] {
+    const char* v = std::getenv("METRALE_CUTLASS_W4A4_PACK_COMPACT");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return on;
+}
+
+// 2026-10-10: Test hook (glm_moe_w4a4_pack_once_microtest): -1 follows pack_compact_lever, 0 / 1
+// force the original / compact launch, so one process can compare both.
+static std::atomic<int> g_pack_compact_override{-1};
+
+extern "C" void metrale_cutlass_set_w4a4_pack_compact_override(int v) {
+  g_pack_compact_override.store(v, std::memory_order_relaxed);
+}
+
+static bool pack_compact_on() {
+  const int o = g_pack_compact_override.load(std::memory_order_relaxed);
+  return o >= 0 ? o != 0 : pack_compact_lever();
+}
+
+// 2026-10-10: Whether the last W4A4 prep_grouped_a call launched the compact pack. Diagnostic.
+static std::atomic<int> g_last_pack_compact{0};
+
+extern "C" int metrale_cutlass_w4a4_last_pack_compact() {
+  return g_last_pack_compact.load(std::memory_order_relaxed);
+}
+
+// 2026-10-10: What the last W4A4 prep_grouped_a pack launched, so the microtest can replay just
+// the pack kernels (graph-capturable: no host copies) with the original or the compact grid.
+// Device arrays live in the CUTLASS workspace; PACK_ONCE's staging is scratch there, so replay
+// right after a pack-only call (metrale_cutlass_w4a4_pack_only). Diagnostic; not thread-safe.
+struct PackRec {
+  bool valid = false;
+  bool compact_ok = false;
+  bool po = false;
+  const __nv_bfloat16* A = nullptr;
+  const int* sorted = nullptr;
+  const int* d_ms = nullptr;
+  const int* d_me = nullptr;
+  unsigned char* const* d_apk = nullptr;
+  unsigned char* const* d_sfa = nullptr;
+  const float* d_gs = nullptr;
+  int k = 0;
+  int G = 0;
+  int T = 0;
+  int max_me = 0;
+  int stage_len = 0;
+  unsigned char* st_codes = nullptr;
+  unsigned char* st_sf = nullptr;
+  const unsigned char* flags = nullptr;
+};
+static PackRec g_pack_rec;
 
 static bool sfb_pack_tiled_lever() {
   static const bool on = [] {
@@ -1214,6 +1424,47 @@ static GroupedAPrep prep_grouped_a(
           st_sf = st_codes + codes_b;
         }
       }
+      // 2026-10-10: METRALE_CUTLASS_W4A4_PACK_COMPACT: the flat grid over the T routed rows,
+      // only when ms is the dense exclusive prefix of me (so the original grid's (e, row)
+      // set is exactly gid in [0, T)) and G fits the shared-memory staging.
+      bool compact = false;
+      int compact_rows = 0;
+      if (pack_compact_on() && G <= kCompactMaxG) {
+        long long acc = 0;
+        bool dense = true;
+        for (int g = 0; g < G && dense; ++g) {
+          dense = (long long)h_ms[g] == acc && h_me[g] > 0;
+          acc += h_me[g];
+        }
+        const long long items = acc * (long long)(k / 16);
+        compact = dense && acc > 0 && acc <= 0x7fffffffLL && (items + 255) / 256 <= 0x7fffffffLL;
+        compact_rows = compact ? (int)acc : 0;
+      }
+      const unsigned int cgrid =
+          compact ? (unsigned int)(((long long)compact_rows * (k / 16) + 255) / 256) : 0u;
+      g_pack_rec = PackRec{};
+      g_pack_rec.valid = true;
+      g_pack_rec.compact_ok = compact;
+      g_pack_rec.po = po;
+      g_pack_rec.A = A_global;
+      g_pack_rec.sorted = sorted_token_ids;
+      g_pack_rec.d_ms = (const int*)d_ms;
+      g_pack_rec.d_me = (const int*)d_me;
+      g_pack_rec.d_apk = (unsigned char* const*)d_apk;
+      g_pack_rec.d_sfa = (unsigned char* const*)d_sfa;
+      g_pack_rec.d_gs = d_gs;
+      g_pack_rec.k = k;
+      g_pack_rec.G = G;
+      g_pack_rec.T = compact_rows;
+      g_pack_rec.max_me = max_me;
+      static std::atomic<int> compact_logged{0};
+      if (compact && compact_logged.exchange(1, std::memory_order_relaxed) == 0) {
+        std::fprintf(stderr,
+                     "METRALE_CUTLASS_W4A4_PACK_COMPACT ENGAGED: W4A4 MoE prefill activation "
+                     "pack on a flat grid over %d routed rows (G=%d, k=%d), identical bytes\n",
+                     compact_rows, G, k);
+      }
+      g_last_pack_compact.store(compact ? 1 : 0, std::memory_order_relaxed);
       if (po) {
         // 2026-10-06: Flags exist only when every group is dynamic (one gs) and the dedup amax
         // ran: they mark every in-range token a group reads; the gather re-checks them anyway.
@@ -1225,10 +1476,26 @@ static GroupedAPrep prep_grouped_a(
           pack_once_fault_k<<<1, 1, 0, stream>>>(sorted_token_ids, h_ms[0], stage_len, k / 16,
                                                  st_sf);
         }
-        pack_once_gather_k<<<grd, blk, 0, stream>>>(
+        g_pack_rec.stage_len = stage_len;
+        g_pack_rec.st_codes = st_codes;
+        g_pack_rec.st_sf = st_sf;
+        g_pack_rec.flags = flags;
+        if (compact) {
+          pack_once_gather_compact_k<<<cgrid, blk, 0, stream>>>(
+              A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
+              (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, d_gs, k, st_codes,
+              st_sf, flags, stage_len, G, compact_rows, lsa0);
+        } else {
+          pack_once_gather_k<<<grd, blk, 0, stream>>>(
+              A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
+              (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, d_gs, k, st_codes,
+              st_sf, flags, stage_len, lsa0);
+        }
+      } else if (compact) {
+        pack_act_grouped_gs_compact<<<cgrid, blk, 0, stream>>>(
             A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
-            (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, d_gs, k, st_codes, st_sf,
-            flags, stage_len, lsa0);
+            (unsigned char* const*)d_apk, (unsigned char* const*)d_sfa, d_gs, k, G,
+            compact_rows, lsa0);
       } else {
         pack_act_grouped_gs<<<grd, blk, 0, stream>>>(
             A_global, sorted_token_ids, (const int*)d_ms, (const int*)d_me,
@@ -1644,6 +1911,101 @@ extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4(
       A_bf16, sorted_token_ids, gate_packed_ptrs, gate_sfb_ptrs, gate_scale2_vals,
       up_packed_ptrs, up_sfb_ptrs, up_scale2_vals, act_gscale_vals, C_gate_bf16, C_up_bf16,
       expert_offsets_host, num_experts, n, k, 0, 0, nullptr, workspace, workspace_size, stream);
+}
+
+// 2026-10-10: Test-only (glm_moe_w4a4_pack_once_microtest): prep_grouped_a of the gate/up W4A4
+// call (sorted_token_ids null = the down call's row-ordered A) with no GEMM, so the pack can be
+// compared and replayed alone. valid_ptrs is the B pointer table prep uses to drop experts.
+// Same arguments and statuses as the prep of metrale_cutlass_nvfp4_grouped_gate_up_w4a4_ex.
+extern "C" int metrale_cutlass_w4a4_pack_only(
+    const void* A_bf16,
+    const int* sorted_token_ids,
+    const unsigned long long* valid_ptrs,
+    const float* act_gscale_vals,
+    const int* expert_offsets_host,
+    int num_experts,
+    int n,
+    int k,
+    int num_tokens,
+    int pack_once,
+    int* engaged,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+  if (engaged != nullptr) {
+    *engaged = 0;
+  }
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0 || act_gscale_vals == nullptr) {
+    return -1;
+  }
+  int eng = 0;
+  GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16), sorted_token_ids,
+                                  expert_offsets_host, valid_ptrs, num_experts, n, k,
+                                  static_cast<unsigned char*>(workspace), stream,
+                                  act_gscale_vals, 0, nullptr, workspace_size, num_tokens,
+                                  pack_once, nullptr, 0, 0, &eng);
+  if (engaged != nullptr) {
+    *engaged = eng & 1;
+  }
+  return a.status;
+#else
+  (void)A_bf16;
+  (void)sorted_token_ids;
+  (void)valid_ptrs;
+  (void)act_gscale_vals;
+  (void)expert_offsets_host;
+  (void)num_experts;
+  (void)n;
+  (void)k;
+  (void)num_tokens;
+  (void)pack_once;
+  (void)workspace;
+  (void)workspace_size;
+  (void)stream;
+  return -120;
+#endif
+}
+
+// 2026-10-10: Test-only: relaunch the pack kernels of the last prep_grouped_a W4A4 call `reps`
+// times on `stream` (kernel launches only, so a CUDA graph can capture them): compact != 0 the
+// compact grid (-2 when the last call could not use it), else the original grid. With PACK_ONCE
+// engaged each rep is the staging kernel then the gather. Writes the same slots as the call.
+extern "C" int metrale_cutlass_w4a4_pack_replay(int compact, int reps, cudaStream_t stream) {
+  const PackRec& r = g_pack_rec;
+  if (!r.valid || reps <= 0) {
+    return -1;
+  }
+  if (compact != 0 && !r.compact_ok) {
+    return -2;
+  }
+  auto dummy = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(1, 1, r.k, 1));
+  dim3 blk(256);
+  dim3 grd(r.max_me, (r.k / 16 + blk.x - 1) / blk.x, r.G);
+  const unsigned int cgrid = (unsigned int)(((long long)r.T * (r.k / 16) + 255) / 256);
+  for (int i = 0; i < reps; ++i) {
+    if (r.po) {
+      dim3 sgrd(r.stage_len, (r.k / 16 + blk.x - 1) / blk.x);
+      pack_once_stage_k<<<sgrd, blk, 0, stream>>>(r.A, r.flags, r.stage_len, r.k, r.d_gs,
+                                                  r.st_codes, r.st_sf);
+      if (compact != 0) {
+        pack_once_gather_compact_k<<<cgrid, blk, 0, stream>>>(
+            r.A, r.sorted, r.d_ms, r.d_me, r.d_apk, r.d_sfa, r.d_gs, r.k, r.st_codes, r.st_sf,
+            r.flags, r.stage_len, r.G, r.T, dummy);
+      } else {
+        pack_once_gather_k<<<grd, blk, 0, stream>>>(
+            r.A, r.sorted, r.d_ms, r.d_me, r.d_apk, r.d_sfa, r.d_gs, r.k, r.st_codes, r.st_sf,
+            r.flags, r.stage_len, dummy);
+      }
+    } else if (compact != 0) {
+      pack_act_grouped_gs_compact<<<cgrid, blk, 0, stream>>>(
+          r.A, r.sorted, r.d_ms, r.d_me, r.d_apk, r.d_sfa, r.d_gs, r.k, r.G, r.T, dummy);
+    } else {
+      pack_act_grouped_gs<<<grd, blk, 0, stream>>>(r.A, r.sorted, r.d_ms, r.d_me, r.d_apk,
+                                                   r.d_sfa, r.d_gs, r.k, dummy);
+    }
+  }
+  return cudaGetLastError() == cudaSuccess ? 0 : -3;
 }
 
 // 2026-10-03: W4A4 grouped down with an NVFP4 global activation scale: as

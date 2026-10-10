@@ -40,6 +40,12 @@ impl TransformerModel {
         use metrale_model_layers::layer::SsmLayerState;
 
         let stream = self.secondary_stream;
+        // 2026-10-10: `METRALE_SSM_NO_CHECKPOINT=1`: no copies and no lazy alloc; the event
+        // is still recorded so `sync_secondary_dispatch` has something to wait on.
+        if metrale_model_layers::ssm_reserve::ssm_no_checkpoint() {
+            self.gpu.record_event(self.secondary_event, stream)?;
+            return Ok(());
+        }
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
@@ -92,6 +98,19 @@ impl TransformerModel {
         use metrale_model_layers::layer::SsmLayerState;
 
         let stream = self.secondary_stream;
+        // 2026-10-10: `METRALE_SSM_NO_CHECKPOINT=1`: a rollback to 0 would need the
+        // checkpoint; refuse loudly (counted for the gate). num_accepted >= 1 restores an
+        // intermediate as before; only the checkpoint copies are skipped.
+        let no_ckpt = metrale_model_layers::ssm_reserve::ssm_no_checkpoint();
+        if no_ckpt && num_accepted == 0 {
+            let n = metrale_model_layers::ssm_reserve::note_ssm_checkpoint_read_refused();
+            bail!(
+                "start_rollback_and_checkpoint_async: num_accepted == 0 needs the pre-verify \
+                 SSM checkpoint, which METRALE_SSM_NO_CHECKPOINT=1 does not allocate \
+                 (ngram / self-speculative are not supported with it). \
+                 METRALE_SSM_NO_CHECKPOINT: checkpoint reads refused = {n}"
+            );
+        }
         let mut ssm_layer_idx = 0usize;
         // 2026-09-25: All rollback copies are issued before all checkpoint copies,
         // on one stream, so each checkpoint reads the state its rollback wrote.
@@ -152,14 +171,15 @@ impl TransformerModel {
                 }
 
                 // 2026-09-25: Checkpoint the rolled-back state for the next verify.
-                if let Some(ckpt) = ssm.h_state_checkpoint {
+                // 2026-10-10: Skipped under `METRALE_SSM_NO_CHECKPOINT=1`.
+                if let Some(ckpt) = ssm.h_state_checkpoint.filter(|_| !no_ckpt) {
                     h_ckpt.push(StateCopy {
                         src: ssm.h_state,
                         dst: ckpt,
                         bytes: h_bytes,
                     });
                 }
-                if let Some(ckpt) = ssm.conv_state_checkpoint {
+                if let Some(ckpt) = ssm.conv_state_checkpoint.filter(|_| !no_ckpt) {
                     conv_ckpt.push(StateCopy {
                         src: ssm.conv_state,
                         dst: ckpt,

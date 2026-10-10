@@ -36,6 +36,14 @@ use metrale_model_layers::weight_map::{DenseWeight, MtpWeights, QuantizedWeight}
 impl Drop for TransformerModel {
     fn drop(&mut self) {
         self.drop_pinned_staging();
+        // 2026-10-10: Shutdown stat for the `METRALE_SSM_NO_CHECKPOINT` gate: the number of
+        // checkpoint reads/writes refused in this process (must be 0 on an MTP serve).
+        if metrale_model_layers::ssm_reserve::ssm_no_checkpoint() {
+            tracing::info!(
+                "METRALE_SSM_NO_CHECKPOINT: checkpoint reads refused = {}",
+                metrale_model_layers::ssm_reserve::ssm_checkpoint_reads_refused()
+            );
+        }
         // 2026-09-25: The snapshot pool's spill staging buffer is freed here
         // because the pool holds no `gpu` handle. It is allocated on first use,
         // so this is a no-op when the spill tier never ran.

@@ -442,3 +442,66 @@ mod marconi_gate {
         assert_eq!(d.slots, 0);
     }
 }
+
+/// 2026-10-10: `METRALE_SSM_NO_CHECKPOINT`: the reserve drops exactly one blob per
+/// covered verify slot, in both rollback modes, for both lever values (the `_with`
+/// core takes the bool, so no process env is set).
+#[test]
+fn no_checkpoint_drops_one_blob_per_verify_slot() {
+    for rollback in [SsmRollbackMode::Snapshot, SsmRollbackMode::Replay] {
+        for (bs, nd) in [(1usize, 1usize), (16, 2), (16, 3), (64, 3), (128, 3)] {
+            let slots = mtp_state_slots_with(bs, 32, false);
+            let run = |no_ckpt| {
+                ssm_pool_reserve_bytes_with(
+                    bs, H_BLOB, CONV_BLOB, true, nd, slots, false, false, rollback, no_ckpt,
+                )
+            };
+            assert_eq!(
+                run(false) - run(true),
+                slots * BLOB,
+                "{rollback:?} bs={bs} nd={nd}"
+            );
+            // 2026-10-10: Lever off is the legacy entry point's value.
+            assert_eq!(
+                run(false),
+                ssm_pool_reserve_bytes(
+                    bs, H_BLOB, CONV_BLOB, true, nd, slots, false, false, rollback
+                )
+            );
+        }
+    }
+    // Spec off: nothing to drop.
+    assert_eq!(
+        ssm_pool_reserve_bytes_with(
+            16,
+            H_BLOB,
+            CONV_BLOB,
+            false,
+            2,
+            16,
+            false,
+            false,
+            SsmRollbackMode::Snapshot,
+            true
+        ),
+        16 * BLOB
+    );
+}
+
+/// 2026-10-10: Pinned numbers at max_batch 16, num_drafts 2 (27B geometry above): the
+/// 16-slot checkpoint share is the saving, and replay-mode verify cost goes to 0.
+#[test]
+fn no_checkpoint_pinned_bs16_nd2() {
+    let on =
+        |m| ssm_pool_reserve_bytes_with(16, H_BLOB, CONV_BLOB, true, 2, 16, false, false, m, true);
+    let off =
+        |m| ssm_pool_reserve_bytes_with(16, H_BLOB, CONV_BLOB, true, 2, 16, false, false, m, false);
+    assert_eq!(
+        off(SsmRollbackMode::Snapshot) - on(SsmRollbackMode::Snapshot),
+        16 * BLOB
+    );
+    assert_eq!(on(SsmRollbackMode::Replay), 16 * BLOB);
+    assert_eq!(off(SsmRollbackMode::Replay), 32 * BLOB);
+    assert_eq!(ssm_checkpoint_bytes(16, BLOB, false), 16 * BLOB);
+    assert_eq!(ssm_checkpoint_bytes(16, BLOB, true), 0);
+}

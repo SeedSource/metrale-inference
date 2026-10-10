@@ -61,10 +61,16 @@ fn seed(gpu: &MockGpuBackend, p: &SsmStatePool) {
                 .unwrap();
             gpu.copy_h2d(&vec![tag(1); p.conv_bytes], p.conv_state(l, s))
                 .unwrap();
-            gpu.copy_h2d(&vec![tag(2); p.h_stored_bytes], p.h_checkpoint(l, s))
-                .unwrap();
-            gpu.copy_h2d(&vec![tag(3); p.conv_bytes], p.conv_checkpoint(l, s))
-                .unwrap();
+            gpu.copy_h2d(
+                &vec![tag(2); p.h_stored_bytes],
+                p.h_checkpoint(l, s).unwrap(),
+            )
+            .unwrap();
+            gpu.copy_h2d(
+                &vec![tag(3); p.conv_bytes],
+                p.conv_checkpoint(l, s).unwrap(),
+            )
+            .unwrap();
             for t in 0..p.h_inter_count(s) {
                 gpu.copy_h2d(
                     &vec![tag(4 + t); p.h_stored_bytes],
@@ -141,10 +147,10 @@ fn commit_plans(
 fn reject_plans(p: &SsmStatePool, slot: usize) -> (Vec<StateCopy>, Vec<StateCopy>) {
     let (mut h, mut c) = commit_plans(p, slot, 1);
     for (l, row) in h.iter_mut().enumerate() {
-        row.src = p.h_checkpoint(l, slot);
+        row.src = p.h_checkpoint(l, slot).unwrap();
     }
     for (l, row) in c.iter_mut().enumerate() {
-        row.src = p.conv_checkpoint(l, slot);
+        row.src = p.conv_checkpoint(l, slot).unwrap();
     }
     (h, c)
 }
@@ -354,4 +360,32 @@ fn the_collapsed_run_reproduces_the_plan_row_for_row() {
         })
         .collect();
     assert_eq!(expanded, plan);
+}
+
+/// 2026-10-10: `METRALE_SSM_NO_CHECKPOINT` pool: no checkpoint pools, the accessors say
+/// so, and `reset_slot` / `copy_slot` still work on the remaining families.
+#[test]
+fn no_checkpoint_pool_skips_checkpoint_in_reset_and_copy() {
+    let gpu = MockGpuBackend::new();
+    let on = SsmStatePool::new_with_checkpoint_mode(
+        &tiny_config(),
+        MAX_SLOTS,
+        true,
+        NUM_INTERMEDIATES,
+        NUM_DRAFTS,
+        false,
+        SsmRollbackMode::Snapshot,
+        true,
+        &gpu,
+    )
+    .unwrap();
+    assert!(!on.has_checkpoints());
+    assert!(on.h_checkpoint(0, 0).is_none() && on.conv_checkpoint(0, 0).is_none());
+    on.reset_slot(0, &gpu).unwrap();
+    on.copy_slot(0, 1, &gpu, 0).unwrap();
+    let off = pool(&gpu);
+    assert!(off.has_checkpoints());
+    assert!(off.h_checkpoint(0, 0).is_some());
+    off.reset_slot(0, &gpu).unwrap();
+    off.copy_slot(0, 1, &gpu, 0).unwrap();
 }

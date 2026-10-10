@@ -41,6 +41,17 @@ impl TransformerModel {
     pub(super) fn checkpoint_ssm_states_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
         use metrale_model_layers::layer::SsmLayerState;
 
+        // 2026-10-10: A stray ngram / self-spec call must fail loudly, never lazily
+        // allocate per-sequence checkpoint memory (counted for the gate).
+        if metrale_model_layers::ssm_reserve::ssm_no_checkpoint() {
+            let n = metrale_model_layers::ssm_reserve::note_ssm_checkpoint_read_refused();
+            anyhow::bail!(
+                "checkpoint_ssm_states: METRALE_SSM_NO_CHECKPOINT=1 allocates no SSM \
+                 checkpoint (ngram / self-speculative are not supported with it). \
+                 METRALE_SSM_NO_CHECKPOINT: checkpoint reads refused = {n}"
+            );
+        }
+
         let stream = self.gpu.default_stream();
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
@@ -92,6 +103,18 @@ impl TransformerModel {
         num_accepted: usize,
     ) -> Result<()> {
         use metrale_model_layers::layer::SsmLayerState;
+
+        // 2026-10-10: A rollback to 0 restores the checkpoint, which `METRALE_SSM_NO_CHECKPOINT=1`
+        // does not allocate (counted for the gate).
+        if num_accepted == 0 && metrale_model_layers::ssm_reserve::ssm_no_checkpoint() {
+            let n = metrale_model_layers::ssm_reserve::note_ssm_checkpoint_read_refused();
+            anyhow::bail!(
+                "rollback_ssm_states: num_accepted == 0 needs the pre-verify SSM checkpoint, \
+                 which METRALE_SSM_NO_CHECKPOINT=1 does not allocate (ngram / \
+                 self-speculative are not supported with it). \
+                 METRALE_SSM_NO_CHECKPOINT: checkpoint reads refused = {n}"
+            );
+        }
 
         // 2026-09-25: Validate every SSM layer before planning any copy: an error part-way
         // through the copies would leave some layers rewound and the rest advanced.

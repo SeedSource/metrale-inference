@@ -184,6 +184,45 @@ pub fn ssm_h_prefill_stage_bytes(slots: usize, h_layer_f32_bytes: usize, f16_poo
     }
 }
 
+/// 2026-10-10: `METRALE_SSM_NO_CHECKPOINT=1` (exactly `1`). Read once per process.
+///
+/// When on, `SsmStatePool::new` allocates no per-slot pre-verify checkpoint pools
+/// (`h_checkpoint_pools` / `conv_checkpoint_pools`) and the pre-load preflight reserve
+/// ([`ssm_pool_reserve_bytes`]) drops the same share, so the KV budget receives it.
+/// The checkpoint is read only by a rollback to `num_accepted == 0`, which the MTP path
+/// never issues (ngram and self-speculative do; `validate_serve_args` refuses them with
+/// the lever on). Exact: no numeric change. Both the reserve and the pool read this one
+/// function so they agree; the pure helpers below take the value as a `bool`.
+pub fn ssm_no_checkpoint() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("METRALE_SSM_NO_CHECKPOINT").as_deref() == Ok("1"))
+}
+
+/// 2026-10-10: Process-wide count of checkpoint reads/writes refused under
+/// `METRALE_SSM_NO_CHECKPOINT=1` (a num_accepted == 0 rollback, a lazy checkpoint). The
+/// gate expects 0 on every MTP serve.
+static CHECKPOINT_READS_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 2026-10-10: Count one refused checkpoint use and return the new total. Call before
+/// bailing; put the total in the error text.
+pub fn note_ssm_checkpoint_read_refused() -> u64 {
+    CHECKPOINT_READS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// 2026-10-10: Refused checkpoint uses so far in this process.
+pub fn ssm_checkpoint_reads_refused() -> u64 {
+    CHECKPOINT_READS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 2026-10-10: Bytes of the per-verify-slot pre-verify checkpoint (h and conv, all SSM
+/// layers) the pool allocates for `slots` slots: `slots * blob`, or 0 when
+/// `no_checkpoint` ([`ssm_no_checkpoint`]). `SsmStatePool::new` and
+/// [`ssm_pool_reserve_bytes_with`] both size the checkpoint through this.
+pub fn ssm_checkpoint_bytes(slots: usize, blob_bytes: usize, no_checkpoint: bool) -> usize {
+    if no_checkpoint { 0 } else { slots * blob_bytes }
+}
+
 /// 2026-09-25: SSM state-pool bytes for the pre-load preflight reserve, following the
 /// layout `SsmStatePool::new` allocates, without the pools' dummy slots:
 ///
@@ -196,6 +235,9 @@ pub fn ssm_h_prefill_stage_bytes(slots: usize, h_layer_f32_bytes: usize, f16_poo
 /// `h_blob_bytes` and `conv_blob_bytes` are per-sequence totals across all SSM
 /// layers at FP32 width; `h_f16_pool` narrows the h terms through
 /// [`ssm_h_stored_bytes`].
+///
+/// 2026-10-10: The checkpoint blob is left out when `METRALE_SSM_NO_CHECKPOINT=1`
+/// ([`ssm_no_checkpoint`]); see [`ssm_pool_reserve_bytes_with`].
 pub fn ssm_pool_reserve_bytes(
     max_batch_size: usize,
     h_blob_bytes: usize,
@@ -207,22 +249,52 @@ pub fn ssm_pool_reserve_bytes(
     h_f16_pool: bool,
     rollback: SsmRollbackMode,
 ) -> usize {
+    ssm_pool_reserve_bytes_with(
+        max_batch_size,
+        h_blob_bytes,
+        conv_blob_bytes,
+        spec_on,
+        num_drafts,
+        mtp_state_slots,
+        uniform_verify,
+        h_f16_pool,
+        rollback,
+        ssm_no_checkpoint(),
+    )
+}
+
+/// 2026-10-10: Env-free core of [`ssm_pool_reserve_bytes`]. `no_checkpoint` drops the
+/// pre-verify checkpoint blob from every verify slot in both rollback modes (Replay's
+/// whole per-slot term was that blob, so it drops to 0).
+pub fn ssm_pool_reserve_bytes_with(
+    max_batch_size: usize,
+    h_blob_bytes: usize,
+    conv_blob_bytes: usize,
+    spec_on: bool,
+    num_drafts: usize,
+    mtp_state_slots: usize,
+    uniform_verify: bool,
+    h_f16_pool: bool,
+    rollback: SsmRollbackMode,
+    no_checkpoint: bool,
+) -> usize {
     let h_blob_bytes = ssm_h_stored_bytes(h_blob_bytes, h_f16_pool);
     let blob = h_blob_bytes + conv_blob_bytes;
     let base = max_batch_size * blob;
     if !spec_on {
         return base;
     }
+    let ckpt = ssm_checkpoint_bytes(1, blob, no_checkpoint);
     let verify: usize = (0..mtp_state_slots)
         .map(|slot| match rollback {
             SsmRollbackMode::Snapshot => {
                 verify_slot_h_intermediates(slot, num_drafts, uniform_verify) * h_blob_bytes
                     + (num_drafts + 1) * conv_blob_bytes
-                    + blob
+                    + ckpt
             }
             // 2026-09-25: Replay's verify-window input ring is a separate
             // term (`ssm_replay_ring_bytes`), sized by activation rows.
-            SsmRollbackMode::Replay => blob,
+            SsmRollbackMode::Replay => ckpt,
         })
         .sum();
     base + verify

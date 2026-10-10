@@ -103,3 +103,13 @@ fn migration_releases_old_once_then_owns_new() {
     sorted.sort_unstable();
     assert_eq!(sorted, vec![0, 1], "both slots free exactly once, no dupes");
 }
+
+/// 2026-10-10: A pool with no checkpoint pools (`METRALE_SSM_NO_CHECKPOINT`, or no MTP)
+/// reports none and returns `None` from the accessors instead of indexing.
+#[test]
+fn bare_pool_has_no_checkpoints() {
+    let pool = bare_pool(2);
+    assert!(!pool.has_checkpoints());
+    assert!(pool.h_checkpoint(0, 0).is_none());
+    assert!(pool.conv_checkpoint(0, 0).is_none());
+}

@@ -81,11 +81,11 @@ impl TransformerModel {
                     if has_mtp {
                         if ssm.h_state_checkpoint.is_some() {
                             ssm.h_state_checkpoint =
-                                Some(self.ssm_pool.h_checkpoint(ssm_layer_idx, new_slot));
+                                self.ssm_pool.h_checkpoint(ssm_layer_idx, new_slot);
                         }
                         if ssm.conv_state_checkpoint.is_some() {
                             ssm.conv_state_checkpoint =
-                                Some(self.ssm_pool.conv_checkpoint(ssm_layer_idx, new_slot));
+                                self.ssm_pool.conv_checkpoint(ssm_layer_idx, new_slot);
                         }
                         if !ssm.h_state_intermediates.is_empty() {
                             ssm.h_state_intermediates.clear();

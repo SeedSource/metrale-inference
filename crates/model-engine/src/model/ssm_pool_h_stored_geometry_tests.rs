@@ -181,7 +181,7 @@ fn h_families_stride_by_the_stored_width() {
             "intermediate stride (f16={f16})"
         );
         assert_eq!(
-            p.h_checkpoint(0, 1).0 - p.h_checkpoint(0, 0).0,
+            p.h_checkpoint(0, 1).unwrap().0 - p.h_checkpoint(0, 0).unwrap().0,
             expect as u64,
             "checkpoint stride (f16={f16})"
         );
@@ -235,4 +235,36 @@ fn prefill_staging_is_one_fp32_blob_per_slot_and_only_when_narrowed() {
         metrale_model_layers::ssm_reserve::ssm_h_prefill_stage_bytes(SLOTS + 1, p16.h_bytes, false),
         0
     );
+}
+
+/// 2026-10-10: `METRALE_SSM_NO_CHECKPOINT`: the pool allocates exactly the checkpoint
+/// share less (2 bulk allocations; `ssm_checkpoint_bytes` bytes), keeps both vecs empty,
+/// and the other four families are unchanged. Reserve and allocation use the same
+/// `ssm_checkpoint_bytes`, so the saving matches `ssm_pool_reserve_bytes_with`.
+#[test]
+fn no_checkpoint_pool_omits_exactly_the_checkpoint_share() {
+    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    for f16 in [false, true] {
+        let mode = metrale_model_layers::ssm_reserve::SsmRollbackMode::Snapshot;
+        let build = |no_ckpt| {
+            let gpu = MockGpuBackend::new();
+            let p = SsmStatePool::new_with_checkpoint_mode(
+                &config, SLOTS, true, 4, 3, f16, mode, no_ckpt, &gpu,
+            )
+            .unwrap();
+            (p, gpu.alloc_count())
+        };
+        let (off, off_allocs) = build(false);
+        let (on, on_allocs) = build(true);
+        assert!(off.has_checkpoints() && !on.has_checkpoints(), "f16={f16}");
+        assert!(on.h_checkpoint_pools.is_empty() && on.conv_checkpoint_pools.is_empty());
+        assert_eq!(off_allocs - on_allocs, 2, "f16={f16}");
+        assert_eq!(on.owned_allocations.len(), 4 + usize::from(f16));
+        assert_eq!(on.mtp_slots, off.mtp_slots);
+        let blob = off.num_ssm_layers * (off.h_stored_bytes + off.conv_bytes);
+        assert_eq!(
+            metrale_model_layers::ssm_reserve::ssm_checkpoint_bytes(off.mtp_slots + 1, blob, false),
+            (off.mtp_slots + 1) * blob
+        );
+    }
 }

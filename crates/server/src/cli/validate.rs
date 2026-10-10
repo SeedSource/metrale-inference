@@ -262,6 +262,19 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         }
     }
 
+    // 2026-10-10: `METRALE_SSM_NO_CHECKPOINT=1` allocates no pre-verify SSM checkpoint; ngram
+    // and self-speculative verify roll back to it (`num_accepted == 0`), MTP never does.
+    if metrale_model_layers::ssm_reserve::ssm_no_checkpoint()
+        && (args.self_speculative || args.ngram_speculative)
+    {
+        v.push(Violation::new(
+            "METRALE_SSM_NO_CHECKPOINT=1 is set with --self-speculative / --ngram-speculative.",
+            "those paths restore the per-slot pre-verify SSM checkpoint, which the lever does \
+             not allocate; only the MTP path never reads it.",
+            "unset METRALE_SSM_NO_CHECKPOINT, or serve with --speculative (MTP).",
+        ));
+    }
+
     if args.disable_thinking && args.max_thinking_budget.is_some() {
         v.push(Violation::new(
             "--max-thinking-budget is set together with --disable-thinking.",

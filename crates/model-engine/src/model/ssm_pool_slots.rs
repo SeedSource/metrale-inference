@@ -76,6 +76,16 @@ impl SsmStatePool {
             "release_slot: slot {idx} already free (double-release hands it to two seqs)"
         );
         free.push(idx);
+        drop(free);
+        // 2026-10-10: `METRALE_SSM_NO_CHECKPOINT` gate evidence on every released slot (rank 0
+        // and the EP worker both release through here): one atomic load plus one line, only
+        // with the lever on. The harness snapshots rank logs before teardown.
+        if metrale_model_layers::ssm_reserve::ssm_no_checkpoint() {
+            tracing::info!(
+                "METRALE_SSM_NO_CHECKPOINT: checkpoint reads refused = {}",
+                metrale_model_layers::ssm_reserve::ssm_checkpoint_reads_refused()
+            );
+        }
     }
 
     /// 2026-09-25: Remove `slot` from the free list if present; returns whether it
@@ -279,12 +289,25 @@ impl SsmStatePool {
             .offset((slot * ni + token_idx) * self.conv_bytes)
     }
 
-    pub(super) fn h_checkpoint(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
-        self.h_checkpoint_pools[ssm_layer_idx].offset(self.mtp_slot(slot) * self.h_stored_bytes)
+    /// 2026-10-10: Whether the pre-verify checkpoint pools exist: false under
+    /// `METRALE_SSM_NO_CHECKPOINT=1` (and without MTP).
+    pub(super) fn has_checkpoints(&self) -> bool {
+        !self.h_checkpoint_pools.is_empty()
     }
 
-    pub(super) fn conv_checkpoint(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
-        self.conv_checkpoint_pools[ssm_layer_idx].offset(self.mtp_slot(slot) * self.conv_bytes)
+    /// 2026-10-10: `None` when the checkpoint pools are not allocated
+    /// ([`Self::has_checkpoints`]).
+    pub(super) fn h_checkpoint(&self, ssm_layer_idx: usize, slot: usize) -> Option<DevicePtr> {
+        self.h_checkpoint_pools
+            .get(ssm_layer_idx)
+            .map(|p| p.offset(self.mtp_slot(slot) * self.h_stored_bytes))
+    }
+
+    /// 2026-10-10: `None` when the checkpoint pools are not allocated.
+    pub(super) fn conv_checkpoint(&self, ssm_layer_idx: usize, slot: usize) -> Option<DevicePtr> {
+        self.conv_checkpoint_pools
+            .get(ssm_layer_idx)
+            .map(|p| p.offset(self.mtp_slot(slot) * self.conv_bytes))
     }
 
     pub(super) fn reset_slot(&self, slot: usize, gpu: &dyn GpuBackend) -> Result<()> {
@@ -301,8 +324,12 @@ impl SsmStatePool {
                 for t in 0..self.num_intermediates {
                     gpu.memset(self.conv_intermediate(i, slot, t), 0, self.conv_bytes)?;
                 }
-                gpu.memset(self.h_checkpoint(i, slot), 0, self.h_stored_bytes)?;
-                gpu.memset(self.conv_checkpoint(i, slot), 0, self.conv_bytes)?;
+                if let (Some(h), Some(c)) =
+                    (self.h_checkpoint(i, slot), self.conv_checkpoint(i, slot))
+                {
+                    gpu.memset(h, 0, self.h_stored_bytes)?;
+                    gpu.memset(c, 0, self.conv_bytes)?;
+                }
             }
         }
         Ok(())
@@ -349,18 +376,15 @@ impl SsmStatePool {
                         stream,
                     )?;
                 }
-                gpu.copy_d2d_async(
+                if let (Some(hf), Some(ht), Some(cf), Some(ct)) = (
                     self.h_checkpoint(i, from),
                     self.h_checkpoint(i, to),
-                    self.h_stored_bytes,
-                    stream,
-                )?;
-                gpu.copy_d2d_async(
                     self.conv_checkpoint(i, from),
                     self.conv_checkpoint(i, to),
-                    self.conv_bytes,
-                    stream,
-                )?;
+                ) {
+                    gpu.copy_d2d_async(hf, ht, self.h_stored_bytes, stream)?;
+                    gpu.copy_d2d_async(cf, ct, self.conv_bytes, stream)?;
+                }
             }
         }
         Ok(())

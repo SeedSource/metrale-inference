@@ -267,7 +267,7 @@ pub(crate) fn preflight_reserve(
     let spec_on = spec_on_pool;
     tracing::debug!(
         "Preflight reserve breakdown: \
-         ssm_pool={} MB ({} max_batch blobs + {} MTP-covered slots × {} verify blobs, \
+         ssm_pool={} MB ({} max_batch blobs + {} MTP-covered slots × {} verify blobs{}, \
          {} ssm_layers × (h+conv)), \
          ssm_snapshot={} MB ({} slots), \
          gdn_two_phase={} MB ({} tokens), \
@@ -276,10 +276,18 @@ pub(crate) fn preflight_reserve(
         ssm_pool_bytes / (1024 * 1024),
         args.max_batch_size,
         if spec_on_pool { mtp_state_slots } else { 0 },
+        // 2026-10-10: Snapshot mode: `nd` h + (`nd`+1) conv + checkpoint blobs; the checkpoint
+        // is not reserved under `METRALE_SSM_NO_CHECKPOINT=1`.
         if spec_on_pool {
             args.resolved_num_drafts() + 2
+                - usize::from(metrale_model_layers::ssm_reserve::ssm_no_checkpoint())
         } else {
             0
+        },
+        if metrale_model_layers::ssm_reserve::ssm_no_checkpoint() {
+            " (checkpoint off)"
+        } else {
+            ""
         },
         config.num_ssm_layers(),
         ssm_snapshot_bytes / (1024 * 1024),

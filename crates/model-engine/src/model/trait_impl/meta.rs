@@ -269,10 +269,10 @@ impl TransformerModel {
                 if has_mtp {
                     // 2026-09-25: Pool addresses are fixed per slot, so a CUDA graph replays
                     // without stale pointers.
-                    ssm_state.h_state_checkpoint =
-                        Some(self.ssm_pool.h_checkpoint(ssm_layer_idx, slot));
+                    // 2026-10-10: `None` under `METRALE_SSM_NO_CHECKPOINT=1` (no pool).
+                    ssm_state.h_state_checkpoint = self.ssm_pool.h_checkpoint(ssm_layer_idx, slot);
                     ssm_state.conv_state_checkpoint =
-                        Some(self.ssm_pool.conv_checkpoint(ssm_layer_idx, slot));
+                        self.ssm_pool.conv_checkpoint(ssm_layer_idx, slot);
 
                     // 2026-09-25: Tiered pools: the h intermediate count is per slot
                     // (`h_inter_count`); the conv count is the same for every slot.

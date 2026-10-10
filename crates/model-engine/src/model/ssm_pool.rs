@@ -185,6 +185,36 @@ impl SsmStatePool {
         rollback_mode: metrale_model_layers::ssm_reserve::SsmRollbackMode,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
+        Self::new_with_checkpoint_mode(
+            config,
+            max_slots,
+            has_mtp,
+            num_intermediates,
+            num_drafts,
+            h_f16_pool,
+            rollback_mode,
+            // 2026-10-10: The same reader the preflight reserve uses
+            // (`ssm_reserve::ssm_pool_reserve_bytes`), so reserve and allocation agree.
+            metrale_model_layers::ssm_reserve::ssm_no_checkpoint(),
+            gpu,
+        )
+    }
+
+    /// 2026-10-10: [`Self::new`] with `METRALE_SSM_NO_CHECKPOINT` as a parameter, so pool
+    /// geometry is testable for both values without setting process env. With
+    /// `no_checkpoint` the per-slot pre-verify checkpoint pools are not allocated and
+    /// stay empty ([`Self::has_checkpoints`] is false).
+    pub(super) fn new_with_checkpoint_mode(
+        config: &ModelConfig,
+        max_slots: usize,
+        has_mtp: bool,
+        num_intermediates: usize,
+        num_drafts: usize,
+        h_f16_pool: bool,
+        rollback_mode: metrale_model_layers::ssm_reserve::SsmRollbackMode,
+        no_checkpoint: bool,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
         let _d_conv = config.linear_conv_kernel_dim;
 
         let h_bytes = config.ssm_h_state_bytes();
@@ -308,18 +338,41 @@ impl SsmStatePool {
 
             // 2026-09-25: One checkpoint per MTP slot (dummy included) per
             // layer, in both rollback modes.
-            let (layers, allocations) =
-                alloc_layer_pools(gpu, num_ssm_layers, mtp_total * h_stored_bytes)?;
-            h_checkpoint_pools = layers;
-            owned_allocations.extend(allocations);
-            let (layers, allocations) =
-                alloc_layer_pools(gpu, num_ssm_layers, mtp_total * conv_bytes)?;
-            conv_checkpoint_pools = layers;
-            owned_allocations.extend(allocations);
+            // 2026-10-10: Skipped under `METRALE_SSM_NO_CHECKPOINT=1`: the vecs stay
+            // empty and the preflight reserve (`ssm_checkpoint_bytes`) drops the same share.
+            let ckpt_blob = h_stored_bytes + conv_bytes;
+            if !no_checkpoint {
+                let (layers, allocations) =
+                    alloc_layer_pools(gpu, num_ssm_layers, mtp_total * h_stored_bytes)?;
+                h_checkpoint_pools = layers;
+                owned_allocations.extend(allocations);
+                let (layers, allocations) =
+                    alloc_layer_pools(gpu, num_ssm_layers, mtp_total * conv_bytes)?;
+                conv_checkpoint_pools = layers;
+                owned_allocations.extend(allocations);
+            } else {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                let skipped_mb = num_ssm_layers
+                    * metrale_model_layers::ssm_reserve::ssm_checkpoint_bytes(
+                        mtp_total, ckpt_blob, false,
+                    )
+                    / (1024 * 1024);
+                LOGGED.call_once(|| {
+                    tracing::info!(
+                        "METRALE_SSM_NO_CHECKPOINT: ENGAGED ({skipped_mb} MB of SSM checkpoint pools not allocated)"
+                    )
+                });
+            }
+            // 2026-10-10: The log arithmetic counts the checkpoint only when it exists.
+            let ckpt_slot_bytes = metrale_model_layers::ssm_reserve::ssm_checkpoint_bytes(
+                1,
+                ckpt_blob,
+                no_checkpoint,
+            );
 
             let mtp_mb = num_ssm_layers
                 * (h_inter_total * h_stored_bytes
-                    + mtp_total * (ni * conv_bytes + h_stored_bytes + conv_bytes))
+                    + mtp_total * (ni * conv_bytes + ckpt_slot_bytes))
                 / (1024 * 1024);
             // 2026-09-25: Log baseline: full-width uniform sizing, per slot
             // (ni-1) H + ni conv + a checkpoint.
@@ -327,22 +380,31 @@ impl SsmStatePool {
             if mtp_slots < max_slots || h_inter_total < full_h {
                 let saved_mb = (num_ssm_layers
                     * (max_slots - mtp_slots)
-                    * (ni.saturating_sub(1) * h_stored_bytes
-                        + ni * conv_bytes
-                        + h_stored_bytes
-                        + conv_bytes)
+                    * (ni.saturating_sub(1) * h_stored_bytes + ni * conv_bytes + ckpt_slot_bytes)
                     + num_ssm_layers * (full_h - h_inter_total) * h_stored_bytes)
                     / (1024 * 1024);
                 tracing::info!(
-                    "SSM MTP pools (conv {ni}/slot, h tiered {:?}..{:?} + checkpoints): \
+                    "SSM MTP pools (conv {ni}/slot, h tiered {:?}..{:?}{}): \
                      {mtp_mb} MB, covering {mtp_slots}/{max_slots} slots (spec dispatch \
                      width; saves {saved_mb} MB vs full-width uniform; kill switch \
                      METRALE_MTP_POOL_FULL_WIDTH)",
                     h_inter_counts.iter().min(),
                     h_inter_counts.iter().max(),
+                    if no_checkpoint {
+                        ", no checkpoints"
+                    } else {
+                        " + checkpoints"
+                    },
                 );
             } else {
-                tracing::info!("SSM MTP pools ({ni} intermediates + checkpoints): {mtp_mb} MB");
+                tracing::info!(
+                    "SSM MTP pools ({ni} intermediates{}): {mtp_mb} MB",
+                    if no_checkpoint {
+                        ", no checkpoints"
+                    } else {
+                        " + checkpoints"
+                    },
+                );
             }
         }
 

@@ -68,7 +68,7 @@ pub struct SharedPlan {
     /// 2026-10-05: Region and `tokens` bytes of the one shared scratch.
     /// 2026-10-06: Seven regions; the seventh is the radix top-k work buffer (0 with
     /// `METRALE_GLM_DSA_TOPK_RADIX` off).
-    pub plan: ([usize; 7], usize),
+    pub plan: ([usize; 8], usize),
     /// 2026-10-05: Bytes one text-layer workspace allocates on its own.
     pub layer_bytes: usize,
     /// 2026-10-05: Bytes the MTP head's workspace allocates on its own.

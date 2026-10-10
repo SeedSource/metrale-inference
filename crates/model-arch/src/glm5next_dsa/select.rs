@@ -375,7 +375,10 @@ pub struct DsaSelectScratch {
     tokens: DevicePtr,
     /// 2026-10-06: Radix top-k work buffer (region 6), NULL when none was planned.
     radix: DevicePtr,
-    capacity: [usize; 7],
+    /// 2026-10-10: BF16 copy of the pass's q (region 7), written by `dsa_q_to_bf16` for
+    /// `dsa_index_scores_tc3` (`METRALE_GLM_DSA_SCORES_TC3=1`); NULL when none was planned.
+    qbf: DevicePtr,
+    capacity: [usize; 8],
     tokens_bytes: usize,
 }
 
@@ -389,6 +392,7 @@ pub mod scores_decode;
 pub mod shared;
 pub mod split;
 pub mod tc2;
+pub mod tc3;
 
 #[cfg(test)]
 mod tests;

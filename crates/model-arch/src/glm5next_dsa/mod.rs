@@ -81,6 +81,7 @@ pub const KERNEL_MAX_KPOOL: usize = 8;
 /// 2026-10-06: So do the five `topk_radix_*` handles.
 /// 2026-10-07: So does `index_scores_tc2`.
 /// 2026-10-08: So does `index_scores_decode`.
+/// 2026-10-10: So do `index_scores_tc3` and `q_to_bf16`.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
@@ -101,6 +102,14 @@ pub struct Glm5NextDsaKernels {
     /// `METRALE_GLM_DSA_SCORES_TC2=1` (`select::tc2::scores_tc2_for`); `KernelHandle(0)` when
     /// the target lacks it, and `index_scores_tc` runs.
     pub index_scores_tc2: KernelHandle,
+    /// 2026-10-10: `dsa_index_scores_tc3`: the bytes of `index_scores_tc2` from a BF16 copy of q
+    /// (32 rows x 256 pools per block). `select_tokens` launches it, after `q_to_bf16`, in place
+    /// of `index_scores_tc2` under `METRALE_GLM_DSA_SCORES_TC3=1` (`select::tc3::scores_tc3_for`);
+    /// `KernelHandle(0)` when the target lacks it, and `index_scores_tc2` runs.
+    pub index_scores_tc3: KernelHandle,
+    /// 2026-10-10: `dsa_q_to_bf16`: q FP32 to BF16 (`__float2bfloat16_rn`), the prepass of
+    /// `index_scores_tc3`. `KernelHandle(0)` when the target lacks it.
+    pub q_to_bf16: KernelHandle,
     /// 2026-10-08: `dsa_index_scores_decode`: the bytes of `index_scores` for the ceiling
     /// (graph-replay decode) launch, q staged once per block and one pool per lane.
     /// `select_tokens` launches it in place of `index_scores` on a ceiling launch under
@@ -186,6 +195,16 @@ impl Glm5NextDsaKernels {
                 gpu,
                 DSA_MODULE,
                 "dsa_index_scores_tc2",
+            ),
+            index_scores_tc3: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_index_scores_tc3",
+            ),
+            q_to_bf16: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_q_to_bf16",
             ),
             index_scores_decode: metrale_model_layers::layers::try_kernel(
                 gpu,

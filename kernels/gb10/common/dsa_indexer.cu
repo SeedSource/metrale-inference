@@ -1259,6 +1259,418 @@ extern "C" __global__ void __launch_bounds__(DSA_TC2_THREADS, 2) dsa_index_score
 #undef DSA_TC2_CASE
 }
 
+// 2026-10-10: 2d'. dsa_q_to_bf16 + dsa_index_scores_tc3: dsa_index_scores_tc2's bytes with q
+// converted to BF16 once per call instead of once per block and head. Opt-in
+// (METRALE_GLM_DSA_SCORES_TC3=1, default off, host side
+// crates/model-arch/src/glm5next_dsa/select/tc3.rs), only where dsa_index_scores_tc2 would
+// launch; resolved with try_kernel; gated on a GPU by
+// crates/model-arch/examples/dsa_indexer_tc3_microtest.rs (bitwise against tc2, and timing).
+//
+// Why: tc2 (32 rows x 128 pools per block) reads its block's 32-row FP32 q slice from global
+// for every head and converts it, so a call reads q P / 128 times through L2 (measured
+// 53 TF/s at Q 128). Here dsa_q_to_bf16 writes q once as BF16 [Q][H][D] (half the bytes), and
+// dsa_index_scores_tc3 covers 32 rows x 256 pools per block (8 warps x 32 pools, four 8-pool
+// n-tiles per warp), so q is staged P / 256 times, as BF16 with 16-byte loads and no
+// conversion.
+//
+// Why the bytes equal tc2's for every (row r, pool p) it stores (the arithmetic of a given
+// (r, p) is tc2's, line for line; only which block and warp owns it differs):
+// - dsa_q_to_bf16 is __float2bfloat16_rn per element, the conversion tc2's q_store applies to
+//   the same FP32 value; the staging copies those bits to shared memory unchanged, and rows
+//   past Q are 0 (BF16 +0, as tc2's pack of two rounded zeros).
+// - B fragments: tc2's code (float2 keys, __float2bfloat16_rn, dsa_tc_pack, hi only), for
+//   NJ n-tiles instead of 2.
+// - Dot: per head, acc from 0.0f, one mma.sync.m16n8k16 BF16 -> FP32 per K step s = 0 ..
+//   D / 16 - 1 ascending, the A fragment from ldmatrix of the same smem layout. m-tiles start
+//   at multiples of 16 rows and n-tiles at multiples of 8 pools in tc2 and here, so (r, p) is
+//   the same row / column of the same 16 x 8 x 16 product with the same C.
+// - Head sum: sum += w * fmaxf(scale * acc, 0.0f) from 0.0f in ascending h, tc2's expression
+//   (same file, same --fmad=false).
+// - Candidacy, valid_cand and the -FLT_MAX store: tc2's code.
+// The body is a template (NJ n-tiles per warp, QF32 = FP32 q source, ABL = ablation) because
+// the microtest's tc2 ablations must be separate entry points that leave tc2 itself and its
+// SASS untouched: NJ = 2, QF32 = 1 is tc2's dataflow, ABL = 1 drops the q global loads (q_load
+// leaves zeros, the smem stores stay), ABL = 2 guards the final out / valid_cand stores with a
+// runtime flag the microtest passes as 0 (the MMAs, the head sums and the guard stay live).
+// Production uses NJ = 4, QF32 = 0, ABL = 0 only.
+//
+// Not supported (traps): geom != NULL, D not a multiple of 16 or above 128, mode != 1.
+
+#define DSA_TC3_THREADS 256u
+#define DSA_TC3_NJ 4
+#define DSA_TC3_POOLS (DSA_TC2_WARPS * 8u * (unsigned int)DSA_TC3_NJ)
+
+extern "C" __global__ void dsa_q_to_bf16(
+    const float* __restrict__ q,
+    __nv_bfloat16* __restrict__ qb,
+    unsigned int n4
+) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += gridDim.x * blockDim.x) {
+        const float4 v = reinterpret_cast<const float4*>(q)[i];
+        uint2 o;
+        o.x = dsa_tc_pack(__float2bfloat16_rn(v.x), __float2bfloat16_rn(v.y));
+        o.y = dsa_tc_pack(__float2bfloat16_rn(v.z), __float2bfloat16_rn(v.w));
+        reinterpret_cast<uint2*>(qb)[i] = o;
+    }
+}
+
+template <int NKS, int NJ, int QF32, int ABL>
+__device__ __forceinline__ void dsa_scores_tc3_tile(
+    const float* __restrict__ q32,
+    const __nv_bfloat16* __restrict__ qb,
+    const float* __restrict__ pool_keys,
+    const float* __restrict__ weights,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ pool_valid,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    float* __restrict__ out,
+    unsigned char* __restrict__ valid_cand,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int H,
+    unsigned int KP,
+    unsigned int S,
+    float scale,
+    unsigned int store_on,
+    __nv_bfloat16* qs,
+    float* ws
+) {
+    constexpr unsigned int D = 16u * (unsigned int)NKS;
+    constexpr unsigned int LD = D + 8u;
+    constexpr unsigned int BUF = DSA_TC2_ROWS * LD;
+    constexpr unsigned int PW = 8u * (unsigned int)NJ;               // pools per warp
+    constexpr unsigned int F4_ROW = D / 4u;                          // FP32 q: float4 per row
+    constexpr unsigned int F4_ALL = DSA_TC2_ROWS * F4_ROW;
+    constexpr int F4_IT = (int)((F4_ALL + DSA_TC2_THREADS - 1u) / DSA_TC2_THREADS);
+    constexpr unsigned int U4_ROW = D / 8u;                          // BF16 q: uint4 per row
+    constexpr unsigned int U4_ALL = DSA_TC2_ROWS * U4_ROW;
+    constexpr int U4_IT = (int)((U4_ALL + DSA_TC2_THREADS - 1u) / DSA_TC2_THREADS);
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int g = lane >> 2;
+    const unsigned int t = lane & 3u;
+    const unsigned int r0 = blockIdx.y * DSA_TC2_ROWS;
+    const unsigned int pw = blockIdx.x * (DSA_TC2_WARPS * PW) + warp * PW;
+    const bool active = pw < P;
+    const unsigned int WS = H + 1u;
+
+    for (unsigned int e = tid; e < DSA_TC2_ROWS * H; e += DSA_TC2_THREADS) {
+        const unsigned int rr = e / H;
+        const unsigned int hh = e - rr * H;
+        const unsigned int r = r0 + rr;
+        ws[rr * WS + hh] = r < Q ? weights[(size_t)r * H + hh] : 0.0f;
+    }
+
+    unsigned int bk[NJ][NKS][2];
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        const unsigned int p = pw + 8u * (unsigned int)j + g;
+        const bool vp = active && p < P;
+        const float* __restrict__ pk = pool_keys + (size_t)(vp ? p : 0u) * D;
+#pragma unroll
+        for (int s = 0; s < NKS; ++s) {
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+                const unsigned int k = 16u * (unsigned int)s + 8u * (unsigned int)b + 2u * t;
+                const float2 v = dsa_tc_ld2(pk, k, vp);
+                bk[j][s][b] = dsa_tc_pack(__float2bfloat16_rn(v.x), __float2bfloat16_rn(v.y));
+            }
+        }
+    }
+
+    // q staging into buffer `buf`. FP32 source (tc2's dataflow): float4 loads into registers
+    // (q_load), converted at the smem store (q_store). BF16 source: the dsa_q_to_bf16 buffer's
+    // 16-byte groups go to shared memory with cp.async (no registers, no conversion; a copy of
+    // the same bits), a row past Q as a zero fill (BF16 +0); q_store is then the wait. Either
+    // way rows past Q are zeros.
+    float4 pf[QF32 ? F4_IT : 1];
+    auto q_load = [&](unsigned int h, unsigned int buf) {
+        if constexpr (QF32) {
+#pragma unroll
+            for (int it = 0; it < F4_IT; ++it) {
+                const unsigned int e = tid + (unsigned int)it * DSA_TC2_THREADS;
+                const unsigned int rr = e / F4_ROW;
+                const unsigned int c4 = e - rr * F4_ROW;
+                const unsigned int r = r0 + rr;
+                pf[it] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (ABL != 1 && e < F4_ALL && r < Q)
+                    pf[it] = *reinterpret_cast<const float4*>(q32 + ((size_t)r * H + h) * D +
+                                                              4u * c4);
+            }
+        } else {
+#pragma unroll
+            for (int it = 0; it < U4_IT; ++it) {
+                const unsigned int e = tid + (unsigned int)it * DSA_TC2_THREADS;
+                if (e >= U4_ALL) continue;
+                const unsigned int rr = e / U4_ROW;
+                const unsigned int c8 = e - rr * U4_ROW;
+                const unsigned int r = r0 + rr;
+                const bool ok = ABL != 1 && r < Q;
+                const __nv_bfloat16* src = qb + ((size_t)(ok ? r : 0u) * H + h) * D + 8u * c8;
+                const unsigned int dst =
+                    (unsigned int)__cvta_generic_to_shared(qs + buf * BUF + rr * LD + 8u * c8);
+                const unsigned int n = ok ? 16u : 0u;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst),
+                             "l"(src), "r"(n)
+                             : "memory");
+            }
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+    };
+    auto q_store = [&](unsigned int buf) {
+        if constexpr (QF32) {
+#pragma unroll
+            for (int it = 0; it < F4_IT; ++it) {
+                const unsigned int e = tid + (unsigned int)it * DSA_TC2_THREADS;
+                if (e >= F4_ALL) continue;
+                const unsigned int rr = e / F4_ROW;
+                const unsigned int c4 = e - rr * F4_ROW;
+                uint2 v;
+                v.x = dsa_tc_pack(__float2bfloat16_rn(pf[it].x), __float2bfloat16_rn(pf[it].y));
+                v.y = dsa_tc_pack(__float2bfloat16_rn(pf[it].z), __float2bfloat16_rn(pf[it].w));
+                *reinterpret_cast<uint2*>(qs + buf * BUF + rr * LD + 4u * c4) = v;
+            }
+        } else {
+            asm volatile("cp.async.wait_all;" ::: "memory");
+        }
+    };
+
+    const unsigned int qs_base = (unsigned int)__cvta_generic_to_shared(qs);
+    unsigned int a_off[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const unsigned int row = 16u * (unsigned int)i + (lane & 7u) + ((lane >> 3) & 1u) * 8u;
+        a_off[i] = (row * LD + (lane >> 4) * 8u) * 2u;
+    }
+
+    float sum[2][NJ][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            sum[i][j][0] = 0.0f; sum[i][j][1] = 0.0f; sum[i][j][2] = 0.0f; sum[i][j][3] = 0.0f;
+        }
+    }
+
+    if (H > 0u) {
+        q_load(0u, 0u);
+        q_store(0u);
+    }
+    __syncthreads();
+
+    for (unsigned int h = 0; h < H; ++h) {
+        const unsigned int cur = h & 1u;
+        if (h + 1u < H) q_load(h + 1u, cur ^ 1u);
+        if (active) {
+            const unsigned int qbase = qs_base + cur * BUF * 2u;
+            if constexpr (NJ >= 4) {
+                // One m-tile at a time: half the live accumulators and A fragments (the
+                // 128-register budget of two blocks per SM). Each (r, p) still sees the
+                // same MMA chain from 0.0f in ascending s.
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    float acc[NJ][4];
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        acc[j][0] = 0.0f; acc[j][1] = 0.0f; acc[j][2] = 0.0f; acc[j][3] = 0.0f;
+                    }
+#pragma unroll
+                    for (int s = 0; s < NKS; ++s) {
+                        unsigned int a[4];
+                        dsa_tc2_ldsm_x4(qbase + a_off[i] + 32u * (unsigned int)s, a[0], a[1],
+                                        a[2], a[3]);
+#pragma unroll
+                        for (int j = 0; j < NJ; ++j)
+                            dsa_tc_mma(acc[j], a[0], a[1], a[2], a[3], bk[j][s][0], bk[j][s][1]);
+                    }
+                    const float wa = ws[(16u * (unsigned int)i + g) * WS + h];
+                    const float wb = ws[(16u * (unsigned int)i + g + 8u) * WS + h];
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        sum[i][j][0] += wa * fmaxf(scale * acc[j][0], 0.0f);
+                        sum[i][j][1] += wa * fmaxf(scale * acc[j][1], 0.0f);
+                        sum[i][j][2] += wb * fmaxf(scale * acc[j][2], 0.0f);
+                        sum[i][j][3] += wb * fmaxf(scale * acc[j][3], 0.0f);
+                    }
+                }
+            } else {
+                float acc[2][NJ][4];
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        acc[i][j][0] = 0.0f; acc[i][j][1] = 0.0f;
+                        acc[i][j][2] = 0.0f; acc[i][j][3] = 0.0f;
+                    }
+                }
+#pragma unroll
+                for (int s = 0; s < NKS; ++s) {
+                    unsigned int a[2][4];
+#pragma unroll
+                    for (int i = 0; i < 2; ++i)
+                        dsa_tc2_ldsm_x4(qbase + a_off[i] + 32u * (unsigned int)s, a[i][0],
+                                        a[i][1], a[i][2], a[i][3]);
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                        for (int j = 0; j < NJ; ++j)
+                            dsa_tc_mma(acc[i][j], a[i][0], a[i][1], a[i][2], a[i][3],
+                                       bk[j][s][0], bk[j][s][1]);
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const float wa = ws[(16u * (unsigned int)i + g) * WS + h];
+                    const float wb = ws[(16u * (unsigned int)i + g + 8u) * WS + h];
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        sum[i][j][0] += wa * fmaxf(scale * acc[i][j][0], 0.0f);
+                        sum[i][j][1] += wa * fmaxf(scale * acc[i][j][1], 0.0f);
+                        sum[i][j][2] += wb * fmaxf(scale * acc[i][j][2], 0.0f);
+                        sum[i][j][3] += wb * fmaxf(scale * acc[i][j][3], 0.0f);
+                    }
+                }
+            }
+        }
+        if (h + 1u < H) q_store(cur ^ 1u);
+        __syncthreads();
+    }
+
+    if (!active) return;
+    if (ABL == 2 && store_on == 0u) return;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const unsigned int r = r0 + 16u * (unsigned int)i + g + ((e < 2) ? 0u : 8u);
+                const unsigned int p = pw + 8u * (unsigned int)j + 2u * t + (unsigned int)(e & 1);
+                if (r >= Q || p >= P) continue;
+                const int end = pool_indices[(size_t)p * KP + KP - 1];
+                const int end_c = end < 0 ? 0 : (end >= (int)S ? (int)S - 1 : end);
+                const bool vis = (end_c <= q_pos[r]) && (valid_keys[end_c] != 0);
+                const bool cand = (pool_valid[p] != 0) && vis;
+                valid_cand[(size_t)r * P + p] = cand ? 1 : 0;
+                out[(size_t)r * P + p] = cand ? sum[i][j][e] : -FLT_MAX;
+            }
+        }
+    }
+}
+
+// 2026-10-10: D = 16 NKS dispatch of one block (D >> 4 is a block-uniform kernel argument).
+// Only the production variant (ABL = 0) instantiates every NKS; the ablations are D = 128.
+template <int NJ, int QF32, int ABL>
+__device__ __forceinline__ void dsa_scores_tc3_dispatch(
+    const float* __restrict__ q32,
+    const __nv_bfloat16* __restrict__ qb,
+    const float* __restrict__ pool_keys,
+    const float* __restrict__ weights,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ pool_valid,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    float* __restrict__ out,
+    unsigned char* __restrict__ valid_cand,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int H,
+    unsigned int D,
+    unsigned int KP,
+    unsigned int S,
+    float scale,
+    unsigned int store_on
+) {
+    extern __shared__ uint4 dsa_tc3_smem[];
+    __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(dsa_tc3_smem);
+    float* ws = reinterpret_cast<float*>(qs + 2u * DSA_TC2_ROWS * (D + 8u));
+#define DSA_TC3_CASE(N)                                                                      \
+    case N:                                                                                  \
+        dsa_scores_tc3_tile<N, NJ, QF32, ABL>(q32, qb, pool_keys, weights, pool_indices,     \
+                                              pool_valid, valid_keys, q_pos, out, valid_cand, \
+                                              Q, P, H, KP, S, scale, store_on, qs, ws);      \
+        break;
+    switch (D >> 4) {
+        DSA_TC3_CASE(8)
+        default:
+            if constexpr (ABL == 0) {
+                switch (D >> 4) {
+                    DSA_TC3_CASE(1)
+                    DSA_TC3_CASE(2)
+                    DSA_TC3_CASE(3)
+                    DSA_TC3_CASE(4)
+                    DSA_TC3_CASE(5)
+                    DSA_TC3_CASE(6)
+                    DSA_TC3_CASE(7)
+                    default:
+                        __trap();
+                }
+            } else {
+                __trap();
+            }
+    }
+#undef DSA_TC3_CASE
+}
+
+#ifndef DSA_TC3_MINB
+#define DSA_TC3_MINB 2
+#endif
+
+// 2026-10-10: Production: tc2's argument list with q the dsa_q_to_bf16 buffer.
+extern "C" __global__ void __launch_bounds__(DSA_TC3_THREADS, DSA_TC3_MINB) dsa_index_scores_tc3(
+    const __nv_bfloat16* __restrict__ qb,
+    const float* __restrict__ pool_keys,
+    const float* __restrict__ weights,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ pool_valid,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    float* __restrict__ out,
+    unsigned char* __restrict__ valid_cand,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int H,
+    unsigned int D,
+    unsigned int KP,
+    unsigned int S,
+    float scale,
+    const int* __restrict__ geom,
+    unsigned int mode
+) {
+    if (geom || D == 0u || (D & 15u) != 0u || D > 16u * DSA_TC_MAX_KSTEP || mode != 1u)
+        __trap();
+    dsa_scores_tc3_dispatch<DSA_TC3_NJ, 0, 0>(nullptr, qb, pool_keys, weights, pool_indices,
+                                              pool_valid, valid_keys, q_pos, out, valid_cand, Q,
+                                              P, H, D, KP, S, scale, 1u);
+}
+
+// 2026-10-10: Test-only entries for the microtest (never resolved by the engine): tc2's
+// dataflow (NJ = 2, FP32 q) as a replica (ABL = 0), without the q global loads (ABL = 1), and
+// with the final stores behind `store_on` (ABL = 2). tc2 itself is not touched. D = 128 only.
+#define DSA_TC3_ABL_ENTRY(NAME, ABL_)                                                        \
+    extern "C" __global__ void __launch_bounds__(DSA_TC2_THREADS, 2) NAME(                    \
+        const float* __restrict__ q, const float* __restrict__ pool_keys,                    \
+        const float* __restrict__ weights, const int* __restrict__ pool_indices,             \
+        const unsigned char* __restrict__ pool_valid,                                        \
+        const unsigned char* __restrict__ valid_keys, const int* __restrict__ q_pos,         \
+        float* __restrict__ out, unsigned char* __restrict__ valid_cand, unsigned int Q,     \
+        unsigned int P, unsigned int H, unsigned int D, unsigned int KP, unsigned int S,     \
+        float scale, const int* __restrict__ geom, unsigned int mode,                        \
+        unsigned int store_on) {                                                             \
+        if (geom || D != 128u || mode != 1u) __trap();                                       \
+        dsa_scores_tc3_dispatch<2, 1, ABL_>(q, nullptr, pool_keys, weights, pool_indices,    \
+                                            pool_valid, valid_keys, q_pos, out, valid_cand,  \
+                                            Q, P, H, D, KP, S, scale, store_on);             \
+    }
+DSA_TC3_ABL_ENTRY(dsa_index_scores_tc3_abl_replica, 0)
+DSA_TC3_ABL_ENTRY(dsa_index_scores_tc3_abl_noq, 1)
+DSA_TC3_ABL_ENTRY(dsa_index_scores_tc3_abl_noout, 2)
+#undef DSA_TC3_ABL_ENTRY
+
 // 2026-10-08: 2e. dsa_index_scores_decode: the scores and candidacy of dsa_index_scores,
 // byte-identical by construction, for the decode (ceiling, graph-replay) launch, which the
 // tiled and tensor-core scorers do not serve. Opt-in (METRALE_GLM_DSA_SCORES_DECODE=1, host

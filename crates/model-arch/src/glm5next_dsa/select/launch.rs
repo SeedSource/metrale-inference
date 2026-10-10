@@ -170,6 +170,25 @@ pub(super) fn select_tokens_with(
         if !tc2_on {
             log_scores_tc(tc_mode, tc, kernels, ceiling.is_some(), geom);
         }
+        // 2026-10-10: `METRALE_GLM_DSA_SCORES_TC3=1` runs `dsa_q_to_bf16` into scratch region 7,
+        // then `dsa_index_scores_tc3` (tc2's argument list, q the BF16 copy, same bytes), in
+        // place of tc2; see `tc3::scores_tc3_for`. Not on a ceiling launch (tc2 is not either).
+        let tc3_requested = tc3::dsa_scores_tc3();
+        let tc3_region_ok =
+            scratch.qbf.0 != 0 && scratch.capacity[7] >= tc3::qbf_region_bytes(geom, true);
+        let tc3_on = tc3::scores_tc3_for(
+            tc3_requested,
+            tc3::tc3_resolved(kernels),
+            tc2_on,
+            geom.q_rows,
+            tc3_region_ok,
+        );
+        tc3::log_scores_tc3(tc3_requested, tc3_on, tc2_on, kernels, geom, tc3_region_ok);
+        let mut q_ptr = inputs.q;
+        if tc3_on {
+            tc3::launch_q_to_bf16(gpu, kernels, inputs.q, scratch.qbf, geom, stream)?;
+            q_ptr = scratch.qbf;
+        }
         let requested = crate::glm5next_layer::levers::dsa_scores_tiled();
         let tiled = !tc
             && scores_tiled_for(
@@ -205,7 +224,14 @@ pub(super) fn select_tokens_with(
             kernels,
             geom,
         );
-        let (handle, grid, block, smem) = if tc2_on {
+        let (handle, grid, block, smem) = if tc3_on {
+            (
+                kernels.index_scores_tc3,
+                tc3::scores_tc3_grid(geom.q_rows, geom.n_pools),
+                tc3::SCORES_TC3_BLOCK,
+                tc2::scores_tc2_smem(d, geom.index_heads) as u32,
+            )
+        } else if tc2_on {
             (
                 kernels.index_scores_tc2,
                 tc2::scores_tc2_grid(geom.q_rows, geom.n_pools),
@@ -252,7 +278,7 @@ pub(super) fn select_tokens_with(
             .grid(grid)
             .block([block, 1, 1])
             .shared_mem(smem)
-            .arg_ptr(inputs.q)
+            .arg_ptr(q_ptr)
             .arg_ptr(pool_keys)
             .arg_ptr(inputs.weights)
             .arg_ptr(pool_indices)

@@ -5,6 +5,8 @@
 //! pool regions optional.
 //! 2026-10-06 (comb21 port): seven regions, the seventh the radix top-k work buffer
 //! (`METRALE_GLM_DSA_TOPK_RADIX`, [`radix::regions`]); the two levers plan independently.
+//! 2026-10-10: eight regions, the eighth the BF16 q copy of `METRALE_GLM_DSA_SCORES_TC3`
+//! ([`super::tc3::qbf_region_bytes`]), 0 bytes and not allocated with the lever off.
 //!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants: those of `select.rs` (a pass larger than the allocation is an `Err`; with the
@@ -36,7 +38,8 @@ impl DsaSelectScratch {
     /// bytes and not allocated ([`Self::plan_bytes_with`]).
     /// 2026-10-06: Seven regions; the seventh is the radix top-k work buffer (0 with
     /// `METRALE_GLM_DSA_TOPK_RADIX` off).
-    pub fn plan_bytes(cfg: &Glm5NextDsaConfig, geoms: &[DsaSelectGeometry]) -> ([usize; 7], usize) {
+    /// 2026-10-10: Eight; the eighth is the BF16 q copy (0 with `METRALE_GLM_DSA_SCORES_TC3` off).
+    pub fn plan_bytes(cfg: &Glm5NextDsaConfig, geoms: &[DsaSelectGeometry]) -> ([usize; 8], usize) {
         let pool_cache = crate::glm5next_dsa::pool_cache::dsa_pool_cache();
         Self::plan_bytes_levers(cfg, geoms, radix::dsa_topk_radix(), pool_cache)
     }
@@ -47,7 +50,7 @@ impl DsaSelectScratch {
         cfg: &Glm5NextDsaConfig,
         geoms: &[DsaSelectGeometry],
         lever: bool,
-    ) -> ([usize; 7], usize) {
+    ) -> ([usize; 8], usize) {
         let pool_cache = crate::glm5next_dsa::pool_cache::dsa_pool_cache();
         Self::plan_bytes_levers(cfg, geoms, lever, pool_cache)
     }
@@ -59,7 +62,7 @@ impl DsaSelectScratch {
         cfg: &Glm5NextDsaConfig,
         geoms: &[DsaSelectGeometry],
         pool_cache: bool,
-    ) -> ([usize; 7], usize) {
+    ) -> ([usize; 8], usize) {
         Self::plan_bytes_levers(cfg, geoms, radix::dsa_topk_radix(), pool_cache)
     }
 
@@ -70,8 +73,8 @@ impl DsaSelectScratch {
         geoms: &[DsaSelectGeometry],
         radix_lever: bool,
         pool_cache: bool,
-    ) -> ([usize; 7], usize) {
-        let mut capacity = [0usize; 7];
+    ) -> ([usize; 8], usize) {
+        let mut capacity = [0usize; 8];
         let mut tokens_bytes = 0;
         for g in geoms {
             for (c, w) in capacity
@@ -86,14 +89,14 @@ impl DsaSelectScratch {
     }
 
     /// 2026-10-05: Total bytes of a scratch planned by [`Self::plan_bytes`].
-    pub fn planned_total(plan: &([usize; 7], usize)) -> usize {
+    pub fn planned_total(plan: &([usize; 8], usize)) -> usize {
         plan.0.iter().sum::<usize>() + plan.1
     }
 
     /// 2026-10-05: Allocate `plan` (from [`Self::plan_bytes`]), in field order.
     /// 2026-10-06: A pool region planned at 0 bytes (`METRALE_GLM_DSA_POOL_CACHE=1`) is left
     /// null and not allocated; `fits` then refuses any pass that would write it.
-    pub fn alloc_sized(gpu: &dyn GpuBackend, plan: ([usize; 7], usize)) -> Result<Self> {
+    pub fn alloc_sized(gpu: &dyn GpuBackend, plan: ([usize; 8], usize)) -> Result<Self> {
         let (capacity, tokens_bytes) = plan;
         let pool_region = |bytes: usize| -> Result<DevicePtr> {
             if bytes == 0 {
@@ -111,6 +114,7 @@ impl DsaSelectScratch {
             selected: gpu.alloc(capacity[5])?,
             tokens: gpu.alloc(tokens_bytes)?,
             radix: radix::alloc_region(gpu, capacity[6])?,
+            qbf: radix::alloc_region(gpu, capacity[7])?,
             capacity,
             tokens_bytes,
         })
@@ -196,6 +200,7 @@ impl DsaSelectScratch {
             self.selected,
             self.tokens,
             self.radix,
+            self.qbf,
         ] {
             gpu.free(p)?;
         }

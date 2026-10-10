@@ -129,6 +129,10 @@ name = "dsa_topk_chain_prefill_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dsa_expand_tail_count_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_indexer_microtest"
 required-features = ["cuda", "gpu-examples"]
 

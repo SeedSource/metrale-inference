@@ -21,6 +21,7 @@ use super::{Glm5NextMlpConfig, Glm5NextMlpKernels};
 mod dense;
 mod launch;
 mod moe_experts;
+mod union_log;
 mod workspace;
 
 use dense::row_slices;
@@ -399,6 +400,8 @@ pub fn forward_moe_sliced(
         .arg_u32(u32::from(cfg.router_bf16_ladder))
         .launch(stream)?;
     profile::end(profile::MOE_ROUTER, t, gpu, stream);
+    // 2026-10-10: `METRALE_GLM_MOE_UNION_LOG`: observe-only, off by default.
+    union_log::maybe_log(gpu, cfg, ws.ids, rows, &groups, stream);
 
     // 2026-09-25: Zero every routed output first: an expert this rank does not own writes
     // nothing, and its slots must add zero to the sum.

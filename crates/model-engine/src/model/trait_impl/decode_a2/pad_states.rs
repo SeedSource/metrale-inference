@@ -30,6 +30,7 @@ impl TransformerModel {
             for (li, layer) in self.layers.iter().enumerate() {
                 if self.config.layer_type(li) == LayerType::LinearAttention {
                     dummy.push(Box::new(SsmLayerState {
+                        kda_defer: None,
                         h_state: self.ssm_pool.h_state(ssm_idx, dummy_ssm_slot),
                         conv_state: self.ssm_pool.conv_state(ssm_idx, dummy_ssm_slot),
                         h_state_checkpoint: None,

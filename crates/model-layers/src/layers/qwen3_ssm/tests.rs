@@ -117,6 +117,7 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
     let h_slab = gpu.alloc(h_bytes * n_inter).unwrap();
     let conv_slab = gpu.alloc(conv_bytes * n_inter).unwrap();
     SsmLayerState {
+        kda_defer: None,
         h_state: gpu.alloc(h_bytes).unwrap(),
         conv_state: gpu.alloc(conv_bytes).unwrap(),
         h_state_checkpoint: None,

@@ -12,6 +12,7 @@ fn test_empty_layer_state_downcast() {
 #[test]
 fn test_ssm_layer_state_downcast() {
     let state: Box<dyn LayerState> = Box::new(SsmLayerState {
+        kda_defer: None,
         h_state: DevicePtr(0x1000),
         conv_state: DevicePtr(0x2000),
         h_state_checkpoint: None,
@@ -30,6 +31,7 @@ fn test_ssm_layer_state_downcast() {
 #[test]
 fn test_ssm_layer_state_mut() {
     let mut state: Box<dyn LayerState> = Box::new(SsmLayerState {
+        kda_defer: None,
         h_state: DevicePtr(0x1000),
         conv_state: DevicePtr(0x2000),
         h_state_checkpoint: None,

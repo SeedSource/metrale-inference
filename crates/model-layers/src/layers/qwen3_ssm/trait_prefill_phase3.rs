@@ -96,6 +96,7 @@ impl Qwen3SsmLayer {
         let conv_state = gpu.alloc(self.conv_state_bytes)?;
         gpu.memset(conv_state, 0, self.conv_state_bytes)?;
         Ok(Box::new(SsmLayerState {
+            kda_defer: None,
             h_state,
             conv_state,
             h_state_checkpoint: None,

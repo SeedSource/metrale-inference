@@ -32,6 +32,7 @@ pub fn alloc_kda_ssm_state(gpu: &dyn GpuBackend, cfg: &Glm5NextKdaConfig) -> Res
     gpu.memset_async(conv_state, 0, conv_bytes, 0)?;
     gpu.synchronize(0)?;
     Ok(SsmLayerState {
+        kda_defer: None,
         h_state,
         conv_state,
         h_state_checkpoint: None,

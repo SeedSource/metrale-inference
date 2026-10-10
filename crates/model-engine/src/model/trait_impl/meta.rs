@@ -251,6 +251,7 @@ impl TransformerModel {
                 // 2026-09-25: The FP32 staging blob is per slot, shared by all layers.
                 let stage = self.ssm_pool.h_prefill_stage(slot);
                 let mut ssm_state = SsmLayerState {
+                    kda_defer: None,
                     h_state: self.ssm_pool.h_state(ssm_layer_idx, slot),
                     conv_state: self.ssm_pool.conv_state(ssm_layer_idx, slot),
                     h_state_checkpoint: None,

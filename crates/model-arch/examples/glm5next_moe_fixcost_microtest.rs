@@ -22,11 +22,21 @@
 //! its gate and up bytes are compared to the car `_c8` gate and up launches on every routing of
 //! every U, on the check routing with holes and on a ragged one; any mismatch prints a FAIL line.
 //!
+//! 2026-10-10: Replay mode (env FIXCOST_REPLAY=<path>|1; R=8 only): times the entries on REAL 8-row
+//! routings captured from a serve (examples/data/glm53_route_r8.bin, written by
+//! runs/race/mem/route_extract.py; embedded with include_bytes!, `1` or `embedded` selects it) and on
+//! synthetic routings at U = round(replay U_mean), each with a clean and a dirty L2 (a memset of
+//! FIXCOST_DIRTY_MB, default 6.5, before every timed MoE launch; its own time is removed by
+//! subtracting a graph of the memsets alone, since the runtime has no event-elapsed API). The REPLAY /
+//! REPLAY_SYNTH / REPLAY2 lines are per-call averages. FIXCOST_REPLAY_CHUNKS (default 24) = chunks of
+//! 42 consecutive calls, spread evenly over the file. Unset: behaviour unchanged.
+//!
 //! Env: MOE_MT_ROWS (R, 2..=8, default 8), MOE_MT_UNIONS (comma list, clamped to R * 8).
 //! Run (GPU):
 //!   METRALE_TARGET_HW=gb10 METRALE_TARGET_MODEL=glm-5.3-flash METRALE_TARGET_QUANT=nvfp4 \
 //!     cargo run -p metrale-model-arch --release --features cuda,gpu-examples \
 //!     --example glm5next_moe_fixcost_microtest
+//! Replay: add FIXCOST_REPLAY=1 (MOE_MT_UNIONS=8 shortens the sweep).
 
 use anyhow::{Result, bail};
 use half::bf16;
@@ -256,17 +266,28 @@ fn time_graph(g: &dyn GpuBackend, s: u64, f: &mut dyn FnMut() -> Result<()>) -> 
     Ok(v[SAMPLES / 2])
 }
 
+/// us per layer of the dirty-L2 memset alone (the part subtracted from the dirty arms).
+#[rustfmt::skip]
+fn time_dirty_base(g: &dyn GpuBackend, s: u64, d: DevicePtr, n: usize) -> Result<f64> {
+    let ms = time_graph(g, s, &mut || { for _ in 0..STEP_LAYERS { g.memset_async(d, 0x5A, n, s)?; } Ok(()) })?;
+    Ok(ms * 1e3 / STEP_LAYERS as f64)
+}
+
 /// us per layer of [gate, up, down, seq, down_fast, gateup_fast]; seq is the three car launches
 /// back to back; down_fast / gateup_fast (one launch for both matrices) are NaN without the entry.
 #[allow(clippy::too_many_arguments)]
 #[rustfmt::skip]
-fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &[Routing], b: &Bufs, rows: usize) -> Result<[f64; 6]> {
+fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &[Routing], b: &Bufs, rows: usize, dirty: Option<(DevicePtr, usize)>, skip_seq: bool) -> Result<[f64; 6]> {
     let mut out = [f64::NAN; 6];
+    // Dirty L2: one memset before the (single) MoE launch of each layer; modes with 1 launch only.
+    let base = match dirty { Some((d, n)) => time_dirty_base(g, s, d, n)?, None => 0.0 };
     for (mode, o) in out.iter_mut().enumerate() {
         if (mode == 4 && kz.fast.is_none()) || (mode == 5 && kz.gu.is_none()) { continue; }
+        if mode == 3 && (skip_seq || dirty.is_some()) { continue; }
         let ms = time_graph(g, s, &mut || {
             for l in 0..STEP_LAYERS {
                 let (lt, rt) = (&layers[l % LAYERS], &routs[l % routs.len()]);
+                if let Some((d, n)) = dirty { g.memset_async(d, 0x5A, n, s)?; }
                 if mode == 0 || mode == 3 { launch(g, kz.car, CAR_COLS, b.x, &lt.gate, b.c_gu, rt, rows, MI, HIDDEN, false, s)?; }
                 if mode == 1 || mode == 3 { launch(g, kz.car, CAR_COLS, b.x, &lt.up, b.c_gu, rt, rows, MI, HIDDEN, false, s)?; }
                 if mode == 2 || mode == 3 { launch(g, kz.car, CAR_COLS, b.act, &lt.down, b.c_dn, rt, rows, HIDDEN, MI, true, s)?; }
@@ -275,7 +296,7 @@ fn time_u(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], routs: &
             }
             Ok(())
         })?;
-        *o = ms * 1e3 / STEP_LAYERS as f64;
+        *o = ms * 1e3 / STEP_LAYERS as f64 - base;
     }
     Ok(out)
 }
@@ -350,6 +371,85 @@ fn fit(x: &[f64], y: &[f64]) -> (f64, f64, f64) {
     (slope, icpt, res)
 }
 
+/// 2026-10-10: Replay file "GR8R" v1: b"GR8R", u32 version, n, rows, top_k, num_experts; then n x
+/// (u8 layer, i16 ids[rows * top_k]); all little-endian. Returns the calls' ids (rows x TOP_K each).
+static EMBEDDED_REPLAY: &[u8] = include_bytes!("data/glm53_route_r8.bin");
+#[rustfmt::skip]
+fn parse_replay(b: &[u8]) -> Result<Vec<Vec<Vec<i32>>>> {
+    if b.len() < 24 || &b[..4] != b"GR8R" { bail!("replay file: bad magic"); }
+    let w = |i: usize| u32::from_le_bytes(b[4 + 4 * i..8 + 4 * i].try_into().unwrap()) as usize;
+    let (ver, n, rows, k, e) = (w(0), w(1), w(2), w(3), w(4));
+    if ver != 1 || rows != 8 || k != TOP_K || e != NUM_EXPERTS { bail!("replay file: unsupported header v{ver} rows {rows} k {k} e {e}"); }
+    let rec = 1 + 2 * rows * k;
+    if b.len() != 24 + n * rec { bail!("replay file: size {} != {}", b.len(), 24 + n * rec); }
+    Ok((0..n).map(|i| {
+        let r = &b[24 + i * rec + 1..24 + (i + 1) * rec];
+        (0..rows).map(|row| (0..k).map(|j| i16::from_le_bytes([r[2 * (row * k + j)], r[2 * (row * k + j) + 1]]) as i32).collect()).collect()
+    }).collect())
+}
+
+/// Replay driver: {real, synthetic at U = round(real U_mean)} routings x {clean, dirty} L2, per-call
+/// averages over `chunks` chunks of STEP_LAYERS calls (modes: gate, up, down, down_fast, gateup_fast).
+/// Returns the number of failed fast-vs-car byte checks.
+#[allow(clippy::too_many_arguments)]
+#[rustfmt::skip]
+fn replay(g: &dyn GpuBackend, s: u64, kz: &Kerns, layers: &[LayerTabs], b: &Bufs, rows: usize, calls: &[Vec<Vec<i32>>], c_cmp: [DevicePtr; 2], c_gu_cmp: [DevicePtr; 4], rng: &mut Rng) -> Result<usize> {
+    let want: usize = std::env::var("FIXCOST_REPLAY_CHUNKS").ok().map_or(Ok(24), |v| v.trim().parse())?;
+    let dirty_mb: f64 = std::env::var("FIXCOST_DIRTY_MB").ok().map_or(Ok(6.5), |v| v.trim().parse())?;
+    let nbytes = (dirty_mb * 1048576.0) as usize;
+    let d_dirty = g.alloc(nbytes.max(1))?;
+    let per = STEP_LAYERS.min(calls.len());
+    let chunks = (calls.len() / per).clamp(1, want);
+    let stride = calls.len() / chunks;
+    let (mut bad, mut checked) = (0usize, 0usize);
+    // acc[routing: 0 real, 1 synth][l2: 0 clean, 1 dirty] -> per-call mean of the 6 time_u modes; um[routing] = U_mean
+    let mut acc = [[[0.0f64; 6]; 2]; 2];
+    let mut um = [0.0f64; 2];
+    let mut u_syn = 0usize;
+    for pass in 0..2 {
+        for c in 0..chunks {
+            let routs: Vec<Routing> = if pass == 0 {
+                (0..per).map(|i| build_routing(g, kz.union, &calls[(c * stride + i) % calls.len()])).collect::<Result<_>>()?
+            } else {
+                (0..per).map(|_| build_routing(g, kz.union, &union_ids(rng, rows, u_syn))).collect::<Result<_>>()?
+            };
+            um[pass] += routs.iter().map(|r| r.union as f64).sum::<f64>() / (routs.len() * chunks) as f64;
+            for (l2, d) in [None, Some((d_dirty, nbytes))].into_iter().enumerate() {
+                let t = time_u(g, s, kz, layers, &routs, b, rows, d, true)?;
+                for m in 0..6 { acc[pass][l2][m] += t[m] / chunks as f64; }
+            }
+            if pass == 0 {
+                // Byte check on one real call per chunk: fast vs car.
+                let rt = &routs[c % routs.len()];
+                if let Some(fh) = kz.fast {
+                    checked += 1;
+                    if !down_fast_same(g, kz, fh, b.act, &layers[0].down, c_cmp, rt, rows)? { println!("FAIL replay down_fast chunk {c} union={}: bytes differ from car _c8", rt.union); bad += 1; }
+                }
+                if let Some(gh) = kz.gu && !gateup_fast_same(g, kz, gh, b.x, &layers[0].gate, &layers[0].up, c_gu_cmp, rt, rows)? {
+                    println!("FAIL replay gateup_fast chunk {c} union={}: gate or up bytes differ from car _c8", rt.union);
+                    bad += 1;
+                }
+            }
+            for r in &routs { free_routing(g, r)?; }
+        }
+        if pass == 0 { u_syn = um[0].round() as usize; }
+    }
+    g.free(d_dirty)?;
+    let n_calls = chunks * per;
+    let line = |tag: &str, u: f64, t: &[f64; 6]| format!("{tag} U_mean={u:.2} car_gateup_us={:.2} fast_gateup_us={:.2} car_down_us={:.2} fast_down_us={:.2}", t[0] + t[1], t[5], t[2], t[4]);
+    println!("REPLAY R={rows} calls={n_calls} U_mean={:.2} car_gateup_us={:.2} fast_gateup_us={:.2} car_down_us={:.2} fast_down_us={:.2} fast_gateup_per_U_us={:.3}",
+        um[0], acc[0][0][0] + acc[0][0][1], acc[0][0][5], acc[0][0][2], acc[0][0][4], acc[0][0][5] / um[0]);
+    println!("REPLAY_SYNTH R={rows} calls={n_calls} U_mean={:.2} car_gateup_us={:.2} fast_gateup_us={:.2} car_down_us={:.2} fast_down_us={:.2} fast_gateup_per_U_us={:.3}",
+        um[1], acc[1][0][0] + acc[1][0][1], acc[1][0][5], acc[1][0][2], acc[1][0][4], acc[1][0][5] / um[1]);
+    for (pass, rname) in ["real", "synth"].iter().enumerate() {
+        for (l2, lname) in ["clean", "dirty"].iter().enumerate() {
+            println!("{}", line(&format!("REPLAY2 routing={rname} l2={lname}"), um[pass], &acc[pass][l2]));
+        }
+    }
+    println!("CHECK replay fast==car sampled {checked} calls (bad {bad}); dirty_mb={dirty_mb} chunks={chunks}");
+    Ok(bad)
+}
+
 #[rustfmt::skip]
 fn run() -> Result<i32> {
     let rows: usize = std::env::var("MOE_MT_ROWS").ok().map_or(Ok(8), |v| v.trim().parse())?;
@@ -394,7 +494,7 @@ fn run() -> Result<i32> {
         let routs: Vec<Routing> = (0..ROUTINGS)
             .map(|_| build_routing(g, kz.union, &union_ids(&mut rng, rows, u)))
             .collect::<Result<_>>()?;
-        let t = time_u(g, s, &kz, &layers, &routs, &b, rows)?;
+        let t = time_u(g, s, &kz, &layers, &routs, &b, rows, None, false)?;
         let mu = routs.iter().map(|r| r.union as f64).sum::<f64>() / ROUTINGS as f64;
         let gbs = |us: f64| mu * (MI * HIDDEN) as f64 * BYTES_PER_W / us / 1e3;
         println!("U={u} R={rows} gate_us={:.2} up_us={:.2} down_us={:.2} seq_us={:.2} gate_GBs={:.0} up_GBs={:.0} down_GBs={:.0} down_fast_us={:.2} down_fast_GBs={:.0} gateup_fast_us={:.2} gateup_fast_GBs={:.0}",
@@ -425,6 +525,16 @@ fn run() -> Result<i32> {
         ts.push(t);
         for r in &routs { free_routing(g, r)?; }
     }
+    let mut replay_note = String::new();
+    if let Ok(v) = std::env::var("FIXCOST_REPLAY") {
+        if rows != 8 { println!("NOTE FIXCOST_REPLAY needs MOE_MT_ROWS=8: replay skipped"); } else {
+            let file = if matches!(v.trim(), "" | "1" | "embedded") { EMBEDDED_REPLAY.to_vec() } else { std::fs::read(v.trim())? };
+            let calls = parse_replay(&file)?;
+            if calls.is_empty() { bail!("replay file has no calls"); }
+            bad += replay(g, s, &kz, &layers, &b, rows, &calls, c_cmp, c_gu_cmp, &mut rng)?;
+            replay_note = format!("; replay: fast entries equal car _c8 on sampled real routings ({} calls in file)", calls.len());
+        }
+    }
     println!("FIT least squares over U>=8 (us vs union experts)");
     let sel: Vec<usize> = (0..us.len()).filter(|&i| us[i] >= 8.0).collect();
     if sel.len() >= 2 {
@@ -444,6 +554,7 @@ fn run() -> Result<i32> {
     }
     let mut fp = if kz.fast.is_some() { format!("; down_m{rows} bytes equal car _c8 on every routing") } else { String::new() };
     if kz.gu.is_some() { fp.push_str(&format!("; gateup_m{rows} gate and up bytes equal car _c8 on every routing")); }
+    fp.push_str(&replay_note);
     if bad == 0 { println!("PASS: car _m{rows}_c8 bytes equal _m{rows} on gate/up and down{fp}; sweep done"); Ok(0) } else { println!("FAIL: {bad} byte check(s) failed (car vs core, down_fast vs car, gateup_fast vs car)"); Ok(1) }
 }
 

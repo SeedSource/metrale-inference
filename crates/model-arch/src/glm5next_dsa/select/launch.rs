@@ -286,6 +286,23 @@ pub(super) fn select_tokens_with(
         );
         radix::log_radix_mode(mode);
         if mode == radix::RadixMode::Engaged {
+            // 2026-10-10: `METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1`: the pair buffer is the tail of
+            // region 6, after this pass's work buffers; see `radix_compact`.
+            let work_bytes = radix::radix_work_bytes(cfg, geom.q_rows);
+            let requested = radix_compact::dsa_topk_radix_compact();
+            let compact = radix_compact::radix_compact_for(
+                requested,
+                radix_compact::radix_compact_resolved(kernels),
+                scratch.capacity[6],
+                work_bytes,
+                geom.q_rows,
+            );
+            radix_compact::log_radix_compact(requested, compact);
+            let bins = if compact {
+                scratch.radix.offset(work_bytes)
+            } else {
+                DevicePtr::NULL
+            };
             let t = radix::RadixTopk {
                 scores: scratch.scores,
                 selected: scratch.selected,
@@ -295,6 +312,7 @@ pub(super) fn select_tokens_with(
                 select_k: selk_a,
                 kcap: radix::radix_kcap(cfg),
                 geom_dev: gd,
+                bins,
             };
             radix::launch_topk_radix(gpu, kernels, &t, stream)?;
         } else {

@@ -75,5 +75,5 @@ fn slots_match_the_kernel_source() {
     assert!(src.contains(&format!("#define DSA_RS_B0CNT  {}u", RS_B0CNT)));
     assert!(src.contains(&format!("#define DSA_RS_BINP   {}u", RS_BINP)));
     assert!(src.contains(&format!("#define DSA_COMPACT_CAP {}u", BINSTAT_CAP)));
-    assert!(RS_BINP < RADIX_STATE_WORDS);
+    const { assert!(RS_BINP < RADIX_STATE_WORDS) };
 }

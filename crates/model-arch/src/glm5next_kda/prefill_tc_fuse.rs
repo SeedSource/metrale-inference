@@ -8,8 +8,11 @@
 //! - Byte-identical to the unfused chunked-TC prefill: the chunk records, the core output, the
 //!   block output and both states carry the same bits (kernels/gb10/common/kda_front_fuse.cu
 //!   says why; `kda_front_fuse_microtest` checks it).
-//! - Only [`Glm5NextKdaLayer::prefill_chunked_tc_arm`] takes this path, after
-//!   `chunked_tc_refusal` passed; decode, verify, snapshot and capture walks never do.
+//! - Only `prefill_chunked_tc_inner` ([`Glm5NextKdaLayer::prefill_chunked_tc`] and
+//!   [`Glm5NextKdaLayer::prefill_chunked_tc_arm`]) takes this path, after `chunked_tc_refusal`
+//!   passed; decode, verify, snapshot and capture walks never do. 2026-10-10: an in-pass capture
+//!   that splits the scan inside the call runs the unfused front instead (its conv tail needs
+//!   `ws.qkv_proj`); a capture at the end of the call keeps the fused front.
 //! - Allocates nothing; `ws.qkv_proj`, `ws.conv_out`, `ws.gate` and `ws.beta` are left
 //!   unwritten (nothing on this path reads them).
 //!

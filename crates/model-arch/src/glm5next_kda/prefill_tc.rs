@@ -48,7 +48,9 @@
 //! 2026-10-07: Under `METRALE_GLM_KDA_FRONT_FUSE=1` the first three launches and the front
 //! end's pack, gate and beta sigmoid become two (prefill_tc_fuse.rs); the scan is unchanged.
 
-use super::prefill_tc_fuse::{front_fuse_refusal, kda_front_fuse, kda_front_fuse_fallback};
+use super::prefill_tc_fuse::{
+    front_fuse_refusal, kda_front_fuse, kda_front_fuse_fallback, kda_front_fuse_split_capture,
+};
 use super::*;
 use metrale_model_layers::layer::InpassSplit;
 

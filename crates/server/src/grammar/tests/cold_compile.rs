@@ -352,3 +352,15 @@ fn a_failed_snapshot_save_is_latched_not_retried() {
     assert_eq!(e.snapshot_save_state(), Some((1, true)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 2026-10-10: `METRALE_GRAMMAR_CACHE_MB`: unset or blank keeps 1 GiB, a value
+/// sets MiB, and a typo or a value below 16 is an error, never the default.
+#[test]
+fn grammar_cache_mb_parses_strictly() {
+    use crate::grammar::engine::cache_budget_bytes;
+    assert_eq!(cache_budget_bytes(None), Ok(1024 * 1024 * 1024));
+    assert_eq!(cache_budget_bytes(Some("  ")), Ok(1024 * 1024 * 1024));
+    assert_eq!(cache_budget_bytes(Some("256")), Ok(256 * 1024 * 1024));
+    assert!(cache_budget_bytes(Some("256MB")).is_err());
+    assert!(cache_budget_bytes(Some("8")).is_err());
+}

@@ -14,6 +14,22 @@ use metrale_grammar::{GrammarCompiler, TokenizerInfo, VocabType, detect_metadata
 /// each to stay inside its share.
 const GRAMMAR_CACHE_BUDGET_BYTES: isize = 1024 * 1024 * 1024;
 
+/// 2026-10-10: `METRALE_GRAMMAR_CACHE_MB` overrides [`GRAMMAR_CACHE_BUDGET_BYTES`]
+/// in MiB (at least 16). The whole cache lives in the host memory of the rank
+/// that runs grammar, and one compiled grammar over a ~155K-token vocab is
+/// ~20 MB, so the budget sets how many distinct tool sets stay cached; a miss
+/// recompiles. Unset or blank keeps 1 GiB; anything else that does not parse
+/// is an error, so a typo stops model load instead of silently using 1 GiB.
+pub(crate) fn cache_budget_bytes(raw: Option<&str>) -> Result<isize, String> {
+    let mb = crate::env_config::parse_min::<isize>(
+        "METRALE_GRAMMAR_CACHE_MB",
+        raw,
+        16,
+        "the grammar cache budget in MiB",
+    )?;
+    Ok(mb.map_or(GRAMMAR_CACHE_BUDGET_BYTES, |mb| mb * 1024 * 1024))
+}
+
 use super::extract_ordered_vocab;
 
 /// 2026-09-25: The grammar compiler shared by every request to a loaded model.
@@ -137,7 +153,9 @@ impl GrammarEngine {
         // because the compiled-grammar cache keys by the full request text:
         // every distinct tool set adds an entry, and only the budget's LRU
         // eviction removes them.
-        let compiler = GrammarCompiler::new(&tokenizer_info, 1, true, GRAMMAR_CACHE_BUDGET_BYTES)
+        let budget = cache_budget_bytes(std::env::var("METRALE_GRAMMAR_CACHE_MB").ok().as_deref())
+            .map_err(GrammarError::Compilation)?;
+        let compiler = GrammarCompiler::new(&tokenizer_info, 1, true, budget)
             .map_err(GrammarError::Compilation)?;
         Ok(Self {
             compiler,

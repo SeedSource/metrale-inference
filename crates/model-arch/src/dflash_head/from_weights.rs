@@ -110,7 +110,7 @@ impl BlockDiffusionDraftHead {
 
         // 2026-09-25: A `gpu.kernel(..)?` handle is required and fails construction
         // when absent; a `try_kernel` handle is `KernelHandle(0)` when absent.
-        let kernels = kernel_handles::load_kernels(gpu)?;
+        let kernels = kernel_handles::load_kernels(gpu, head_dim)?;
 
         // 2026-09-25: Scratch, allocated once. The row buffers hold `rows_max` rows: the
         // non-paged path's `ctx_window` ctx rows plus `gamma` block rows, or `nb` bands of

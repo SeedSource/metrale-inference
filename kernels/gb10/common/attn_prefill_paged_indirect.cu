@@ -39,7 +39,10 @@
         } \
     } while(0)
 
+// 2026-10-10: Overridable so attn_prefill_paged_indirect_h128.cu can build this body under its own symbol (A93).
+#ifndef KERNEL_NAME
 #define KERNEL_NAME attn_prefill_paged_indirect
+#endif
 #define K_CACHE_TYPE const __nv_bfloat16* __restrict__
 #define V_CACHE_TYPE const __nv_bfloat16* __restrict__
 #define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d,                          \

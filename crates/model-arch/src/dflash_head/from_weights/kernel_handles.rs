@@ -3,15 +3,27 @@
 //! 2026-09-26: The DFlash drafter's kernel handles, resolved once when the head is built.
 //!
 //! Owner: model-arch (DFlash drafter).
-//! Invariants: none beyond the types.
+//! Invariants: the γ-block paged-indirect attention is the build for the drafter's `head_dim`
+//! (`attn_width`, A93); a width without a build fails construction.
 
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::GpuBackend;
 
 use crate::dflash_head::DflashKernels;
+use crate::dflash_head::attn_width;
 
 /// 2026-09-26: Every handle in `DflashKernels`, resolved in field order.
-pub(super) fn load_kernels(gpu: &dyn GpuBackend) -> Result<DflashKernels> {
+pub(super) fn load_kernels(gpu: &dyn GpuBackend, head_dim: usize) -> Result<DflashKernels> {
+    // 2026-10-10: The paged-indirect kernel's tile width is compile-time; pick the build for this
+    // drafter's head_dim and refuse a mismatch before binding it (A93).
+    let indirect = attn_width::paged_indirect_spec_for(head_dim)?;
+    attn_width::assert_width(indirect, head_dim)?;
+    tracing::info!(
+        "DFlash γ-block attention: {}::{} (HDIM {}, drafter head_dim {head_dim})",
+        indirect.module,
+        indirect.func,
+        indirect.hdim
+    );
     Ok(DflashKernels {
         // 2026-09-25: The drafter's norms use `rms_norm_vanilla`
         // (`x * w / RMS(x)`), not `rms_norm`, which computes `x * (1 + w) / RMS(x)`.
@@ -30,8 +42,7 @@ pub(super) fn load_kernels(gpu: &dyn GpuBackend) -> Result<DflashKernels> {
         reshape_cache_bf16: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash")?,
         prefill_attn_dflash_fp8: gpu.kernel("prefill_paged_fp8", "attn_prefill_paged_fp8")?,
         prefill_attn_dflash_bf16: gpu.kernel("prefill_paged", "attn_prefill_paged")?,
-        prefill_attn_dflash_bf16_indirect: gpu
-            .kernel("prefill_paged_indirect", "attn_prefill_paged_indirect")?,
+        prefill_attn_dflash_bf16_indirect: gpu.kernel(indirect.module, indirect.func)?,
         silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
         residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
         argmax: gpu.kernel("argmax", "argmax_bf16")?,

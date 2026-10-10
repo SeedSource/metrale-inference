@@ -248,6 +248,7 @@ pub struct BlockDiffusionDraftHead {
     pub selector_hidden_proj: Option<DenseWeight>,
 }
 
+mod attn_width;
 mod dflash2;
 /// 2026-09-25: Rows the batched ctx precompute staging holds per step.
 pub(super) const PRECOMPUTE_BATCH_ROWS: usize = 256;

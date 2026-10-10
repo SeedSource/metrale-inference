@@ -33,6 +33,21 @@ pub struct GdnCarryBinding {
     pub conv_tab: DevicePtr,
 }
 
+/// 2026-10-09: `METRALE_GLM_KDA_DEFER_COMMIT=1`: where row 0 of one sequence's K-row verify
+/// reads its input recurrent and conv state. A partial-accept commit no longer copies verify
+/// intermediate `a - 1` into the live state; it leaves the index in the device `i32` at `idx`
+/// (`-1`: the live state is current). The kernel reads that word, so a captured verify graph
+/// stays valid; `h_base` / `conv_base` are this layer's intermediate 0 for the slot and the
+/// strides the bytes between consecutive intermediates (model-engine `kda_defer.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SsmDeferSrc {
+    pub idx: DevicePtr,
+    pub h_base: DevicePtr,
+    pub h_stride: usize,
+    pub conv_base: DevicePtr,
+    pub conv_stride: usize,
+}
+
 /// 2026-09-26: A supertrait of `TransformerLayer`; see the module header.
 pub trait LayerWriteOnAccept {
     /// 2026-09-25: Per-sequence write-on-accept stash size in f32 elements when this layer
@@ -57,6 +72,13 @@ pub trait LayerWriteOnAccept {
     /// 2026-09-26: Bind this layer's carried-state buffers. Called once, before any
     /// capture; the buffers never move afterwards.
     fn gdn_carry_bind(&self, _binding: GdnCarryBinding) {}
+
+    /// 2026-10-09: Whether this layer's K-row verify honours [`SsmDeferSrc`]
+    /// (`METRALE_GLM_KDA_DEFER_COMMIT=1` with the kernels it needs). The model defers a commit
+    /// only when every linear-attention layer answers true. Default false.
+    fn kda_defer_commit_ready(&self) -> bool {
+        false
+    }
 
     /// 2026-09-25: Apply the accepted rows of the last batched verify to this layer's h
     /// states. `h_table` is the layer's WY pointer-table slice, `na_tab` a device `u32[n]`

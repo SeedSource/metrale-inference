@@ -231,6 +231,7 @@ mod prefill_narrowing_tests {
 
     fn state(stage: Option<DevicePtr>, h_is_f16: bool) -> SsmLayerState {
         SsmLayerState {
+            kda_defer: None,
             h_state: DevicePtr(0x1000),
             conv_state: DevicePtr(0x2000),
             h_state_checkpoint: None,

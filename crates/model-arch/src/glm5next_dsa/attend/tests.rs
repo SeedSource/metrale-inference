@@ -283,21 +283,49 @@ fn prefill_tc_names_and_mirrors_are_consistent() {
 #[test]
 fn prefill_tc2_replaces_only_tensor_core_launches() {
     use super::prefill_tc::prefill_tc2_ignored;
-    assert_eq!(prefill_tc2_ignored(true, None, true), None);
-    let off = prefill_tc2_ignored(false, None, true).unwrap();
+    assert_eq!(prefill_tc2_ignored(true, None, None, true), None);
+    let off = prefill_tc2_ignored(false, None, None, true).unwrap();
     assert!(off.contains("METRALE_GLM_MLA_PREFILL_TC is off"), "{off}");
     // 2026-10-08: TC off wins over everything else: nothing the TC2 kernel could replace.
-    assert_eq!(prefill_tc2_ignored(false, Some("x"), false), Some(off));
-    let refused = prefill_tc2_ignored(true, Some("selection width 4000 > 2560"), true).unwrap();
+    assert_eq!(
+        prefill_tc2_ignored(false, Some("x"), Some("y"), false),
+        Some(off)
+    );
+    let refused =
+        prefill_tc2_ignored(true, Some("selection width 4000 > 2560"), None, true).unwrap();
     assert!(
         refused.contains(MLA_PREFILL_TC_ENTRY) && refused.contains("selection width 4000"),
         "{refused}"
     );
-    let unresolved = prefill_tc2_ignored(true, None, false).unwrap();
+    let unresolved = prefill_tc2_ignored(true, None, None, false).unwrap();
     assert!(
         unresolved.contains(MLA_PREFILL_TC2_ENTRY) && unresolved.contains("did not resolve"),
         "{unresolved}"
     );
+    // 2026-10-09: A6: a launch the tensor-core kernel takes but the rewrite refuses goes to the
+    // tensor-core kernel, with the rewrite named as the refuser.
+    let own = prefill_tc2_ignored(true, None, Some("page stride"), true).unwrap();
+    assert!(
+        own.contains(MLA_PREFILL_TC2_ENTRY) && own.contains("page stride"),
+        "{own}"
+    );
+}
+
+/// 2026-10-09: A6 addresses keys as cache rows x 512 bytes, so it takes only pages of
+/// `block_size` contiguous rows; a padded page (16-byte aligned, so the tensor-core kernel takes
+/// it) is refused by the rewrite only.
+#[test]
+fn prefill_tc2_refuses_a_page_stride_that_is_not_block_size_rows() {
+    use super::prefill_tc::prefill_tc2_refusal;
+    assert_eq!(prefill_tc2_refusal(&paging()), None);
+    let padded = DsaDecodePaging {
+        cache_stride_bytes: 64 * 512 + 16,
+        ..paging()
+    };
+    let why = prefill_tc2_refusal(&padded).unwrap();
+    assert!(why.contains("page stride 32784"), "{why}");
+    let g = DsaSelectGeometry::plan(&cfg(), 8_192, 1).unwrap();
+    assert!(!tc_refused(&cfg(), &g, &padded, &tc_inputs()));
 }
 
 /// 2026-10-08: The rewrite launches with the tensor-core kernel's geometry: same heads per block

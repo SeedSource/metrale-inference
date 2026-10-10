@@ -316,7 +316,7 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let prompt_len = seq.prompt_len;
+        let (prompt_len, run_start) = (seq.prompt_len, seq.prefill_run_start);
         // 2026-10-10: `dflash_ctx_state`: the hybrid serve's DFlash state, else `proposer_state`.
         let dstate = match self.dflash_ctx_state(seq) {
             Some(ps) => match ps
@@ -336,6 +336,7 @@ impl TransformerModel {
             prompt_len,
             chunk_start + proc_count,
             dstate.max_ctx_len,
+            run_start,
         );
         let src_base = self.buffers.hidden_states();
         let (t0, rows) = win.chunk_rows(chunk_start, proc_count);
@@ -370,7 +371,7 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let prompt_len = seq.prompt_len;
+        let (prompt_len, run_start) = (seq.prompt_len, seq.prefill_run_start);
         if let Some(ps) = self.dflash_ctx_state(seq)
             && let Some(dstate) =
                 ps.as_any_mut()
@@ -381,6 +382,7 @@ impl TransformerModel {
                 prompt_len,
                 chunk_end,
                 dstate.max_ctx_len,
+                run_start,
             );
             dstate.ctx_len = win.len_after(chunk_end);
             // 2026-09-25: Prefill slot i holds prompt position i, so each

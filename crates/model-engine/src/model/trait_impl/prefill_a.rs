@@ -239,6 +239,8 @@ impl TransformerModel {
         } else {
             (tokens, n, 0usize)
         };
+        // 2026-10-10: The DFlash prefill window starts no earlier than the first row run.
+        seq.prefill_run_start = seq_len_start;
 
         // 2026-09-25: 2. Embed the processed tokens into `[proc_count, H]`.
         {

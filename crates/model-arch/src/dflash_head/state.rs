@@ -160,11 +160,12 @@ pub struct PrefillCtxWindow {
 impl PrefillCtxWindow {
     /// 2026-10-10: The window of a prompt of `prompt_len` tokens. `chunk_end` (the end of the
     /// chunk just run) raises `end` if `prompt_len` is stale, so a captured row never falls
-    /// past the window.
-    pub fn new(prompt_len: usize, chunk_end: usize, max_ctx_len: usize) -> Self {
+    /// past the window. `run_start` is the first position this prefill runs (a prefix-cache
+    /// skip point, else 0): the window starts no earlier, so it holds only captured rows.
+    pub fn new(prompt_len: usize, chunk_end: usize, max_ctx_len: usize, run_start: usize) -> Self {
         let end = prompt_len.max(chunk_end);
         Self {
-            start: end.saturating_sub(max_ctx_len),
+            start: end.saturating_sub(max_ctx_len).max(run_start.min(end)),
             end,
         }
     }
@@ -227,7 +228,7 @@ mod prefill_window_tests {
                 let mut cs = 0;
                 while cs < p {
                     let n = chunk.min(p - cs);
-                    let win = PrefillCtxWindow::new(p, cs + n, w);
+                    let win = PrefillCtxWindow::new(p, cs + n, w, 0);
                     assert_eq!(win.start, 0);
                     let (rows, len) = first_w(cs, n, w);
                     assert_eq!(kept(&win, cs, n), rows, "p={p} chunk={chunk} cs={cs}");
@@ -251,7 +252,7 @@ mod prefill_window_tests {
             let mut cs = 0;
             while cs < p {
                 let n = chunk.min(p - cs);
-                let win = PrefillCtxWindow::new(p, cs + n, w);
+                let win = PrefillCtxWindow::new(p, cs + n, w, 0);
                 assert_eq!(win.span(), (s, p));
                 for t in kept(&win, cs, n) {
                     let pos = cs + t;
@@ -269,18 +270,56 @@ mod prefill_window_tests {
             assert_eq!(slots, (s..p).collect::<Vec<_>>(), "chunk={chunk}");
         }
         // A chunk ending exactly at `start` keeps nothing; one starting there keeps all.
-        let win = PrefillCtxWindow::new(p, s, w);
+        let win = PrefillCtxWindow::new(p, s, w, 0);
         assert_eq!(win.chunk_rows(s - 100, 100), (0, 0));
         assert_eq!(win.chunk_rows(s, 100), (0, 100));
         assert_eq!(win.chunk_rows(s - 1, 2), (1, 1));
     }
 
+    /// 2026-10-10: A prefix-cache skip: the window starts at max(P - W, first position run),
+    /// with the skip point before, at and after P - W, inside and past the window, and a whole
+    /// restored prompt (only the last token re-runs). Every slot is a captured row, `ctx_len`
+    /// counts only those, and the positions are absolute from the window start.
+    #[test]
+    fn a_prefix_skip_starts_the_window_at_the_first_row_run() {
+        let w = 2048;
+        for p in [1500usize, 5000] {
+            let tail = p.saturating_sub(w);
+            for skip in [0, tail / 2, tail, tail + 1, tail + 300, p - 1] {
+                let s = tail.max(skip);
+                for chunk in [256usize, 1000, 2048, 5000] {
+                    let mut slots = Vec::new();
+                    // The prefill runs from `skip`; rows before it are cached, never captured.
+                    let mut cs = skip;
+                    while cs < p {
+                        let n = chunk.min(p - cs);
+                        let win = PrefillCtxWindow::new(p, cs + n, w, skip);
+                        assert_eq!(win.span(), (s, p), "p={p} skip={skip}");
+                        for t in kept(&win, cs, n) {
+                            slots.push(cs + t);
+                        }
+                        let len = win.len_after(cs + n);
+                        assert_eq!(len, slots.len(), "p={p} skip={skip} cs={cs}");
+                        let want: Vec<i32> = (s..s + len).map(|x| x as i32).collect();
+                        assert_eq!(win.positions_after(cs + n), want);
+                        cs += n;
+                    }
+                    assert_eq!(slots, (s..p).collect::<Vec<_>>(), "p={p} skip={skip}");
+                }
+            }
+        }
+        // No skip: the window is the plain last-W one.
+        assert_eq!(PrefillCtxWindow::new(5000, 5000, w, 0).span(), (2952, 5000));
+        // A run start past the prompt is clamped to the end.
+        assert_eq!(PrefillCtxWindow::new(100, 100, w, 400).span(), (100, 100));
+    }
+
     /// A stale (short) prompt length never lets a row past the window.
     #[test]
     fn a_stale_prompt_len_is_raised_to_the_chunk_end() {
-        let win = PrefillCtxWindow::new(0, 300, 2048);
+        let win = PrefillCtxWindow::new(0, 300, 2048, 0);
         assert_eq!(win.span(), (0, 300));
-        let win = PrefillCtxWindow::new(10, 3000, 2048);
+        let win = PrefillCtxWindow::new(10, 3000, 2048, 0);
         assert_eq!(win.span(), (952, 3000));
     }
 }

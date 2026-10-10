@@ -81,6 +81,12 @@ pub struct SequenceState {
     /// 2026-09-25: Prompt position covered by the restored SSM snapshot and cached KV, set by the
     /// chunk-0 prefix lookup and returned again when that lookup is replayed.
     pub marconi_skip_to: usize,
+    /// 2026-10-10: First prompt position the current prefill runs through the layers: 0 without
+    /// a prefix skip, else the skip point (the last prompt position when the whole prompt was
+    /// restored and only its last token re-runs). Set at chunk 0 (`prefill_b` from the
+    /// rank-agreed `marconi_skip_to`, `prefill_a` from its own skip). The DFlash prefill window
+    /// starts no earlier (`PrefillCtxWindow`), so the drafter never sees an uncaptured row.
+    pub prefill_run_start: usize,
     /// 2026-09-25: Snapshot slot when the whole prompt matched a snapshot. The last prompt token
     /// is then re-run for logits, which advances the SSM state a second time, so
     /// `finalize_last` restores the state from this snapshot again and takes the first token's
@@ -219,6 +225,7 @@ impl SequenceState {
             slot_idx,
             ssm_slot: None,
             marconi_skip_to: 0,
+            prefill_run_start: 0,
             marconi_exact_snap: None,
             session_hash: 0,
             mtp_capture_gen: 0,

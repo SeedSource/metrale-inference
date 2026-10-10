@@ -330,6 +330,10 @@ impl TransformerModel {
             );
             let skip_tokens = snap_agree::skip_point(skip, snap_tok, matched, total, has_ssm);
             seq.marconi_skip_to = skip_tokens;
+            // 2026-10-10: The first position this prefill runs: the skip point, or the last
+            // token's re-run when the whole prompt was restored. Rank-agreed, as `skip_tokens`
+            // is (`snap_agree::skip_point` over the agreed restore and the F83-capped match).
+            seq.prefill_run_start = skip_tokens.min(total.saturating_sub(1));
             // 2026-09-25: Report what was reused, not what matched: an SSM hit without a
             // restore has `matched > 0` but skips nothing (`reused_prefix_tokens`).
             seq.reused_prefix_tokens = crate::model::trait_impl::prefix_reuse::reused_prefix_tokens(

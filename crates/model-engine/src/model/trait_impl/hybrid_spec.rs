@@ -206,7 +206,7 @@ impl TransformerModel {
         let Some(comm) = self.comm.as_deref() else {
             return Ok(());
         };
-        let prompt_len = seq.prompt_len;
+        let (prompt_len, run_start) = (seq.prompt_len, seq.prefill_run_start);
         let Some(max_ctx) = self.dflash_ctx_state(seq).and_then(|ps| {
             ps.as_any_mut()
                 .downcast_mut::<metrale_model_arch::dflash_head::DflashProposerState>()
@@ -218,6 +218,7 @@ impl TransformerModel {
             prompt_len,
             chunk_start + proc_count,
             max_ctx,
+            run_start,
         );
         let rows = metrale_model_arch::glm5next_layer::seq_parallel::tap_window_rows(
             chunk_start,

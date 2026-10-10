@@ -347,6 +347,7 @@ impl TransformerModel {
             slot_idx: slot,
             ssm_slot: Some(slot_guard),
             marconi_skip_to: 0,
+            prefill_run_start: 0,
             marconi_exact_snap: None,
             session_hash: 0,
             mtp_capture_gen: 0,

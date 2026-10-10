@@ -325,7 +325,7 @@ fn tap_swap_rows_match_the_non_sp_kept_rows() {
             let mut cs = 0;
             while cs < p {
                 let n = chunk.min(p - cs);
-                let win = PrefillCtxWindow::new(p, cs + n, w);
+                let win = PrefillCtxWindow::new(p, cs + n, w, 0);
                 let sp = tap_window_rows(cs, n, win.span());
                 assert_eq!(sp, win.chunk_rows(cs, n), "p={p} chunk={chunk} cs={cs}");
                 let plan = SpPlan::new(&owner_chunks(n, 256, 2048, true)).unwrap();

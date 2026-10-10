@@ -1015,3 +1015,86 @@ fn self_spec_commits_token_0_before_picking_the_window() {
     assert_eq!(a.last_token, THINK_END);
     assert_eq!(commit_state(&a), commit_state(&serial));
 }
+
+// 2026-10-10: A155 R07: the masked chat fast path (`fast_masked.rs`) returned
+// the GPU argmax at any temperature, so speculative content tokens above 0
+// were greedy where decode and the host verify path sample. It now declines a
+// row with temperature > 0 when `mtp_verify_sample` is on (and
+// `force_temp_zero` off), as the other two fast paths already do.
+
+/// 2026-10-10: like [`with_ctx`], with only the masked chat fast path's
+/// levers on (`dflash_masked_verify`, `fast_masked`) and `mtp_verify_sample`
+/// as given.
+fn with_ctx_masked_chat<R>(mtp_verify_sample: bool, f: impl FnOnce(&LogitsContext) -> R) -> R {
+    let scratch = crate::scheduler::sched_ctx::DecodeScratch::default();
+    let io = crate::scheduler::io::SchedIo::for_test();
+    let ctx = LogitsContext {
+        scratch: &scratch,
+        tel: &*io.tel,
+        clock: &*io.clock,
+        watchdog: crate::scheduler::helpers::WatchdogParams::default(),
+        boundary_mask: None,
+        mid_word_mask: None,
+        sampling: SamplingLevers {
+            dflash_masked_verify: true,
+            fast_masked: true,
+            mtp_verify_sample,
+            think_ended_gpu_argmax: true,
+            ..SamplingLevers::default()
+        },
+        think_end_token: Some(THINK_END),
+        think_start_token: Some(THINK_START),
+        tool_call_start_token: Some(TOOL_CALL_OPEN),
+        tool_call_end_token: Some(TOOL_CALL_CLOSE),
+        code_fence_token: None,
+        verify_pos: 0,
+    };
+    f(&ctx)
+}
+
+/// 2026-10-10: a content token the host rows below make certain.
+const WORLD: u32 = b'w' as u32;
+
+#[test]
+fn masked_chat_fast_path_at_temperature_zero_returns_the_gpu_argmax() {
+    // 2026-10-10: the stub holds no rows, so a D2H would panic: passing proves
+    // the masked chat fast path answered.
+    let mut a = post_think_grammarless_seq();
+    a.temperature = 0.0;
+    let model = FastPathStubModel::new(VOCAB, &[]);
+    let picks = with_ctx_masked_chat(true, |ctx| {
+        verify_pick_all_with_pipeline(&model, &[HELLO], &mut a, ctx, 0)
+    });
+    assert_eq!(picks, vec![HELLO]);
+}
+
+#[test]
+fn masked_chat_fast_path_declines_above_temperature_zero() {
+    // 2026-10-10: the passed GPU argmax (HELLO) disagrees with the host row,
+    // where WORLD holds all the mass. Only the host path, which samples, can
+    // return WORLD.
+    let mut a = post_think_grammarless_seq();
+    a.temperature = 0.6;
+    let model = FastPathStubModel::new(VOCAB, &[row(&[(WORLD, 100.0)])]);
+    let picks = with_ctx_masked_chat(true, |ctx| {
+        verify_pick_all_with_pipeline(&model, &[HELLO], &mut a, ctx, 0)
+    });
+    assert_eq!(
+        picks,
+        vec![WORLD],
+        "a row above temperature 0 must be sampled on the host, not given the GPU argmax"
+    );
+}
+
+#[test]
+fn masked_chat_fast_path_above_zero_without_verify_sampling_is_unchanged() {
+    // 2026-10-10: with `mtp_verify_sample` off the host path would itself take
+    // the argmax, so the fast path still answers (no rows: a D2H would panic).
+    let mut a = post_think_grammarless_seq();
+    a.temperature = 0.6;
+    let model = FastPathStubModel::new(VOCAB, &[]);
+    let picks = with_ctx_masked_chat(false, |ctx| {
+        verify_pick_all_with_pipeline(&model, &[HELLO], &mut a, ctx, 0)
+    });
+    assert_eq!(picks, vec![HELLO]);
+}

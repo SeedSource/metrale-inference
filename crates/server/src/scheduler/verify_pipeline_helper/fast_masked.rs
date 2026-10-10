@@ -24,8 +24,13 @@ use metrale_model_engine::traits::Model;
 /// penalty-immune (`fast_greedy`).
 ///
 /// Not checked: `MinTokensEosMask`, so an EOS argmax below `min_tokens` is
-/// returned unmasked; and the temperature, so above 0 this returns the
-/// argmax where the host path, with `mtp_verify_sample` on, would sample.
+/// returned unmasked.
+///
+/// 2026-10-10 (A155 R07): declines a row whose temperature is above 0 when
+/// `mtp_verify_sample` is on and `force_temp_zero` is off, so the host path
+/// samples it, as the two later fast paths of `verify_pick_all_with_pipeline`
+/// already do. Before this, speculative content tokens at T>0 were greedy.
+/// Rows at temperature 0 are unchanged.
 ///
 /// `row_base` is as for `verify_pick_all_with_pipeline`.
 pub(super) fn try_chat_fast_path(
@@ -41,6 +46,9 @@ pub(super) fn try_chat_fast_path(
     // fires, the GPU argmax replaces the host argmax, which can break
     // near-ties differently.
     if !ctx.sampling.dflash_masked_verify {
+        return None;
+    }
+    if a.temperature > 0.0 && ctx.sampling.mtp_verify_sample && !ctx.sampling.force_temp_zero {
         return None;
     }
     let fast_masked_enabled = ctx.sampling.fast_masked;

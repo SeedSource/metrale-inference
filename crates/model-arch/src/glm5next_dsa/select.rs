@@ -388,6 +388,7 @@ pub mod radix;
 pub mod scores_decode;
 pub mod shared;
 pub mod split;
+pub mod tail_count;
 pub mod tc2;
 
 #[cfg(test)]

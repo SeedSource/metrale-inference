@@ -1943,7 +1943,16 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_s
 // row of `width` slots (index_topk, plus index_kpool - 1 when always_tail). The row is
 // filled with -1 and synchronised before any real index is written, so short rows, invalid
 // pools and a missing tail all leave the sentinel.
-extern "C" __global__ void dsa_expand_selection(
+//
+// 2026-10-10: The body is a template on CC, so two entry points share it. CC = false is
+// `dsa_expand_selection` exactly as before (the byte scan of valid_keys). CC = true is
+// `dsa_expand_selection_cc` (METRALE_GLM_DSA_EXPAND_TAIL_COUNT=1): the same integer
+// vis_count from per-chunk counts of valid_keys (`dsa_valid_chunk_counts`, one launch per
+// call) plus a byte scan of at most one partial chunk, so a row reads about S / 1024 ints and
+// at most 1023 bytes instead of S bytes.
+#define DSA_CC_CHUNK 1024
+template <bool CC>
+__device__ __forceinline__ void dsa_expand_selection_body(
     const int* __restrict__ selected,
     const int* __restrict__ pool_indices,
     const unsigned char* __restrict__ valid_cand,
@@ -1959,7 +1968,8 @@ extern "C" __global__ void dsa_expand_selection(
     unsigned int width,
     int first_key,
     int always_tail,
-    const int* __restrict__ geom
+    const int* __restrict__ geom,
+    const int* __restrict__ chunk_cnt
 ) {
     const unsigned int r = blockIdx.x;
     const unsigned int tid = threadIdx.x;
@@ -2028,8 +2038,23 @@ extern "C" __global__ void dsa_expand_selection(
         __shared__ int vis_warp[32];
         const int qp = q_pos[r];
         int local = 0;
-        for (unsigned int t = tid; t < S; t += blockDim.x)
-            if ((int)t <= qp && valid_keys[t] != 0) ++local;
+        if (CC) {
+            // 2026-10-10: The original counts t in [0, S) with t <= qp and valid_keys[t] != 0.
+            // That is the t in [0, lim), lim = 0 for qp < 0, else min(qp + 1, S): whole chunks
+            // below lim from chunk_cnt (the same != 0 count over the same bytes), then the
+            // bytes of [nfull * DSA_CC_CHUNK, lim). lim <= S, so every whole chunk is inside
+            // [0, S) and the unused trailing partial chunk's count is never read.
+            const unsigned int lim = (qp < 0) ? 0u
+                : (((unsigned long long)qp + 1ull < (unsigned long long)S)
+                       ? (unsigned int)qp + 1u : S);
+            const unsigned int nfull = lim / DSA_CC_CHUNK;
+            for (unsigned int c = tid; c < nfull; c += blockDim.x) local += chunk_cnt[c];
+            for (unsigned int t = nfull * DSA_CC_CHUNK + tid; t < lim; t += blockDim.x)
+                if (valid_keys[t] != 0) ++local;
+        } else {
+            for (unsigned int t = tid; t < S; t += blockDim.x)
+                if ((int)t <= qp && valid_keys[t] != 0) ++local;
+        }
         for (int off = 16; off > 0; off >>= 1)
             local += __shfl_down_sync(0xffffffffu, local, off);
         const unsigned int lane = tid & 31u;
@@ -2050,6 +2075,82 @@ extern "C" __global__ void dsa_expand_selection(
                       && ((int)idx <= q_pos[r]) && valid_keys[(unsigned)idx] != 0;
             if (base + t < width) row[base + t] = ok ? (int)idx : DSA_INVALID;
         }
+    }
+}
+
+extern "C" __global__ void dsa_expand_selection(
+    const int* __restrict__ selected,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ valid_cand,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    const unsigned char* __restrict__ q_mask,
+    int* __restrict__ out,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int KP,
+    unsigned int S,
+    unsigned int select_k,
+    unsigned int width,
+    int first_key,
+    int always_tail,
+    const int* __restrict__ geom
+) {
+    dsa_expand_selection_body<false>(selected, pool_indices, valid_cand, valid_keys, q_pos,
+                                     q_mask, out, Q, P, KP, S, select_k, width, first_key,
+                                     always_tail, geom, nullptr);
+}
+
+// 2026-10-10: `dsa_expand_selection` plus `chunk_cnt`, the [ceil(S / DSA_CC_CHUNK)] i32 output
+// of `dsa_valid_chunk_counts` over the same valid_keys and S. Exact launches only (S from the
+// scalar argument; `geom` must be null, as the chunk counts are made for that S).
+extern "C" __global__ void dsa_expand_selection_cc(
+    const int* __restrict__ selected,
+    const int* __restrict__ pool_indices,
+    const unsigned char* __restrict__ valid_cand,
+    const unsigned char* __restrict__ valid_keys,
+    const int* __restrict__ q_pos,
+    const unsigned char* __restrict__ q_mask,
+    int* __restrict__ out,
+    unsigned int Q,
+    unsigned int P,
+    unsigned int KP,
+    unsigned int S,
+    unsigned int select_k,
+    unsigned int width,
+    int first_key,
+    int always_tail,
+    const int* __restrict__ geom,
+    const int* __restrict__ chunk_cnt
+) {
+    dsa_expand_selection_body<true>(selected, pool_indices, valid_cand, valid_keys, q_pos,
+                                    q_mask, out, Q, P, KP, S, select_k, width, first_key,
+                                    always_tail, geom, chunk_cnt);
+}
+
+// 2026-10-10: chunk_cnt[c] = number of t in [c * DSA_CC_CHUNK, min((c + 1) * DSA_CC_CHUNK, S))
+// with valid_keys[t] != 0. One block (256 threads) per chunk; an integer count, so exact.
+extern "C" __global__ void dsa_valid_chunk_counts(
+    const unsigned char* __restrict__ valid_keys,
+    int* __restrict__ chunk_cnt,
+    unsigned int S
+) {
+    __shared__ int warp_sum[8];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int base = blockIdx.x * DSA_CC_CHUNK;
+    int local = 0;
+    for (unsigned int i = tid; i < DSA_CC_CHUNK; i += blockDim.x) {
+        const unsigned int t = base + i;
+        if (t < S && valid_keys[t] != 0) ++local;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        local += __shfl_down_sync(0xffffffffu, local, off);
+    if ((tid & 31u) == 0) warp_sum[tid >> 5] = local;
+    __syncthreads();
+    if (tid == 0) {
+        int total = 0;
+        for (unsigned int w = 0; w < (blockDim.x + 31u) / 32u; ++w) total += warp_sum[w];
+        chunk_cnt[blockIdx.x] = total;
     }
 }
 

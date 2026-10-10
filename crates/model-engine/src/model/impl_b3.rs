@@ -44,7 +44,10 @@ impl TransformerModel {
         seq: &mut SequenceState,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
-        let proposer = match &self.proposer {
+        // 2026-10-10: The step's proposer (`hybrid_spec.rs`): on a hybrid serve's DFLASH step the
+        // DFlash drafter and its state, else `proposer` and `proposer_state` as before.
+        let hybrid_dflash = self.hybrid_on() && self.dflash_step();
+        let proposer = match self.step_proposer() {
             Some(p) => p.as_ref(),
             None => return Ok(Vec::new()),
         };
@@ -110,17 +113,25 @@ impl TransformerModel {
         // propose of this sequence: a whole-prompt drafter prefill on a cold
         // turn or, with the carry lever on, the previous turn's drafter rows
         // plus an append on a warm one. See `ensure_drafter_context`.
-        self.ensure_drafter_context(proposer, seq, &ctx, stream);
-        let prop_state = seq
-            .proposer_state
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
+        // 2026-10-10: Skipped on a hybrid DFLASH step: it prefills the MTP head from the MTP
+        // capture (the eager consume at end of prefill already did on a hybrid serve).
+        if !hybrid_dflash {
+            self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        }
+        let prop_state = if hybrid_dflash {
+            seq.dflash_state.as_mut()
+        } else {
+            seq.proposer_state.as_mut()
+        }
+        .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
         // 2026-09-25: METRALE_MTP_CATCHUP: before proposing, feed the drafter
         // the pairs it missed during serial decode. Pair key k is
         // (embed(tokens[k+1]), hidden_k) at RoPE k+1. The serial-decode hook
         // writes each step's hidden under the post-step `seq_len`, so ring
         // label n holds hidden_{n-1} and pair key k reads label k+1.
-        if metrale_model_layers::speculative::mtp_catchup_enabled()
+        // 2026-10-10: MTP head only, so never on a hybrid DFLASH step.
+        if !hybrid_dflash
+            && metrale_model_layers::speculative::mtp_catchup_enabled()
             && !self.mtp_catchup_ring.is_null()
         {
             let rows = proposer.drafter_rows(prop_state.as_mut());
@@ -299,7 +310,8 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let dstate = match seq.proposer_state.as_mut() {
+        // 2026-10-10: `dflash_ctx_state`: the hybrid serve's DFlash state, else `proposer_state`.
+        let dstate = match self.dflash_ctx_state(seq) {
             Some(ps) => match ps
                 .as_any_mut()
                 .downcast_mut::<metrale_model_arch::dflash_head::DflashProposerState>()
@@ -348,7 +360,7 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        if let Some(ps) = seq.proposer_state.as_mut()
+        if let Some(ps) = self.dflash_ctx_state(seq)
             && let Some(dstate) =
                 ps.as_any_mut()
                     .downcast_mut::<metrale_model_arch::dflash_head::DflashProposerState>()
@@ -400,6 +412,23 @@ impl TransformerModel {
         let dst_slot = dst.offset(slot * h * bf16);
         self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
         Ok(())
+    }
+
+    /// 2026-10-10: The DFlash capture of a single-sequence K-row verify (K2/K3/K4): row `k - 1`
+    /// as before, or, on a hybrid serve, rows `0..k`, so the scheduler commits every accepted
+    /// row to the drafter context (`commit_ctx`) whichever proposer drafted. Fixed per process,
+    /// so a captured verify graph never bakes the other choice.
+    pub(super) fn try_dflash_capture_verify(
+        &self,
+        layer_idx: usize,
+        k: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if self.hybrid_on() {
+            self.try_dflash_capture_all(layer_idx, k, stream)
+        } else {
+            self.try_dflash_capture(layer_idx, k - 1, stream)
+        }
     }
 
     /// 2026-09-25: `Model::save_dflash_hidden_for_propose`: run

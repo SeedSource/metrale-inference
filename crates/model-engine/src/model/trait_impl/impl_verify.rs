@@ -143,11 +143,12 @@ impl TransformerModel {
             .min();
         // 2026-10-09: With a DFlash drafter the route is the batched DFlash verify
         // (`METRALE_GLM_DFLASH_BATCHED_VERIFY` across ranks).
-        let (kind, admits) = match (self.dflash_hidden_save.is_some(), ok) {
+        // 2026-10-10: `dflash_step` (a hybrid serve's MTP steps verify through the MTP route).
+        let (kind, admits) = match (self.dflash_step(), ok) {
             (true, true) => ("DFlash", "ADMITS: batched DFlash verify admitted (route engaged)"),
             (false, true) => ("MTP", "ADMITS (route engaged)"),
             (_, false) => (
-                if self.dflash_hidden_save.is_some() { "DFlash" } else { "MTP" },
+                if self.dflash_step() { "DFlash" } else { "MTP" },
                 "REFUSES (per-sequence verify)",
             ),
         };

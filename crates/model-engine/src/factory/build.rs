@@ -326,8 +326,23 @@ pub fn build_model(
     // (max_seq_len × layers × 2 × kv_dim × BF16), fused KV, the hidden-state
     // capture, FP8 weight mirrors (half the drafter store) and 300 MiB of
     // scratch.
+    // 2026-10-10: A hybrid serve (`METRALE_HYBRID_DFLASH=1`) sizes the drafter's paged KV and
+    // its reserve by the drafter window (`hybrid_drafter_window`), not `--max-seq-len`, and for
+    // one sequence: only the sequence on `ssm_reserve::HYBRID_DFLASH_SLOT` ever proposes
+    // through it, one at a time (design note (b)).
+    let hybrid_drafter =
+        dflash_args.is_some() && metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled();
+    let (dflash_seq_len, dflash_batch) = if hybrid_drafter {
+        let w = metrale_model_layers::speculative::hybrid::hybrid_drafter_window(
+            max_seq_len,
+            metrale_model_arch::dflash_head::dflash_ctx_cap(),
+        );
+        (w, 1)
+    } else {
+        (max_seq_len, max_batch_size)
+    };
     let dflash_reserve: usize =
-        kv_budget::dflash_reserve_bytes(&dflash_args, &config, max_seq_len, gib);
+        kv_budget::dflash_reserve_bytes(&dflash_args, &config, dflash_seq_len, gib);
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
     let kv_budget = total_budget
         .saturating_sub(used_so_far)
@@ -479,8 +494,8 @@ pub fn build_model(
         target_lm_head_nvfp4_for_dflash,
         target_lm_head_native_fp8_for_dflash,
         target_hidden_for_dflash,
-        max_seq_len,
-        max_batch_size,
+        dflash_seq_len,
+        dflash_batch,
     )?;
 
     // 2026-09-25: Step 8: the n-gram embedding, and the LoRA adapters loaded

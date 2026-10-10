@@ -68,7 +68,8 @@ impl TransformerModel {
     /// must fit `dflash_hidden_save_rows`.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
-        let shape_ok = if self.dflash_hidden_save.is_some() {
+        // 2026-10-10: `dflash_step`: a DFlash serve, or a hybrid serve's DFLASH step.
+        let shape_ok = if self.dflash_step() {
             // 2026-09-25: DFlash: one k for the whole batch, any value a capture band holds
             // (2026-10-09: at most 4 with a comm backend), and a full band per sequence.
             self.dflash_batch_shape_ok(ks)
@@ -142,10 +143,7 @@ impl TransformerModel {
         // 2026-09-25: Re-checks the row-count range `can_batch_verify_dispatch`
         // admits: 2..=4 without DFlash, 2..=dflash_kgamma with it. DFlash
         // uniformity is not re-checked here.
-        let dflash_k = self
-            .dflash_hidden_save
-            .is_some()
-            .then_some(self.dflash_kgamma);
+        let dflash_k = self.dflash_step().then_some(self.dflash_kgamma);
         ensure!(
             n >= 2
                 && ks.len() == n

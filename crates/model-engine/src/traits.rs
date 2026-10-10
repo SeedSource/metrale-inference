@@ -65,6 +65,11 @@ pub struct SequenceState {
     pub layer_states: Vec<Box<dyn LayerState>>,
     /// 2026-09-25: The draft proposer's per-sequence state; `None` without a proposer.
     pub proposer_state: Option<Box<dyn ProposerState>>,
+    /// 2026-10-10: Hybrid serve (`METRALE_HYBRID_DFLASH=1`): the DFlash drafter's state, beside
+    /// the MTP head's in `proposer_state`, allocated only for a sequence on
+    /// `ssm_reserve::HYBRID_DFLASH_SLOT`. `None` otherwise and on every other serve (a pure
+    /// DFlash serve keeps its drafter state in `proposer_state`).
+    pub dflash_state: Option<Box<dyn ProposerState>>,
     /// 2026-09-25: Pool slot of this sequence, taken from `ssm_slot` at `alloc_sequence`.
     /// `compact_sequence` moves it, and `detach_slot_for_reuse` sets it to `usize::MAX`.
     pub slot_idx: usize,
@@ -210,6 +215,7 @@ impl SequenceState {
             seq_len: 0,
             layer_states: Vec::new(),
             proposer_state: None,
+            dflash_state: None,
             slot_idx,
             ssm_slot: None,
             marconi_skip_to: 0,

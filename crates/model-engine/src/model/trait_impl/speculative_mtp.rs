@@ -64,8 +64,9 @@ impl TransformerModel {
         // The command and its words go on the wire before this rank enters the drafter
         // forward, or the worker is still waiting for a command when rank 0 reaches its
         // first all-reduce.
-        if self.multi_rank_protocol_active()
-            && self.proposer.as_ref().is_some_and(|p| p.needs_comm())
+        // 2026-10-10: Asked of the step's proposer (`step_proposer`; `proposer` off the hybrid
+        // serve). The worker routes the command the same way, by the mode rank 0 sent it.
+        if self.multi_rank_protocol_active() && self.step_proposer().is_some_and(|p| p.needs_comm())
         {
             self.ep_broadcast_cmd_for_seq(
                 seq.slot_idx as u32,
@@ -100,6 +101,10 @@ impl TransformerModel {
         seqs: &mut [&mut SequenceState],
         out_conf: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
+        // 2026-10-10: The batched propose is the MTP head's; a hybrid DFLASH step declines it.
+        if self.hybrid_on() && self.dflash_step() {
+            return Ok(None);
+        }
         let proposer = match &self.proposer {
             Some(p) => p.as_ref(),
             None => return Ok(None),
@@ -219,7 +224,11 @@ impl TransformerModel {
         first_pos: &[usize],
         seqs: &mut [&mut SequenceState],
     ) -> Result<usize> {
-        if !self.levers.mtp_kv_exact || self.verify_catchup_stash.is_null() {
+        // 2026-10-10: MTP head only; a hybrid DFLASH step skips it.
+        if !self.levers.mtp_kv_exact
+            || self.verify_catchup_stash.is_null()
+            || (self.hybrid_on() && self.dflash_step())
+        {
             return Ok(0);
         }
         let Some(proposer) = self.proposer.as_ref().map(|p| p.as_ref()) else {

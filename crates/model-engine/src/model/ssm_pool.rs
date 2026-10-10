@@ -284,8 +284,14 @@ impl SsmStatePool {
         // 2026-09-25: Every slot gets the full H width when the model captures
         // DFlash layers (DFlash's K=γ verify uses every slot at full width) or
         // when `num_intermediates` is not the MTP `num_drafts + 1`.
-        let uniform_h =
-            !config.dflash_capture_layers.is_empty() || num_intermediates != num_drafts + 1;
+        //
+        // 2026-10-10: A hybrid serve (`METRALE_HYBRID_DFLASH=1`) keeps the MTP per-slot widths
+        // and widens only `ssm_reserve::HYBRID_DFLASH_SLOT` (the one DFlash-eligible slot) to the
+        // full `num_intermediates - 1` (the factory passes `max(gamma, num_drafts) + 1`).
+        let hybrid = metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled()
+            && !config.dflash_capture_layers.is_empty();
+        let uniform_h = !hybrid
+            && (!config.dflash_capture_layers.is_empty() || num_intermediates != num_drafts + 1);
         let h_inter_counts: Vec<usize> = if has_mtp && replay {
             // 2026-09-25: Replay keeps no per-token snapshots, so every count is
             // 0; the vec keeps its length for the accessors.
@@ -295,6 +301,13 @@ impl SsmStatePool {
                 .map(|s| {
                     if s == mtp_slots || uniform_h {
                         num_intermediates.saturating_sub(1)
+                    } else if hybrid {
+                        metrale_model_layers::ssm_reserve::hybrid_slot_h_intermediates(
+                            s,
+                            num_drafts,
+                            num_intermediates.saturating_sub(1),
+                        )
+                        .min(num_intermediates.saturating_sub(1))
                     } else {
                         metrale_model_layers::ssm_reserve::verify_slot_h_intermediates(
                             s, num_drafts, false,

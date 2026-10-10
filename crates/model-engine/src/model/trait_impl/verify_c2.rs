@@ -332,7 +332,8 @@ impl TransformerModel {
                 // 2026-09-25: DFlash: capture this layer's hidden at the last row (K-1) into
                 // `dflash_hidden_save` for the next propose, inside the captured region. A
                 // no-op without DFlash.
-                self.try_dflash_capture(layer_idx, k - 1, stream)?;
+                // 2026-10-10: every row on a hybrid serve (`try_dflash_capture_verify`).
+                self.try_dflash_capture_verify(layer_idx, k, stream)?;
 
                 if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                     anyhow::bail!(

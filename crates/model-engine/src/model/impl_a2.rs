@@ -156,6 +156,8 @@ impl TransformerModel {
     ///   `EP_CKPT_WORDS` words in one bulk broadcast
     /// - 0xFFFFFFF9 (`EP_CMD_VERIFY_BATCH`): batched MTP verify → `verify_ep.rs`
     /// - 0xFFFFFFFA (`EP_CMD_MTP_PROPOSE_BATCH`): batched MTP propose → `propose_batch_ep.rs`
+    /// - 0xFFFFFFFB (`EP_CMD_SPEC_MODE`, 2026-10-10): hybrid step mode → one mode word
+    ///   (`hybrid_spec.rs`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored)
     /// - any other value: a token id, decoded in the addressed slot
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
@@ -198,6 +200,12 @@ impl TransformerModel {
         // arrive in its payload (`trait_impl/propose_batch_ep.rs`).
         if cmd == crate::model::trait_impl::propose_batch_ep::EP_CMD_MTP_PROPOSE_BATCH {
             return self.ep_worker_propose_batch(slots);
+        }
+
+        // 2026-10-10: Hybrid step mode (`hybrid_spec.rs`): the preamble seq_id is 0 and the mode
+        // word is the payload. It addresses no slot.
+        if cmd == metrale_model_layers::speculative::hybrid::EP_CMD_SPEC_MODE {
+            return self.ep_worker_set_spec_mode();
         }
 
         let slot_idx = seq_id as usize;

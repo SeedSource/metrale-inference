@@ -20,6 +20,29 @@ pub trait ModelDraft {
         usize::MAX
     }
 
+    /// 2026-10-10: Whether this is a hybrid serve (`METRALE_HYBRID_DFLASH=1`): the MTP head and a
+    /// DFlash drafter both resident, the proposer picked per step through
+    /// [`Self::set_spec_step_mode`]. Default `false`.
+    fn hybrid_dflash(&self) -> bool {
+        false
+    }
+
+    /// 2026-10-10: Rank 0, hybrid serve: the proposer the next speculative step runs. On a change
+    /// it is sent to the worker ranks (`EP_CMD_SPEC_MODE`) before this rank switches. A no-op
+    /// on any other serve. Default `Ok(())`.
+    fn set_spec_step_mode(
+        &self,
+        _mode: metrale_model_layers::speculative::hybrid::SpecStepMode,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// 2026-10-10: Hybrid serve: whether `seq` can take a DFlash step: it holds a DFlash state
+    /// and its SSM slot's verify pools fit the K=gamma verify. Default `false`.
+    fn hybrid_dflash_ready(&self, _seq: &SequenceState) -> bool {
+        false
+    }
+
     /// 2026-09-25: Generate for one prompt with the model's own draft proposer.
     fn generate_speculative(
         &self,

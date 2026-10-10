@@ -199,6 +199,16 @@ pub struct TransformerModel {
     /// 2026-09-25: Draft proposer: built in `new` from the MTP weights, or
     /// installed later by `set_dflash_proposer`.
     pub(super) proposer: Option<Arc<dyn DraftProposer>>,
+    /// 2026-10-10: Hybrid serve (`METRALE_HYBRID_DFLASH=1`): the DFlash drafter, held beside the
+    /// MTP head in `proposer`, and each sequence's state for it in
+    /// `SequenceState::dflash_state`. `None` on every other serve, so a pure DFlash serve keeps
+    /// its drafter in `proposer` as before (`set_dflash_proposer`).
+    pub(super) dflash_proposer: Option<Arc<dyn DraftProposer>>,
+    /// 2026-10-10: Hybrid serve: the proposer the current step runs
+    /// (`metrale_model_layers::speculative::hybrid::SpecStepMode as u8`). Rank 0 sets it through
+    /// `set_spec_step_mode`; a worker only from `EP_CMD_SPEC_MODE`. Unused without
+    /// `dflash_proposer`.
+    pub(super) spec_mode: std::sync::atomic::AtomicU8,
     /// 2026-09-25: One FP32 hidden row (`hidden_size * 4` bytes): the target
     /// hidden that `save_hidden_for_mtp` copies out before the MTP head runs.
     pub(super) mtp_hidden_save: DevicePtr,

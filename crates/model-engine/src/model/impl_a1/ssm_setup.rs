@@ -69,6 +69,12 @@ pub(super) fn size_rollback_pools(
         mtp_quant.effective_for_head(mtp_weights.first().is_some_and(|w| w.dense_ffn.is_some()));
     let num_intermediates = if !has_mtp {
         0
+    } else if dflash_kgamma > 0
+        && metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled()
+    {
+        // 2026-10-10: A hybrid serve verifies through both proposers: `num_drafts` is the MTP
+        // depth, and the widest verify is the larger of the two.
+        dflash_kgamma.max(num_drafts + 1)
     } else if dflash_kgamma > 0 {
         // 2026-09-25: A DFlash serve verifies through the block drafter, so
         // the widest verify is K = γ + 1 and `num_drafts` does not size the

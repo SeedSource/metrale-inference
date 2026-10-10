@@ -161,7 +161,11 @@ pub(super) fn alloc_prefill_capture(
         .as_ref()
         .map_or(max_seq_len, |p| p.prefill_hidden_rows(max_seq_len))
         .min(max_seq_len);
-    let capture_rows = if dflash_kgamma > 0 {
+    // 2026-10-10: A hybrid serve's MTP head keeps the pure-MTP ceiling: the DFlash drafter
+    // takes its prompt rows through its own capture, not this buffer.
+    let capture_rows = if dflash_kgamma > 0
+        && !metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled()
+    {
         let cap = metrale_model_arch::dflash_head::dflash_ctx_cap();
         if cap == 0 {
             mtp_prefill_rows

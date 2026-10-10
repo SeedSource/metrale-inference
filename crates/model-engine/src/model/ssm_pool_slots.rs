@@ -52,8 +52,21 @@ impl SsmStatePool {
         }
     }
 
+    /// 2026-10-10: On a hybrid serve (`METRALE_HYBRID_DFLASH=1`) the lowest free index, so
+    /// a request that starts alone gets `ssm_reserve::HYBRID_DFLASH_SLOT`, the only slot sized
+    /// for the DFlash verify. Both ranks claim and release in the same order, so they agree.
     pub(super) fn claim_slot(&self) -> Result<usize> {
-        self.free_slots.lock().pop().ok_or_else(|| {
+        let mut free = self.free_slots.lock();
+        let got = if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
+            free.iter()
+                .enumerate()
+                .min_by_key(|&(_, &s)| s)
+                .map(|(pos, _)| pos)
+                .map(|pos| free.swap_remove(pos))
+        } else {
+            free.pop()
+        };
+        got.ok_or_else(|| {
             anyhow::anyhow!("SSM state pool exhausted (max {} slots)", self.max_slots)
         })
     }

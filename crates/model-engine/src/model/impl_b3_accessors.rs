@@ -32,8 +32,9 @@ impl TransformerModel {
     /// 2026-10-09: Whether a rank other than 0 captures the DFlash prompt rows: only when the
     /// proposer joins every propose on all ranks (`needs_comm`, the two-rank drafter), so
     /// rank 1 holds the prompt rows its propose reads (`dflash_head/tp.rs`).
+    /// 2026-10-10: On a hybrid serve this asks the DFlash drafter, not the MTP head.
     pub(super) fn dflash_capture_on_every_rank(&self) -> bool {
-        self.proposer.as_ref().is_some_and(|p| p.needs_comm())
+        self.dflash_head().is_some_and(|p| p.needs_comm())
     }
 
     /// 2026-09-25: Borrow the model config, for building the proposers that

@@ -14,6 +14,7 @@ use metrale_gpu_runtime::gpu::DevicePtr;
 use metrale_model_arch::weight_loader::deepseek_v4::mtp::DeepseekV4MtpModule;
 use metrale_model_arch::weight_loader::glm5_next_mtp::Glm5NextMtpModule;
 use metrale_model_arch::weight_loader::load_dflash_weights;
+use metrale_model_layers::speculative::DraftProposer as _;
 use metrale_model_layers::weight_map::{DenseWeight, Fp8DenseWeight, QuantizedWeight};
 
 use crate::factory::DflashBuildArgs;
@@ -114,8 +115,21 @@ pub(super) fn install_dflash_drafter(
                 max_batch_size,
                 model.dflash_tp_rank(),
             )?;
-            model.set_dflash_proposer(std::sync::Arc::new(head));
-            tracing::info!(target: "metrale_model_engine::factory::build", "DFlash drafter installed as the active proposer");
+            if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
+                // 2026-10-10: Hybrid serve: the drafter goes beside the MTP head, which stays in
+                // `proposer` with every buffer it was sized with (`hybrid_spec.rs`).
+                let gamma = head.block_gamma();
+                model.set_hybrid_dflash_proposer(std::sync::Arc::new(head))?;
+                tracing::info!(target: "metrale_model_engine::factory::build",
+                    "HYBRID DFLASH: ENGAGED — proposers: MTP head (proposer slot) + DFlash drafter \
+                     (γ={gamma:?}, KV window {max_seq_len} tokens); rank 0 picks one per step \
+                     (METRALE_HYBRID_DFLASH_DWELL_MS={} ms)",
+                    metrale_model_layers::speculative::hybrid::hybrid_dflash_dwell_ms(),
+                );
+            } else {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(target: "metrale_model_engine::factory::build", "DFlash drafter installed as the active proposer");
+            }
         } else {
             tracing::warn!(target: "metrale_model_engine::factory::build", "DFlash drafter store had no fc.weight — proposer not installed; \
                  falling back to whatever proposer (if any) the target's MTP path built"

@@ -412,6 +412,10 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            dflash_proposer: None,
+            spec_mode: std::sync::atomic::AtomicU8::new(
+                metrale_model_layers::speculative::hybrid::SpecStepMode::Mtp as u8,
+            ),
             mtp_hidden_save,
             verify_hidden_stash,
             verify_catchup_stash,

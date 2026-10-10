@@ -320,6 +320,13 @@ impl TransformerModel {
         {
             proposer.free_state(self.gpu.as_ref(), pstate.as_mut())?;
         }
+        // 2026-10-10: Hybrid serve: the DFlash drafter's state (its paged blocks and ctx
+        // accumulator).
+        if let Some(ref drafter) = self.dflash_proposer
+            && let Some(ref mut dstate) = seq.dflash_state
+        {
+            drafter.free_state(self.gpu.as_ref(), dstate.as_mut())?;
+        }
 
         self.free_chunked_prefill_meta(seq)?;
 

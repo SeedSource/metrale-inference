@@ -228,7 +228,8 @@ impl TransformerModel {
         gdb::batched_verify_ep_admits(
             self.multi_rank_protocol_active(),
             self.ep_protocol_v2,
-            self.dflash_hidden_save.is_some(),
+            // 2026-10-10: `dflash_step`: a hybrid serve's MTP batch is admitted as on the MTP car.
+            self.dflash_step(),
             gdb::glm_dflash_batched_verify(),
             own,
         )

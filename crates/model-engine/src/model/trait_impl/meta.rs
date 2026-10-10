@@ -305,6 +305,23 @@ impl TransformerModel {
             Some(p) => Some(p.alloc_state_for(self.gpu.as_ref(), budget_tokens)?),
             None => None,
         };
+        // 2026-10-10: Hybrid serve: the DFlash drafter's state too (its ctx accumulator is capped
+        // by `METRALE_DFLASH_CTX_CAP`), only on `HYBRID_DFLASH_SLOT`, the one slot whose verify
+        // pools fit the DFlash verify: a sequence elsewhere never takes a DFlash step. Both ranks
+        // claim the same slot, so they agree. On failure the MTP state just allocated is freed.
+        let dflash_slot = slot == metrale_model_layers::ssm_reserve::HYBRID_DFLASH_SLOT;
+        let dflash_state = match &self.dflash_proposer {
+            Some(d) if dflash_slot => match d.alloc_state_for(self.gpu.as_ref(), budget_tokens) {
+                Ok(st) => Some(st),
+                Err(e) => {
+                    if let (Some(p), Some(mut st)) = (&self.proposer, proposer_state) {
+                        let _ = p.free_state(self.gpu.as_ref(), st.as_mut());
+                    }
+                    return Err(e);
+                }
+            },
+            _ => None,
+        };
 
         // 2026-09-25: `disk_last_offloaded_per_layer` is sized once to the attention-layer
         // count, so the offload helper never grows it.
@@ -323,6 +340,7 @@ impl TransformerModel {
             seq_len: 0,
             layer_states,
             proposer_state,
+            dflash_state,
             slot_idx: slot,
             ssm_slot: Some(slot_guard),
             marconi_skip_to: 0,

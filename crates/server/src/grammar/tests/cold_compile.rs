@@ -323,3 +323,32 @@ fn cold_vs_snapshot_warm_with_a_real_tokenizer() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 2026-10-10: A177: a failing save is attempted once, not per prewarm.
+#[test]
+fn a_failed_snapshot_save_is_latched_not_retried() {
+    let dir = scratch("failsave");
+    // A file where the cache directory should be makes every save fail.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".metrale-grammar-cache"), b"not a dir").unwrap();
+    let tools = tool("get_weather", "city", "days");
+    let mut e = engine();
+    e.attach_mask_cache(&dir);
+    prepare(&mut e, &tools);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while e.snapshot_save_state() != Some((1, true)) {
+        assert!(
+            Instant::now() < deadline,
+            "save never failed: {:?}",
+            e.snapshot_save_state()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let hook = e.mask_snapshot_hook().expect("armed");
+    for _ in 0..5 {
+        hook(1);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(e.snapshot_save_state(), Some((1, true)));
+    let _ = std::fs::remove_dir_all(&dir);
+}

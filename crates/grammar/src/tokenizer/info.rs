@@ -7,6 +7,7 @@
 // tokens used by the grammar matcher to mask the logit bitmask.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::tokenizer::decoder::decode_token;
 use crate::tokenizer::hf_metadata::detect_metadata_from_hf;
@@ -39,14 +40,17 @@ pub struct TokenizerInfo {
     add_prefix_space: bool,
     /// Decoded token bytes for every id `0..vocab_size`. Ids beyond the
     /// supplied raw vocab are padding and decode to an empty sequence.
-    decoded_vocab: Vec<Vec<u8>>,
+    ///
+    /// 2026-10-10: `Arc`-shared (A177): `clone()` is O(1) so every compiled
+    /// grammar shares one ~19 MB vocabulary instead of a deep copy.
+    decoded_vocab: Arc<[Vec<u8>]>,
     /// `(id, token)` pairs sorted lexicographically by token bytes.
     /// Excludes special tokens and stop tokens — maximizes prefix reuse
     /// during trie matching.
-    sorted_decoded_vocab: Vec<(i32, Vec<u8>)>,
+    sorted_decoded_vocab: Arc<[(i32, Vec<u8>)]>,
     /// Pseudo-trie subtree ranges: `trie_subtree_nodes_range[i]` is the
     /// exclusive end index of the subtree rooted at sorted entry `i`.
-    trie_subtree_nodes_range: Vec<i32>,
+    trie_subtree_nodes_range: Arc<[i32]>,
     /// Ids accepted as end-of-generation by the grammar matcher.
     stop_token_ids: Vec<i32>,
     /// Ids masked out (ignored) during grammar-guided generation.
@@ -121,9 +125,9 @@ impl TokenizerInfo {
             vocab_type,
             vocab_size,
             add_prefix_space,
-            decoded_vocab,
-            sorted_decoded_vocab,
-            trie_subtree_nodes_range,
+            decoded_vocab: Arc::from(decoded_vocab),
+            sorted_decoded_vocab: Arc::from(sorted_decoded_vocab),
+            trie_subtree_nodes_range: Arc::from(trie_subtree_nodes_range),
             stop_token_ids: stop_ids,
             special_token_ids: special_ids,
         }
@@ -192,6 +196,23 @@ impl TokenizerInfo {
         &self.trie_subtree_nodes_range
     }
 
+    /// 2026-10-10: Approximate heap bytes of the shared per-token storage
+    /// (Vec capacities plus headers); counted once, not per grammar.
+    pub fn approx_vocab_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let decoded: usize = self
+            .decoded_vocab
+            .iter()
+            .map(|t| size_of::<Vec<u8>>() + t.capacity())
+            .sum();
+        let sorted: usize = self
+            .sorted_decoded_vocab
+            .iter()
+            .map(|(_, t)| size_of::<(i32, Vec<u8>)>() + t.capacity())
+            .sum();
+        decoded + sorted + self.trie_subtree_nodes_range.len() * size_of::<i32>()
+    }
+
     /// A PROCESS-STABLE digest of everything an adaptive token mask
     /// depends on: the vocab type / size / prefix-space flag, the
     /// sorted decoded vocabulary (ids *and* bytes, in order), and the
@@ -211,7 +232,7 @@ impl TokenizerInfo {
         h = fnv1a(h, &(self.vocab_size as u64).to_le_bytes());
         h = fnv1a(h, &[self.add_prefix_space as u8]);
         h = fnv1a(h, &(self.sorted_decoded_vocab.len() as u64).to_le_bytes());
-        for (id, token) in &self.sorted_decoded_vocab {
+        for (id, token) in self.sorted_decoded_vocab.iter() {
             h = fnv1a(h, &id.to_le_bytes());
             h = fnv1a(h, &(token.len() as u32).to_le_bytes());
             h = fnv1a(h, token);

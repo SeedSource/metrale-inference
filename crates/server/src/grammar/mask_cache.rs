@@ -48,6 +48,11 @@ pub(super) struct MaskSnapshot {
     /// 2026-09-26: Set while a save runs; a hook call that finds it set
     /// skips its save.
     writing: Arc<AtomicBool>,
+    /// 2026-10-10: A177: latched by the first FAILED save (e.g. read-only
+    /// directory) so later prewarm hooks stop re-encoding ~10 MB per request.
+    failed: Arc<AtomicBool>,
+    /// 2026-10-10: Save attempts that reached `save_to_file` (test observable).
+    attempts: Arc<AtomicUsize>,
 }
 
 /// 2026-09-26: Called by the prewarm with the number of masks it warmed,
@@ -139,7 +144,19 @@ impl GrammarEngine {
             cache,
             saved_entries: Arc::new(AtomicUsize::new(imported)),
             writing: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+            attempts: Arc::new(AtomicUsize::new(0)),
         });
+    }
+
+    /// 2026-10-10: Save attempts so far, and whether a failure is latched.
+    #[cfg(test)]
+    pub(crate) fn snapshot_save_state(&self) -> Option<(usize, bool)> {
+        let s = self.snapshot.as_ref()?;
+        Some((
+            s.attempts.load(Ordering::Relaxed),
+            s.failed.load(Ordering::Relaxed),
+        ))
     }
 
     /// 2026-09-26: The hook handed to a request's prewarm. When the cache
@@ -153,7 +170,12 @@ impl GrammarEngine {
         let cache = snap.cache.clone();
         let saved = Arc::clone(&snap.saved_entries);
         let writing = Arc::clone(&snap.writing);
+        let failed = Arc::clone(&snap.failed);
+        let attempts = Arc::clone(&snap.attempts);
         Some(Arc::new(move |_warmed: usize| {
+            if failed.load(Ordering::Relaxed) {
+                return;
+            }
             if cache.len() <= saved.load(Ordering::Relaxed) {
                 return;
             }
@@ -162,9 +184,11 @@ impl GrammarEngine {
             }
             let (path, cache, saved) = (path.clone(), cache.clone(), Arc::clone(&saved));
             let done = Arc::clone(&writing);
+            let (failed, attempts) = (Arc::clone(&failed), Arc::clone(&attempts));
             let spawned = std::thread::Builder::new()
                 .name("grammar-mask-save".to_string())
                 .spawn(move || {
+                    attempts.fetch_add(1, Ordering::Relaxed);
                     let written =
                         mask_snapshot::save_to_file(&cache, identity, &path, MAX_PERSISTED_MASKS);
                     match written {
@@ -177,10 +201,20 @@ impl GrammarEngine {
                         }
                         // 2026-09-26: A failed save is only logged; the
                         // server keeps running without a new snapshot.
-                        Err(e) => tracing::debug!(
-                            "Grammar: could not persist masks to {}: {e}",
-                            path.display()
-                        ),
+                        // 2026-10-10: A177: latch the failure and warn once
+                        // per process; later hooks skip the re-encode.
+                        Err(e) => {
+                            if !failed.swap(true, Ordering::AcqRel) {
+                                static WARNED: AtomicBool = AtomicBool::new(false);
+                                if !WARNED.swap(true, Ordering::AcqRel) {
+                                    tracing::warn!(
+                                        "Grammar: could not persist masks to {}: {e}; \
+                                         not retrying this process",
+                                        path.display()
+                                    );
+                                }
+                            }
+                        }
                     }
                     done.store(false, Ordering::Release);
                 });

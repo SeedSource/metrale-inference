@@ -132,6 +132,16 @@ impl GrammarCompiler {
         self.inner.cache_size_bytes()
     }
 
+    /// 2026-10-10: Number of compiled grammars resident in the cache.
+    pub fn cache_len(&self) -> usize {
+        self.inner.cache_len()
+    }
+
+    /// 2026-10-10: Approximate bytes of the shared vocabulary.
+    pub fn vocab_shared_bytes(&self) -> usize {
+        self.inner.vocab_shared_bytes()
+    }
+
     /// Seed the cross-grammar rule-level mask cache from a snapshot a
     /// previous process wrote (#918). Returns masks imported; `0` is a
     /// miss (absent / stale / corrupt file), never an error.

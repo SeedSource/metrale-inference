@@ -85,6 +85,11 @@ impl CompiledGrammarImpl {
     /// Approximate heap memory usage in bytes. Port of
     /// `MemorySize(const CompiledGrammar::Impl&)`. The mask term sums
     /// only the masks computed so far (the lazy cache).
+    ///
+    /// 2026-10-10: A177: `tokenizer_info` is deliberately NOT counted. Its
+    /// vocabulary is an `Arc`-shared handle common to every grammar from
+    /// one compiler, so it is reported once by the server's cache-stats
+    /// line (`vocab_shared_bytes`), not per entry.
     pub fn memory_size(&self) -> usize {
         let grammar_bytes = self.grammar.complete_fsm.memory_size()
             + self.grammar.num_exprs() as usize * 4

@@ -99,6 +99,15 @@ impl<K: std::hash::Hash + Eq + Clone> GrammarCache<K> {
         inner.lru.clear();
     }
 
+    /// 2026-10-10: Number of resident entries (A177 cache stats log).
+    pub fn cache_len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("grammar cache mutex poisoned")
+            .lru
+            .len()
+    }
+
     /// Bytes currently resident, re-measured across live entries.
     pub fn resident_bytes(&self) -> usize {
         let inner = self.inner.lock().expect("grammar cache mutex poisoned");

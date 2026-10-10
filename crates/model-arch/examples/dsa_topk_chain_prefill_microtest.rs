@@ -38,6 +38,14 @@
 //! `set_radix_chunks_override`), `CHAIN EXPAND` (always_tail 1 vs 0), `CHAIN BIN` (pass-0 bin
 //! that holds the select_k-th key: its element count, read from hist0 after find pass 0).
 //!
+//! 2026-10-10: `CHAIN COMPACT S=<S> compact_us=<x> gather_us=<y> ratio=<x/y> b0_median=<n>`: the
+//! prototype `dsa_topk_radix_compact` (one read of the row after find pass 0: keys above the
+//! pass-0 threshold bin to the candidate slots, bin-b0 pairs to a per-row buffer capped at 2,048)
+//! timed in the same way as the stages above (state after init, hist 0, find 0; cold L2) next to
+//! the production gather (state after find 2). `b0_median` is the median row count of bin b0
+//! as counted by the compact kernel. A `CHAIN COMPACT CHECK` line compares those counts with the
+//! `dsa_topk_radix_binstat` kernel's. Timing only: compact's output is not a selection.
+//!
 //! Exit: 0 and `PASS - CHAIN gate0 ...` when every chunk output is bitwise identical to c = 1
 //! (and the staged chain matches production); 1 with `FAIL`; 2 when the radix entry points are
 //! absent from this target.
@@ -59,6 +67,7 @@ use metrale_model_arch::glm5next_dsa::select::radix::{
     RADIX_BINS, RADIX_PASSES, RADIX_STATE, RADIX_THREADS, RadixTopk, launch_topk_radix,
     radix_chunks, radix_resolved, radix_row_bytes, set_radix_chunks_override,
 };
+use metrale_model_arch::glm5next_dsa::select::binstat::launch_binstat;
 
 // 2026-10-10: this example uses only the score generator of the shared helpers.
 #[allow(dead_code)]
@@ -100,6 +109,8 @@ enum Stage {
     Sort,
     /// 2026-10-10: `dsa_expand_selection` with `always_tail` set to the flag.
     Expand(bool),
+    /// 2026-10-10: `dsa_topk_radix_compact` prototype (not part of [`STAGES`]).
+    Compact,
 }
 
 /// 2026-10-10: The chain in launch order.
@@ -141,7 +152,12 @@ struct Rig<'a> {
     valid_keys: DevicePtr,
     q_pos: DevicePtr,
     q_mask: DevicePtr,
+    /// 2026-10-10: Per-row bin-b0 buffers of the compact prototype (shared by all layers).
+    bins: DevicePtr,
 }
+
+/// 2026-10-10: Words of one row's compact buffer (`DSA_COMPACT_CAP` keys, then indices).
+const BIN_ROW_WORDS: usize = 2 * 2048;
 
 fn le_i32(v: &[i32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -208,6 +224,7 @@ impl<'a> Rig<'a> {
             valid_keys: up(g, &valid_keys)?,
             q_pos: up(g, &le_i32(&q_pos))?,
             q_mask: up(g, &vec![1u8; Q])?,
+            bins: g.alloc(Q * BIN_ROW_WORDS * 4)?,
         };
         g.memset(rig.work_all, POISON, LAYERS * work_bytes)?;
         Ok(rig)
@@ -227,6 +244,7 @@ impl<'a> Rig<'a> {
             self.valid_keys,
             self.q_pos,
             self.q_mask,
+            self.bins,
         ] {
             self.g.free(b)?;
         }
@@ -338,6 +356,17 @@ impl<'a> Rig<'a> {
                 .arg_ptr(gd)
                 .launch(stream),
             Stage::Expand(tail) => self.expand(l, tail, stream),
+            Stage::Compact => KernelLaunch::new(g, k.topk_radix_compact)
+                .grid([chunks, rows, 1])
+                .block(block)
+                .arg_ptr(b.scores)
+                .arg_ptr(b.work)
+                .arg_ptr(self.bins)
+                .arg_u32(p)
+                .arg_u32(selk)
+                .arg_u32(kcap)
+                .arg_ptr(gd)
+                .launch(stream),
         }
     }
 
@@ -485,6 +514,54 @@ fn bin_occupancy(rig: &Rig<'_>) -> Result<(Vec<u32>, usize)> {
     Ok((counts, rig.p))
 }
 
+/// 2026-10-10: State word offsets (`DSA_RS_*`) the compact and binstat kernels write.
+const RS_B0CNT: usize = 4;
+const RS_BINCNT: usize = 6;
+
+/// 2026-10-10: The COMPACT arm for the rig's context: with every layer at the state after init,
+/// hist 0 and find 0 (and the binstat kernel run), time the compact prototype per layer, then
+/// read the bin-b0 counts it and the binstat kernel produced for layer 0. Returns
+/// `(compact_us, median count, binstat_matches_compact)`.
+fn compact_arm(rig: &Rig<'_>) -> Result<(f64, u32, bool)> {
+    for stg in [Stage::Init, Stage::Hist(0), Stage::Find(0)] {
+        for l in 0..LAYERS {
+            rig.stage(stg, l, rig.st)?;
+        }
+    }
+    for l in 0..LAYERS {
+        launch_binstat(
+            rig.g,
+            rig.k,
+            rig.layers[l].work,
+            Q as u32,
+            rig.p as u32,
+            SELECT_K as u32,
+            KCAP as u32,
+            DevicePtr::NULL,
+            rig.st,
+        )?;
+    }
+    rig.sync()?;
+    let us = rig.time_stage(Stage::Compact)?;
+    // One real run on the (restored) post-find0 state, then read layer 0's counters.
+    for l in 0..LAYERS {
+        rig.stage(Stage::Compact, l, rig.st)?;
+    }
+    rig.sync()?;
+    let mut raw = vec![0u8; rig.work_bytes];
+    rig.g.copy_d2h(rig.layers[0].work, &mut raw)?;
+    let row_words = radix_row_bytes(KCAP) / 4;
+    let word = |r: usize, i: usize| {
+        let o = 4 * (r * row_words + RADIX_STATE + i);
+        u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]])
+    };
+    let compact: Vec<u32> = (0..Q).map(|r| word(r, RS_BINCNT)).collect();
+    let stat: Vec<u32> = (0..Q).map(|r| word(r, RS_B0CNT)).collect();
+    let mut sorted = compact.clone();
+    sorted.sort_unstable();
+    Ok((us, sorted[sorted.len() / 2], compact == stat))
+}
+
 fn main() -> Result<()> {
     let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
@@ -506,6 +583,7 @@ fn main() -> Result<()> {
     );
     let mut all_identical = true;
     let mut staged_ok = true;
+    let mut binstat_ok = true;
 
     for &s in CONTEXTS {
         set_radix_chunks_override(None);
@@ -566,9 +644,27 @@ fn main() -> Result<()> {
             100.0 * f64::from(med) / p as f64,
             100.0 * f64::from(max) / p as f64
         );
+        // e) compact prototype vs gather (gather_us is the pass-2-state stage time above).
+        if k.topk_radix_compact.0 != 0 && k.topk_radix_binstat.0 != 0 {
+            let (compact_us, b0_med, matches) = compact_arm(&rig)?;
+            binstat_ok &= matches;
+            println!(
+                "CHAIN COMPACT S={s} compact_us={compact_us:.2} gather_us={:.2} ratio={:.3} \
+                 b0_median={b0_med}",
+                t[7],
+                compact_us / t[7].max(1e-9)
+            );
+            println!("CHAIN COMPACT CHECK S={s} binstat_matches_compact={matches}");
+        } else {
+            println!("CHAIN COMPACT S={s} skipped: dsa_topk_radix_compact/binstat absent");
+        }
         rig.free()?;
     }
 
+    if !binstat_ok {
+        println!("FAIL - CHAIN COMPACT: binstat counts differ from the compact kernel's");
+        std::process::exit(1);
+    }
     if all_identical && staged_ok {
         println!("PASS - CHAIN gate0: chunk outputs identical in every S and c");
         Ok(())

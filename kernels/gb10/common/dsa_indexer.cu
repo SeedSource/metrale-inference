@@ -1889,6 +1889,96 @@ extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_g
     }
 }
 
+// 2026-10-10: State word slots used by the gate-0 tools below; nothing in the production
+// sequence reads or writes them (init zeroes all DSA_RADIX_STATE_WORDS words each call).
+#define DSA_RS_B0CNT  4u   // binstat: hist0[b0], keys in the pass-0 threshold bin
+#define DSA_RS_BINP   5u   // binstat: the row's live P (0 when select_k is 0)
+#define DSA_RS_BINCNT 6u   // compact: keys seen in bin b0 (all counted, stored up to the cap)
+#define DSA_COMPACT_CAP 2048u
+
+// 2026-10-10: METRALE_GLM_DSA_RADIX_BINSTAT=1 (debug, default off): after find pass 0, record
+// the pass-0 threshold bin's population. Grid Q, one thread a row. It reads hist0 (words
+// [0, 4096), still intact: pass 2's per-chunk histograms overwrite them later) and the prefix,
+// and writes two state slots that no other kernel reads, so `selected` is unchanged.
+extern "C" __global__ void __launch_bounds__(32) dsa_topk_radix_binstat(
+    unsigned int* __restrict__ work,
+    unsigned int P,
+    unsigned int select_k,
+    unsigned int kcap,
+    const int* __restrict__ geom
+) {
+    if (geom) {
+        P = (unsigned int)geom[DSA_GEOM_NPOOLS];
+        select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    }
+    if (threadIdx.x != 0u) return;
+    unsigned int* w = dsa_radix_row(work, blockIdx.x, kcap);
+    if (select_k == 0u) {
+        w[DSA_RADIX_STATE + DSA_RS_BINP] = 0u;
+        return;
+    }
+    const unsigned int b0 = w[DSA_RADIX_STATE + DSA_RS_PREFIX] >> 20;
+    w[DSA_RADIX_STATE + DSA_RS_B0CNT] = w[b0];
+    w[DSA_RADIX_STATE + DSA_RS_BINP] = P;
+}
+
+// 2026-10-10: PROTOTYPE, timing only, not wired into production: a single read of the row after
+// find pass 0 (state: init, hist0 and find0 done; DSA_RS_GT_CNT and DSA_RS_BINCNT zero). Same
+// grid as gather (C chunks x Q rows). A key whose top 12 bits exceed b0 goes to candidate slot
+// atomicAdd(GT_CNT) (fewer than select_k <= kcap of them, so always in range); a key in bin b0
+// is counted through DSA_RS_BINCNT and, below DSA_COMPACT_CAP, its (key, index) pair is stored
+// in the row's buffer `bins` (DSA_COMPACT_CAP keys, then DSA_COMPACT_CAP indices). The output
+// is not a valid selection (no tie handling, no sort); it exists to time the single read.
+extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_compact(
+    const float* __restrict__ scores,
+    unsigned int* __restrict__ work,
+    unsigned int* __restrict__ bins,
+    unsigned int P,
+    unsigned int select_k,
+    unsigned int kcap,
+    const int* __restrict__ geom
+) {
+    if (geom) {
+        P = (unsigned int)geom[DSA_GEOM_NPOOLS];
+        select_k = (unsigned int)geom[DSA_GEOM_SELECT_K];
+    }
+    if (select_k == 0u) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int c = blockIdx.x;
+    const unsigned int r = blockIdx.y;
+    unsigned int* w = dsa_radix_row(work, r, kcap);
+    const unsigned int b0 = w[DSA_RADIX_STATE + DSA_RS_PREFIX] >> 20;
+    unsigned int* cand_key = w + DSA_RADIX_CAND;
+    unsigned int* cand_idx = w + DSA_RADIX_CAND + kcap;
+    unsigned int* bin_key = bins + (size_t)r * (2u * DSA_COMPACT_CAP);
+    unsigned int* bin_idx = bin_key + DSA_COMPACT_CAP;
+
+    const unsigned int chunk = (P + gridDim.x - 1u) / gridDim.x;
+    const unsigned int lo = min(c * chunk, P);
+    const unsigned int hi = min(lo + chunk, P);
+    const float* row = scores + (size_t)r * P;
+    for (unsigned int base = lo; base < hi; base += blockDim.x) {
+        const unsigned int i = base + tid;
+        if (i < hi) {
+            const unsigned int key = dsa_radix_key(row[i]);
+            const unsigned int top = key >> 20;
+            if (top > b0) {
+                const unsigned int slot = atomicAdd(&w[DSA_RADIX_STATE + DSA_RS_GT_CNT], 1u);
+                if (slot < kcap) {
+                    cand_key[slot] = key;
+                    cand_idx[slot] = i;
+                }
+            } else if (top == b0) {
+                const unsigned int slot = atomicAdd(&w[DSA_RADIX_STATE + DSA_RS_BINCNT], 1u);
+                if (slot < DSA_COMPACT_CAP) {
+                    bin_key[slot] = key;
+                    bin_idx[slot] = i;
+                }
+            }
+        }
+    }
+}
+
 // 2026-10-06: Sort row blockIdx.x's select_k candidates (key descending, then index ascending)
 // and write their pool indices.
 extern "C" __global__ void __launch_bounds__(DSA_RADIX_THREADS) dsa_topk_radix_sort(

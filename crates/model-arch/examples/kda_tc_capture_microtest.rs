@@ -22,6 +22,10 @@
 //!   kernels (the prefill would fall back to `decode_k` and (a) would compare `decode_k` with
 //!   itself), when the uncaptured outputs are all zero or not finite, or when the reference left
 //!   either state unchanged.
+//! - 2026-10-10 (FUSECAP): for an 8192-row call and cuts none/2048/4096/6144, the fused front
+//!   (`METRALE_GLM_KDA_FRONT_FUSE`) and the unfused front with the same capture give identical
+//!   slot conv, slot h, layer output, core and final states; prints `FUSECAP BITWISE cut=<n>
+//!   conv=<identical|DIFF> h=<..> out=<..>` per cut and `PASS - FUSECAP` only if all are identical.
 //! - Each arm fills its outputs and slots with its own poison byte first (0xAB uncaptured,
 //!   0xCD captured), so a byte neither arm writes cannot pass as a match.
 //!
@@ -199,6 +203,7 @@ impl Rig<'_> {
         c0: &[f32],
         cut: Option<usize>,
         poison: u8,
+        fuse: bool,
     ) -> Result<Arm> {
         let (g, c, ws) = (self.g, &self.cfg, &self.ws);
         let (hb, cb) = self.bytes();
@@ -215,7 +220,7 @@ impl Rig<'_> {
         });
         let took = self
             .layer
-            .prefill_chunked_tc(g, hidden, k, &st, ws, split.as_ref(), 0)?;
+            .prefill_chunked_tc_inner(g, hidden, k, &st, ws, fuse, split.as_ref(), 0)?;
         g.synchronize(0)?;
         let arm = Arm {
             took,
@@ -333,7 +338,7 @@ fn run_rows(rig: &Rig, t: usize, total: &mut usize, cases: &mut usize) -> Result
     let h0 = r.vec(c.recurrent_state_elems(), 0.1);
     let c0 = r.vec(c.conv_state_elems(), 0.3);
     let (h0b, c0b) = (f32_bytes(&h0), f32_bytes(&c0));
-    let plain = rig.run(hidden, t, &h0, &c0, None, POISON_PLAIN)?;
+    let plain = rig.run(hidden, t, &h0, &c0, None, POISON_PLAIN, false)?;
 
     let mut all = true;
     let mut base = Checks {
@@ -349,10 +354,10 @@ fn run_rows(rig: &Rig, t: usize, total: &mut usize, cases: &mut usize) -> Result
     all &= base.report(total);
 
     for cut in cuts(t) {
-        let cap = rig.run(hidden, t, &h0, &c0, Some(cut), POISON_CAP)?;
+        let cap = rig.run(hidden, t, &h0, &c0, Some(cut), POISON_CAP, false)?;
         let (ref_h, ref_conv) = rig.reference(cut, &h0, &c0)?;
         let bad = bad_cut(cut, t);
-        let worse = rig.run(hidden, t, &h0, &c0, Some(bad), POISON_CAP)?;
+        let worse = rig.run(hidden, t, &h0, &c0, Some(bad), POISON_CAP, false)?;
         let mut k = Checks {
             tag: format!("T={t} cut={cut} bad={bad}"),
             fails: Vec::new(),
@@ -379,7 +384,7 @@ fn run_rows(rig: &Rig, t: usize, total: &mut usize, cases: &mut usize) -> Result
 
     // 2026-10-06: (d) a cut inside a chunk: no capture, slot untouched, nothing else changed.
     let mid = t - 3;
-    let skip = rig.run(hidden, t, &h0, &c0, Some(mid), POISON_CAP)?;
+    let skip = rig.run(hidden, t, &h0, &c0, Some(mid), POISON_CAP, false)?;
     let (hb, cb) = rig.bytes();
     let mut k = Checks {
         tag: format!("T={t} cut={mid} (inside a chunk)"),
@@ -400,6 +405,64 @@ fn run_rows(rig: &Rig, t: usize, total: &mut usize, cases: &mut usize) -> Result
     Ok(all)
 }
 
+/// 2026-10-10: Fused front vs unfused front, each with the same in-pass capture, inside one
+/// 8192-row call at cuts 2048, 4096 and 6144 (the 2048-mode grid inside an 8192 chunk): the
+/// slot's conv state, the slot's h state, the layer output, core and final states must be
+/// identical. Prints `FUSECAP BITWISE cut=<n> conv=<identical|DIFF> h=<identical|DIFF> ...`;
+/// returns whether every line was identical. Also checks the no-capture fused call.
+fn run_fusecap(rig: &Rig, cases: &mut usize) -> Result<bool> {
+    let (g, c) = (rig.g, &rig.cfg);
+    let t = 8192;
+    let mut r = Lcg(SEED ^ 0xF05E);
+    let hidden = up_bf16(g, &r.vec(t * c.hidden, 1.0))?;
+    let h0 = r.vec(c.recurrent_state_elems(), 0.1);
+    let c0 = r.vec(c.conv_state_elems(), 0.3);
+    let (h0b, c0b) = (f32_bytes(&h0), f32_bytes(&c0));
+    let word = |ok: bool| if ok { "identical" } else { "DIFF" };
+    let same = |a: &[u8], b: &[u8], w: usize| {
+        let (n, first) = diff(a, b, w);
+        n > 0 && first.is_none()
+    };
+    let mut all = true;
+    for cut in [None, Some(2048), Some(4096), Some(6144)] {
+        let un = rig.run(hidden, t, &h0, &c0, cut, POISON_PLAIN, false)?;
+        let fu = rig.run(hidden, t, &h0, &c0, cut, POISON_PLAIN, true)?;
+        let live_ok = live(&un.final_out, 2) && live(&un.core, 4) && un.h != h0b && un.conv != c0b;
+        let (conv, h) = match cut {
+            Some(_) => (
+                same(&un.slot_conv, &fu.slot_conv, 4) && un.took && fu.took,
+                same(&un.slot_h, &fu.slot_h, 4),
+            ),
+            None => (same(&un.conv, &fu.conv, 4), same(&un.h, &fu.h, 4)),
+        };
+        let out = same(&un.final_out, &fu.final_out, 2)
+            && same(&un.core, &fu.core, 4)
+            && same(&un.h, &fu.h, 4)
+            && same(&un.conv, &fu.conv, 4);
+        let ok = conv && h && out && live_ok;
+        match cut {
+            Some(n) => println!(
+                "FUSECAP BITWISE cut={n} conv={} h={} out={}{}",
+                word(conv),
+                word(h),
+                word(out),
+                if live_ok { "" } else { " (reference not live)" }
+            ),
+            None => println!(
+                "FUSECAP BITWISE cut=none conv={} h={} out={}{}",
+                word(conv),
+                word(h),
+                word(out),
+                if live_ok { "" } else { " (reference not live)" }
+            ),
+        }
+        all &= ok;
+        *cases += 1;
+    }
+    let _ = g.free(hidden);
+    Ok(all)
+}
+
 fn main() -> Result<()> {
     let g0 = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &g0;
@@ -414,12 +477,20 @@ fn main() -> Result<()> {
     }
     let max_rows = ROWS.iter().copied().max().unwrap_or(0);
     let ws = Glm5NextKdaWorkspace::new(g, &c, max_rows)?;
+    let layer_has_fuse = layer.kernels.has_front_fuse();
     let rig = Rig { g, layer, ws, cfg: c };
 
     let (mut all, mut total, mut cases) = (true, 0usize, 0usize);
     for t in ROWS {
         all &= run_rows(&rig, t, &mut total, &mut cases)?;
     }
+    if !layer_has_fuse {
+        println!("FAIL FUSECAP: the target lacks the kda_front_fuse kernels");
+        std::process::exit(1);
+    }
+    let fusecap = run_fusecap(&rig, &mut cases)?;
+    println!("{}", if fusecap { "PASS - FUSECAP" } else { "FAIL - FUSECAP" });
+    all &= fusecap;
     if total == 0 || cases == 0 {
         println!("FAIL kda_tc_capture_microtest: compared nothing; this run proves nothing");
         std::process::exit(1);

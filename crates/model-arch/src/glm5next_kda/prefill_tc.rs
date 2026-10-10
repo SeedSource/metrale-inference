@@ -48,16 +48,14 @@
 //! 2026-10-07: Under `METRALE_GLM_KDA_FRONT_FUSE=1` the first three launches and the front
 //! end's pack, gate and beta sigmoid become two (prefill_tc_fuse.rs); the scan is unchanged.
 
-use super::prefill_tc_fuse::{
-    front_fuse_refusal, kda_front_fuse, kda_front_fuse_fallback, kda_front_fuse_split_capture,
-};
+use super::prefill_tc_fuse::{front_fuse_refusal, kda_front_fuse, kda_front_fuse_fallback};
 use super::*;
 use metrale_model_layers::layer::InpassSplit;
 
 /// 2026-10-06: How the tensor-core prefill takes an in-pass capture after `row` rows of a
 /// `k`-row call ([`tc_capture_plan`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TcCapture {
+pub(super) enum TcCapture {
     /// 2026-10-06: No copy: no capture asked for, or `row` is inside a 16-row chunk.
     NoCapture,
     /// 2026-10-06: `row = c0 * KDA_TC_C < k`: the scan runs as chunks `[0, c0)`, then the copy,
@@ -137,12 +135,13 @@ impl Glm5NextKdaLayer {
     }
 
     /// 2026-10-10: The body of [`Self::prefill_chunked_tc`] and [`Self::prefill_chunked_tc_arm`]:
-    /// the front-fuse switch and the in-pass capture together. A capture that splits the scan at
-    /// a chunk boundary ([`TcCapture::Split`]) needs the unfused front (its conv-state tail
-    /// reads `ws.qkv_proj`, which the fused front never writes), so it runs unfused, warning
-    /// once; a capture at the end of the call (or none) is compatible with the fused front.
+    /// the front-fuse switch and the in-pass capture together. The fused front takes every
+    /// capture (`stateful_chunked_tc_fused` reads the conv tail at the cut from `ws.qkv_parts`).
+    ///
+    /// Public for `kda_tc_capture_microtest`, which runs the fused and unfused front with the
+    /// same capture in one process.
     #[allow(clippy::too_many_arguments)]
-    fn prefill_chunked_tc_inner(
+    pub fn prefill_chunked_tc_inner(
         &self,
         gpu: &dyn GpuBackend,
         hidden: DevicePtr,
@@ -171,15 +170,7 @@ impl Glm5NextKdaLayer {
         // 2026-10-07: METRALE_GLM_KDA_FRONT_FUSE=1: the front end skips the pack, the gate and
         // the beta sigmoid, and the recurrence computes them inside its prepare
         // (prefill_tc_fuse.rs); byte-identical.
-        let split = matches!(
-            capture.map(|cap| tc_capture_plan(cap.row, k)),
-            Some(TcCapture::Split { .. })
-        );
-        if front_fuse && split {
-            kda_front_fuse_split_capture();
-        }
         let fuse = front_fuse
-            && !split
             && match front_fuse_refusal(&self.cfg, self.kernels.has_front_fuse()) {
                 Some(why) => {
                     kda_front_fuse_fallback(why);
@@ -194,17 +185,7 @@ impl Glm5NextKdaLayer {
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
         let t_recur = profile::start();
         let captured = if fuse {
-            self.stateful_chunked_tc_fused(gpu, k, state, ws, stream)?;
-            // 2026-10-10: `fuse` implies the plan is not `Split`: the only capture left is the
-            // end-of-call copy, the same two copies `stateful_chunked_tc` issues after its scan.
-            match capture.map(|cap| (cap, tc_capture_plan(cap.row, k))) {
-                Some((cap, TcCapture::After)) => {
-                    gpu.copy_d2d_async(state.recurrent, cap.h_dst, cap.h_bytes, stream)?;
-                    gpu.copy_d2d_async(state.conv, cap.conv_dst, cap.conv_bytes, stream)?;
-                    true
-                }
-                _ => false,
-            }
+            self.stateful_chunked_tc_fused(gpu, k, state, ws, capture, stream)?
         } else {
             self.stateful_chunked_tc(gpu, k, state, ws, capture, stream)?
         };
@@ -267,13 +248,7 @@ impl Glm5NextKdaLayer {
         let c = &self.cfg;
         let (qkv, cd, d) = (c.qkv_dim(), c.conv_dim(), c.head_dim);
         let nchunks = k.div_ceil(KDA_TC_C);
-        let plan = match capture.map(|cap| (cap, tc_capture_plan(cap.row, k))) {
-            Some((cap, TcCapture::Split { .. })) if cap.conv_bytes < c.conv_state_elems() * 4 => {
-                TcCapture::NoCapture
-            }
-            Some((_, p)) => p,
-            None => TcCapture::NoCapture,
-        };
+        let plan = self.tc_capture_plan_for(capture, k);
 
         // 2026-10-01: The token loop's conv (`stateful_rows`) with its rows spread over grid.y;
         // it reads the conv state, and the tail launch then writes it.
@@ -327,9 +302,41 @@ impl Glm5NextKdaLayer {
             .arg_u32(c.heads as u32)
             .arg_f32(1.0 / (d as f32).sqrt())
             .launch(stream)?;
-        // 2026-10-06: The scan reads the recurrent state once and writes it once, FP32, so two
-        // launches split at a chunk boundary carry it exactly; the copy between them is the
-        // state after `row` rows.
+        self.tc_scan_captured(gpu, k, state, ws, capture, plan, stream)
+    }
+
+    /// 2026-10-10: The capture [`tc_capture_plan`] allows for this layer: a `Split` needs the
+    /// slot's `conv_bytes` to hold the whole conv state, else `NoCapture`.
+    pub(super) fn tc_capture_plan_for(&self, capture: Option<&InpassSplit>, k: usize) -> TcCapture {
+        match capture.map(|cap| (cap, tc_capture_plan(cap.row, k))) {
+            Some((cap, TcCapture::Split { .. }))
+                if cap.conv_bytes < self.cfg.conv_state_elems() * 4 =>
+            {
+                TcCapture::NoCapture
+            }
+            Some((_, p)) => p,
+            None => TcCapture::NoCapture,
+        }
+    }
+
+    /// 2026-10-10: The scan of `stateful_chunked_tc` and its capture copies, shared with the
+    /// fused front (`stateful_chunked_tc_fused`): both leave the same chunk records.
+    ///
+    /// 2026-10-06: The scan reads the recurrent state once and writes it once, FP32, so two
+    /// launches split at a chunk boundary carry it exactly; the copy between them is the state
+    /// after `row` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tc_scan_captured(
+        &self,
+        gpu: &dyn GpuBackend,
+        k: usize,
+        state: &KdaSeqState,
+        ws: &Glm5NextKdaWorkspace,
+        capture: Option<&InpassSplit>,
+        plan: TcCapture,
+        stream: u64,
+    ) -> Result<bool> {
+        let nchunks = k.div_ceil(KDA_TC_C);
         match (capture, plan) {
             (Some(cap), TcCapture::Split { c0 }) => {
                 self.tc_scan_launch(gpu, (0, c0), cap.row, state, ws, stream)?;
@@ -403,20 +410,6 @@ impl Glm5NextKdaLayer {
             .arg_u32(qkv as u32)
             .launch(stream)?;
         Ok(())
-    }
-
-    /// 2026-10-07: `kda_tc_scan` over the chunk records of rows `0..k` (the fused front launches
-    /// it too). 2026-10-10: now the uncaptured `tc_scan_launch` over every chunk, the same
-    /// arguments as before.
-    pub(super) fn launch_tc_scan(
-        &self,
-        gpu: &dyn GpuBackend,
-        k: usize,
-        state: &KdaSeqState,
-        ws: &Glm5NextKdaWorkspace,
-        stream: u64,
-    ) -> Result<()> {
-        self.tc_scan_launch(gpu, (0, k.div_ceil(KDA_TC_C)), k, state, ws, stream)
     }
 }
 

@@ -335,6 +335,9 @@ pub fn launch_topk_radix(
     }
     let rows = t.q_rows as u32;
     let chunks = radix_chunks(t.q_rows) as u32;
+    // 2026-10-10: METRALE_GLM_DSA_RADIX_BINSTAT=1 (debug): this call is sampled; never while
+    // capturing a graph.
+    let sampled = super::binstat::begin_call(gpu, kernels, stream);
     let block = [RADIX_THREADS, 1, 1];
     let (p, selk, kcap, gd) = (
         t.n_pools as u32,
@@ -373,6 +376,10 @@ pub fn launch_topk_radix(
             .arg_u32(chunks)
             .arg_ptr(gd)
             .launch(stream)?;
+        // 2026-10-10: after find 0, hist0 and the prefix are final and hist 1 has not run.
+        if sampled && pass == 0 {
+            super::binstat::launch_binstat(gpu, kernels, t.work, rows, p, selk, kcap, gd, stream)?;
+        }
     }
     KernelLaunch::new(gpu, kernels.topk_radix_gather)
         .grid([chunks, rows, 1])
@@ -392,7 +399,11 @@ pub fn launch_topk_radix(
         .arg_u32(selk)
         .arg_u32(kcap)
         .arg_ptr(gd)
-        .launch(stream)
+        .launch(stream)?;
+    if sampled {
+        super::binstat::report(gpu, t.work, t.q_rows, t.kcap, stream)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

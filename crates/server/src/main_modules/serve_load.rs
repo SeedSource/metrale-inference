@@ -155,6 +155,7 @@ pub(crate) fn load_model(
         config.hidden_size,
         config.vocab_size,
     )?;
+    serve_phases::spawn_comm_watch(&comm);
     config.profile = args.profile;
     serve_phases::cap_vocab_size_to_tokenizer(&model_dir, &mut config);
     let serve_phases::KvCacheConfig {

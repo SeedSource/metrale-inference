@@ -505,3 +505,32 @@ fn no_checkpoint_pinned_bs16_nd2() {
     assert_eq!(ssm_checkpoint_bytes(16, BLOB, false), 16 * BLOB);
     assert_eq!(ssm_checkpoint_bytes(16, BLOB, true), 0);
 }
+
+/// 2026-10-10: `METRALE_MTP_POOL_CAP` sizing: `min(max_batch, cap)` with no 32 floor,
+/// at least 1; the reserve drops exactly the uncovered slots' verify terms.
+#[test]
+fn pool_cap_sizes_to_dispatch_cap_without_floor() {
+    assert_eq!(mtp_state_slots_capped(16, 8), 8);
+    assert_eq!(mtp_state_slots_capped(4, 8), 4);
+    assert_eq!(mtp_state_slots_capped(64, 32), 32);
+    assert_eq!(mtp_state_slots_capped(16, 0), 1);
+    let (h, conv, nd) = (1000usize, 100usize, 2usize);
+    for no_ckpt in [false, true] {
+        let at = |slots| {
+            ssm_pool_reserve_bytes_with(
+                16,
+                h,
+                conv,
+                true,
+                nd,
+                slots,
+                true,
+                false,
+                SsmRollbackMode::Snapshot,
+                no_ckpt,
+            )
+        };
+        let per_slot = nd * h + (nd + 1) * conv + if no_ckpt { 0 } else { h + conv };
+        assert_eq!(at(16) - at(8), 8 * per_slot);
+    }
+}

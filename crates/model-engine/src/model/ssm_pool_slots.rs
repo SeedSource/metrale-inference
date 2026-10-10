@@ -57,16 +57,28 @@ impl SsmStatePool {
     /// for the DFlash verify. Both ranks claim and release in the same order, so they agree.
     pub(super) fn claim_slot(&self) -> Result<usize> {
         let mut free = self.free_slots.lock();
-        let got = if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
-            free.iter()
-                .enumerate()
-                .min_by_key(|&(_, &s)| s)
-                .map(|(pos, _)| pos)
-                .map(|pos| free.swap_remove(pos))
-        } else {
-            free.pop()
-        };
-        got.ok_or_else(|| {
+        // 2026-10-10: Under `METRALE_MTP_POOL_CAP` with an uncovered tail
+        // (`ssm_reserve::mtp_pool_cap`), claim the lowest free slot so a batch of at most
+        // `mtp_max_seqs` sequences sits on covered slots without compaction (EP v2 has
+        // none). Both EP ranks run this rule, so the worker's mirrored claim still
+        // returns the head's slot. The hybrid serve claims lowest-first too (above).
+        // Otherwise the last released slot (LIFO), as before.
+        let cap_bites =
+            self.mtp_slots < self.max_slots && metrale_model_layers::ssm_reserve::mtp_pool_cap();
+        let lowest_first =
+            cap_bites || metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled();
+        let slot = take_free_slot(&mut free, lowest_first);
+        if cap_bites {
+            // 2026-10-10: Gate evidence (boundary probe): which slot each sequence gets.
+            if let Some(s) = slot {
+                tracing::info!(
+                    "METRALE_MTP_POOL_CAP: claimed SSM slot {s} (cover {}, {} free)",
+                    self.mtp_slots,
+                    free.len()
+                );
+            }
+        }
+        slot.ok_or_else(|| {
             anyhow::anyhow!("SSM state pool exhausted (max {} slots)", self.max_slots)
         })
     }
@@ -455,5 +467,20 @@ impl Drop for SlotGuard {
             tracing::debug!("SlotGuard::drop releasing un-freed SSM slot {idx}");
             self.pool.release_slot(idx);
         }
+    }
+}
+
+/// 2026-10-10: Take a slot from the free list: the lowest index when `lowest_first`
+/// (`METRALE_MTP_POOL_CAP`), else the last pushed (LIFO). `None` when empty.
+pub(super) fn take_free_slot(free: &mut Vec<usize>, lowest_first: bool) -> Option<usize> {
+    if lowest_first {
+        let i = free
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &s)| s)
+            .map(|(i, _)| i)?;
+        Some(free.swap_remove(i))
+    } else {
+        free.pop()
     }
 }

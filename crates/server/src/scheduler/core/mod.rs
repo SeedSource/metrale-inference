@@ -219,7 +219,15 @@ impl SchedulerCore {
         } else {
             max_batch_size
         };
-        if spec_slot_cap < max_batch_size {
+        if spec_slot_cap < max_batch_size && metrale_model_layers::ssm_reserve::mtp_pool_cap() {
+            // 2026-10-10: `METRALE_MTP_POOL_CAP`: no compaction under EP v2; the pool
+            // claims the lowest free slot instead (`SsmStatePool::claim_slot`).
+            tracing::info!(
+                "METRALE_MTP_POOL_CAP: ENGAGED, MTP verify pools cover {spec_slot_cap}/{max_batch_size} \
+                 SSM slots, lowest-free slot claim; a batch with a sequence on an uncovered slot \
+                 plain-decodes (counted at shutdown)"
+            );
+        } else if spec_slot_cap < max_batch_size {
             tracing::info!(
                 "MTP verify pools cover {spec_slot_cap}/{max_batch_size} SSM slots — \
                  sequences on uncovered slots plain-decode until compaction moves them \

@@ -171,7 +171,7 @@ pub(crate) fn load_model(
     )?;
 
     load_phases::validate_kv_kernels(gpu.as_ref(), kv_dtype, &layer_dtypes, &config)?;
-    let dflash_drafter_state =
+    let mut dflash_drafter_state =
         serve_phases::load_dflash_drafter(&args, &config, &ptx_set, gpu.as_ref())?;
     // 2026-09-26: LoRA adapters load before `gpu` moves into `build_model`.
     // `lora_states` outlives it: `lora_args` borrows each `store`, and
@@ -190,7 +190,7 @@ pub(crate) fn load_model(
         );
     }
     let lora_args = adapters::lora_build_args(&args, &lora_states);
-    let dflash_args = adapters::dflash_build_args(&args, &dflash_drafter_state);
+    let dflash_args = adapters::dflash_build_args(&args, &mut dflash_drafter_state);
     let nllb_lang = adapters::resolve_nllb_lang(&args, &config, &model_dir)?;
     let (nllb_lora_dir, nllb_adapter_name) = adapters::resolve_nllb_adapter(&args, is_nllb)?;
     let model = serve_phases::build_model(

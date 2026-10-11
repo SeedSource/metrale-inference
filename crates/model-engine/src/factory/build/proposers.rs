@@ -103,7 +103,7 @@ pub(super) fn install_dflash_drafter(
             1,
         )?;
         if let Some(weights) = weights {
-            let head = metrale_model_arch::dflash_head::BlockDiffusionDraftHead::from_weights(
+            let mut head = metrale_model_arch::dflash_head::BlockDiffusionDraftHead::from_weights(
                 weights,
                 target_embed_for_dflash,
                 target_lm_head_for_dflash,
@@ -117,6 +117,17 @@ pub(super) fn install_dflash_drafter(
                 max_batch_size,
                 model.dflash_tp_rank(),
             )?;
+            // 2026-10-10: The BF16 copies of the layer GEMM weights are dead once the head
+            // runs on FP8 mirrors (#82 P2); every rank frees its own.
+            if let Some((n, bytes)) =
+                head.release_bf16_layer_weights(args.drafter_store, model.gpu_backend())?
+            {
+                tracing::info!(target: "metrale_model_engine::factory::build",
+                    "DFlash drafter: freed {n} BF16 layer weight tensor(s), {:.2} GB; the head \
+                     runs on their FP8 mirrors",
+                    bytes as f64 / 1e9
+                );
+            }
             if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
                 // 2026-10-10: Hybrid serve: the drafter goes beside the MTP head, which stays in
                 // `proposer` with every buffer it was sized with (`hybrid_spec.rs`).

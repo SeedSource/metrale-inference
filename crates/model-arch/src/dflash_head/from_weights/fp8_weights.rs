@@ -202,3 +202,78 @@ fn quantize_drafter_fp8(
     );
     Ok(())
 }
+
+/// 2026-10-10: Store-name suffixes of the seven dense GEMM weights per layer whose BF16
+/// copies [`BlockDiffusionDraftHead::release_bf16_layer_weights`] frees.
+const BF16_LAYER_SUFFIXES: [&str; 7] = [
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+    ".mlp.down_proj.weight",
+];
+
+impl BlockDiffusionDraftHead {
+    /// 2026-10-10: Frees the BF16 copies of the layers' seven dense GEMM weights once the
+    /// head runs on their FP8 mirrors (#82 hybrid memory, P2). Returns the freed (tensors,
+    /// bytes), or `None` when it keeps them.
+    ///
+    /// Kept unless `quant` is `Fp8Weights`, every layer holds all seven mirrors, and the
+    /// paged layer body is on (`levers.option_b`): the non-paged body
+    /// (`forward_block_layer.rs`, METRALE_DFLASH_OPTION_B=0) reads the BF16 weights.
+    /// The paged body passes them to `gemm_swap`, which reads the mirror when it is
+    /// present. The fused ctx K/V weight is its own copy, made in `from_weights`.
+    /// Only BF16 store tensors are freed: an NVFP4-packed tensor was dequantized into
+    /// another allocation.
+    ///
+    /// The head's BF16 pointers are set to null first, so a read that this audit missed
+    /// faults with an illegal address instead of reading freed memory.
+    pub fn release_bf16_layer_weights(
+        &mut self,
+        store: &mut metrale_model_weights::weights::WeightStore,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<(usize, usize)>> {
+        let mirrored = self.layers.iter().all(|l| {
+            l.q_proj_fp8.is_some()
+                && l.k_proj_fp8.is_some()
+                && l.v_proj_fp8.is_some()
+                && l.o_proj_fp8.is_some()
+                && l.gate_proj_fp8.is_some()
+                && l.up_proj_fp8.is_some()
+                && l.down_proj_fp8.is_some()
+        });
+        if self.quant != DflashQuantization::Fp8Weights || !self.levers.option_b || !mirrored {
+            return Ok(None);
+        }
+        let doomed: std::collections::HashSet<String> = store
+            .names()
+            .filter(|n| BF16_LAYER_SUFFIXES.iter().any(|s| n.ends_with(s)))
+            .filter(|n| {
+                store
+                    .get(n)
+                    .is_ok_and(|t| t.dtype == metrale_model_weights::weights::WeightDtype::BF16)
+            })
+            .map(str::to_owned)
+            .collect();
+        if doomed.is_empty() {
+            return Ok(None);
+        }
+        // The quantize kernels and the fused K/V copies read these on stream 0.
+        gpu.synchronize(0)?;
+        let null = metrale_model_layers::weight_map::DenseWeight {
+            weight: metrale_gpu_runtime::gpu::DevicePtr::NULL,
+        };
+        for l in &mut self.layers {
+            l.q_proj = null;
+            l.k_proj = null;
+            l.v_proj = null;
+            l.o_proj = null;
+            l.gate_proj = null;
+            l.up_proj = null;
+            l.down_proj = null;
+        }
+        store.free_matching(gpu, |n| doomed.contains(n)).map(Some)
+    }
+}

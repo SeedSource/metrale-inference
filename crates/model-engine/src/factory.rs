@@ -32,7 +32,9 @@ use metrale_model_arch::weight_loader::{
 /// [`build_model`] passes them to
 /// `metrale_model_arch::dflash_head::BlockDiffusionDraftHead::from_weights`.
 pub struct DflashBuildArgs<'a> {
-    pub drafter_store: &'a WeightStore,
+    /// 2026-10-10: `mut`: the install frees the BF16 layer weights once the head runs on
+    /// their FP8 mirrors (`BlockDiffusionDraftHead::release_bf16_layer_weights`).
+    pub drafter_store: &'a mut WeightStore,
     pub drafter_config: DflashConfig,
     pub gamma: Option<usize>,
     pub window_size: Option<usize>,

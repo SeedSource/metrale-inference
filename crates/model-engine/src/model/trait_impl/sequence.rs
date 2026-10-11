@@ -186,67 +186,8 @@ impl TransformerModel {
         // next request replay graphs that write this one's freed buffers. Only this slot's
         // entries are dropped, and only then (`decode_graph_key` tests pin it).
         if !slot_reused_by_compact && self.layers.iter().any(|l| l.graph_stale_on_new_sequence()) {
-            let slot = seq.slot_idx as u32;
-            let mut stale: Vec<metrale_gpu_runtime::gpu::GraphHandle> = self
-                .decode_graph
-                .lock()
-                .remove(&seq.slot_idx)
-                .into_iter()
-                .collect();
-            // 2026-09-25: The K-row verify graphs are slot-keyed too and bake the same
-            // per-sequence state (`Glm5NextDsaState::{k_normed, gate, valid}`).
-            for m in [
-                &self.verify2_graph,
-                &self.verify3_graph,
-                &self.verify4_graph,
-            ] {
-                stale.extend(m.lock().remove(&seq.slot_idx));
-            }
-            {
-                // 2026-09-25: A batched graph bakes every row's state pointers, so every key
-                // that contains this slot is dropped.
-                let mut batch = self.batch_decode_graphs.lock();
-                let keys: Vec<Vec<u32>> = batch
-                    .0
-                    .keys()
-                    .filter(|k| k.contains(&slot))
-                    .cloned()
-                    .collect();
-                for k in keys {
-                    if let Some((g, _)) = batch.0.remove(&k) {
-                        stale.push(g);
-                    }
-                }
-            }
-            {
-                // 2026-10-07: Batched-verify keys are `(slot, k)` pairs then a sentinel
-                // (`verify_graph_key`); a graphed own-state verify bakes every pair's state, so
-                // every key with a pair on this sequence's SSM slot (or slot index) is dropped.
-                let ssm = seq.ssm_slot_idx().map(|s| s as u32).unwrap_or(slot);
-                let mut vb = self.verify_batched_graphs.lock();
-                let keys: Vec<Vec<u32>> = vb
-                    .0
-                    .keys()
-                    .filter(|k| {
-                        k[..k.len().saturating_sub(1)]
-                            .chunks(2)
-                            .any(|p| p[0] == ssm || p[0] == slot)
-                    })
-                    .cloned()
-                    .collect();
-                for k in keys {
-                    if let Some((g, _)) = vb.0.remove(&k) {
-                        stale.push(g);
-                    }
-                }
-            }
-            for g in stale {
-                if g.0 != 0
-                    && let Err(e) = self.gpu.destroy_graph(g)
-                {
-                    tracing::warn!("free_sequence: destroy graph for slot {slot}: {e:#}");
-                }
-            }
+            let ssm = seq.ssm_slot_idx().map(|s| s as u32);
+            self.drop_slot_graphs(seq.slot_idx, ssm);
         }
 
         // 2026-09-25: The SSM buffers belong to the pool, so the references are cleared,
@@ -263,27 +204,7 @@ impl TransformerModel {
             }
         }
 
-        // 2026-09-25: `verify_kgamma_graph` and `fused_graph` are keyed by (slot, K) and bake
-        // the request's LoRA routing, so every K of this slot is dropped.
-        for graph_map in [&self.verify_kgamma_graph, &self.fused_graph] {
-            let mut cache = graph_map.lock();
-            let keys: Vec<(usize, usize)> = cache
-                .keys()
-                .filter(|k| k.0 == seq.slot_idx)
-                .copied()
-                .collect();
-            for k in keys {
-                if let Some(graph) = cache.remove(&k)
-                    && let Err(e) = self.gpu.destroy_graph(graph)
-                {
-                    tracing::error!(
-                        "free_sequence: destroy_graph(kgamma/fused[{},{}]): {e:#}",
-                        k.0,
-                        k.1
-                    );
-                }
-            }
-        }
+        self.drop_slot_kgamma_graphs(seq.slot_idx);
 
         // 2026-09-25: MTP drafter carry: move this turn's drafter KV into the model's single
         // carry slot before the proposer state is freed, so the next turn of the same session

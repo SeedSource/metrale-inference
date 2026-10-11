@@ -220,7 +220,8 @@ impl SchedulerCore {
             tracing::info!(
                 "METRALE_MTP_POOL_CAP: ENGAGED, MTP verify pools cover {spec_slot_cap}/{max_batch_size} \
                  SSM slots, lowest-free slot claim; a batch with a sequence on an uncovered slot \
-                 plain-decodes (counted at shutdown)"
+                 plain-decodes (counted) until a retirement frees a covered slot and the \
+                 sequence migrates onto it"
             );
         } else if spec_slot_cap < max_batch_size {
             tracing::info!(

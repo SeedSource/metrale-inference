@@ -56,6 +56,15 @@ pub trait ModelLifecycle {
     /// to pool slot `new_slot`.
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()>;
 
+    /// 2026-10-10: `METRALE_MTP_POOL_CAP`: move a sequence on an SSM slot the MTP verify pools
+    /// do not cover onto the lowest free covered slot, on every EP rank. Rank 0 only, between
+    /// steps with no step in flight. Returns the new slot, or `None` when there is nothing to
+    /// do. Default: `None`.
+    fn migrate_to_covered_slot(&self, seq: &mut SequenceState) -> Result<Option<usize>> {
+        let _ = seq;
+        Ok(None)
+    }
+
     /// 2026-09-25: Give up a retired sequence's SSM pool slot after `compact_sequence` moved a
     /// surviving sequence into it: sets `slot_idx` to `usize::MAX` and empties the slot guard, so
     /// freeing or dropping this sequence does not release the slot. Call it right after that

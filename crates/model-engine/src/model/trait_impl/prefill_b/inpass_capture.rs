@@ -208,6 +208,31 @@ impl TransformerModel {
             self.ssm_snapshots.free(snap_id);
             return;
         }
+        // 2026-10-10: The host aux budget, as `save_checkpoint` applies it to grid saves: make room
+        // first (the owner's earlier grid checkpoints, then the global LRU) and register the blob
+        // owned, so it counts against the budget and the owner phase can evict it. Before this an
+        // in-pass blob was stored with no budget check and no owner (gx2b E, #68 6105021151).
+        let grid = seq.prefix_grid_refs && self.prefix_grid_for_bs(tokens, bs).is_some();
+        let budget = super::super::super::ssm_snapshot_auxbudget::aux_budget_bytes();
+        let owner = super::super::super::ssm_snapshot_auxbudget::owner_key(tokens);
+        if grid && budget > 0 {
+            let need = self.aux_prefix_bytes_total(seq, cut);
+            if need > 0
+                && !self.ssm_snapshots.make_room_for_aux(
+                    self.prefix_cache.as_ref(),
+                    owner,
+                    need,
+                    budget,
+                )
+            {
+                tracing::debug!(
+                    "Skip in-pass checkpoint at token {cut}: aux blob {need} B does not fit the \
+                     host aux budget {budget} B"
+                );
+                self.ssm_snapshots.free(snap_id);
+                return;
+            }
+        }
         let aux = match self.collect_aux_states_prefix(seq, cut, stream) {
             Ok(aux) => aux,
             Err(e) => {
@@ -220,7 +245,11 @@ impl TransformerModel {
             }
         };
         if !aux.is_empty() {
-            self.ssm_snapshots.set_aux(snap_id, aux);
+            if grid {
+                self.ssm_snapshots.set_aux_owned(snap_id, aux, owner, cut);
+            } else {
+                self.ssm_snapshots.set_aux(snap_id, aux);
+            }
         }
         let is_prompt_tail = crate::prefill_plan::is_prompt_tail_end(cut, tokens.len(), bs);
         self.prefill_b_register_checkpoint(tokens, seq, kv_cache, cut, snap_id, is_prompt_tail);

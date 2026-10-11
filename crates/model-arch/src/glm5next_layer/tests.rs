@@ -358,7 +358,7 @@ fn batched_verify_graphs_stays_behind_its_lever() {
     assert!(gr.contains("graph_borrow_enabled()\n                && !self.any_verify_own_states()"));
     assert!(gr.contains("layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;"));
     assert!(gr.contains("layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;"));
-    let s = include_str!("../../../model-engine/src/model/trait_impl/sequence.rs");
+    let s = include_str!("../../../model-engine/src/model/trait_impl/sequence_compact.rs");
     assert!(s.contains("let mut vb = self.verify_batched_graphs.lock();"));
     let x = include_str!("../glm5next_dsa/layer/xseq.rs");
     assert!(x.contains("!ctx.graph_capture || crate::glm5next_layer::ms_graphs::xseq_capture_ok()"));

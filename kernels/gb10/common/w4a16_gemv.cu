@@ -2981,8 +2981,14 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
     unsigned int N, unsigned int K, unsigned int num_experts,
     unsigned int a_row_stride,
     unsigned int a_slot_stride,
-    unsigned int c_row_stride)
+    unsigned int c_row_stride,
+    unsigned int row0,
+    unsigned int slot_stride,
+    unsigned int nrows)
 {
+    // 2026-10-11: Rows row0 .. row0 + R - 1 of an `nrows`-row group whose union entry u holds
+    // its slots at u_slot[u * slot_stride + row]; rows at or past nrows are dead. The 2..=8-row
+    // entries pass (0, R, R); `_down_m8x2` runs both 8-row halves of a 9..=16-row group.
     // 2026-10-08: RP rows padded to a power of two; V = 2 * RP values (two columns) per tree.
     constexpr int RP = (R <= 2) ? 2 : ((R <= 4) ? 4 : 8);
     constexpr int V = 2 * RP;
@@ -3012,7 +3018,7 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
     bool any = false;
     #pragma unroll
     for (int r = 0; r < R; r++) {
-        live[r] = u_slot[u * R + r] >= 0;
+        live[r] = row0 + (unsigned int)r < nrows && u_slot[u * slot_stride + row0 + r] >= 0;
         any = any || live[r];
     }
     if (!any) return;
@@ -3050,8 +3056,8 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
     #pragma unroll
     for (int r = 0; r < R; r++) {
         if (!live[r]) continue;
-        const int sl = u_slot[u * R + r];
-        const uint4* ar = (const uint4*)(A + (unsigned long long)r * a_row_stride
+        const int sl = u_slot[u * slot_stride + row0 + r];
+        const uint4* ar = (const uint4*)(A + (unsigned long long)(row0 + r) * a_row_stride
                                            + (unsigned long long)sl * a_slot_stride);
         for (unsigned int ch = tid; ch < CH; ch += blockDim.x) {
             const uint4 x = ar[ch];
@@ -3074,7 +3080,8 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
     const bool holder = (lane & ((32u >> LOGV) - 1u)) == 0u;
     const unsigned int my_c = m / RP, my_r = m % RP;
     int my_slot = -1;
-    if (holder && my_r < (unsigned int)R) my_slot = u_slot[u * R + my_r];
+    if (holder && my_r < (unsigned int)R && row0 + my_r < nrows)
+        my_slot = u_slot[u * slot_stride + row0 + my_r];
 
     #pragma unroll 1
     for (int p = 0; p < MOE_DOWN_FAST_COLS_PER_WARP / 2; p++) {
@@ -3172,7 +3179,7 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
         const unsigned int n = n0 + my_c * N_PER_BLOCK_SW;
         if (my_slot >= 0 && n < N) {
             const float result = __fadd_rn(t, 0.0f);
-            C[(unsigned long long)my_r * c_row_stride
+            C[(unsigned long long)(row0 + my_r) * c_row_stride
               + (unsigned long long)my_slot * N + n] = __float2bfloat16(result);
         }
     }
@@ -3191,7 +3198,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void w4a16_gemv_sw_moe_batchm_do
     unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
 {                                                                                  \
     w4a16_gemv_sw_moe_batchm_down_body<R>(A, packed_ptrs, scale_ptrs, scale2_vals, C, \
-        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride,   \
+        0u, R, R);                                                                 \
 }
 METRALE_MOE_BATCHM_DOWN_ENTRY(2)
 METRALE_MOE_BATCHM_DOWN_ENTRY(3)
@@ -3200,6 +3208,34 @@ METRALE_MOE_BATCHM_DOWN_ENTRY(5)
 METRALE_MOE_BATCHM_DOWN_ENTRY(6)
 METRALE_MOE_BATCHM_DOWN_ENTRY(7)
 METRALE_MOE_BATCHM_DOWN_ENTRY(8)
+
+// 2026-10-11: METRALE_GLM_MOE_UNION_ROWS (#80 m16 v2). The down sweep of a 9..=16-row union
+// group (`nrows`, the extra last argument; union entry u's slots at u_slot[u * nrows + row]):
+// the R = 8 body twice in one block, rows 0..7 then 8..nrows-1, so the block's weight slice is
+// fetched from DRAM once and re-read by the second half from L1/L2 instead of a second sweep's
+// launch reading it again. Each half is the 8-row entry's arithmetic for its rows, so every
+// output is bit-identical to `_down_m8` on that half (and so to `_m<R>`). The barrier keeps a
+// slow warp's first-half reads of s_a ahead of the second half's staging.
+extern "C" __global__ __launch_bounds__(256, 2) void w4a16_gemv_sw_moe_batchm_down_m8x2(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ packed_ptrs,
+    const unsigned long long* __restrict__ scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ u_eid,
+    const int* __restrict__ u_slot,
+    unsigned int N, unsigned int K, unsigned int num_experts,
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride,
+    unsigned int nrows)
+{
+    #pragma unroll 1
+    for (unsigned int row0 = 0u; row0 < nrows; row0 += 8u) {
+        if (row0 != 0u) __syncthreads();
+        w4a16_gemv_sw_moe_batchm_down_body<8>(A, packed_ptrs, scale_ptrs, scale2_vals, C,
+            u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride,
+            row0, nrows, nrows);
+    }
+}
 
 // 2026-10-09: METRALE_GLM_MOE_GATEUP_FAST. w4a16_gemv_sw_moe_batchm_gateup_m<R>: the gate AND up
 // union sweeps of one row group in ONE launch, each output byte-identical to
@@ -3259,7 +3295,13 @@ __device__ __forceinline__ float moe_gateup_tree(float (&v)[V], unsigned int lan
     return t;
 }
 
-template <int R>
+// 2026-10-11: H row halves of R rows each (H = 2: `_gateup_m8x2`, #80 m16 v2): half hh holds
+// rows hh * R .. hh * R + R - 1 of an `nrows`-row group whose union entry u has its slots at
+// u_slot[u * slot_stride + row]; rows at or past nrows are dead. Per column the halves run back
+// to back, so the second half's weight words come from L1 (the first half just loaded them).
+// Each half is the R-row arithmetic for its rows: outputs are bit-identical to `_gateup_m<R>` on
+// that half. The 2..=8-row entries pass H = 1 and (R, R).
+template <int R, int H>
 __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ g_packed_ptrs,
@@ -3275,7 +3317,9 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
     unsigned int N, unsigned int K, unsigned int num_experts,
     unsigned int a_row_stride,
     unsigned int a_slot_stride,
-    unsigned int c_row_stride)
+    unsigned int c_row_stride,
+    unsigned int slot_stride,
+    unsigned int nrows)
 {
     constexpr int RP = (R <= 2) ? 2 : ((R <= 4) ? 4 : 8);
     constexpr int V = 2 * RP;
@@ -3297,15 +3341,16 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
     const float s21 = ok1 ? u_scale2_vals[eid] : 0.0f;
 
     // 2026-10-09: Live rows as a bit mask and 32-bit element offsets into A.
-    unsigned int aoff[R];
+    unsigned int aoff[H * R];
     unsigned int live = 0u;
     #pragma unroll
-    for (int r = 0; r < R; r++) {
-        const int sl = u_slot[u * R + r];
-        aoff[r] = 0u;
+    for (int i = 0; i < H * R; i++) {
+        aoff[i] = 0u;
+        if ((unsigned int)i >= nrows) continue;
+        const int sl = u_slot[u * slot_stride + i];
         if (sl < 0) continue;
-        aoff[r] = (unsigned int)r * a_row_stride + (unsigned int)sl * a_slot_stride;
-        live |= 1u << r;
+        aoff[i] = (unsigned int)i * a_row_stride + (unsigned int)sl * a_slot_stride;
+        live |= 1u << i;
     }
     if (live == 0u) return;
 
@@ -3330,8 +3375,14 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
     const unsigned int m = lane >> (5 - LOGV);
     const bool holder = (lane & ((32u >> LOGV) - 1u)) == 0u;
     const unsigned int my_mat = m / RP, my_r = m % RP;
-    int my_slot = -1;
-    if (holder && my_r < (unsigned int)R && (my_mat ? ok1 : ok0)) my_slot = u_slot[u * R + my_r];
+    int my_slot[H];
+    #pragma unroll
+    for (int hh = 0; hh < H; hh++) {
+        const unsigned int row = (unsigned int)(hh * R) + my_r;
+        my_slot[hh] = -1;
+        if (holder && my_r < (unsigned int)R && row < nrows && (my_mat ? ok1 : ok0))
+            my_slot[hh] = u_slot[u * slot_stride + row];
+    }
     __nv_bfloat16* __restrict__ Cm = my_mat ? C_up : C_gate;
 
     #pragma unroll 1
@@ -3343,81 +3394,87 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
         const unsigned long long wo = (unsigned long long)n * half_K;
         const unsigned long long so = (unsigned long long)n * num_groups;
 
-        float t[2];
+        // 2026-10-11: Unrolled so aoff / my_slot stay in registers (static indices).
         #pragma unroll
-        for (int ch = 0; ch < 2; ch++) {
-            // 2026-10-09: v[mat * RP + r] = this chain's acc0 + acc1 for (mat, r).
-            float v[V];
+        for (int hh = 0; hh < H; hh++) {
+            const unsigned int hl = (live >> (hh * R)) & ((1u << R) - 1u);
+            if (hl == 0u) continue;
+            float t[2];
             #pragma unroll
-            for (int i = 0; i < V; i++) v[i] = 0.0f;
-            #pragma unroll
-            for (int h = 0; h < 2; h++) {
-                float acc0[R], acc1[R];
+            for (int ch = 0; ch < 2; ch++) {
+                // 2026-10-09: v[mat * RP + r] = this chain's acc0 + acc1 for (mat, r).
+                float v[V];
                 #pragma unroll
-                for (int r = 0; r < R; r++) { acc0[r] = 0.0f; acc1[r] = 0.0f; }
-                #pragma unroll 1
-                for (unsigned int kk = 2u * (lane + 32u * (unsigned int)ch) + (unsigned int)h;
-                     kk < K16; kk += 128u) {
-                    const unsigned long long q0 = ok0 ? *(const unsigned long long*)(Bp0 + wo + kk * 8) : 0ull;
-                    const unsigned long long q1 = ok1 ? *(const unsigned long long*)(Bp1 + wo + kk * 8) : 0ull;
-                    const unsigned char b0 = ok0 ? Bs0[so + kk] : (unsigned char)0;
-                    const unsigned char b1 = ok1 ? Bs1[so + kk] : (unsigned char)0;
-                    __nv_fp8_e4m3 f0, f1;
-                    *(unsigned char*)&f0 = b0;
-                    *(unsigned char*)&f1 = b1;
-#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
-                    const float sc0 = scl_fp8(b0) * s20;
-                    const float sc1 = scl_fp8(b1) * s21;
-#else
-                    const float sc0 = (float)f0 * s20;
-                    const float sc1 = (float)f1 * s21;
-#endif
-                    float w0[16], w1[16];
+                for (int i = 0; i < V; i++) v[i] = 0.0f;
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    float acc0[R], acc1[R];
                     #pragma unroll
-                    for (int e = 0; e < 16; e++) {
-                        w0[e] = lut[(unsigned int)(q0 >> (4 * e)) & 0xFu];
-                        w1[e] = lut[(unsigned int)(q1 >> (4 * e)) & 0xFu];
+                    for (int r = 0; r < R; r++) { acc0[r] = 0.0f; acc1[r] = 0.0f; }
+                    #pragma unroll 1
+                    for (unsigned int kk = 2u * (lane + 32u * (unsigned int)ch) + (unsigned int)h;
+                         kk < K16; kk += 128u) {
+                        const unsigned long long q0 = ok0 ? *(const unsigned long long*)(Bp0 + wo + kk * 8) : 0ull;
+                        const unsigned long long q1 = ok1 ? *(const unsigned long long*)(Bp1 + wo + kk * 8) : 0ull;
+                        const unsigned char b0 = ok0 ? Bs0[so + kk] : (unsigned char)0;
+                        const unsigned char b1 = ok1 ? Bs1[so + kk] : (unsigned char)0;
+                        __nv_fp8_e4m3 f0, f1;
+                        *(unsigned char*)&f0 = b0;
+                        *(unsigned char*)&f1 = b1;
+    #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+                        const float sc0 = scl_fp8(b0) * s20;
+                        const float sc1 = scl_fp8(b1) * s21;
+    #else
+                        const float sc0 = (float)f0 * s20;
+                        const float sc1 = (float)f1 * s21;
+    #endif
+                        float w0[16], w1[16];
+                        #pragma unroll
+                        for (int e = 0; e < 16; e++) {
+                            w0[e] = lut[(unsigned int)(q0 >> (4 * e)) & 0xFu];
+                            w1[e] = lut[(unsigned int)(q1 >> (4 * e)) & 0xFu];
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < R; r++) {
+                            if (!(hl & (1u << r))) continue;
+                            const uint4* ar = (const uint4*)(A + aoff[hh * R + r]);
+                            const uint4 a_lo = ar[kk * 2];
+                            const uint4 a_hi = ar[kk * 2 + 1];
+                            const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                                           a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+                            float pg = 0.0f, pu = 0.0f;
+                            #pragma unroll
+                            for (int b = 0; b < 8; b++) {
+                                const float2 af = __bfloat1622float2(*(const __nv_bfloat162*)&a_raw[b]);
+                                pg = fmaf(af.x, w0[2 * b], pg);
+                                pg = fmaf(af.y, w0[2 * b + 1], pg);
+                                pu = fmaf(af.x, w1[2 * b], pu);
+                                pu = fmaf(af.y, w1[2 * b + 1], pu);
+                            }
+                            acc0[r] = fmaf(sc0, pg, acc0[r]);
+                            acc1[r] = fmaf(sc1, pu, acc1[r]);
+                        }
                     }
+                    // 2026-10-09: acc0/acc1 here are the gate/up accumulators of chunk parity h.
+                    // h = 0 parks them in v; h = 1 adds: out = acc(h=0) + acc(h=1), as the car.
                     #pragma unroll
                     for (int r = 0; r < R; r++) {
-                        if (!(live & (1u << r))) continue;
-                        const uint4* ar = (const uint4*)(A + aoff[r]);
-                        const uint4 a_lo = ar[kk * 2];
-                        const uint4 a_hi = ar[kk * 2 + 1];
-                        const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
-                                                       a_hi.x, a_hi.y, a_hi.z, a_hi.w};
-                        float pg = 0.0f, pu = 0.0f;
-                        #pragma unroll
-                        for (int b = 0; b < 8; b++) {
-                            const float2 af = __bfloat1622float2(*(const __nv_bfloat162*)&a_raw[b]);
-                            pg = fmaf(af.x, w0[2 * b], pg);
-                            pg = fmaf(af.y, w0[2 * b + 1], pg);
-                            pu = fmaf(af.x, w1[2 * b], pu);
-                            pu = fmaf(af.y, w1[2 * b + 1], pu);
+                        if (h == 0) { v[r] = acc0[r]; v[RP + r] = acc1[r]; }
+                        else {
+                            v[r] = __fadd_rn(v[r], acc0[r]);
+                            v[RP + r] = __fadd_rn(v[RP + r], acc1[r]);
                         }
-                        acc0[r] = fmaf(sc0, pg, acc0[r]);
-                        acc1[r] = fmaf(sc1, pu, acc1[r]);
                     }
                 }
-                // 2026-10-09: acc0/acc1 here are the gate/up accumulators of chunk parity h.
-                // h = 0 parks them in v; h = 1 adds: out = acc(h=0) + acc(h=1), as the car.
-                #pragma unroll
-                for (int r = 0; r < R; r++) {
-                    if (h == 0) { v[r] = acc0[r]; v[RP + r] = acc1[r]; }
-                    else {
-                        v[r] = __fadd_rn(v[r], acc0[r]);
-                        v[RP + r] = __fadd_rn(v[RP + r], acc1[r]);
-                    }
-                }
+                t[ch] = moe_gateup_tree<V, LOGV>(v, lane);
             }
-            t[ch] = moe_gateup_tree<V, LOGV>(v, lane);
-        }
 
-        // 2026-10-09: result = acc_a + acc_b, both trees' lane-0 nodes for (mat, row).
-        if (my_slot >= 0) {
-            const float result = __fadd_rn(t[0], t[1]);
-            Cm[(unsigned long long)my_r * c_row_stride
-               + (unsigned long long)my_slot * N + n] = __float2bfloat16(result);
+            // 2026-10-09: result = acc_a + acc_b, both trees' lane-0 nodes for (mat, row).
+            if (my_slot[hh] >= 0) {
+                const float result = __fadd_rn(t[0], t[1]);
+                Cm[(unsigned long long)(hh * R + my_r) * c_row_stride
+                   + (unsigned long long)my_slot[hh] * N + n] = __float2bfloat16(result);
+            }
         }
     }
 }
@@ -3438,9 +3495,10 @@ extern "C" __global__ __launch_bounds__(256, 2) void w4a16_gemv_sw_moe_batchm_ga
     unsigned int N, unsigned int K, unsigned int num_experts,                      \
     unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride) \
 {                                                                                  \
-    w4a16_gemv_sw_moe_batchm_gateup_body<R>(A, g_packed_ptrs, g_scale_ptrs,        \
+    w4a16_gemv_sw_moe_batchm_gateup_body<R, 1>(A, g_packed_ptrs, g_scale_ptrs,     \
         g_scale2_vals, u_packed_ptrs, u_scale_ptrs, u_scale2_vals, C_gate, C_up,   \
-        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride); \
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride,   \
+        R, R);                                                                     \
 }
 METRALE_MOE_BATCHM_GATEUP_ENTRY(2)
 METRALE_MOE_BATCHM_GATEUP_ENTRY(3)
@@ -3449,3 +3507,29 @@ METRALE_MOE_BATCHM_GATEUP_ENTRY(5)
 METRALE_MOE_BATCHM_GATEUP_ENTRY(6)
 METRALE_MOE_BATCHM_GATEUP_ENTRY(7)
 METRALE_MOE_BATCHM_GATEUP_ENTRY(8)
+
+// 2026-10-11: METRALE_GLM_MOE_UNION_ROWS (#80 m16 v2). The gate+up sweeps of a 9..=16-row union
+// group (`nrows`, the extra last argument; slots at u_slot[u * nrows + row]) in one launch:
+// the R = 8 body with two halves per column (see the body), bit-identical to `_gateup_m8` on
+// each half.
+extern "C" __global__ __launch_bounds__(256, 2) void w4a16_gemv_sw_moe_batchm_gateup_m8x2(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ g_packed_ptrs,
+    const unsigned long long* __restrict__ g_scale_ptrs,
+    const float* __restrict__ g_scale2_vals,
+    const unsigned long long* __restrict__ u_packed_ptrs,
+    const unsigned long long* __restrict__ u_scale_ptrs,
+    const float* __restrict__ u_scale2_vals,
+    __nv_bfloat16* __restrict__ C_gate,
+    __nv_bfloat16* __restrict__ C_up,
+    const int* __restrict__ u_eid,
+    const int* __restrict__ u_slot,
+    unsigned int N, unsigned int K, unsigned int num_experts,
+    unsigned int a_row_stride, unsigned int a_slot_stride, unsigned int c_row_stride,
+    unsigned int nrows)
+{
+    w4a16_gemv_sw_moe_batchm_gateup_body<8, 2>(A, g_packed_ptrs, g_scale_ptrs,
+        g_scale2_vals, u_packed_ptrs, u_scale_ptrs, u_scale2_vals, C_gate, C_up,
+        u_eid, u_slot, N, K, num_experts, a_row_stride, a_slot_stride, c_row_stride,
+        nrows, nrows);
+}

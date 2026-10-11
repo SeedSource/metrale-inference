@@ -221,7 +221,10 @@ pub(super) fn w4a16_gemv_moe_batchm(
     c_row_stride: usize,
     stream: u64,
 ) -> Result<()> {
-    let fast = if down { batchm_down_fast(gpu, rows, kk) } else { None };
+    // 2026-10-11: A 9..=16-row group (METRALE_GLM_MOE_UNION_ROWS) takes `_down_m8x2`, which
+    // takes the row count as an extra last argument.
+    let pair = if down { batchm_down_pair(gpu, rows, kk) } else { None };
+    let fast = if down { pair.or_else(|| batchm_down_fast(gpu, rows, kk)) } else { None };
     let (k, grid_x) = match (fast, batchm_cols(gpu, rows)) {
         (Some(h), _) => (h, div_ceil(n as u32, MOE_DOWN_FAST_COLS)),
         (None, Some((h, j))) => (h, div_ceil(n as u32, 8 * j)),
@@ -230,7 +233,7 @@ pub(super) fn w4a16_gemv_moe_batchm(
             metrale_model_layers::layers::ops::w4a16_gemv_sw_grid_x(n as u32),
         ),
     };
-    KernelLaunch::new(gpu, k)
+    let l = KernelLaunch::new(gpu, k)
         .grid([grid_x, (rows * top_k) as u32, 1])
         .block([256, 1, 1])
         .arg_ptr(a)
@@ -245,8 +248,12 @@ pub(super) fn w4a16_gemv_moe_batchm(
         .arg_u32(num_experts as u32)
         .arg_u32(a_row_stride as u32)
         .arg_u32(a_slot_stride as u32)
-        .arg_u32(c_row_stride as u32)
-        .launch(stream)
+        .arg_u32(c_row_stride as u32);
+    if pair.is_some() {
+        l.arg_u32(rows as u32).launch(stream)
+    } else {
+        l.launch(stream)
+    }
 }
 
 /// 2026-10-08: `METRALE_GLM_MOE_BATCHM_COLS=2|4|8`: columns per warp of the row-batched union
@@ -296,6 +303,48 @@ fn batchm_down_fast(gpu: &dyn GpuBackend, rows: usize, kk: usize) -> Option<Kern
         );
     });
     Some(h)
+}
+
+/// 2026-10-11: The `w4a16_gemv_sw_moe_batchm_<kind>_m8x2` entry (kind `down` or `gateup`;
+/// #80 m16 v2) for a 9..=16-row union group when `lever` (`METRALE_GLM_MOE_DOWN_FAST` /
+/// `METRALE_GLM_MOE_GATEUP_FAST`) is 1 and the image has the entry (resolved once per kind,
+/// ENGAGED logged once per kind). It runs the 8-row fast body over both halves in one block,
+/// bit-identical to two 8-row sweeps. Otherwise `None`.
+fn batchm_pair(
+    gpu: &dyn GpuBackend,
+    rows: usize,
+    lever: &'static str,
+    kind: &'static str,
+    cell: &'static OnceLock<Option<KernelHandle>>,
+    once: &'static Once,
+) -> Option<KernelHandle> {
+    if !(super::MOE_ROW_BATCH_MAX_ROWS + 1..=super::MOE_ROW_UNION_WIDE_MAX_ROWS).contains(&rows) {
+        return None;
+    }
+    let h = (*cell.get_or_init(|| {
+        if std::env::var(lever).as_deref() != Ok("1") {
+            return None;
+        }
+        gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_{kind}_m8x2"))
+            .ok()
+    }))?;
+    once.call_once(|| {
+        tracing::warn!(
+            "{lever}=1: ENGAGED for 9..=16-row union groups - w4a16_gemv_sw_moe_batchm_{kind}_m8x2 \
+             (both 8-row halves in one block, bit-identical)"
+        );
+    });
+    Some(h)
+}
+
+/// 2026-10-11: [`batchm_pair`] for the down sweep (K <= 1024, as `_down_m<R>`).
+fn batchm_down_pair(gpu: &dyn GpuBackend, rows: usize, kk: usize) -> Option<KernelHandle> {
+    static H: OnceLock<Option<KernelHandle>> = OnceLock::new();
+    static ONCE: Once = Once::new();
+    if kk > 1024 {
+        return None;
+    }
+    batchm_pair(gpu, rows, "METRALE_GLM_MOE_DOWN_FAST", "down", &H, &ONCE)
 }
 
 /// 2026-10-09: Output columns per block of `w4a16_gemv_sw_moe_batchm_gateup_m<R>` (8 warps x 8),
@@ -360,10 +409,13 @@ pub(super) fn w4a16_gemv_moe_batchm_gateup(
     c_row_stride: usize,
     stream: u64,
 ) -> Result<bool> {
-    let Some(k) = batchm_gateup_fast(gpu, rows) else {
+    static PH: OnceLock<Option<KernelHandle>> = OnceLock::new();
+    static PONCE: Once = Once::new();
+    let pair = batchm_pair(gpu, rows, "METRALE_GLM_MOE_GATEUP_FAST", "gateup", &PH, &PONCE);
+    let Some(k) = pair.or_else(|| batchm_gateup_fast(gpu, rows)) else {
         return Ok(false);
     };
-    KernelLaunch::new(gpu, k)
+    let l = KernelLaunch::new(gpu, k)
         .grid([
             div_ceil(n as u32, MOE_GATEUP_FAST_COLS),
             (rows * top_k) as u32,
@@ -386,8 +438,13 @@ pub(super) fn w4a16_gemv_moe_batchm_gateup(
         .arg_u32(num_experts as u32)
         .arg_u32(a_row_stride as u32)
         .arg_u32(a_slot_stride as u32)
-        .arg_u32(c_row_stride as u32)
-        .launch(stream)?;
+        .arg_u32(c_row_stride as u32);
+    // 2026-10-11: `_gateup_m8x2` takes the row count as an extra last argument.
+    if pair.is_some() {
+        l.arg_u32(rows as u32).launch(stream)?;
+    } else {
+        l.launch(stream)?;
+    }
     Ok(true)
 }
 

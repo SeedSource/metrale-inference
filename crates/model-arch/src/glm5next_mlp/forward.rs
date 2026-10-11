@@ -227,9 +227,11 @@ pub const MOE_ROW_UNION_WIDE_MAX_IDS: usize = 128;
 /// 2026-10-11: `METRALE_GLM_MOE_UNION_ROWS=N` (9..=16; #80 m16 union sweep): a row-batched step
 /// of 9..=N rows runs as ONE union sweep (`w4a16_gemv_sw_moe_batchm_m<rows>`, the generic body)
 /// instead of `moe_row_groups`' sub-groups of at most 8, so an expert two sub-groups both picked
-/// is read once. Bit-identical: each (row, slot) keeps its per-row accumulation. The fast gate/up
-/// and down kernels exist only up to 8 rows; a wide group takes the generic body (with
-/// `METRALE_GLM_MOE_BATCHM_COLS` when set). Unset, or any other value: 0, off. Read once.
+/// is read once. Bit-identical: each (row, slot) keeps its per-row accumulation. With
+/// `METRALE_GLM_MOE_GATEUP_FAST` / `METRALE_GLM_MOE_DOWN_FAST` a wide group runs that fast body's
+/// `_m8x2` entry (both 8-row halves in one block; v2, after the generic body lost 37% at C16,
+/// #80 6110238813); without them it takes the generic body (with `METRALE_GLM_MOE_BATCHM_COLS`
+/// when set). Unset, or any other value: 0, off. Read once.
 pub fn union_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {

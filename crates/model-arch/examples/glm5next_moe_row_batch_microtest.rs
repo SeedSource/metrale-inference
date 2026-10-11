@@ -21,6 +21,11 @@
 //!   * every tier 2..=8 at `top_k = 4` and `top_k = 8`, up to `rows * top_k = 64`, the most
 //!     ids `forward_moe` gives the single `glm5next_moe_row_union` block.
 //!
+//! 2026-10-11: The fast entries (`METRALE_GLM_MOE_GATEUP_FAST` `_gateup_m<R>`,
+//! `METRALE_GLM_MOE_DOWN_FAST` `_down_m<R>`, and for 9..=16 rows their `_m8x2` pair entries, #80
+//! m16 v2) are checked against the per-row path too: gate+up on the gate/up layout (both outputs),
+//! down on a K = 1024 slot-major layout ("down1k"; the fast down entry needs K <= 1024).
+//!
 //! The union table is checked separately from the arithmetic: a table that dropped ids could
 //! still produce a plausible output.
 //!
@@ -142,6 +147,53 @@ fn batched(
         .launch(0)
 }
 
+/// 2026-10-11: One fast gate+up (`pair`: `_gateup_m8x2`, which takes `rows` last) or fast down
+/// launch, grid x = ceil(n / cols).
+#[allow(clippy::too_many_arguments)]
+fn fast(
+    g: &dyn GpuBackend,
+    k: KernelHandle,
+    gateup: bool,
+    pair: bool,
+    a: DevicePtr,
+    t: &Table,
+    c: [DevicePtr; 2],
+    u_eid: DevicePtr,
+    u_slot: DevicePtr,
+    n: usize,
+    kk: usize,
+    rows: usize,
+    top_k: usize,
+    strides: [usize; 3],
+) -> Result<()> {
+    let cols = if gateup { 64 } else { 128 };
+    let mut l = KernelLaunch::new(g, k)
+        .grid([n.div_ceil(cols) as u32, (rows * top_k) as u32, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(t.packed)
+        .arg_ptr(t.scale)
+        .arg_ptr(t.scale2);
+    if gateup {
+        l = l.arg_ptr(t.packed).arg_ptr(t.scale).arg_ptr(t.scale2).arg_ptr(c[0]).arg_ptr(c[1]);
+    } else {
+        l = l.arg_ptr(c[0]);
+    }
+    l = l
+        .arg_ptr(u_eid)
+        .arg_ptr(u_slot)
+        .arg_u32(n as u32)
+        .arg_u32(kk as u32)
+        .arg_u32(NUM_EXPERTS as u32)
+        .arg_u32(strides[0] as u32)
+        .arg_u32(strides[1] as u32)
+        .arg_u32(strides[2] as u32);
+    if pair {
+        l = l.arg_u32(rows as u32);
+    }
+    l.launch(0)
+}
+
 fn main() -> Result<()> {
     let gpu = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
     let k_row = gpu.kernel("w4a16_gemv", "w4a16_gemv_sw_moe")?;
@@ -154,6 +206,22 @@ fn main() -> Result<()> {
     let k_bc: Vec<KernelHandle> = (2..=MAX_ROWS)
         .map(|r| gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_m{r}_c{COLS_J}")))
         .collect::<Result<_, _>>()?;
+    // 2026-10-11: The fast entries per tier 2..=MAX_ROWS: `_<kind>_m<R>` up to 8 rows, the
+    // `_<kind>_m8x2` pair entry above (flag true).
+    let fast_tiers = |kind: &str| -> Result<Vec<(KernelHandle, bool)>> {
+        (2..=MAX_ROWS)
+            .map(|r| {
+                let (name, pair) = if r <= 8 {
+                    (format!("w4a16_gemv_sw_moe_batchm_{kind}_m{r}"), false)
+                } else {
+                    (format!("w4a16_gemv_sw_moe_batchm_{kind}_m8x2"), true)
+                };
+                Ok((gpu.kernel("w4a16_gemv", &name)?, pair))
+            })
+            .collect()
+    };
+    let k_gu = fast_tiers("gateup")?;
+    let k_dn = fast_tiers("down")?;
 
     // 2026-09-25: Experts 3 and 11 are remote: NULL pointers.
     let mut seed = 0x51ed_5eedu64;
@@ -351,7 +419,9 @@ fn main() -> Result<()> {
         };
         assert_eq!(n_union, distinct, "{tag}: union size");
 
-        for (layout, kk, nn, a_slot_stride) in [("gate/up", K, N, 0usize), ("down", N, K, N)] {
+        for (layout, kk, nn, a_slot_stride) in
+            [("gate/up", K, N, 0usize), ("down", N, K, N), ("down1k", K, N, K)]
+        {
             let a_row_stride = if a_slot_stride == 0 { kk } else { top_k * kk };
             let a: Vec<u8> = (0..rows * a_row_stride * 2)
                 .map(|_| lcg(&mut seed))
@@ -424,6 +494,50 @@ fn main() -> Result<()> {
                 failures += 1;
             }
             gpu.free(d_cols)?;
+            // 2026-10-11: The fast entry for this layout (gate+up writes both outputs; the
+            // table serves as gate and up), each output into its own poisoned buffer.
+            let fe = match layout {
+                "gate/up" => Some((k_gu[rows - 2], true)),
+                "down1k" => Some((k_dn[rows - 2], false)),
+                _ => None,
+            };
+            if let Some(((kf, pair), gateup)) = fe {
+                let c = [gpu.alloc(bytes)?, gpu.alloc(bytes)?];
+                for p in c {
+                    gpu.memset_async(p, 0, bytes, 0)?;
+                }
+                fast(
+                    &gpu,
+                    kf,
+                    gateup,
+                    pair,
+                    d_a,
+                    &t,
+                    c,
+                    d_ueid,
+                    d_uslot,
+                    nn,
+                    kk,
+                    rows,
+                    top_k,
+                    [a_row_stride, a_slot_stride, top_k * nn],
+                )?;
+                gpu.synchronize(0)?;
+                let outs = if gateup { 2 } else { 1 };
+                for (i, &p) in c.iter().enumerate().take(outs) {
+                    if dn(&gpu, p, bytes)? != r_ref {
+                        let kind = if gateup { "gateup" } else { "down" };
+                        let e = if pair { "m8x2".to_string() } else { format!("m{rows}") };
+                        println!(
+                            "  FAIL  {tag:28} [{layout:7}] _{kind}_{e} output {i} differs from the per-row path"
+                        );
+                        failures += 1;
+                    }
+                }
+                for p in c {
+                    gpu.free(p)?;
+                }
+            }
             if r_ref == r_new {
                 println!(
                     "  PASS  {tag:28} [{layout:7}] rows={rows} union={n_union}/{}",
@@ -441,8 +555,8 @@ fn main() -> Result<()> {
         bail!("{failures} arm(s) are not bit-identical to the per-row path");
     }
     println!(
-        "\nPASS: row-batched MoE (and _c{COLS_J}) is bit-identical to the per-row path on every arm, \
-         tiers 2..={MAX_ROWS}."
+        "\nPASS: row-batched MoE (and _c{COLS_J}, the fast gateup/down entries incl. _m8x2) is \
+         bit-identical to the per-row path on every arm, tiers 2..={MAX_ROWS}."
     );
     Ok(())
 }

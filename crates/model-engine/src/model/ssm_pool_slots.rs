@@ -127,6 +127,13 @@ impl SsmStatePool {
         self.free_slots.lock().contains(&idx)
     }
 
+    /// 2026-10-10: The lowest free slot below `n`, left on the free list (the caller's
+    /// `compact_sequence` claims it). `METRALE_MTP_POOL_CAP` slot migration picks its target
+    /// with it (`migrate_to_covered_slot_dispatch`).
+    pub(super) fn lowest_free_below(&self, n: usize) -> Option<usize> {
+        self.free_slots.lock().iter().copied().filter(|&s| s < n).min()
+    }
+
     /// 2026-09-25: The reserved slot at index `max_slots`, outside the free list's
     /// initial range; batched decode points padding rows at it.
     #[inline]

@@ -156,6 +156,10 @@ pub(crate) fn load_model(
         config.vocab_size,
     )?;
     serve_phases::spawn_comm_watch(&comm);
+    // 2026-10-11: Kept to end the comm boot phase (`end_boot_phase`) once the
+    // model is built: broadcasts before that wait up to 600 s for a slower
+    // peer, broadcasts after it fail at the 30 s steady-state deadline.
+    let boot_comm = comm.clone();
     config.profile = args.profile;
     serve_phases::cap_vocab_size_to_tokenizer(&model_dir, &mut config);
     let serve_phases::KvCacheConfig {
@@ -222,6 +226,13 @@ pub(crate) fn load_model(
     // worker ranks.
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
 
+    // 2026-10-11: A worker's next collective is the head's first command, which
+    // it waits for without a deadline (`recv_command_u32`).
+    if args.rank != 0
+        && let Some(c) = &boot_comm
+    {
+        c.end_boot_phase();
+    }
     let mut model_opt = Some(model);
     if serve_phases::maybe_run_ep_worker(&args, &mut model_opt, &early_high_speed_swap_cfg)? {
         // 2026-09-26: An EP worker rank ran its command loop and the head has
@@ -344,6 +355,10 @@ pub(crate) fn load_model(
         max_seq_len: args.max_seq_len,
         ..tokenizer_limits
     };
+    // 2026-10-11: The head ends its comm boot phase just before it can serve.
+    if let Some(c) = &boot_comm {
+        c.end_boot_phase();
+    }
     // 2026-09-26: Capture the tokio runtime handle so the scheduler thread can
     // send terminal stream events (Done / Error) as tokio tasks.
     scheduler::capture_runtime_handle();

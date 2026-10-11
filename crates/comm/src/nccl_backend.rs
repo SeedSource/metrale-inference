@@ -8,8 +8,9 @@
 //! `ncclSend`/`ncclRecv` into a registered receive buffer plus a local BF16
 //! add; otherwise it is `ncclAllReduce`. After each collective the backend
 //! queries `ncclCommGetAsyncError`; a broadcast waits for completion for at
-//! most `COLLECTIVE_TIMEOUT_SECS`, an idle command receive without a deadline,
-//! and a failure in either marks the communicator unhealthy. `attempt_reconnect`
+//! most `COLLECTIVE_TIMEOUT_SECS` (`BOOT_COLLECTIVE_TIMEOUT_SECS` until
+//! `end_boot_phase`), an idle command receive without a deadline, and a
+//! failure in either marks the communicator unhealthy. `attempt_reconnect`
 //! aborts the communicator and bootstraps again. `METRALE_COMM_DIAGNOSTICS=1`
 //! logs every host submission.
 //!
@@ -65,6 +66,22 @@ pub use recv_buffer::{
 /// only the completion polling, not an NCCL or driver call that hangs.
 pub(super) const COLLECTIVE_TIMEOUT_SECS: u64 = 30;
 
+/// 2026-10-11: Broadcast deadline, in seconds, before `end_boot_phase`. Ranks
+/// load weights at different speeds, so a model-build broadcast (rank
+/// agreement, weight-load scalars) can wait on a peer for more than
+/// `COLLECTIVE_TIMEOUT_SECS`: a rank-0 MTP load 13 s slower than rank 1 plus a
+/// 16 s later start put the peer 30 s behind and killed rank 1 in the build.
+pub(super) const BOOT_COLLECTIVE_TIMEOUT_SECS: u64 = 600;
+
+/// 2026-10-11: The broadcast completion deadline for the current phase.
+pub(super) fn broadcast_deadline(boot_phase: bool) -> std::time::Duration {
+    std::time::Duration::from_secs(if boot_phase {
+        BOOT_COLLECTIVE_TIMEOUT_SECS
+    } else {
+        COLLECTIVE_TIMEOUT_SECS
+    })
+}
+
 /// 2026-09-26: NCCL communicator plus the streams, events and receive buffer
 /// its operations use.
 pub struct NcclBackend {
@@ -102,6 +119,9 @@ pub struct NcclBackend {
     /// 2026-09-26: Set by an async error or a failed completion, cleared by a
     /// successful reconnect.
     unhealthy: AtomicBool,
+    /// 2026-10-11: `true` from construction until `end_boot_phase`; selects
+    /// `BOOT_COLLECTIVE_TIMEOUT_SECS` for broadcasts. Never set again.
+    boot_phase: AtomicBool,
     /// 2026-09-26: Successful reconnects, for the log.
     reconnect_count: AtomicU64,
     /// 2026-09-26: Bootstrap address, reused by reconnect.
@@ -211,6 +231,7 @@ impl NcclBackend {
             registered_handles: Mutex::new(Vec::new()),
             add_kernel: AtomicU64::new(0),
             unhealthy: AtomicBool::new(false),
+            boot_phase: AtomicBool::new(true),
             reconnect_count: AtomicU64::new(0),
             master_addr: master_addr.to_owned(),
             master_port,

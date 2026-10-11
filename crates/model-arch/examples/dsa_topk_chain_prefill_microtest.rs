@@ -644,6 +644,13 @@ fn run_edge(
     chunks: Option<usize>,
 ) -> Result<bool> {
     let (q, p) = (e.rows.len(), e.rows[0].len());
+    // 2026-10-10: the kernels read row r at r * P; a shorter or longer row would be read shifted
+    // while the host reference sorts the row as given (need0_eq_bin had 9000 and 9001, gx2 F).
+    anyhow::ensure!(
+        e.rows.iter().all(|r| r.len() == p),
+        "edge case {}: rows of unequal length",
+        e.name
+    );
     let flat: Vec<u8> = e
         .rows
         .iter()
@@ -701,10 +708,13 @@ fn run_edge(
     };
     let identical = got[0] == got[1] && got[1] == want;
     let suffix = chunks.map_or(String::new(), |c| format!("/c{c}"));
+    // 2026-10-10: on_eq_off is the lever's exactness; off_eq_host checks the case and the old path.
     println!(
-        "RCOMPACT BITWISE S={} case={}{suffix} identical={identical}",
+        "RCOMPACT BITWISE S={} case={}{suffix} identical={identical} on_eq_off={} off_eq_host={}",
         p * KP,
-        e.name
+        e.name,
+        got[0] == got[1],
+        got[0] == want
     );
     println!(
         "RCOMPACT ROWS S={} case={}{suffix} compact={n_compact} fallback={}",
@@ -818,7 +828,9 @@ fn edges() -> Vec<Edge> {
         ),
         e(
             "need0_eq_bin",
-            vec![exact(9_000), exact(9_001)],
+            // 2026-10-10: equal-length rows (the runner strides by rows[0].len()); the second is the
+            // first reversed, so its 12 bin keys sit at the row start instead of the end.
+            vec![exact(9_000), exact(9_000).into_iter().rev().collect()],
             SELECT_K,
             false,
         ),

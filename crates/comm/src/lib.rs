@@ -187,6 +187,12 @@ pub trait CommBackend: Send + Sync {
         Ok(())
     }
 
+    /// 2026-10-11: End the boot phase: later broadcasts use the steady-state
+    /// completion deadline instead of the longer boot one, so a hung peer fails
+    /// fast in serving. Each rank calls it once, after the model build. The
+    /// default does nothing.
+    fn end_boot_phase(&self) {}
+
     /// 2026-09-26: This rank's index, from 0.
     fn rank(&self) -> usize;
 

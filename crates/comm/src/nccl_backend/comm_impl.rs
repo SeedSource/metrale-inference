@@ -11,9 +11,9 @@ use anyhow::{Context, Result, ensure};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use super::{ALL_REDUCE_DTYPE_BYTES, COLLECTIVE_TIMEOUT_SECS, NcclBackend};
+use super::{ALL_REDUCE_DTYPE_BYTES, NcclBackend, broadcast_deadline};
 use crate::CommBackend;
 use crate::collective_diagnostics::Dtype;
 use metrale_gpu_sys::nccl::{self, NcclDataType, NcclRedOp};
@@ -309,6 +309,16 @@ impl CommBackend for NcclBackend {
         self.reconnect_inner()
     }
 
+    fn end_boot_phase(&self) {
+        if self.boot_phase.swap(false, Ordering::AcqRel) {
+            tracing::info!(
+                "NCCL rank {}: boot phase over, broadcast deadline {} s",
+                self.rank,
+                broadcast_deadline(false).as_secs()
+            );
+        }
+    }
+
     fn rank(&self) -> usize {
         self.rank
     }
@@ -372,7 +382,7 @@ impl NcclBackend {
             crate::collective_wait::poll_idle_command(ready, pause)
         } else {
             crate::collective_wait::poll_completion(
-                Duration::from_secs(COLLECTIVE_TIMEOUT_SECS),
+                broadcast_deadline(self.boot_phase.load(Ordering::Acquire)),
                 || start.elapsed(),
                 ready,
                 pause,
@@ -408,10 +418,37 @@ impl NcclBackend {
 mod tests {
     use super::*;
 
+    use super::super::{BOOT_COLLECTIVE_TIMEOUT_SECS, COLLECTIVE_TIMEOUT_SECS};
+    use std::cell::Cell;
+    use std::time::Duration;
+
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn test_collective_timeout_constant() {
         assert!(COLLECTIVE_TIMEOUT_SECS >= 10);
         assert!(COLLECTIVE_TIMEOUT_SECS <= 300);
+        assert!(BOOT_COLLECTIVE_TIMEOUT_SECS >= 10 * COLLECTIVE_TIMEOUT_SECS);
+    }
+
+    /// 2026-10-11: The peer (root) reaches the broadcast 40 s late, as rank 0 did
+    /// at the lazyval boot. During the boot phase the wait completes; after
+    /// `end_boot_phase` the same skew still fails at 30 s.
+    fn wait_for_late_peer(boot_phase: bool, late_s: u64) -> Result<u64> {
+        let now = Cell::new(0u64);
+        crate::collective_wait::poll_completion(
+            broadcast_deadline(boot_phase),
+            || Duration::from_secs(now.get()),
+            || Ok(now.get() >= late_s),
+            || now.set(now.get() + 1),
+        )
+        .map(|()| now.get())
+    }
+
+    #[test]
+    fn boot_broadcast_waits_for_a_late_peer_and_serving_still_fails_fast() {
+        assert_eq!(wait_for_late_peer(true, 40).unwrap(), 40);
+        let err = wait_for_late_peer(false, 40).unwrap_err();
+        assert!(err.to_string().contains("after 30000 ms"), "{err}");
+        assert!(wait_for_late_peer(true, BOOT_COLLECTIVE_TIMEOUT_SECS + 1).is_err());
     }
 }

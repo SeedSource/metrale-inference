@@ -256,3 +256,87 @@ fn ep_v2_mirrored_claims_agree_with_migration() {
         "simulation exercised {migrations} migrations"
     );
 }
+
+/// 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: the worker reserves every slot index at boot
+/// (its free list starts empty), allocates a slot's states on the first command for it
+/// (`ep_worker_materialize`: release the index, then claim), frees them and re-reserves the
+/// index on each head release (`ep_worker_release_lazy`), and under `METRALE_MTP_POOL_CAP`
+/// migrates by releasing the reserved target and re-reserving the source. The materialize
+/// claim must return the head's slot under either claim rule, the worker's free list must be
+/// empty between commands (as with phantoms), and the worker holds states only for live
+/// sequences.
+#[test]
+fn ep_v2_lazy_worker_slots_agree_with_head() {
+    use crate::model::ssm_pool_slots::take_free_slot;
+    let remove = |v: &mut Vec<usize>, s: usize| {
+        let i = v
+            .iter()
+            .position(|&f| f == s)
+            .expect("slot on the free list");
+        v.swap_remove(i);
+    };
+    for lowest_first in [false, true] {
+        let (max, cover) = (16usize, 8usize);
+        let mut head: Vec<usize> = (0..max).rev().collect();
+        let mut worker: Vec<usize> = Vec::new();
+        let mut has_state = vec![false; max];
+        let mut live: Vec<usize> = Vec::new();
+        let mut migrations = 0usize;
+        let mut x: u64 = 0x5851_F42D_4C95_7F2D;
+        for _ in 0..50_000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let alloc = live.is_empty() || (live.len() < max && (x >> 33) % 2 == 0);
+            if alloc {
+                let p = take_free_slot(&mut head, lowest_first).unwrap();
+                assert!(!has_state[p], "a released slot keeps no states");
+                worker.push(p);
+                assert_eq!(take_free_slot(&mut worker, lowest_first), Some(p));
+                has_state[p] = true;
+                live.push(p);
+            } else {
+                let i = ((x >> 17) as usize) % live.len();
+                let p = live.swap_remove(i);
+                head.push(p);
+                worker.push(p);
+                remove(&mut worker, p);
+                has_state[p] = false;
+                if lowest_first {
+                    for slot in live.iter_mut() {
+                        let from = *slot;
+                        if from < cover {
+                            continue;
+                        }
+                        let Some(to) = head.iter().copied().filter(|&s| s < cover).min() else {
+                            continue;
+                        };
+                        remove(&mut head, to);
+                        head.push(from);
+                        assert!(!has_state[to], "a migration target keeps no states");
+                        worker.push(to);
+                        remove(&mut worker, to);
+                        worker.push(from);
+                        remove(&mut worker, from);
+                        has_state[to] = true;
+                        has_state[from] = false;
+                        *slot = to;
+                        migrations += 1;
+                    }
+                }
+            }
+            assert!(
+                worker.is_empty(),
+                "the worker's free list stays empty between commands"
+            );
+            assert_eq!(
+                has_state.iter().filter(|&&h| h).count(),
+                live.len(),
+                "the worker holds states for live sequences only"
+            );
+        }
+        if lowest_first {
+            assert!(migrations > 0, "the walk must exercise migration");
+        }
+    }
+}

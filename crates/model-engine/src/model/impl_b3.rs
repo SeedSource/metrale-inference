@@ -340,13 +340,23 @@ impl TransformerModel {
         );
         let src_base = self.buffers.hidden_states();
         let (t0, rows) = win.chunk_rows(chunk_start, proc_count);
-        for t in t0..t0 + rows {
-            let slot_row = chunk_start + t - win.start;
-            let src = src_base.offset(t * h * bf16);
-            let dst_offset = slot_row * n_capture * h * bf16 + slot_idx * h * bf16;
-            self.gpu
-                .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
+        if rows == 0 {
+            return Ok(());
         }
+        // 2026-10-11: One pitched copy for the chunk's window rows (source rows contiguous,
+        // accumulator rows `n_capture * h` apart) instead of one `copy_d2d_async` per row: up to
+        // 2057 launches per tap layer were a flat TTFT cost on the hybrid serve (#82 row G,
+        // 2K/8K +49 ms). Same bytes to the same places.
+        let slot_row0 = chunk_start + t0 - win.start;
+        self.gpu.copy_d2d_2d_async(
+            src_base.offset(t0 * h * bf16),
+            h * bf16,
+            acc_base.offset(slot_row0 * n_capture * h * bf16 + slot_idx * h * bf16),
+            n_capture * h * bf16,
+            h * bf16,
+            rows,
+            stream,
+        )?;
         Ok(())
     }
 

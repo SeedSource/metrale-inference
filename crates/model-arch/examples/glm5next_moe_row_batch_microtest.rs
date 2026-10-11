@@ -441,7 +441,7 @@ fn main() -> Result<()> {
         bail!("{failures} arm(s) are not bit-identical to the per-row path");
     }
     println!(
-        "\nrow-batched MoE (and _c{COLS_J}) is bit-identical to the per-row path on every arm, \
+        "\nPASS: row-batched MoE (and _c{COLS_J}) is bit-identical to the per-row path on every arm, \
          tiers 2..={MAX_ROWS}."
     );
     Ok(())

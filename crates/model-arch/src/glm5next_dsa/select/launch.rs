@@ -286,6 +286,23 @@ pub(super) fn select_tokens_with(
         );
         radix::log_radix_mode(mode);
         if mode == radix::RadixMode::Engaged {
+            // 2026-10-10: `METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1`: the pair buffer is the tail of
+            // region 6, after this pass's work buffers; see `radix_compact`.
+            let work_bytes = radix::radix_work_bytes(cfg, geom.q_rows);
+            let requested = radix_compact::dsa_topk_radix_compact();
+            let compact = radix_compact::radix_compact_for(
+                requested,
+                radix_compact::radix_compact_resolved(kernels),
+                scratch.capacity[6],
+                work_bytes,
+                geom.q_rows,
+            );
+            radix_compact::log_radix_compact(requested, compact);
+            let bins = if compact {
+                scratch.radix.offset(work_bytes)
+            } else {
+                DevicePtr::NULL
+            };
             let t = radix::RadixTopk {
                 scores: scratch.scores,
                 selected: scratch.selected,
@@ -295,6 +312,7 @@ pub(super) fn select_tokens_with(
                 select_k: selk_a,
                 kcap: radix::radix_kcap(cfg),
                 geom_dev: gd,
+                bins,
             };
             radix::launch_topk_radix(gpu, kernels, &t, stream)?;
         } else {
@@ -315,7 +333,28 @@ pub(super) fn select_tokens_with(
         }
     }
 
-    KernelLaunch::new(gpu, kernels.expand_selection)
+    // 2026-10-10: `METRALE_GLM_DSA_EXPAND_TAIL_COUNT=1`: one `dsa_valid_chunk_counts` launch
+    // into the dead `scores` region, then `dsa_expand_selection_cc` (same arguments plus the
+    // counts) reads each row's visible-key count from it; see `tail_count`.
+    let requested = tail_count::dsa_expand_tail_count();
+    let cc = tail_count::expand_tail_count_for(
+        requested,
+        kernels.expand_selection_cc.0 != 0 && kernels.valid_chunk_counts.0 != 0,
+        ceiling.is_none() && gd.0 == 0,
+        cfg.always_select_tail,
+        seq_a,
+        scratch.capacity[3],
+    );
+    tail_count::log_expand_tail_count(requested, cc, seq_a);
+    if cc {
+        tail_count::launch_chunk_counts(gpu, kernels, inputs.valid, scratch.scores, seq_a, stream)?;
+    }
+    let expand_handle = if cc {
+        kernels.expand_selection_cc
+    } else {
+        kernels.expand_selection
+    };
+    let expand = KernelLaunch::new(gpu, expand_handle)
         .grid([geom.q_rows as u32, 1, 1])
         .block([ROW_BLOCK, 1, 1])
         .arg_ptr(scratch.selected)
@@ -333,8 +372,9 @@ pub(super) fn select_tokens_with(
         .arg_u32(geom.out_width as u32)
         .arg_i32(inputs.first_key)
         .arg_i32(cfg.always_select_tail as i32)
-        .arg_ptr(gd)
-        .launch(stream)?;
+        .arg_ptr(gd);
+    let expand = if cc { expand.arg_ptr(scratch.scores) } else { expand };
+    expand.launch(stream)?;
 
     Ok(())
 }

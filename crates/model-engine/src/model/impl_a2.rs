@@ -156,8 +156,10 @@ impl TransformerModel {
     ///   `EP_CKPT_WORDS` words in one bulk broadcast
     /// - 0xFFFFFFF9 (`EP_CMD_VERIFY_BATCH`): batched MTP verify → `verify_ep.rs`
     /// - 0xFFFFFFFA (`EP_CMD_MTP_PROPOSE_BATCH`): batched MTP propose → `propose_batch_ep.rs`
-    /// - 0xFFFFFFFB (`EP_CMD_SPEC_MODE`, 2026-10-10): hybrid step mode → one mode word
-    ///   (`hybrid_spec.rs`); handled before the `EpCommandFailed` tag, so its failure is fatal
+    /// - 0xFFFFFFFB (`EP_CMD_MIGRATE_SLOT`): cap slot migration → target slot (`sequence_compact.rs`)
+    /// - 0xFFFFFFFC (`EP_CMD_SPEC_MODE`, 2026-10-10; 0xFFFFFFFB until 2026-10-11, which the car's
+    ///   `EP_CMD_MIGRATE_SLOT` took): hybrid step mode → one mode word (`hybrid_spec.rs`); handled
+    ///   before the `EpCommandFailed` tag, so its failure is fatal
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored)
     /// - any other value: a token id, decoded in the addressed slot
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
@@ -222,6 +224,12 @@ impl TransformerModel {
                 seq_id,
                 slots.len(),
             );
+        }
+
+        // 2026-10-10: `METRALE_MTP_POOL_CAP` slot migration: the preamble slot is the
+        // source, the target follows (`sequence_compact.rs`).
+        if cmd == crate::model::trait_impl::sequence_compact::EP_CMD_MIGRATE_SLOT {
+            return self.ep_worker_migrate_slot(slot_idx, slots);
         }
 
         // 2026-09-25: Alloc slot: free the prior occupant, then allocate a

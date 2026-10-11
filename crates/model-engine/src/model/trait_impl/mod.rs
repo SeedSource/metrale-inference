@@ -67,7 +67,7 @@ mod prefill_c;
 mod prefill_d;
 mod prefix_reuse;
 mod sequence;
-mod sequence_compact;
+pub(in crate::model) mod sequence_compact;
 mod speculative;
 mod speculative_mtp;
 pub(in crate::model) mod ssm_fault_in;

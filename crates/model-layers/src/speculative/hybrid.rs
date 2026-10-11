@@ -50,7 +50,9 @@ impl SpecStepMode {
 /// [`encode_spec_mode`]. Rank 0 sends it (preamble `seq_id` 0, ignored) whenever its mode
 /// changes, before the first command of the step that runs in the new mode, so the worker's
 /// proposer routing (`EP_CMD_MTP_PROPOSE`, verify trims) always matches rank 0's.
-pub const EP_CMD_SPEC_MODE: u32 = 0xFFFF_FFFB;
+/// 2026-10-11: 0xFFFF_FFFC; it was 0xFFFF_FFFB, which the car's `EP_CMD_MIGRATE_SLOT`
+/// (METRALE_MTP_POOL_CAP EP v2, 198cb05d) also took.
+pub const EP_CMD_SPEC_MODE: u32 = 0xFFFF_FFFC;
 
 /// 2026-10-10: High half of a mode word: `"HY"`. A word without it is not a mode word.
 const SPEC_MODE_MAGIC: u32 = 0x4859_0000;

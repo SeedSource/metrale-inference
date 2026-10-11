@@ -32,6 +32,7 @@
 //!   what it did before.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
@@ -132,9 +133,33 @@ pub fn radix_work_bytes(cfg: &Glm5NextDsaConfig, q_rows: usize) -> usize {
 /// `geom.q_rows` row buffers when `lever` is on and the pass has more than one top-k tile of
 /// pools, else 0. Planned at the context ceiling it covers every ceiling launch of as many rows,
 /// whatever the live pool count.
+/// 2026-10-10: Plus the pair buffer of `METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1`
+/// ([`radix_region_bytes_with`]); lever off, the same bytes as before.
 pub fn radix_region_bytes(geom: &DsaSelectGeometry, cfg: &Glm5NextDsaConfig, lever: bool) -> usize {
+    radix_region_bytes_with(
+        geom,
+        cfg,
+        lever,
+        super::radix_compact::dsa_topk_radix_compact(),
+    )
+}
+
+/// 2026-10-10: [`radix_region_bytes`] with the compaction lever given: when both levers are on
+/// and the pass has a radix region, the region also holds the rows' pair buffers
+/// (`radix_compact::compact_bytes`, after the work buffers). Pure, for tests.
+pub fn radix_region_bytes_with(
+    geom: &DsaSelectGeometry,
+    cfg: &Glm5NextDsaConfig,
+    lever: bool,
+    compact: bool,
+) -> usize {
     if lever && geom.n_pools > topk_tile() {
-        radix_work_bytes(cfg, geom.q_rows)
+        let pairs = if compact {
+            super::radix_compact::compact_bytes(geom.q_rows)
+        } else {
+            0
+        };
+        radix_work_bytes(cfg, geom.q_rows) + pairs
     } else {
         0
     }
@@ -173,13 +198,37 @@ pub(super) fn alloc_region(gpu: &dyn GpuBackend, bytes: usize) -> Result<DeviceP
     }
 }
 
-/// 2026-10-06: Chunks per row (grid x of the hist and gather launches) for `q_rows` rows:
-/// [`RADIX_TARGET_BLOCKS`] spread over the rows, between 1 and [`RADIX_MAX_CHUNKS`]. Depends on
-/// `q_rows` only, so every capture of a 1-row ceiling launch gets the same grid.
-pub fn radix_chunks(q_rows: usize) -> usize {
+/// 2026-10-10: TEST-ONLY chunk override (0 = none). Production never sets it; the gate-0
+/// microtest `dsa_topk_chain_prefill_microtest` does, to time the hist and gather launches at
+/// other chunk counts. Process-global; [`set_radix_chunks_override`] stores `Some(c)` clamped
+/// to `1..=RADIX_MAX_CHUNKS`, so 0 is never a live chunk count.
+static RADIX_CHUNKS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// 2026-10-10: Test-only: force [`radix_chunks`] to `v` (clamped to `1..=RADIX_MAX_CHUNKS`), or
+/// restore the production policy with `None`. Not called anywhere in the serve path.
+pub fn set_radix_chunks_override(v: Option<usize>) {
+    let raw = v.map_or(0, |c| c.clamp(1, RADIX_MAX_CHUNKS));
+    RADIX_CHUNKS_OVERRIDE.store(raw, Ordering::Relaxed);
+}
+
+/// 2026-10-10: The chunk policy with an explicit override word (0 = none): the production
+/// formula when `over` is 0, else `over`. Split out so a test can check both without touching
+/// the process-global.
+fn radix_chunks_with(over: usize, q_rows: usize) -> usize {
+    if over != 0 {
+        return over.clamp(1, RADIX_MAX_CHUNKS);
+    }
     RADIX_TARGET_BLOCKS
         .div_ceil(q_rows.max(1))
         .clamp(1, RADIX_MAX_CHUNKS)
+}
+
+/// 2026-10-06: Chunks per row (grid x of the hist and gather launches) for `q_rows` rows:
+/// [`RADIX_TARGET_BLOCKS`] spread over the rows, between 1 and [`RADIX_MAX_CHUNKS`]. Depends on
+/// `q_rows` only, so every capture of a 1-row ceiling launch gets the same grid.
+/// 2026-10-10: unless the test-only [`set_radix_chunks_override`] is set (never in production).
+pub fn radix_chunks(q_rows: usize) -> usize {
+    radix_chunks_with(RADIX_CHUNKS_OVERRIDE.load(Ordering::Relaxed), q_rows)
 }
 
 /// 2026-10-06: Whether all five radix entry points resolved.
@@ -278,10 +327,17 @@ pub struct RadixTopk {
     pub kcap: usize,
     /// 2026-10-06: `[5]` i32 device geometry from `dsa_write_geom`, or NULL.
     pub geom_dev: DevicePtr,
+    /// 2026-10-10: `METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1`: the rows' pair buffers, at least
+    /// `radix_compact::compact_bytes(q_rows)` bytes, contents need no init. NULL (the lever off,
+    /// or not engaged) launches the lever-off sequence.
+    pub bins: DevicePtr,
 }
 
 /// 2026-10-06: Enqueue the nine radix launches on `stream` (init; hist + find for each of the
 /// three passes; gather; sort), writing `t.selected` exactly as `dsa_topk_pools` would.
+/// 2026-10-10: With `t.bins` non-null (`METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1`), eleven: init,
+/// hist 0, find 0, compact, select0, then hist and find for passes 1 and 2 and the gather
+/// through their `_rc` entry points, then sort; the same `selected` bytes.
 ///
 /// Fails before any launch when an entry point is missing, `q_rows` is 0 or above 65,535 (grid
 /// y), `kcap` exceeds [`RADIX_SORT_MAX`], or a scalar `select_k` exceeds `kcap` or `n_pools`.
@@ -293,6 +349,13 @@ pub fn launch_topk_radix(
 ) -> Result<()> {
     if !radix_resolved(kernels) {
         bail!("DSA radix top-k: a dsa_topk_radix_* entry point is missing from the kernel module");
+    }
+    let compact = !t.bins.is_null();
+    if compact && !super::radix_compact::radix_compact_resolved(kernels) {
+        bail!(
+            "DSA radix top-k: the compaction (bins set) needs dsa_topk_radix_compact, \
+             dsa_topk_radix_select0 and the _rc entry points, missing from the kernel module"
+        );
     }
     if t.q_rows == 0 || t.q_rows > u16::MAX as usize {
         bail!("DSA radix top-k: q_rows {} is outside 1..=65535", t.q_rows);
@@ -310,6 +373,9 @@ pub fn launch_topk_radix(
     }
     let rows = t.q_rows as u32;
     let chunks = radix_chunks(t.q_rows) as u32;
+    // 2026-10-10: METRALE_GLM_DSA_RADIX_BINSTAT=1 (debug): this call is sampled; never while
+    // capturing a graph.
+    let sampled = super::binstat::begin_call(gpu, kernels, stream);
     let block = [RADIX_THREADS, 1, 1];
     let (p, selk, kcap, gd) = (
         t.n_pools as u32,
@@ -326,8 +392,28 @@ pub fn launch_topk_radix(
         .arg_u32(kcap)
         .arg_ptr(gd)
         .launch(stream)?;
+    // 2026-10-10: Passes 1 and 2 and the gather of a compaction call go through the `_rc`
+    // entry points, which skip the rows select0 finished.
+    let (hist_rc, find_rc, gather) = if compact {
+        (
+            kernels.topk_radix_hist_rc,
+            kernels.topk_radix_find_rc,
+            kernels.topk_radix_gather_rc,
+        )
+    } else {
+        (
+            kernels.topk_radix_hist,
+            kernels.topk_radix_find,
+            kernels.topk_radix_gather,
+        )
+    };
     for pass in 0..RADIX_PASSES {
-        KernelLaunch::new(gpu, kernels.topk_radix_hist)
+        let (hist, find) = if pass == 0 {
+            (kernels.topk_radix_hist, kernels.topk_radix_find)
+        } else {
+            (hist_rc, find_rc)
+        };
+        KernelLaunch::new(gpu, hist)
             .grid([chunks, rows, 1])
             .block(block)
             .arg_ptr(t.scores)
@@ -338,7 +424,7 @@ pub fn launch_topk_radix(
             .arg_u32(pass)
             .arg_ptr(gd)
             .launch(stream)?;
-        KernelLaunch::new(gpu, kernels.topk_radix_find)
+        KernelLaunch::new(gpu, find)
             .grid([rows, 1, 1])
             .block(block)
             .arg_ptr(t.work)
@@ -348,8 +434,22 @@ pub fn launch_topk_radix(
             .arg_u32(chunks)
             .arg_ptr(gd)
             .launch(stream)?;
+        // 2026-10-10: after find 0, hist0 and the prefix are final and hist 1 has not run.
+        if sampled && pass == 0 {
+            super::binstat::launch_binstat(gpu, kernels, t.work, rows, p, selk, kcap, gd, stream)?;
+        }
+        // 2026-10-10: after find 0 (hist0, prefix and need final), before hist 1.
+        if compact && pass == 0 {
+            let dims = [chunks, rows, p, selk, kcap];
+            super::radix_compact::launch_compact(
+                gpu, kernels, t.scores, t.work, t.bins, dims, gd, stream,
+            )?;
+            super::radix_compact::launch_select0(
+                gpu, kernels, t.work, t.bins, rows, selk, kcap, gd, stream,
+            )?;
+        }
     }
-    KernelLaunch::new(gpu, kernels.topk_radix_gather)
+    KernelLaunch::new(gpu, gather)
         .grid([chunks, rows, 1])
         .block(block)
         .arg_ptr(t.scores)
@@ -367,7 +467,32 @@ pub fn launch_topk_radix(
         .arg_u32(selk)
         .arg_u32(kcap)
         .arg_ptr(gd)
-        .launch(stream)
+        .launch(stream)?;
+    if sampled {
+        super::binstat::report(gpu, t.work, t.q_rows, t.kcap, stream)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod chunk_override_tests {
+    use super::*;
+
+    /// 2026-10-10: With no override the policy is exactly the 2026-10-06 formula, for every
+    /// row count, and the override word clamps to 1..=RADIX_MAX_CHUNKS. Does not touch the
+    /// process-global (other tests read `radix_chunks`).
+    #[test]
+    fn radix_chunks_unchanged_when_override_none() {
+        for q in 0..=400usize {
+            let want = RADIX_TARGET_BLOCKS.div_ceil(q.max(1)).clamp(1, RADIX_MAX_CHUNKS);
+            assert_eq!(radix_chunks_with(0, q), want, "q={q}");
+            assert_eq!(radix_chunks(q), want, "q={q}");
+        }
+        assert_eq!(radix_chunks(128), 1);
+        assert_eq!(radix_chunks(1), RADIX_MAX_CHUNKS);
+        assert_eq!(radix_chunks_with(4, 128), 4);
+        assert_eq!(radix_chunks_with(99, 128), RADIX_MAX_CHUNKS);
+    }
 }
 
 #[cfg(test)]

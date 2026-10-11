@@ -385,9 +385,12 @@ pub use launch::{PoolRows, compress_pools_only, select_tokens};
 pub mod pool_once;
 pub mod grid_stride;
 pub mod radix;
+pub mod radix_compact;
+pub mod binstat;
 pub mod scores_decode;
 pub mod shared;
 pub mod split;
+pub mod tail_count;
 pub mod tc2;
 
 #[cfg(test)]

@@ -339,3 +339,110 @@ fn prompts_up_to_one_grid_get_no_snapshot_and_no_restore() {
         assert_eq!(rig.prefill(&p, 0), 0, "len {len}: nothing restorable");
     }
 }
+
+/// 2026-10-06: Chunks under a chunk grid `c` (race #68), through `grid_chunk_len_c`.
+fn chunks_c(total: usize, start: usize, g: usize, c: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut off = start;
+    while off < total {
+        let len = grid_chunk_len_c(off, total, g, c);
+        assert!(len >= 1, "total={total} off={off}: empty chunk");
+        out.push((off, off + len));
+        off += len;
+    }
+    out
+}
+
+#[test]
+fn chunk_grid_equal_to_the_snapshot_grid_is_the_plain_grid() {
+    for g in [2048, 4096, G] {
+        for total in [1, 2047, 2048, 2049, 5000, 8193, 9000, 16385, 20001, 32768, 40000] {
+            for off in [0, 1, g - 1, g, g + 7, 3 * g] {
+                assert_eq!(grid_chunk_len_c(off, total, g, g), grid_chunk_len(off, total, g));
+            }
+            // 2026-10-06: An invalid chunk grid (not a multiple of g, or below it) is the
+            // plain grid.
+            for bad in [0, g / 2, g + 16, 3 * g + 4] {
+                assert_eq!(chunks_c(total, 0, g, bad), chunks_c(total, 0, g, g), "g={g} c={bad}");
+            }
+        }
+    }
+    assert_eq!(grid_chunk_tokens_from(None, 2048), 2048);
+    assert_eq!(grid_chunk_tokens_from(Some(" 8192 "), 2048), 8192);
+    assert_eq!(grid_chunk_tokens_from(Some("6144"), 2048), 6144);
+    assert_eq!(grid_chunk_tokens_from(Some("1024"), 2048), 2048);
+    assert_eq!(grid_chunk_tokens_from(Some("3000"), 2048), 2048);
+    assert_eq!(grid_chunk_tokens_from(Some("x"), 2048), 2048);
+}
+
+#[test]
+fn chunk_grid_splits_only_at_the_deepest_snapshot_point() {
+    let (g, c) = (2048, G);
+    for total in [1, 2048, 2049, 5000, 8192, 8193, 9000, 16385, 20001, 32768, 40000] {
+        let ch = chunks_c(total, 0, g, c);
+        let d = grid_insert_len(total, g);
+        assert_eq!(ch.last().map(|x| x.1), Some(total));
+        for (i, &(s, e)) in ch.iter().enumerate() {
+            assert!(e - s <= c, "total={total}: chunk {i} is {} rows", e - s);
+            if e < total {
+                assert!(e % c == 0 || e == d, "total={total}: chunk {i} ends at {e}");
+                // 2026-10-06: Every non-last chunk end is a snapshot point (a grid save).
+                assert!(is_grid_checkpoint_end(e, total, g, BS), "total={total} end {e}");
+            }
+        }
+        // 2026-10-06: The deepest point is a chunk end, so it is saved, and at most one chunk is
+        // shorter than c besides the last.
+        if d > 0 {
+            assert!(ch.iter().any(|x| x.1 == d), "total={total}: no chunk ends at {d}");
+        }
+        let short = ch.iter().filter(|x| x.1 < total && x.1 - x.0 < c).count();
+        assert!(short <= 1, "total={total}: {short} short non-last chunks");
+    }
+    assert_eq!(chunks_c(9000, 0, g, c), vec![(0, 8192), (8192, 9000)]);
+    assert_eq!(chunks_c(5000, 0, g, c), vec![(0, 4096), (4096, 5000)]);
+    assert_eq!(
+        chunks_c(20001, 0, g, c),
+        vec![(0, 8192), (8192, 16384), (16384, 18432), (18432, 20001)]
+    );
+    assert_eq!(chunks_c(1500, 0, g, c), vec![(0, 1500)]);
+    // 2026-10-06: A follow-up turn of 5000 + 1500 tokens restores at 4096 (the 5000-token turn's
+    // deepest point) and computes [4096, 6500) as one chunk ending at 6144, its own deepest point.
+    assert_eq!(grid_restore_cap(5000, 6500, g), 4096);
+    assert_eq!(chunks_c(6500, 4096, g, c), vec![(4096, 6144), (6144, 6500)]);
+}
+
+#[test]
+fn chunk_grid_with_inpass_capture_runs_the_plain_chunk_grid() {
+    let (g, c) = (2048, G);
+    for total in [1, 2048, 2049, 5000, 8192, 8193, 9000, 16385, 20001, 32768, 40000] {
+        for off in [0, 1, 2048, 4096, 8192, 16384, 20000] {
+            assert_eq!(
+                grid_chunk_len_cs(off, total, g, c, false),
+                grid_chunk_len(off, total, c),
+                "total={total} off={off}"
+            );
+            assert_eq!(
+                grid_chunk_len_cs(off, total, g, c, true),
+                grid_chunk_len_c(off, total, g, c)
+            );
+        }
+        // 2026-10-06: The in-pass cut is the deepest snapshot point unless a chunk end saves it.
+        let d = grid_insert_len(total, g);
+        let want = (d > 0 && d % c != 0).then_some(d);
+        assert_eq!(grid_inpass_cut(total, g, c), want, "total={total}");
+        if let Some(cut) = want {
+            // 2026-10-06: Exactly one plain-grid chunk strictly spans the cut.
+            let n = (0..total)
+                .step_by(c)
+                .filter(|&s| inpass_capture_spans(cut, s, grid_chunk_len(s, total, c)))
+                .count();
+            assert_eq!(n, 1, "total={total} cut={cut}");
+        }
+    }
+    assert_eq!(grid_inpass_cut(5000, g, c), Some(4096));
+    assert_eq!(grid_inpass_cut(9000, g, c), None, "8192 is a chunk end");
+    assert_eq!(grid_inpass_cut(20001, g, c), Some(18432));
+    assert_eq!(grid_inpass_cut(2048, g, c), None);
+    assert_eq!(grid_inpass_cut(5000, g, g), None, "plain grid: no in-pass snapshot");
+    assert_eq!(grid_inpass_cut(5000, 0, c), None);
+}

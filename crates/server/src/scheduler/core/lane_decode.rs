@@ -127,6 +127,17 @@ impl SchedulerCore {
             let spec_width_ok = active.len() <= sched.levers.mtp_max_seqs
                 && step_mode
                     != Some(metrale_model_layers::speculative::hybrid::SpecStepMode::Plain);
+            // 2026-10-10: `METRALE_MTP_POOL_CAP` evidence: MTP steps lost only because an
+            // active sequence sits on a slot the verify pools do not cover.
+            if use_mtp && spec_width_ok && !spec_slots_covered {
+                let n = metrale_model_layers::ssm_reserve::note_mtp_uncovered_step();
+                if n.is_power_of_two() {
+                    let slots: Vec<usize> = active.iter().map(|a| a.seq.slot_idx).collect();
+                    tracing::info!(
+                        "MTP steps lost to uncovered slots: {n} (cover {spec_slot_cap}, active slots {slots:?})"
+                    );
+                }
+            }
             if use_mtp {
                 sched.rung.note_width_regime(
                     active.len(),

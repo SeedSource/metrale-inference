@@ -94,15 +94,24 @@ impl Glm5NextLayer {
                 if flashkda {
                     // 2026-10-03: FlashKDA ran the recurrence; the partial is in `final_out`.
                 } else if chunkable && crate::glm5next_kda::kda_prefill_chunked_tc() {
-                    layer.prefill_chunked_tc(gpu, normed, k, kda, ws, stream)?;
+                    // 2026-10-06: The TC prefill takes the in-pass capture too (at a 16-row
+                    // chunk boundary or the call's end; through `decode_k_capture` when it
+                    // falls back) and says whether it copied; counted as the arm below counts.
+                    let cap = capture.as_ref();
+                    if layer.prefill_chunked_tc(gpu, normed, k, kda, ws, cap, stream)?
+                        && let Some(mc) = ctx.midchunk_capture.as_ref()
+                    {
+                        mc.captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 } else if chunkable && kda_chunk_prefill() {
                     layer.prefill(gpu, normed, k, kda, ws, stream)?;
                 } else if let (Some(cap), Some(mc)) = (capture, ctx.midchunk_capture.as_ref()) {
                     // 2026-10-03: The same launches as `decode_k` below, with the state copied
-                    // into the reserved snapshot slot after row `cap.row - 1`. The chunked arms
-                    // above never capture; the model enables the in-pass capture only when
-                    // neither runs (`inpass_ssm_capture_supported`), and without this count the
-                    // engine registers nothing.
+                    // into the reserved snapshot slot after row `cap.row - 1`. FlashKDA and the
+                    // FP32 chunked scan above never capture; the model enables the in-pass
+                    // capture only when neither can run (`inpass_ssm_capture_supported`), and
+                    // without this count the engine registers nothing. 2026-10-06: the TC arm
+                    // above captures and counts itself.
                     layer.decode_k_capture(gpu, normed, k, kda, ws, cap, stream)?;
                     mc.captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {

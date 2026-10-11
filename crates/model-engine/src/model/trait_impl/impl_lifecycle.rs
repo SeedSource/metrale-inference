@@ -63,6 +63,10 @@ impl ModelLifecycle for TransformerModel {
         self.compact_sequence_dispatch(seq, new_slot)
     }
 
+    fn migrate_to_covered_slot(&self, seq: &mut SequenceState) -> Result<Option<usize>> {
+        self.migrate_to_covered_slot_dispatch(seq)
+    }
+
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
         if let Err(e) = self.gdn_carry_flush_pending() {
             tracing::error!("gdn carry flush before {}: {e:#}", "detach_slot_for_reuse");

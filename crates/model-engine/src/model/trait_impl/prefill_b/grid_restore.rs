@@ -11,6 +11,13 @@
 //! - Chunks: every non-last prefill chunk is exactly `[k*G, (k+1)*G)`, whatever the scheduler's
 //!   budget (`prefill_plan::grid_chunk_len`, through `Model::prefill_grid`). No tail split, no
 //!   in-pass or mid-chunk tail capture.
+//! - 2026-10-06 (race #68): `METRALE_PREFIX_GRID_CHUNK_TOKENS=C` (a multiple of `G`) chunks on
+//!   the `C` grid instead, and splits the chunk holding the prompt's deepest `G` point there
+//!   (`prefill_plan::grid_chunk_len_c`); snapshots, restores and the insert stay on `G`. A hit
+//!   then runs from `k*G` in chunks a cold prefill does not run, so it is NOT identical to cold
+//!   (accepted on quality, not identity). Unset, `C = G` and everything below holds as written.
+//!   With `METRALE_GLM_SSM_INPASS_CAPTURE=1` the deepest `G` point is not split off but
+//!   captured inside the pass that crosses it (`inpass_capture.rs`, `prefill_plan::grid_inpass_cut`).
 //! - Snapshots: one at the end of every non-last chunk (`save_checkpoint`: SSM/KDA h and conv
 //!   state plus the DSA indexer aux blob, the plain end-of-pass state), and no others: no
 //!   prompt-end leaf (`finalize_last`), no decode checkpoints, no finish leaf (`cache_sequence`
@@ -75,13 +82,17 @@ impl TransformerModel {
             return None;
         }
         let arena = self.buffers.max_batch_tokens();
-        if !crate::prefill_plan::grid_valid(g, bs, arena) {
+        // 2026-10-06: The chunk grid (`METRALE_PREFIX_GRID_CHUNK_TOKENS`) must fit the arena too.
+        if !crate::prefill_plan::grid_valid(g, bs, arena)
+            || crate::prefill_plan::grid_chunk_lever(g) > arena
+        {
             static W: std::sync::Once = std::sync::Once::new();
             W.call_once(|| {
                 tracing::warn!(
                     "METRALE_PREFIX_GRID_RESTORE=1 ignored: grid {g} is not a positive multiple \
                      of the KV block size {bs} (and of 4) no larger than the prefill arena \
-                     ({arena} tokens); set METRALE_PREFIX_GRID_TOKENS to --max-prefill-tokens"
+                     ({arena} tokens), or METRALE_PREFIX_GRID_CHUNK_TOKENS is larger than the \
+                     arena; set METRALE_PREFIX_GRID_TOKENS to --max-prefill-tokens"
                 )
             });
             return None;

@@ -40,6 +40,9 @@ pub use rollback::{
 /// `max(mtp_max_seqs(), 32)`, capped at `max_batch_size`. The scheduler never
 /// speculates with more than `mtp_max_seqs()` active sequences.
 pub fn mtp_state_slots(max_batch_size: usize) -> usize {
+    if mtp_pool_cap() {
+        return mtp_state_slots_capped(max_batch_size, crate::speculative::mtp_max_seqs());
+    }
     mtp_state_slots_with(
         max_batch_size,
         crate::speculative::mtp_max_seqs(),
@@ -53,6 +56,48 @@ pub fn mtp_state_slots(max_batch_size: usize) -> usize {
 pub fn mtp_pool_full_width() -> bool {
     std::env::var_os("METRALE_MTP_POOL_FULL_WIDTH").is_some()
         || matches!(std::env::var("METRALE_EP_PROTOCOL").as_deref(), Ok("v2"))
+}
+
+/// 2026-10-10: `METRALE_MTP_POOL_CAP=1` (exactly `1`) and `METRALE_MTP_POOL_FULL_WIDTH`
+/// absent. Read once per process. Then [`mtp_state_slots`] is
+/// [`mtp_state_slots_capped`]: `min(max_batch_size, mtp_max_seqs())` with no 32 floor,
+/// also under EP protocol v2. The scheduler never speculates with more than
+/// `mtp_max_seqs()` active sequences, so wider pools are never used at once.
+/// [`verify_slot_drafts`] is unchanged: under v2 every covered slot keeps `num_drafts`.
+///
+/// v2 never compacts survivors onto low slots (`retire_finished_sequences`), so with the
+/// cap `SsmStatePool` claims the lowest free slot on both ranks (the worker mirrors the
+/// head's claims, `ep_worker_step`). A sequence on a slot at or above the cap can only
+/// have been claimed while at least `mtp_max_seqs()` other slots were held. Until it
+/// finishes, a batch holding it plain-decodes; the scheduler counts those steps
+/// ([`note_mtp_uncovered_step`]). Exact: pool layout and slot choice only.
+pub fn mtp_pool_cap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("METRALE_MTP_POOL_CAP").as_deref() == Ok("1")
+            && std::env::var_os("METRALE_MTP_POOL_FULL_WIDTH").is_none()
+    })
+}
+
+/// 2026-10-10: Env-free core of [`mtp_state_slots`] under [`mtp_pool_cap`]:
+/// `min(max_batch_size, spec_dispatch_cap)`, at least 1.
+pub fn mtp_state_slots_capped(max_batch_size: usize, spec_dispatch_cap: usize) -> usize {
+    max_batch_size.min(spec_dispatch_cap.max(1))
+}
+
+/// 2026-10-10: Decode steps on which MTP would have run but an active sequence sat on a
+/// slot at or above the verify-pool cover ([`mtp_pool_cap`]); reported at shutdown.
+static MTP_UNCOVERED_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 2026-10-10: Count one MTP step lost to an uncovered slot (`lane_decode.rs`) and return
+/// the new total.
+pub fn note_mtp_uncovered_step() -> u64 {
+    MTP_UNCOVERED_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// 2026-10-10: MTP steps lost to uncovered slots so far in this process.
+pub fn mtp_uncovered_steps() -> u64 {
+    MTP_UNCOVERED_STEPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// 2026-09-25: Env-free core of [`mtp_state_slots`]. The `VERIFY_WY_TABLE_SEQS` floor

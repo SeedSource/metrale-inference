@@ -267,12 +267,25 @@ pub(super) fn retire_finished_sequences(
     if io.dev.model().ep_protocol_v2() {
         // 2026-09-25: v2 EP: finish and remove, no compaction.
         let mut i = 0;
+        let mut retired = false;
         while i < active.len() {
             if active[i].finished {
                 let mut a = active.swap_remove(i);
                 finish_sequence(io, &mut a, max_seq_len);
+                retired = true;
             } else {
                 i += 1;
+            }
+        }
+        // 2026-10-10: `METRALE_MTP_POOL_CAP`: a retirement can free a slot the MTP verify pools
+        // cover; move survivors on uncovered slots onto those slots, on both ranks, so the
+        // batch can speculate again (`Model::migrate_to_covered_slot`, a no-op with the cap
+        // off). The caller drained any step in flight before retiring.
+        if retired {
+            for a in active.iter_mut() {
+                if let Err(e) = io.dev.model().migrate_to_covered_slot(&mut a.seq) {
+                    tracing::error!("migrate_to_covered_slot (slot {}): {e:#}", a.seq.slot_idx);
+                }
             }
         }
         return;

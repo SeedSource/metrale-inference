@@ -44,6 +44,14 @@ impl Drop for TransformerModel {
                 metrale_model_layers::ssm_reserve::ssm_checkpoint_reads_refused()
             );
         }
+        // 2026-10-10: Shutdown stat for the `METRALE_MTP_POOL_CAP` gate (rank 0 counts;
+        // the worker reports 0).
+        if metrale_model_layers::ssm_reserve::mtp_pool_cap() {
+            tracing::info!(
+                "METRALE_MTP_POOL_CAP: MTP steps lost to uncovered slots = {}",
+                metrale_model_layers::ssm_reserve::mtp_uncovered_steps()
+            );
+        }
         // 2026-09-25: The snapshot pool's spill staging buffer is freed here
         // because the pool holds no `gpu` handle. It is allocated on first use,
         // so this is a no-op when the spill tier never ran.

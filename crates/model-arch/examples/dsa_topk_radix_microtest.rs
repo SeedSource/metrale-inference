@@ -193,6 +193,7 @@ fn radix_topk(
         select_k: selk,
         kcap: KCAP,
         geom_dev: gd,
+        bins: DevicePtr::NULL,
     };
     launch_topk_radix(g, k, &t, stream)
 }

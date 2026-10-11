@@ -81,6 +81,9 @@ pub const KERNEL_MAX_KPOOL: usize = 8;
 /// 2026-10-06: So do the five `topk_radix_*` handles.
 /// 2026-10-07: So does `index_scores_tc2`.
 /// 2026-10-08: So does `index_scores_decode`.
+/// 2026-10-10: So do `expand_selection_cc` and `valid_chunk_counts`.
+/// 2026-10-10: So do `topk_radix_binstat` and `topk_radix_compact`.
+/// 2026-10-10: So do `topk_radix_select0` and `topk_radix_{hist,find,gather}_rc`.
 #[derive(Clone, Copy)]
 pub struct Glm5NextDsaKernels {
     pub kpool_compress: KernelHandle,
@@ -128,7 +131,26 @@ pub struct Glm5NextDsaKernels {
     pub topk_radix_find: KernelHandle,
     pub topk_radix_gather: KernelHandle,
     pub topk_radix_sort: KernelHandle,
+    /// 2026-10-10: `dsa_topk_radix_binstat` (METRALE_GLM_DSA_RADIX_BINSTAT=1, debug);
+    /// `KernelHandle(0)` when the target lacks it.
+    pub topk_radix_binstat: KernelHandle,
+    /// 2026-10-10: METRALE_GLM_DSA_TOPK_RADIX_COMPACT=1 (`select::radix_compact`):
+    /// `dsa_topk_radix_compact`, `dsa_topk_radix_select0` and the `_rc` entry points of hist,
+    /// find and gather (the same code, returning at once for a row select0 finished).
+    /// `KernelHandle(0)` when the target lacks one; the lever is then ignored, with one warning.
+    pub topk_radix_compact: KernelHandle,
+    pub topk_radix_select0: KernelHandle,
+    pub topk_radix_hist_rc: KernelHandle,
+    pub topk_radix_find_rc: KernelHandle,
+    pub topk_radix_gather_rc: KernelHandle,
     pub expand_selection: KernelHandle,
+    /// 2026-10-10: `dsa_expand_selection_cc` and `dsa_valid_chunk_counts`: `expand_selection`
+    /// with each row's visible-key count taken from per-chunk counts of `valid_keys` instead of
+    /// a byte scan of all of it. `select_tokens` launches the pair under
+    /// `METRALE_GLM_DSA_EXPAND_TAIL_COUNT=1` (`select::tail_count`); `KernelHandle(0)` when the
+    /// target's module lacks either, and `expand_selection` runs.
+    pub expand_selection_cc: KernelHandle,
+    pub valid_chunk_counts: KernelHandle,
     /// 2026-09-25: `indexer.k_norm`, a LayerNorm with a bias: `nllb_layernorm_bf16`, in place,
     /// taking `(x, weight, bias, rows, dim, eps)`. An RMSNorm kernel would drop both the mean
     /// subtraction and the bias, and the shapes would not show it.
@@ -223,7 +245,47 @@ impl Glm5NextDsaKernels {
                 DSA_MODULE,
                 "dsa_topk_radix_sort",
             ),
+            topk_radix_binstat: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_binstat",
+            ),
+            topk_radix_compact: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_compact",
+            ),
+            topk_radix_select0: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_select0",
+            ),
+            topk_radix_hist_rc: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_hist_rc",
+            ),
+            topk_radix_find_rc: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_find_rc",
+            ),
+            topk_radix_gather_rc: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_topk_radix_gather_rc",
+            ),
             expand_selection: gpu.kernel(DSA_MODULE, "dsa_expand_selection")?,
+            expand_selection_cc: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_expand_selection_cc",
+            ),
+            valid_chunk_counts: metrale_model_layers::layers::try_kernel(
+                gpu,
+                DSA_MODULE,
+                "dsa_valid_chunk_counts",
+            ),
             k_norm: gpu.kernel(LAYERNORM_MODULE, "nllb_layernorm_bf16")?,
             write_geom: metrale_model_layers::layers::try_kernel(gpu, DSA_MODULE, "dsa_write_geom"),
             indexer_store: metrale_model_layers::layers::try_kernel(

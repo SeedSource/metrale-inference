@@ -17,6 +17,9 @@
 //!      whose call covers the cut copies its recurrent and conv state as of the cut into the
 //!      slot (GLM-5.3 KDA: `Glm5NextKdaLayer::decode_k_capture`, which splits the token loop's
 //!      two launches at that row; bit-identical to the uncaptured pass) and counts itself.
+//!      2026-10-06: Under `METRALE_GLM_KDA_PREFILL_CHUNKED_TC=1`, `prefill_chunked_tc` splits
+//!      its scan at the cut instead when the cut is a 16-row chunk boundary of the call (or its
+//!      end); a cut inside a chunk takes no copy, so the count falls short and step 3 frees it.
 //!   3. [`TransformerModel::finalize_inpass_capture`], after the pass: when every SSM layer
 //!      captured, attach the aux blobs as of the cut (`LayerAuxState::snapshot_aux_prefix`; the
 //!      DSA indexer rows `[0, cut)`) and register the slot exactly as `save_checkpoint` registers
@@ -106,10 +109,18 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         // 2026-10-03: Under the absolute grid (`grid_restore.rs`) snapshots come only from grid
         // chunk ends; no tail snapshot.
-        if self.prefix_grid_for_bs(tokens, bs).is_some() {
-            return None;
-        }
-        let cut = crate::prefill_plan::tail_split_point(tokens.len(), bs)?;
+        // 2026-10-06: Except under a chunk grid coarser than the snapshot grid
+        // (`METRALE_PREFIX_GRID_CHUNK_TOKENS`): the prompt's deepest snapshot point, when it is
+        // not a chunk end, is captured inside the pass that crosses it (the planner no longer
+        // splits there, `prefill_plan::grid_split_deepest`).
+        let cut = match self.prefix_grid_for_bs(tokens, bs) {
+            Some(g) => crate::prefill_plan::grid_inpass_cut(
+                tokens.len(),
+                g,
+                crate::prefill_plan::grid_chunk_lever(g),
+            )?,
+            None => crate::prefill_plan::tail_split_point(tokens.len(), bs)?,
+        };
         if !crate::prefill_plan::inpass_capture_spans(cut, proc_start, proc_count) {
             return None;
         }

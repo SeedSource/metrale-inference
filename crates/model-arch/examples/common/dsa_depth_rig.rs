@@ -474,6 +474,7 @@ impl Fixture {
                 select_k: selk_a,
                 kcap: radix::radix_kcap(&self.cfg),
                 geom_dev: row.geom,
+                bins: DevicePtr::NULL,
             };
             return radix::launch_topk_radix(g, &self.kernels, &t, stream);
         }

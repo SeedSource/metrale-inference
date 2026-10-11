@@ -241,6 +241,7 @@ fn launch_sequence_and_grids() {
         select_k: 512,
         kcap: 512,
         geom_dev: DevicePtr::NULL,
+        bins: DevicePtr::NULL,
     };
     launch_topk_radix(&gpu, &k, &t, 7).unwrap();
     let l = gpu.launches_snapshot();

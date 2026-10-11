@@ -113,3 +113,145 @@ fn bare_pool_has_no_checkpoints() {
     assert!(pool.h_checkpoint(0, 0).is_none());
     assert!(pool.conv_checkpoint(0, 0).is_none());
 }
+
+/// 2026-10-10: `METRALE_MTP_POOL_CAP` claim rule (`take_free_slot`): the lowest free
+/// index first; LIFO without the cap.
+#[test]
+fn take_free_slot_lowest_first_or_lifo() {
+    use crate::model::ssm_pool_slots::take_free_slot;
+    let mut free = vec![5, 1, 9, 3];
+    assert_eq!(take_free_slot(&mut free, true), Some(1));
+    assert_eq!(take_free_slot(&mut free, true), Some(3));
+    assert_eq!(take_free_slot(&mut free, false), Some(9));
+    assert_eq!(take_free_slot(&mut free, true), Some(5));
+    assert_eq!(take_free_slot(&mut free, true), None);
+    assert_eq!(take_free_slot(&mut free, false), None);
+}
+
+/// 2026-10-10: EP v2 mirror invariant under either claim rule. The worker frees the
+/// slot's prior occupant and allocates again on every head alloc, and re-allocates a
+/// phantom on every head release (`ep_worker_step`, `EP_FREE_REALLOC`); its claim must
+/// return the head's slot each time, or the worker bails. With the lowest-first rule a
+/// batch never holds a slot at or above `n` while fewer than `n + 1` sequences are
+/// claimed at that sequence's claim time.
+#[test]
+fn ep_v2_mirrored_claims_agree_under_both_rules() {
+    use crate::model::ssm_pool_slots::take_free_slot;
+    for lowest_first in [false, true] {
+        let max = 16usize;
+        let mut head: Vec<usize> = (0..max).rev().collect();
+        let mut worker: Vec<usize> = (0..max).rev().collect();
+        let mut worker_held = vec![false; max];
+        let mut live: Vec<usize> = Vec::new();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..20_000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let alloc = live.is_empty() || (live.len() < max && (x >> 33) % 2 == 0);
+            if alloc {
+                let p = take_free_slot(&mut head, lowest_first).unwrap();
+                if lowest_first {
+                    assert!(
+                        p <= live.len(),
+                        "lowest-first gave slot {p} with {} live",
+                        live.len()
+                    );
+                }
+                if worker_held[p] {
+                    worker.push(p);
+                }
+                assert_eq!(take_free_slot(&mut worker, lowest_first), Some(p));
+                worker_held[p] = true;
+                live.push(p);
+            } else {
+                let i = ((x >> 17) as usize) % live.len();
+                let p = live.swap_remove(i);
+                head.push(p);
+                worker.push(p);
+                assert_eq!(take_free_slot(&mut worker, lowest_first), Some(p));
+            }
+        }
+    }
+}
+
+/// 2026-10-10: The EP v2 mirror invariant with `METRALE_MTP_POOL_CAP` slot migration
+/// (`migrate_to_covered_slot_dispatch` on the head, `ep_worker_migrate_slot` on the worker).
+/// After every release the head moves each survivor on a slot at or above `cover` onto the
+/// lowest free covered slot; the worker frees its phantom on the target, migrates, and
+/// re-allocates a phantom on the source, which must be the slot its lowest-first claim
+/// returns. Every later mirrored claim must still agree, and once at most `cover`
+/// sequences are live after a release, all of them sit on covered slots.
+#[test]
+fn ep_v2_mirrored_claims_agree_with_migration() {
+    use crate::model::ssm_pool_slots::take_free_slot;
+    let (max, cover) = (16usize, 8usize);
+    let mut head: Vec<usize> = (0..max).rev().collect();
+    let mut worker: Vec<usize> = (0..max).rev().collect();
+    let mut worker_held = vec![false; max];
+    let mut live: Vec<usize> = Vec::new();
+    let mut migrations = 0usize;
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    let remove = |v: &mut Vec<usize>, s: usize| {
+        let i = v
+            .iter()
+            .position(|&f| f == s)
+            .expect("target on the free list");
+        v.swap_remove(i);
+    };
+    for _ in 0..50_000 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let alloc = live.is_empty() || (live.len() < max && (x >> 33) % 2 == 0);
+        if alloc {
+            let p = take_free_slot(&mut head, true).unwrap();
+            if worker_held[p] {
+                worker.push(p);
+            }
+            assert_eq!(take_free_slot(&mut worker, true), Some(p));
+            worker_held[p] = true;
+            live.push(p);
+        } else {
+            let i = ((x >> 17) as usize) % live.len();
+            let p = live.swap_remove(i);
+            head.push(p);
+            worker.push(p);
+            assert_eq!(take_free_slot(&mut worker, true), Some(p));
+            for slot in live.iter_mut() {
+                let from = *slot;
+                if from < cover {
+                    continue;
+                }
+                let Some(to) = head.iter().copied().filter(|&s| s < cover).min() else {
+                    continue;
+                };
+                remove(&mut head, to);
+                head.push(from);
+                if worker_held[to] {
+                    worker.push(to);
+                }
+                remove(&mut worker, to);
+                worker.push(from);
+                assert_eq!(
+                    take_free_slot(&mut worker, true),
+                    Some(from),
+                    "worker phantom must re-take the migration source"
+                );
+                worker_held[to] = true;
+                *slot = to;
+                migrations += 1;
+            }
+            if live.len() <= cover {
+                assert!(
+                    live.iter().all(|&s| s < cover),
+                    "uncovered survivor: {live:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        migrations > 1000,
+        "simulation exercised {migrations} migrations"
+    );
+}

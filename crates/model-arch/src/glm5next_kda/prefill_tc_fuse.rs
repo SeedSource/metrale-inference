@@ -8,8 +8,13 @@
 //! - Byte-identical to the unfused chunked-TC prefill: the chunk records, the core output, the
 //!   block output and both states carry the same bits (kernels/gb10/common/kda_front_fuse.cu
 //!   says why; `kda_front_fuse_microtest` checks it).
-//! - Only [`Glm5NextKdaLayer::prefill_chunked_tc_arm`] takes this path, after
-//!   `chunked_tc_refusal` passed; decode, verify, snapshot and capture walks never do.
+//! - Only `prefill_chunked_tc_inner` ([`Glm5NextKdaLayer::prefill_chunked_tc`] and
+//!   [`Glm5NextKdaLayer::prefill_chunked_tc_arm`]) takes this path, after `chunked_tc_refusal`
+//!   passed; decode, verify and snapshot walks never do. 2026-10-10: an in-pass capture is taken
+//!   here too, bit-identical to the unfused capture: the conv state at a cut inside the call is
+//!   `kda_ff_conv_state_tail` over `ws.qkv_parts` with `rows = cut` on the slot (the parts hold
+//!   the pre-conv projections, the values `qkv_proj` would), the recurrent state comes from
+//!   the split scan over the same chunk records.
 //! - Allocates nothing; `ws.qkv_proj`, `ws.conv_out`, `ws.gate` and `ws.beta` are left
 //!   unwritten (nothing on this path reads them).
 //!
@@ -31,7 +36,9 @@
 //! re-read `qkv_proj` (192 MiB), `conv_out` (192 MiB) and `gate` (128 MiB): about 1.0 GiB of
 //! DRAM traffic per layer call (estimate, not measured).
 
+use super::prefill_tc::TcCapture;
 use super::*;
+use metrale_model_layers::layer::InpassSplit;
 
 /// 2026-10-07: `KDA_FF_DCONV` in kda_front_fuse.cu: the conv taps `kda_ff_prepare` is compiled
 /// for.
@@ -100,10 +107,12 @@ impl Glm5NextKdaLayer {
         k: usize,
         state: &KdaSeqState,
         ws: &Glm5NextKdaWorkspace,
+        capture: Option<&InpassSplit>,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let c = &self.cfg;
-        let (qkv, cd, d) = (c.qkv_dim(), c.conv_dim(), c.head_dim);
+        let (qkv, d) = (c.qkv_dim(), c.head_dim);
+        let plan = self.tc_capture_plan_for(capture, k);
         let nchunks = k.div_ceil(KDA_TC_C);
         // 2026-10-07: logged once when the fused front first runs (gate scripts grep it).
         static ENGAGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -137,18 +146,48 @@ impl Glm5NextKdaLayer {
             .arg_f32(c.gate_lower_bound)
             .arg_f32(1.0 / (d as f32).sqrt())
             .launch(stream)?;
+        // 2026-10-10: A split capture's conv state, as `stateful_chunked_tc` takes it: the
+        // incoming state (`ff_prepare` only read it) copied to the slot and advanced there by
+        // `row` rows, the same tail kernel on the same projections as the call's own tail.
+        if let (Some(cap), TcCapture::Split { .. }) = (capture, plan) {
+            gpu.copy_d2d_async(state.conv, cap.conv_dst, cap.conv_bytes, stream)?;
+            self.ff_tail_launch(gpu, cap.conv_dst, cap.row, ws, k, qkv, stream)?;
+        }
+        self.ff_tail_launch(gpu, state.conv, k, ws, k, qkv, stream)?;
+        self.tc_scan_captured(gpu, k, state, ws, capture, plan, stream)
+    }
+
+    /// 2026-10-10: `kda_ff_conv_state_tail` on `conv` after `rows` rows of the projections in
+    /// `ws.qkv_parts` (laid out for a `k`-row call: part `i` at `i * k * qkv` elements, with
+    /// `k` the call's row count, passed as `parts_k`).
+    #[allow(clippy::too_many_arguments)]
+    fn ff_tail_launch(
+        &self,
+        gpu: &dyn GpuBackend,
+        conv: DevicePtr,
+        rows: usize,
+        ws: &Glm5NextKdaWorkspace,
+        parts_k: usize,
+        qkv: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let cd = c.conv_dim();
+        let q = ws.qkv_parts;
+        let kp = ws.qkv_parts.offset(parts_k * qkv * 2);
+        let v = ws.qkv_parts.offset(2 * parts_k * qkv * 2);
         KernelLaunch::new(gpu, self.kernels.ff_tail)
             .grid([div_ceil(cd as u32, 256), 1, 1])
             .block([256, 1, 1])
-            .arg_ptr(state.conv)
+            .arg_ptr(conv)
             .arg_ptr(q)
             .arg_ptr(kp)
             .arg_ptr(v)
-            .arg_u32(k as u32)
+            .arg_u32(rows as u32)
             .arg_u32(qkv as u32)
             .arg_u32(c.conv_kernel as u32)
             .arg_u32(qkv as u32)
             .launch(stream)?;
-        self.launch_tc_scan(gpu, k, state, ws, stream)
+        Ok(())
     }
 }

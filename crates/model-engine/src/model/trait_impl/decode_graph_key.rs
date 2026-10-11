@@ -233,38 +233,60 @@ mod tests {
     /// `graph_stale_on_new_sequence()`, never drains or clears them wholesale, and drops the
     /// LoRA-baked `verify_kgamma_graph` / `fused_graph` entries of the slot. Removing the guard,
     /// or replacing the per-slot `remove` with `drain`/`clear`, fails this test.
+    /// 2026-10-10: The drops live in `drop_slot_graphs` / `drop_slot_kgamma_graphs`
+    /// (`sequence_compact.rs`, shared with the `METRALE_MTP_POOL_CAP` slot migration); the
+    /// wholesale checks read those helpers, the guard check reads `free_sequence_dispatch`.
     #[test]
     fn free_sequence_only_drops_slot_graphs_a_layer_calls_stale() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/model/trait_impl/sequence.rs"),
-        )
-        .unwrap();
-        let start = src
-            .find("fn free_sequence_dispatch")
-            .expect("free_sequence_dispatch");
-        let body = &src[start..];
-        let end = body.find("\n    pub(super) fn ").unwrap_or(body.len());
-        let body = &body[..end];
-        for bad in ["decode_graph.lock().drain()", "decode_graph.lock().clear()"] {
+        let read = |f: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/model/trait_impl")
+                    .join(f),
+            )
+            .unwrap()
+        };
+        let fn_body = |src: &str, name: &str| -> String {
+            let start = src.find(name).unwrap_or_else(|| panic!("{name}"));
+            let body = &src[start..];
+            let end = body.find("\n    pub(super) fn ").unwrap_or(body.len());
+            body[..end].to_string()
+        };
+        let seq = read("sequence.rs");
+        let compact = read("sequence_compact.rs");
+        let body = fn_body(&seq, "fn free_sequence_dispatch");
+        let helpers = fn_body(&compact, "fn drop_slot_graphs")
+            + &fn_body(&compact, "fn drop_slot_kgamma_graphs");
+        for src in [&body, &helpers] {
+            for bad in ["decode_graph.lock().drain()", "decode_graph.lock().clear()"] {
+                assert!(
+                    !src.contains(bad),
+                    "free_sequence must not invalidate decode graphs wholesale ({bad})"
+                );
+            }
             assert!(
-                !body.contains(bad),
-                "free_sequence must not invalidate decode graphs wholesale ({bad})"
+                !src.contains("batch.0.drain()") && !src.contains("batch.0.clear()"),
+                "free_sequence must not invalidate batch decode graphs wholesale"
             );
         }
         assert!(
-            !body.contains("batch.0.drain()") && !body.contains("batch.0.clear()"),
-            "free_sequence must not invalidate batch decode graphs wholesale"
+            helpers.contains("decode_graph")
+                && helpers.contains(".remove(&slot_idx)")
+                && helpers.contains("self.batch_decode_graphs.lock()"),
+            "drop_slot_graphs drops the slot-keyed decode graphs"
         );
         let touches_graphs = body.contains("self.decode_graph.lock()")
-            || body.contains("self.batch_decode_graphs.lock()");
+            || body.contains("self.batch_decode_graphs.lock()")
+            || body.contains("self.drop_slot_graphs(");
         assert_eq!(
             touches_graphs,
             body.contains("graph_stale_on_new_sequence"),
             "free_sequence may drop slot graphs ONLY behind graph_stale_on_new_sequence()"
         );
         assert!(
-            body.contains("verify_kgamma_graph") && body.contains("fused_graph"),
+            body.contains("self.drop_slot_kgamma_graphs(")
+                && helpers.contains("verify_kgamma_graph")
+                && helpers.contains("fused_graph"),
             "LoRA-baked graphs still drop"
         );
     }

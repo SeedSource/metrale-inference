@@ -66,7 +66,8 @@ fn the_release_chokepoint_has_no_env_escape_hatch() {
 
 /// 2026-09-25: The chokepoint calls `release_state` for every layer with no
 /// `uses_ssm_pool()` filter at the call site; each impl decides by the state's type. The
-/// one `.free_state(` call is the proposer's (`DraftProposer`).
+/// `.free_state(` calls are proposers' (`DraftProposer`): the proposer slot's and, on a hybrid
+/// MTP + DFlash serve (2026-10-10), the DFlash drafter's.
 #[test]
 fn the_chokepoint_releases_every_layer_without_a_site_filter() {
     let dispatch = SEQUENCE_RS
@@ -77,11 +78,19 @@ fn the_chokepoint_releases_every_layer_without_a_site_filter() {
         dispatch.contains("release_state("),
         "the chokepoint must call release_state"
     );
-    assert_eq!(
-        dispatch.matches(".free_state(").count(),
-        1,
-        "exactly one .free_state( call may remain in the chokepoint: the proposer's, which is \
-         DraftProposer::free_state and a different trait"
+    let frees: Vec<&str> = dispatch
+        .match_indices(".free_state(")
+        .map(|(i, _)| {
+            dispatch[..i]
+                .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("")
+        })
+        .collect();
+    assert!(
+        !frees.is_empty() && frees.iter().all(|r| matches!(*r, "proposer" | "drafter")),
+        "only DraftProposer::free_state calls (on `proposer` / the hybrid `drafter`) may remain in \
+         the chokepoint, a different trait from the layers' release_state; found receivers {frees:?}"
     );
     assert!(
         !dispatch.contains("uses_ssm_pool()"),

@@ -35,14 +35,19 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 const N: usize = 2048;
 const K: usize = 1024;
 /// 2026-09-25: At `rows = 8`, `top_k = 8` the disjoint routing case needs 64 distinct ids.
-const NUM_EXPERTS: usize = 72;
+/// 2026-10-11: 136: at `rows = 16`, `top_k = 8` it needs 128 (the METRALE_GLM_MOE_UNION_ROWS tiers).
+const NUM_EXPERTS: usize = 136;
 /// 2026-09-25: 8 is GLM-5.3's routed top-k.
 const TOP_KS: [usize; 2] = [4, 8];
 /// 2026-09-25: The widest `w4a16_gemv_sw_moe_batchm_m<R>` that `w4a16_gemv.cu` compiles.
-const MAX_ROWS: usize = 8;
+/// 2026-10-11: 16, with the `_m9` .. `_m16` union-sweep entries (METRALE_GLM_MOE_UNION_ROWS).
+const MAX_ROWS: usize = 16;
 /// 2026-09-25: `MOE_ROW_UNION_MAX_IDS` in `glm5next_mlp/forward.rs`: the most ids
 /// `forward_moe` gives the one-block `glm5next_moe_row_union`.
-const MAX_UNION_IDS: usize = 64;
+/// 2026-10-11: `MOE_ROW_UNION_WIDE_MAX_IDS` (128) for the 9..=16-row tiers.
+const MAX_UNION_IDS: usize = 128;
+/// 2026-10-11: The car's `METRALE_GLM_MOE_BATCHM_COLS`; its `_m<R>_c8` entries are checked too.
+const COLS_J: usize = 8;
 
 /// 2026-09-25: Deterministic random bytes. A realistic NVFP4 packing is irrelevant to a
 /// bit-equality gate.
@@ -116,9 +121,10 @@ fn batched(
     a_row_stride: usize,
     a_slot_stride: usize,
     c_row_stride: usize,
+    j: usize,
 ) -> Result<()> {
     KernelLaunch::new(g, k)
-        .grid([n.div_ceil(8) as u32, (rows * top_k) as u32, 1])
+        .grid([n.div_ceil(8 * j) as u32, (rows * top_k) as u32, 1])
         .block([256, 1, 1])
         .arg_ptr(a)
         .arg_ptr(t.packed)
@@ -140,8 +146,13 @@ fn main() -> Result<()> {
     let gpu = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
     let k_row = gpu.kernel("w4a16_gemv", "w4a16_gemv_sw_moe")?;
     let k_union = gpu.kernel("w4a16_gemv", "glm5next_moe_row_union")?;
+    // 2026-10-11: The car's union kernel (METRALE_GLM_MOE_UNION_SCAN=1); its tables must match.
+    let k_scan = gpu.kernel("w4a16_gemv", "glm5next_moe_row_union_scan")?;
     let k_b: Vec<KernelHandle> = (2..=MAX_ROWS)
         .map(|r| gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_m{r}")))
+        .collect::<Result<_, _>>()?;
+    let k_bc: Vec<KernelHandle> = (2..=MAX_ROWS)
+        .map(|r| gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_m{r}_c{COLS_J}")))
         .collect::<Result<_, _>>()?;
 
     // 2026-09-25: Experts 3 and 11 are remote: NULL pointers.
@@ -272,6 +283,30 @@ fn main() -> Result<()> {
             .arg_u32(top_k as u32)
             .launch(0)?;
         gpu.synchronize(0)?;
+        // 2026-10-11: The scan variant's tables, byte-compared with the base kernel's.
+        {
+            let d_ueid2 = gpu.alloc(rows * top_k * 4)?;
+            let d_uslot2 = gpu.alloc(rows * top_k * rows * 4)?;
+            KernelLaunch::new(&gpu, k_scan)
+                .grid([1, 1, 1])
+                .block([(rows * top_k) as u32, 1, 1])
+                .arg_ptr(d_ids)
+                .arg_ptr(d_ueid2)
+                .arg_ptr(d_uslot2)
+                .arg_u32(rows as u32)
+                .arg_u32(top_k as u32)
+                .launch(0)?;
+            gpu.synchronize(0)?;
+            let same = dn(&gpu, d_ueid, rows * top_k * 4)? == dn(&gpu, d_ueid2, rows * top_k * 4)?
+                && dn(&gpu, d_uslot, rows * top_k * rows * 4)?
+                    == dn(&gpu, d_uslot2, rows * top_k * rows * 4)?;
+            if !same {
+                println!("  FAIL  {tag:28} union_scan tables differ from glm5next_moe_row_union");
+                failures += 1;
+            }
+            gpu.free(d_ueid2)?;
+            gpu.free(d_uslot2)?;
+        }
 
         let ueid: Vec<i32> = dn(&gpu, d_ueid, rows * top_k * 4)?
             .chunks(4)
@@ -358,11 +393,37 @@ fn main() -> Result<()> {
                 a_row_stride,
                 a_slot_stride,
                 top_k * nn,
+                1,
+            )?;
+            // 2026-10-11: The `_c8` entry into its own buffer.
+            let d_cols = gpu.alloc(bytes)?;
+            gpu.memset_async(d_cols, 0, bytes, 0)?;
+            batched(
+                &gpu,
+                k_bc[rows - 2],
+                d_a,
+                &t,
+                d_cols,
+                d_ueid,
+                d_uslot,
+                nn,
+                kk,
+                rows,
+                top_k,
+                a_row_stride,
+                a_slot_stride,
+                top_k * nn,
+                COLS_J,
             )?;
             gpu.synchronize(0)?;
 
             let r_ref = dn(&gpu, d_ref, bytes)?;
             let r_new = dn(&gpu, d_new, bytes)?;
+            if dn(&gpu, d_cols, bytes)? != r_ref {
+                println!("  FAIL  {tag:28} [{layout:7}] _c{COLS_J} differs from the per-row path");
+                failures += 1;
+            }
+            gpu.free(d_cols)?;
             if r_ref == r_new {
                 println!(
                     "  PASS  {tag:28} [{layout:7}] rows={rows} union={n_union}/{}",
@@ -379,6 +440,9 @@ fn main() -> Result<()> {
     if failures > 0 {
         bail!("{failures} arm(s) are not bit-identical to the per-row path");
     }
-    println!("\nrow-batched MoE is bit-identical to the per-row path on every arm, tiers 2..=8.");
+    println!(
+        "\nrow-batched MoE (and _c{COLS_J}) is bit-identical to the per-row path on every arm, \
+         tiers 2..={MAX_ROWS}."
+    );
     Ok(())
 }

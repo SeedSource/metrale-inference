@@ -268,7 +268,7 @@ pub(super) fn row_batched_experts(site: &MoeSite<'_>, groups: &[(usize, usize)])
             .arg_u32(cfg.top_k as u32)
             .launch(stream)?;
 
-        let kb = k.w4a16_gemv_sw_moe_batchm[w_rows - 2];
+        let kb = super::batchm_kernel(k, w_rows);
         // 2026-10-09: METRALE_GLM_MOE_GATEUP_FAST=1 runs gate and up as one launch
         // (bit-identical); off or unavailable, the two launches below run as before.
         let fused = w4a16_gemv_moe_batchm_gateup(

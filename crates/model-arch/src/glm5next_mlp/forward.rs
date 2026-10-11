@@ -90,6 +90,8 @@ pub struct Glm5NextMlpWorkspace {
     max_inter: usize,
     /// 2026-09-25: Widest row group this scratch serves, at least 1.
     max_rows: usize,
+    /// 2026-10-11: Widest row-batched union group `u_slot` holds (`[w * top_k, w]`).
+    union_rows: usize,
     /// 2026-09-25: `max_rows * top_k`, the routed-slot count the grouped-path buffers hold.
     max_total_expanded: usize,
 }
@@ -214,6 +216,81 @@ fn moe_row_groups(rows: usize, cap: usize) -> Vec<(usize, usize)> {
 /// 2026-09-25: Most ids `glm5next_moe_row_union` resolves: it runs as one block of
 /// `rows * top_k` threads, and `forward_moe` does not take the row-batched path above this.
 pub const MOE_ROW_UNION_MAX_IDS: usize = 64;
+
+/// 2026-10-11: Widest `METRALE_GLM_MOE_UNION_ROWS` group: the `_m9` .. `_m16` entries.
+pub const MOE_ROW_UNION_WIDE_MAX_ROWS: usize = 16;
+
+/// 2026-10-11: `MOE_ROW_UNION_MAX_IDS` for a wide group: 16 rows x top_k 8, the
+/// `MOE_ROW_UNION_SCAN_MAX` of `glm5next_moe_row_union_scan` (w4a16_gemv.cu).
+pub const MOE_ROW_UNION_WIDE_MAX_IDS: usize = 128;
+
+/// 2026-10-11: `METRALE_GLM_MOE_UNION_ROWS=N` (9..=16; #80 m16 union sweep): a row-batched step
+/// of 9..=N rows runs as ONE union sweep (`w4a16_gemv_sw_moe_batchm_m<rows>`, the generic body)
+/// instead of `moe_row_groups`' sub-groups of at most 8, so an expert two sub-groups both picked
+/// is read once. Bit-identical: each (row, slot) keeps its per-row accumulation. The fast gate/up
+/// and down kernels exist only up to 8 rows; a wide group takes the generic body (with
+/// `METRALE_GLM_MOE_BATCHM_COLS` when set). Unset, or any other value: 0, off. Read once.
+pub fn union_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let v = std::env::var("METRALE_GLM_MOE_UNION_ROWS").ok();
+        let n = v.as_deref().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        if (MOE_ROW_BATCH_MAX_ROWS + 1..=MOE_ROW_UNION_WIDE_MAX_ROWS).contains(&n) {
+            tracing::warn!(
+                "METRALE_GLM_MOE_UNION_ROWS={n}: ENGAGED - a {}..={n}-row MoE step runs one \
+                 union sweep (w4a16_gemv_sw_moe_batchm_m<rows>, bit-identical)",
+                MOE_ROW_BATCH_MAX_ROWS + 1
+            );
+            n
+        } else {
+            if let Some(s) = v {
+                tracing::warn!(
+                    "METRALE_GLM_MOE_UNION_ROWS={s} ignored: needs {}..={MOE_ROW_UNION_WIDE_MAX_ROWS}",
+                    MOE_ROW_BATCH_MAX_ROWS + 1
+                );
+            }
+            0
+        }
+    })
+}
+
+/// 2026-10-11: The sub-group cap for `rows` rows: `rows` itself (one wide union sweep) when
+/// `union_rows` (the lever, 0 = off) covers it, it is wider than one 8-row sweep, the workspace's
+/// `u_slot` holds it and its `_m<rows>` kernel is loaded; otherwise `fallback`
+/// (`row_batch_max`).
+fn union_cap(
+    rows: usize,
+    union_rows: usize,
+    ws_union_rows: usize,
+    wide_loaded: bool,
+    fallback: usize,
+) -> usize {
+    if rows > MOE_ROW_BATCH_MAX_ROWS && rows <= union_rows && rows <= ws_union_rows && wide_loaded
+    {
+        rows
+    } else {
+        fallback
+    }
+}
+
+/// 2026-10-11: The row-batched sweep kernel for a group of `w` rows: `[w - 2]` of the 2..=8
+/// table, `[w - 9]` of the wide one; `KernelHandle(0)` outside 2..=16.
+pub(super) fn batchm_kernel(k: &Glm5NextMlpKernels, w: usize) -> KernelHandle {
+    match w {
+        2..=MOE_ROW_BATCH_MAX_ROWS => k.w4a16_gemv_sw_moe_batchm[w - 2],
+        9..=MOE_ROW_UNION_WIDE_MAX_ROWS => k.w4a16_gemv_sw_moe_batchm_wide[w - 9],
+        _ => KernelHandle(0),
+    }
+}
+
+/// 2026-10-11: The most union ids a group of `w` rows may resolve.
+fn union_max_ids(w: usize) -> usize {
+    if w > MOE_ROW_BATCH_MAX_ROWS {
+        MOE_ROW_UNION_WIDE_MAX_IDS
+    } else {
+        MOE_ROW_UNION_MAX_IDS
+    }
+}
 
 /// 2026-09-25: Log once per row count (counts from 15 up share one bit) whether the routed
 /// experts took the row-batched path.
@@ -345,7 +422,14 @@ pub fn forward_moe_sliced(
 
     use crate::glm5next_layer::profile;
 
-    let groups = moe_row_groups(rows, row_batch_max());
+    let cap = union_cap(
+        rows,
+        union_rows(),
+        ws.union_rows,
+        rows <= MOE_ROW_UNION_WIDE_MAX_ROWS && batchm_kernel(k, rows).0 != 0,
+        row_batch_max(),
+    );
+    let groups = moe_row_groups(rows, cap);
     let grouped_prefill = forward_prefill_gemm::grouped_prefill_selected(k, cfg, ws, rows);
     let batched = !grouped_prefill
         && rows >= 2
@@ -354,9 +438,7 @@ pub fn forward_moe_sliced(
         && !profile::trace_on()
         && k.moe_row_union.0 != 0
         && groups.iter().all(|&(_, w)| {
-            w >= 2
-                && w * cfg.top_k <= MOE_ROW_UNION_MAX_IDS
-                && k.w4a16_gemv_sw_moe_batchm[w - 2].0 != 0
+            w >= 2 && w * cfg.top_k <= union_max_ids(w) && batchm_kernel(k, w).0 != 0
         });
     announce_row_batch(batched, rows);
     announce_grouped_prefill(grouped_prefill, rows);

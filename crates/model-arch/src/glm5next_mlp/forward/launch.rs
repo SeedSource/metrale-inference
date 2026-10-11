@@ -396,7 +396,24 @@ pub(super) fn w4a16_gemv_moe_batchm_gateup(
 fn batchm_cols(gpu: &dyn GpuBackend, rows: usize) -> Option<(KernelHandle, u32)> {
     static H: OnceLock<Option<Vec<KernelHandle>>> = OnceLock::new();
     let j = moe_batchm_cols();
-    if j == 1 || !(2..=8).contains(&rows) {
+    if j == 1 {
+        return None;
+    }
+    // 2026-10-11: A 9..=16-row union group (METRALE_GLM_MOE_UNION_ROWS) takes its own
+    // `_m<R>_c<J>` entry when the image has it; otherwise the generic `_m<R>` (J = 1).
+    if (9..=super::MOE_ROW_UNION_WIDE_MAX_ROWS).contains(&rows) {
+        static W: OnceLock<Vec<Option<KernelHandle>>> = OnceLock::new();
+        let ws = W.get_or_init(|| {
+            (9..=super::MOE_ROW_UNION_WIDE_MAX_ROWS)
+                .map(|r| {
+                    gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_sw_moe_batchm_m{r}_c{j}"))
+                        .ok()
+                })
+                .collect()
+        });
+        return ws[rows - 9].map(|h| (h, j));
+    }
+    if !(2..=8).contains(&rows) {
         return None;
     }
     let hs = H.get_or_init(|| {

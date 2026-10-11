@@ -138,3 +138,36 @@ mod ws_sizing {
         }
     }
 }
+
+/// 2026-10-11: `METRALE_GLM_MOE_UNION_ROWS`: a 9..=16-row step runs one group only when the
+/// lever covers it, the workspace's `u_slot` holds it and its kernel is loaded; otherwise the
+/// 8-row split as before, and steps of 8 rows or fewer never change.
+#[test]
+fn union_cap_takes_one_wide_group_only_when_everything_allows_it() {
+    use super::{MOE_ROW_UNION_WIDE_MAX_ROWS, union_cap};
+    let fb = MOE_ROW_BATCH_MAX_ROWS;
+    for rows in 1..=24 {
+        let wide = rows > fb && rows <= MOE_ROW_UNION_WIDE_MAX_ROWS;
+        let cap = union_cap(rows, 16, 16, true, fb);
+        assert_eq!(cap, if wide { rows } else { fb }, "rows {rows}");
+        if wide {
+            assert_eq!(moe_row_groups(rows, cap), vec![(0, rows)], "rows {rows}");
+        }
+        // Lever off, workspace too small, or kernel missing: the 8-row split.
+        assert_eq!(union_cap(rows, 0, 16, true, fb), fb);
+        assert_eq!(union_cap(rows, 16, 8, true, fb), fb);
+        assert_eq!(union_cap(rows, 16, 16, false, fb), fb);
+    }
+    // A lever of 12 covers 9..=12 only.
+    assert_eq!(union_cap(12, 12, 16, true, fb), 12);
+    assert_eq!(union_cap(13, 12, 16, true, fb), fb);
+}
+
+/// 2026-10-11: Every wide group's union fits the scan kernel's 128-entry tables.
+#[test]
+fn wide_union_ids_fit_the_scan_tables() {
+    use super::{MOE_ROW_UNION_MAX_IDS, MOE_ROW_UNION_WIDE_MAX_IDS, MOE_ROW_UNION_WIDE_MAX_ROWS};
+    assert_eq!(super::union_max_ids(8), MOE_ROW_UNION_MAX_IDS);
+    assert_eq!(super::union_max_ids(9), MOE_ROW_UNION_WIDE_MAX_IDS);
+    assert!(MOE_ROW_UNION_WIDE_MAX_ROWS * 8 <= MOE_ROW_UNION_WIDE_MAX_IDS);
+}

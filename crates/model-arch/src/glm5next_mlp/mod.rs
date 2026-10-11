@@ -113,6 +113,9 @@ pub struct Glm5NextMlpKernels {
     /// grid.y is the union entry, not the slot, with extent `rows * top_k`; unfilled entries
     /// return on `u_eid < 0`. Needs [`Self::moe_row_union`].
     pub w4a16_gemv_sw_moe_batchm: [KernelHandle; 7],
+    /// 2026-10-11: The 9..=16-row union sweeps (`w4a16_gemv_sw_moe_batchm_m9` .. `_m16`),
+    /// indexed `[rows - 9]`; used only under `METRALE_GLM_MOE_UNION_ROWS` (`forward::union_rows`).
+    pub w4a16_gemv_sw_moe_batchm_wide: [KernelHandle; 8],
     /// 2026-09-25: Builds the union table the batched kernel indexes: one block of
     /// `rows * top_k` threads. `forward_moe` uses it only when `rows * top_k` is at most
     /// `MOE_ROW_UNION_MAX_IDS` (64).
@@ -247,6 +250,13 @@ impl Glm5NextMlpKernels {
                     "w4a16_gemv_sw_moe_batchm_m8",
                 ),
             ],
+            w4a16_gemv_sw_moe_batchm_wide: std::array::from_fn(|i| {
+                metrale_model_layers::layers::try_kernel(
+                    gpu,
+                    W4A16_GEMV_MODULE,
+                    &format!("w4a16_gemv_sw_moe_batchm_m{}", i + 9),
+                )
+            }),
             moe_row_union: metrale_model_layers::layers::try_kernel(
                 gpu,
                 W4A16_GEMV_MODULE,

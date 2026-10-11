@@ -2676,7 +2676,8 @@ extern "C" __global__ void glm5next_moe_row_union(
 // is the count of flags before it (the old kernel recomputed every earlier flag per thread
 // from global memory, O(T^3) loads at T = 64). T = rows * top_k <= 64.
 
-#define MOE_ROW_UNION_SCAN_MAX 64
+// 2026-10-11: 128 = 16 rows x top_k 8, the widest union METRALE_GLM_MOE_UNION_ROWS builds (was 64).
+#define MOE_ROW_UNION_SCAN_MAX 128
 
 extern "C" __global__ void glm5next_moe_row_union_scan(
     const int* __restrict__ ids,
@@ -2896,6 +2897,17 @@ METRALE_MOE_BATCHM_ENTRY(5)
 METRALE_MOE_BATCHM_ENTRY(6)
 METRALE_MOE_BATCHM_ENTRY(7)
 METRALE_MOE_BATCHM_ENTRY(8)
+// 2026-10-11: METRALE_GLM_MOE_UNION_ROWS (#80 m16 union sweep): one sweep for a 9..16-row group,
+// the same body (per-row registers, no cross-row reduction), so every row's output is
+// bit-identical to the two 8-row sweeps it replaces. No fast gate/up or down variant at R > 8.
+METRALE_MOE_BATCHM_ENTRY(9)
+METRALE_MOE_BATCHM_ENTRY(10)
+METRALE_MOE_BATCHM_ENTRY(11)
+METRALE_MOE_BATCHM_ENTRY(12)
+METRALE_MOE_BATCHM_ENTRY(13)
+METRALE_MOE_BATCHM_ENTRY(14)
+METRALE_MOE_BATCHM_ENTRY(15)
+METRALE_MOE_BATCHM_ENTRY(16)
 
 // 2026-10-08: METRALE_GLM_MOE_BATCHM_COLS entries: J columns per warp, grid x ceil(N / (8 J)),
 // same arguments as w4a16_gemv_sw_moe_batchm_m<R>, bit-identical outputs.
@@ -2922,6 +2934,15 @@ extern "C" __global__ void w4a16_gemv_sw_moe_batchm_m##R##_c##J(                
 METRALE_MOE_BATCHM_COLS_ENTRIES(2)
 METRALE_MOE_BATCHM_COLS_ENTRIES(4)
 METRALE_MOE_BATCHM_COLS_ENTRIES(8)
+// 2026-10-11: The 9..16-row union sweeps (METRALE_GLM_MOE_UNION_ROWS) with J columns per warp.
+#define METRALE_MOE_BATCHM_COLS_WIDE_ENTRIES(J)                                      \
+    METRALE_MOE_BATCHM_COLS_ENTRY(9, J) METRALE_MOE_BATCHM_COLS_ENTRY(10, J)         \
+    METRALE_MOE_BATCHM_COLS_ENTRY(11, J) METRALE_MOE_BATCHM_COLS_ENTRY(12, J)        \
+    METRALE_MOE_BATCHM_COLS_ENTRY(13, J) METRALE_MOE_BATCHM_COLS_ENTRY(14, J)        \
+    METRALE_MOE_BATCHM_COLS_ENTRY(15, J) METRALE_MOE_BATCHM_COLS_ENTRY(16, J)
+METRALE_MOE_BATCHM_COLS_WIDE_ENTRIES(2)
+METRALE_MOE_BATCHM_COLS_WIDE_ENTRIES(4)
+METRALE_MOE_BATCHM_COLS_WIDE_ENTRIES(8)
 
 // 2026-10-08: METRALE_GLM_MOE_DOWN_FAST. w4a16_gemv_sw_moe_batchm_down_m<R>: the down-projection
 // union sweep (K <= 1024, K16 = K / 16 <= 64) with output bytes identical to

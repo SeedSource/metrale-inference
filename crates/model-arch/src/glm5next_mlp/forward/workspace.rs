@@ -156,6 +156,7 @@ impl Glm5NextMlpWorkspace {
             moe_perm,
             max_inter,
             max_rows: rows,
+            union_rows: ur,
             max_total_expanded: rows * cfg.top_k,
         })
     }

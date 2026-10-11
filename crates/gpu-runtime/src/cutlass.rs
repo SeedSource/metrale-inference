@@ -4,8 +4,9 @@
 //! the shared `extern` block and workspace here; dense BF16 and NVFP4 GEMMs in
 //! `gemm`, grouped per-expert NVFP4 MoE GEMMs in `grouped`, NVFP4 weight
 //! pack, SFB swizzle and transpose in `pack`, (2026-10-06) the FP8
-//! blockwise-scaled W8A8 GEMM in `fp8_blockwise`, and (2026-10-08) the dense
-//! NVFP4 W4A4 GEMM in `dense_w4a4`.
+//! blockwise-scaled W8A8 GEMM in `fp8_blockwise`, (2026-10-08) the dense
+//! NVFP4 W4A4 GEMM in `dense_w4a4`, and (2026-10-07) the W4A4 grouped GEMM tile
+//! lever in `w4a4_tile`.
 //!
 //! Owner: gpu-runtime.
 //! Invariants:
@@ -27,6 +28,7 @@ mod fp8_blockwise;
 mod gemm;
 mod grouped;
 mod pack;
+mod w4a4_tile;
 
 pub use dense_w4a4::{
     DenseW4a4Args, DenseW4a4Outcome, dense_w4a4_sfb_bytes, dense_w4a4_shape_ok,
@@ -47,6 +49,10 @@ pub use grouped::{
 pub use pack::{
     pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, pack_weight_sfb_batched, pack_weight_sfb_batched_mode,
     sfb_bytes, transpose_nvfp4_packed_kton,
+};
+pub use w4a4_tile::{
+    W4a4GemmTile, W4a4GemmTiming, set_w4a4_gemm_skip, set_w4a4_gemm_tile_override,
+    set_w4a4_gemm_timing, w4a4_gemm_tile_lever, w4a4_gemm_tile_stats, w4a4_gemm_timing_take,
 };
 
 /// 2026-10-03: Whether this build carries the CUTLASS objects (`CUTLASS_HOME` was set at build
@@ -244,6 +250,12 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     pub(crate) fn metrale_cutlass_w4a4_last_prep(out: *mut u64, n: i32);
+    pub(crate) fn metrale_cutlass_set_w4a4_gemm_tile(v: i32);
+    pub(crate) fn metrale_cutlass_set_w4a4_gemm_tile_override(v: i32);
+    pub(crate) fn metrale_cutlass_w4a4_gemm_tile_stats(out: *mut u64, n: i32);
+    pub(crate) fn metrale_cutlass_set_w4a4_gemm_skip(v: i32);
+    pub(crate) fn metrale_cutlass_set_w4a4_gemm_timing(v: i32);
+    pub(crate) fn metrale_cutlass_w4a4_gemm_timing_take(out: *mut f64, n_slots: i32) -> i32;
     pub(crate) fn metrale_cutlass_pack_weight_sfb_batched_mode(
         scale_ptrs_dev: *const u64,
         first: i32,

@@ -16,6 +16,11 @@
 // - 2026-10-06: The `_w4a4_ex` entry points add two opt-in exact paths (PACK_ONCE for gate/up,
 //   an external amax for down; see prep_grouped_a). With them off they launch what the plain
 //   `_w4a4` entries launch, and those entries now call them with both off.
+// - 2026-10-07: The `_w4a4` entries launch the METRALE_CUTLASS_W4A4_GROUPED_TILE variant of the grouped
+//   GEMM (W4a4TileVariant: tile / schedule combinations from CUTLASS's own Sm120 NVFP4 grouped
+//   tests, same strides, SF layouts and epilogue as the default); variant 0 (the default, and
+//   every non-W4A4 entry) launches the default Gemm exactly as before. Bitwise equality with the
+//   default is checked by glm_moe_w4a4_tile_microtest, not assumed.
 // - CUTLASS (BSD-3-Clause, NVIDIA) headers only; see THIRD_PARTY_NOTICES.md.
 
 #include <cuda_bf16.h>
@@ -27,6 +32,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
+#include <type_traits>
 #include <vector>
 
 #include "cute/tensor.hpp"
@@ -124,6 +131,125 @@ using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutS
 using Sm1xxBlkScaledConfig =
     typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 using ProblemShape = cute::Shape<int, int, int>;
+
+// 2026-10-07: METRALE_CUTLASS_W4A4_GROUPED_TILE variants of the grouped GEMM above: the same element
+// types, alignments, layouts, epilogue (EpilogueScheduleAuto, D = alpha[g] * acc) and stage
+// carveout, with another CTA tile and/or mainloop schedule. Only combinations CUTLASS itself
+// builds for the Sm120 block-scaled NVFP4 ptr-array grouped GEMM are instantiated. Sources,
+// at the CUTLASS_SHA pinned in docker/gb10/Dockerfile.builder (cf064d2e, 13 commits before the
+// v4.6.0 tag; neither file changed in between):
+//   T = test/unit/gemm/device/sm120_blockscaled_tensorop_gemm/
+//       sm120_bs_gemm_nvf4_nvf4_f32_nvf4_group_gemm_fusion.cu
+//   X = examples/79_blackwell_geforce_gemm/79d_blackwell_geforce_nvfp4_grouped_gemm.cu
+// - variant 1 "co128":     128x128x128, KernelScheduleAuto (= ptr-array cooperative,
+//                          sm120_blockscaled_mma_builder.inl:115): T:283-353 (tile :298,
+//                          schedule :341); X:132-165 (schedule :165).
+// - variant 2 "pp128k256": 128x128x256, KernelPtrArrayTmaWarpSpecializedPingpong: T:208-279
+//                          (tile :223, schedule :267).
+// - variant 3 "co128k256": 128x128x256, KernelScheduleAuto: T:357-428 (tile :372, schedule
+//                          :416).
+// The tests' epilogue is an NVFP4-output fusion; ours is the default BF16 epilogue the default
+// kernel builds, whose builder reads only the tile's M and N (sm120_builder.inl). The scale
+// factor layouts come from Sm1xxBlockScaledConfig<16>::deduce_layoutSFA/SFB, which do not depend
+// on the tile or the schedule (sm120_blockscaled_mma_builder.inl:218-219); the static_asserts
+// below hold every variant to the default's strides, SF layouts and SF config, because A/SFA
+// (prep_grouped_a) and the weight SFB cache are packed once with the default's layouts.
+template <class TileShape_, class MainloopSchedule_>
+struct W4a4TileVariant {
+  using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      TileShape_,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementCompute,
+      ElementC,
+      GmemLayoutC*,
+      AlignmentC,
+      ElementD,
+      GmemLayoutD*,
+      AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+  using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      GmemLayoutA*,
+      AlignmentA,
+      ElementB,
+      GmemLayoutB*,
+      AlignmentB,
+      ElementAccumulator,
+      TileShape_,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+      MainloopSchedule_>::CollectiveOp;
+  using Kernel = cutlass::gemm::kernel::GemmUniversal<
+      cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>,
+      Mainloop,
+      Epilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+
+using GemmTileCoop = W4a4TileVariant<Shape<_128, _128, _128>,
+                                     cutlass::gemm::collective::KernelScheduleAuto>::Gemm;
+using GemmTileK256 = W4a4TileVariant<Shape<_128, _128, _256>,
+                                     cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>::Gemm;
+using GemmTileCoopK256 = W4a4TileVariant<Shape<_128, _128, _256>,
+                                         cutlass::gemm::collective::KernelScheduleAuto>::Gemm;
+// 2026-10-11: 256-row and 256-column tiles (race-pf moetile2: with 128-row M tiles each expert's
+// ~228 prefill rows span two M tiles that each read the expert's B tiles). Not in CUTLASS's
+// Sm120 NVFP4 grouped tests; the builder accepts them (sm120_blockscaled_mma_builder.inl:101 needs
+// only N >= 32; the SF smem atoms :192-206 scale with the tile, the gmem SF layouts :218-219 do
+// not). Bitwise equality with the default is checked, not assumed.
+// - variant 4 "co256":     256x128x128, KernelPtrArrayTmaWarpSpecializedCooperative (3 stages).
+// - variant 5 "co128n256": 128x256x128, KernelPtrArrayTmaWarpSpecializedCooperative (3 stages).
+// Not instantiated: the same two tiles with KernelPtrArrayTmaWarpSpecializedPingpong compile, but
+// each pingpong consumer warpgroup then holds a whole 256x128 FP32 accumulator (256 per thread)
+// under the kernel's 168-register cap: sm_121a SASS had ~480 STL / ~590 LDL per kernel (stack
+// 1152-1184 B) vs 17-37 STL for every kernel here (cuobjdump, CUDA 13.2.86, 2026-10-11).
+using GemmTileCo256 =
+    W4a4TileVariant<Shape<_256, _128, _128>,
+                    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::Gemm;
+using GemmTileCo128N256 =
+    W4a4TileVariant<Shape<_128, _256, _128>,
+                    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::Gemm;
+
+// 2026-10-07: Same strides, SF layouts and SF config as the default kernel, so the packed A,
+// SFA and SFB the default's layouts produced are read identically by a variant.
+template <class G>
+struct W4a4SameLayouts {
+  using K = typename G::GemmKernel;
+  using M = typename K::CollectiveMainloop;
+  static constexpr bool value =
+      std::is_same<typename K::InternalStrideA, StrideA>::value &&
+      std::is_same<typename K::InternalStrideB, StrideB>::value &&
+      std::is_same<typename K::InternalStrideC, StrideC>::value &&
+      std::is_same<typename K::InternalStrideD, StrideD>::value &&
+      std::is_same<typename M::InternalLayoutSFA, LayoutSFA>::value &&
+      std::is_same<typename M::InternalLayoutSFB, LayoutSFB>::value &&
+      std::is_same<typename M::Sm1xxBlkScaledConfig, Sm1xxBlkScaledConfig>::value;
+};
+static_assert(W4a4SameLayouts<GemmTileCoop>::value, "coop: strides/SF layouts differ");
+static_assert(W4a4SameLayouts<GemmTileK256>::value, "k256: strides/SF layouts differ");
+static_assert(W4a4SameLayouts<GemmTileCoopK256>::value, "coop_k256: strides/SF layouts differ");
+static_assert(W4a4SameLayouts<GemmTileCo256>::value, "co256: strides/SF layouts differ");
+static_assert(W4a4SameLayouts<GemmTileCo128N256>::value, "co128n256: strides/SF layouts differ");
+// 2026-10-07: KernelScheduleAuto resolved to the ptr-array cooperative schedule.
+template <class G>
+struct W4a4IsCoop {
+  using Schedule = typename G::GemmKernel::CollectiveMainloop::DispatchPolicy::Schedule;
+  static constexpr bool value =
+      cute::is_base_of_v<cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative, Schedule>;
+};
+static_assert(W4a4IsCoop<GemmTileCoop>::value, "coop: Auto did not resolve to cooperative");
+static_assert(W4a4IsCoop<GemmTileCoopK256>::value,
+              "coop_k256: Auto did not resolve to cooperative");
+static_assert(!W4a4IsCoop<GemmTileK256>::value, "k256: not pingpong");
+static_assert(W4a4IsCoop<GemmTileCo256>::value, "co256: not cooperative");
+static_assert(W4a4IsCoop<GemmTileCo128N256>::value, "co128n256: not cooperative");
 
 static inline size_t align_up_(size_t x, size_t a) {
   return (x + a - 1) & ~(a - 1);
@@ -914,6 +1040,111 @@ static bool amax_dedup_on() {
   return g_amax_dedup_override >= 0 ? g_amax_dedup_override != 0 : amax_dedup_lever();
 }
 
+// 2026-10-07: METRALE_CUTLASS_W4A4_GROUPED_TILE: which grouped GEMM instantiation the `_w4a4` entries
+// launch (0 pp128 = default, 1 co128, 2 pp128k256, 3 co128k256, 4 co256, 5 co128n256;
+// see W4a4TileVariant). The lever value is
+// parsed and logged once on the Rust side (gpu-runtime src/cutlass/w4a4_tile.rs) and set here
+// before the first W4A4 call; the override (-1 = follow the lever) is the microtest's hook
+// (glm_moe_w4a4_tile_microtest). Out-of-range values select the default. Every other entry
+// point always launches the default.
+// 2026-10-11: Highest variant id (4 co256 and 5 co128n256 added).
+static constexpr int kW4a4TileMax = 5;
+static std::atomic<int> g_w4a4_tile_lever{0};
+static std::atomic<int> g_w4a4_tile_override{-1};
+// 2026-10-07: The variant the last W4A4 GEMM launched (-1 none yet) and how many W4A4 GEMMs fell
+// back to the default because the selected variant did not fit the workspace or failed
+// can_implement. Diagnostic (microtest); concurrent callers may interleave.
+static std::atomic<int> g_w4a4_tile_last{-1};
+static std::atomic<unsigned long long> g_w4a4_tile_fallbacks{0};
+static std::atomic<int> g_w4a4_tile_fallback_logged{0};
+// 2026-10-07: Timing hook (glm_moe_w4a4_tile_microtest): nonzero makes every W4A4 GEMM return 0
+// after its arrays are staged, without launching, so the microtest can time the A-side prep
+// alone and subtract it. Outputs are then NOT written.
+static std::atomic<int> g_w4a4_gemm_skip{0};
+
+extern "C" void metrale_cutlass_set_w4a4_gemm_skip(int v) {
+  g_w4a4_gemm_skip.store(v, std::memory_order_relaxed);
+}
+
+// 2026-10-11: GEMM-only timing hook (glm_moe_w4a4_cutlass_microtest RPE sweep). While on, every
+// W4A4 grouped GEMM records a CUDA event pair on its stream right around `gemm.run` (after
+// `initialize`, which is host work plus the params copy), tagged with its projection slot (0 gate,
+// 1 up, 2 down = tag / 100000 - 1). `metrale_cutlass_w4a4_gemm_timing_take` waits for the pairs,
+// returns per-slot count / sum / min / max milliseconds and frees them. Off (the default), the
+// launch path only loads one atomic. Not for concurrent callers.
+static std::atomic<int> g_w4a4_gemm_timing{0};
+struct W4a4GemmTimingPair {
+  int slot;
+  cudaEvent_t start;
+  cudaEvent_t stop;
+};
+static std::mutex g_w4a4_gemm_timing_mu;
+static std::vector<W4a4GemmTimingPair> g_w4a4_gemm_timing_pairs;
+
+extern "C" void metrale_cutlass_set_w4a4_gemm_timing(int v) {
+  g_w4a4_gemm_timing.store(v, std::memory_order_relaxed);
+}
+
+// 2026-10-11: out is [3 slots][4] doubles: count, sum_ms, min_ms, max_ms (min/max 0 when count
+// is 0). Returns 0, or the first CUDA error seen (pairs are freed either way).
+extern "C" int metrale_cutlass_w4a4_gemm_timing_take(double* out, int n_slots) {
+  std::vector<W4a4GemmTimingPair> pairs;
+  {
+    std::lock_guard<std::mutex> lk(g_w4a4_gemm_timing_mu);
+    pairs.swap(g_w4a4_gemm_timing_pairs);
+  }
+  for (int i = 0; i < n_slots * 4; ++i) {
+    out[i] = 0.0;
+  }
+  int rc = 0;
+  for (const W4a4GemmTimingPair& p : pairs) {
+    float ms = 0.0f;
+    cudaError_t e = cudaEventSynchronize(p.stop);
+    if (e == cudaSuccess) {
+      e = cudaEventElapsedTime(&ms, p.start, p.stop);
+    }
+    if (e != cudaSuccess) {
+      if (rc == 0) {
+        rc = static_cast<int>(e);
+      }
+    } else if (p.slot >= 0 && p.slot < n_slots) {
+      double* o = out + p.slot * 4;
+      o[1] += ms;
+      o[2] = o[0] == 0.0 ? ms : (ms < o[2] ? ms : o[2]);
+      o[3] = o[0] == 0.0 ? ms : (ms > o[3] ? ms : o[3]);
+      o[0] += 1.0;
+    }
+    cudaEventDestroy(p.start);
+    cudaEventDestroy(p.stop);
+  }
+  return rc;
+}
+
+extern "C" void metrale_cutlass_set_w4a4_gemm_tile(int v) {
+  g_w4a4_tile_lever.store(v, std::memory_order_relaxed);
+}
+
+extern "C" void metrale_cutlass_set_w4a4_gemm_tile_override(int v) {
+  g_w4a4_tile_override.store(v, std::memory_order_relaxed);
+}
+
+// 2026-10-07: [0] last launched variant (as unsigned; ~0 none yet), [1] fallbacks so far.
+extern "C" void metrale_cutlass_w4a4_gemm_tile_stats(unsigned long long* out, int n) {
+  if (n > 0) {
+    out[0] = static_cast<unsigned long long>(
+        static_cast<long long>(g_w4a4_tile_last.load(std::memory_order_relaxed)));
+  }
+  if (n > 1) {
+    out[1] = g_w4a4_tile_fallbacks.load(std::memory_order_relaxed);
+  }
+}
+
+static int w4a4_tile_now() {
+  int o = g_w4a4_tile_override.load(std::memory_order_relaxed);
+  int v = o >= 0 ? o : g_w4a4_tile_lever.load(std::memory_order_relaxed);
+  return (v >= 0 && v <= kW4a4TileMax) ? v : 0;
+}
+
 // 2026-10-06: Test hooks (glm_moe_w4a4_pack_once_microtest). A nonzero fault makes every
 // engaged PACK_ONCE call flip one staged scale byte (pack_once_fault_k) before the gather.
 static std::atomic<int> g_pack_once_fault{0};
@@ -1556,8 +1787,88 @@ static GroupedAPrep prep_grouped_a(
   return p;
 }
 
+// 2026-10-07: The GEMM half of launch_projection (formerly inline there) for one instantiation:
+// GemmT is the default Gemm or a METRALE_CUTLASS_W4A4_GROUPED_TILE variant (same strides and SF layouts,
+// static_assert'd), over the arrays launch_projection staged; CUTLASS workspace at ws + cursor.
+// Status: -2 no room (nothing launched), tag - 50 can_implement (nothing launched), else tag +
+// CUTLASS status.
+template <class GemmT>
+static int run_grouped_gemm(
+    const GroupedAPrep& a,
+    const ElementB::DataType** dB,
+    StrideB* dsB,
+    const ElementSF** dSFB,
+    LayoutSFB* dlSFB,
+    const ElementC** dC,
+    StrideC* dsC,
+    ElementD** dD,
+    StrideD* dsD,
+    const float** dAlphaPtr,
+    const cutlass::KernelHardwareInfo& hw,
+    unsigned char* ws,
+    size_t cursor,
+    size_t workspace_size,
+    cudaStream_t stream,
+    int tag,
+    bool w4a4_timed) {
+  int G = a.G;
+  typename GemmT::GemmKernel::CollectiveMainloop::Arguments mainloop_args{
+      a.dA, a.dsA, dB, dsB, a.dSFA, a.dlSFA, dSFB, dlSFB};
+
+  typename GemmT::GemmKernel::CollectiveEpilogue::Arguments epi_args{};
+  epi_args.thread.alpha = 1.0f;
+  epi_args.thread.beta = 0.0f;
+  epi_args.thread.alpha_ptr_array = dAlphaPtr;
+  epi_args.ptr_C = dC;
+  epi_args.dC = dsC;
+  epi_args.ptr_D = dD;
+  epi_args.dD = dsD;
+
+  typename GemmT::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {G, a.dShapes, const_cast<ProblemShape*>(a.host_shapes.data())},
+      mainloop_args,
+      epi_args,
+      hw};
+
+  GemmT gemm;
+  size_t need = GemmT::get_workspace_size(args);
+  if (cursor + need > workspace_size) {
+    return -2;
+  }
+  if (gemm.can_implement(args) != cutlass::Status::kSuccess) {
+    return tag + (-50);
+  }
+  cutlass::Status st = gemm.initialize(args, ws + cursor, stream);
+  if (st != cutlass::Status::kSuccess) {
+    return tag + static_cast<int>(st);
+  }
+  // 2026-10-11: GEMM-only timing hook (metrale_cutlass_set_w4a4_gemm_timing); W4A4 calls only.
+  W4a4GemmTimingPair tp{tag / 100000 - 1, nullptr, nullptr};
+  bool timed = w4a4_timed && g_w4a4_gemm_timing.load(std::memory_order_relaxed) != 0 &&
+               cudaEventCreate(&tp.start) == cudaSuccess &&
+               cudaEventCreate(&tp.stop) == cudaSuccess &&
+               cudaEventRecord(tp.start, stream) == cudaSuccess;
+  st = gemm.run(stream);
+  if (timed && cudaEventRecord(tp.stop, stream) == cudaSuccess) {
+    std::lock_guard<std::mutex> lk(g_w4a4_gemm_timing_mu);
+    g_w4a4_gemm_timing_pairs.push_back(tp);
+  } else {
+    if (tp.start) {
+      cudaEventDestroy(tp.start);
+    }
+    if (tp.stop) {
+      cudaEventDestroy(tp.stop);
+    }
+  }
+  return st == cutlass::Status::kSuccess ? 0 : tag + static_cast<int>(st);
+}
+
 // 2026-09-25: One kGrouped GEMM over a's groups, arrays and CUTLASS workspace from cursor_start.
 // Status: -140 null B/SFB pointer, -2 no room, tag - 50 can_implement, else tag + CUTLASS status.
+// 2026-10-07: w4a4_tile (only the `_w4a4` entries pass true) launches the
+// METRALE_CUTLASS_W4A4_GROUPED_TILE variant (w4a4_tile_now); false (every other caller) launches the
+// default Gemm exactly as before.
 static int launch_projection(
     const GroupedAPrep& a,
     const unsigned long long* packed_ptrs,
@@ -1571,7 +1882,8 @@ static int launch_projection(
     size_t workspace_size,
     cudaStream_t stream,
     int tag,
-    const float* d_alpha = nullptr) {
+    const float* d_alpha = nullptr,
+    bool w4a4_tile = false) {
   int G = a.G;
   if (G == 0) {
     return 0;
@@ -1641,39 +1953,56 @@ static int launch_projection(
   hw.device_id = 0;
   hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
 
-  typename Gemm::GemmKernel::CollectiveMainloop::Arguments mainloop_args{
-      a.dA, a.dsA, dB, dsB, a.dSFA, a.dlSFA, dSFB, dlSFB};
-
-  typename Gemm::GemmKernel::CollectiveEpilogue::Arguments epi_args{};
-  epi_args.thread.alpha = 1.0f;
-  epi_args.thread.beta = 0.0f;
-  epi_args.thread.alpha_ptr_array = dAlphaPtr;
-  epi_args.ptr_C = dC;
-  epi_args.dC = dsC;
-  epi_args.ptr_D = dD;
-  epi_args.dD = dsD;
-
-  typename Gemm::Arguments args{
-      cutlass::gemm::GemmUniversalMode::kGrouped,
-      {G, a.dShapes, const_cast<ProblemShape*>(a.host_shapes.data())},
-      mainloop_args,
-      epi_args,
-      hw};
-
-  Gemm gemm;
-  size_t need = Gemm::get_workspace_size(args);
-  if (cursor + need > workspace_size) {
-    return -2;
+  // 2026-10-07: A variant that does not fit the workspace or fails can_implement launched
+  // nothing; the call then runs the default (counted, logged once to stderr). Any other variant
+  // status is returned as the default's would be. The K=256 variants also need k % 256 == 0 (a
+  // K tail would add TMA zero-fill products, which can turn a -0 accumulator into +0); GLM-5.3's
+  // K (4096, 2048, 1024) always is.
+  if (w4a4_tile && g_w4a4_gemm_skip.load(std::memory_order_relaxed) != 0) {
+    return 0;
   }
-  if (gemm.can_implement(args) != cutlass::Status::kSuccess) {
-    return tag + (-50);
+  int tile = w4a4_tile ? w4a4_tile_now() : 0;
+  if (tile != 0) {
+    int rc = -2;
+    const char* why = "does not fit the CUTLASS workspace (METRALE_CUTLASS_WORKSPACE_MB)";
+#define METRALE_W4A4_RUN(G_)                                                                  \
+  run_grouped_gemm<G_>(a, dB, dsB, dSFB, dlSFB, dC, dsC, dD, dsD, dAlphaPtr, hw, ws, cursor,   \
+                       workspace_size, stream, tag, true)
+    bool k256 = tile == 2 || tile == 3;
+    if (k256 && (k % 256) != 0) {
+      why = "needs K % 256 == 0";
+    } else {
+      switch (tile) {
+        case 1: rc = METRALE_W4A4_RUN(GemmTileCoop); break;
+        case 2: rc = METRALE_W4A4_RUN(GemmTileK256); break;
+        case 3: rc = METRALE_W4A4_RUN(GemmTileCoopK256); break;
+        case 4: rc = METRALE_W4A4_RUN(GemmTileCo256); break;
+        default: rc = METRALE_W4A4_RUN(GemmTileCo128N256); break;
+      }
+    }
+#undef METRALE_W4A4_RUN
+    if (rc == tag + (-50)) {
+      why = "failed can_implement";
+    }
+    if (rc != -2 && rc != tag + (-50)) {
+      g_w4a4_tile_last.store(tile, std::memory_order_relaxed);
+      return rc;
+    }
+    g_w4a4_tile_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    if (g_w4a4_tile_fallback_logged.exchange(1, std::memory_order_relaxed) == 0) {
+      std::fprintf(stderr,
+                   "WARN metrale cutlass: METRALE_CUTLASS_W4A4_GROUPED_TILE variant %d %s (G=%d "
+                   "n=%d k=%d, workspace %zu MiB); this GEMM runs the default tile (logged "
+                   "once)\n",
+                   tile, why, G, n, k, workspace_size >> 20);
+    }
   }
-  cutlass::Status st = gemm.initialize(args, ws + cursor, stream);
-  if (st != cutlass::Status::kSuccess) {
-    return tag + static_cast<int>(st);
+  int rc = run_grouped_gemm<Gemm>(a, dB, dsB, dSFB, dlSFB, dC, dsC, dD, dsD, dAlphaPtr, hw, ws,
+                                  cursor, workspace_size, stream, tag, w4a4_tile);
+  if (w4a4_tile) {
+    g_w4a4_tile_last.store(0, std::memory_order_relaxed);
   }
-  st = gemm.run(stream);
-  return st == cutlass::Status::kSuccess ? 0 : tag + static_cast<int>(st);
+  return rc;
 }
 #endif
 
@@ -1856,13 +2185,13 @@ extern "C" int metrale_cutlass_nvfp4_grouped_gate_up_w4a4_ex(
   }
   int rc = launch_projection(a, gate_packed_ptrs, gate_sfb_ptrs, gate_scale2_vals,
                              static_cast<__nv_bfloat16*>(C_gate_bf16), n, k, ws,
-                             a.cursor, workspace_size, stream, 100000, a.dAlpha[0]);
+                             a.cursor, workspace_size, stream, 100000, a.dAlpha[0], true);
   if (rc) {
     return rc;
   }
   return launch_projection(a, up_packed_ptrs, up_sfb_ptrs, up_scale2_vals,
                            static_cast<__nv_bfloat16*>(C_up_bf16), n, k, ws, a.cursor,
-                           workspace_size, stream, 200000, a.dAlpha[1]);
+                           workspace_size, stream, 200000, a.dAlpha[1], true);
 #else
   (void)A_bf16;
   (void)sorted_token_ids;
@@ -2061,7 +2390,7 @@ extern "C" int metrale_cutlass_nvfp4_grouped_down_w4a4_ex(
   }
   return launch_projection(a, packed_ptrs, sfb_ptrs, scale2_vals,
                            static_cast<__nv_bfloat16*>(C_bf16), n, k, ws, a.cursor,
-                           workspace_size, stream, 300000, a.dAlpha[0]);
+                           workspace_size, stream, 300000, a.dAlpha[0], true);
 #else
   (void)A_bf16;
   (void)packed_ptrs;

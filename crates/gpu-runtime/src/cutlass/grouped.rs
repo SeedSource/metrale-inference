@@ -398,6 +398,8 @@ pub fn nvfp4_grouped_gate_up_w4a4_ex(
     )?;
     #[cfg(metrale_cutlass)]
     {
+        // 2026-10-07: Applies METRALE_CUTLASS_W4A4_GROUPED_TILE on the first W4A4 call.
+        super::w4a4_tile::w4a4_gemm_tile_lever();
         let ctx = ctx()?;
         let mut engaged = 0i32;
         let status = unsafe {
@@ -527,6 +529,8 @@ pub fn nvfp4_grouped_down_w4a4_ex(
     )?;
     #[cfg(metrale_cutlass)]
     {
+        // 2026-10-07: Applies METRALE_CUTLASS_W4A4_GROUPED_TILE on the first W4A4 call.
+        super::w4a4_tile::w4a4_gemm_tile_lever();
         let ctx = ctx()?;
         let mut engaged = 0i32;
         let status = unsafe {

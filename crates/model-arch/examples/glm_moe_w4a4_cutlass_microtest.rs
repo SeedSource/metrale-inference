@@ -48,6 +48,26 @@
 //!       --features cuda,gpu-examples      (build with CUTLASS_HOME set, or arm (b) cannot run)
 //!   Env: GLM_W4A4_MT_ITERS (timed iterations, 10), GLM_W4A4_MT_REF_ROWS (sampled rows per case
 //!   for the FP32 reference, 64).
+//! - 2026-10-11 (race-pf moetile2; all additions leave the lines above unchanged when their env
+//!   is unset):
+//!   - `GLM_W4A4_MT_ROUTING=zipf|uniform` (default zipf, the s = 0.9 popularity above; uniform =
+//!     every expert equally likely; the RNG draws are the same either way). A non-default value
+//!     prints one `ROUTING uniform` line.
+//!   - `HASH case=t<tokens> mode=<static|dynamic> tile=<variant> out=<hex> act=<hex> rows=<n>`
+//!     per case and mode (`tile` = the variant the last GEMM launched, so a fallback shows): FNV-1a 64 of arm (b)'s first-run `expert_out` and `a_act` rows of the
+//!     local experts, expert-major then by token id (independent of the sort's row order), so runs
+//!     with different `METRALE_CUTLASS_W4A4_GROUPED_TILE` values compare bitwise.
+//!   - `GLM_W4A4_MT_RPE_SWEEP="64 128 129 ..."` (rows per expert; blanks or commas): before the
+//!     cases, a GEMM-only sweep. Per value r every one of the `GLM_MT_LOCAL` local experts gets
+//!     exactly r rows (no remote rows), dynamic-scale tables, its own RNG (the cases' data is
+//!     unchanged). After two warm-up calls, `GLM_W4A4_MT_ITERS` calls with the C side's CUDA-event
+//!     GEMM timing on (`cutlass::set_w4a4_gemm_timing`: only the grouped GEMM launches, per
+//!     projection). Lines: `RPE r=<r> proj=<gate|up|down> tile=<variant> ms=<mean> ms_min=<min>
+//!     weight_GBps=<local*N*K/2 bytes / mean> TFLOPps=<2*local*r*N*K / mean>`, then
+//!     `HASH case=rpe<r> mode=dynamic tile=<variant> gate=<hex> up=<hex> out=<hex> rows=<n>`
+//!     (whole buffers). A sweep where a GEMM fell back to the default tile or a projection was not
+//!     timed `GLM_W4A4_MT_ITERS` times is a FAIL. `GLM_W4A4_MT_RPE_ONLY=1` ends after the sweep
+//!     with its own `PASS:` line.
 
 use std::time::Instant;
 
@@ -217,6 +237,195 @@ fn build_table(
     Ok(t)
 }
 
+/// 2026-10-11: `GLM_W4A4_MT_ROUTING`: `None` = unset or `zipf`, `Some(true)` = `uniform`,
+/// `Some(false)` = anything else (main refuses it).
+fn routing_env() -> Option<bool> {
+    match std::env::var("GLM_W4A4_MT_ROUTING") {
+        Err(_) => None,
+        Ok(v) if v.trim().is_empty() || v.trim().eq_ignore_ascii_case("zipf") => None,
+        Ok(v) => Some(v.trim().eq_ignore_ascii_case("uniform")),
+    }
+}
+
+fn routing_uniform() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| routing_env() == Some(true))
+}
+
+/// 2026-10-11: FNV-1a 64 over byte slices, in order.
+fn fnv64<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in parts {
+        for &b in p {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// 2026-10-11: The local experts' sorted rows, expert-major then by token id: a row order that
+/// does not depend on how the sort orders rows within an expert.
+fn canonical_local_rows(off: &[usize], stid: &[usize]) -> Vec<usize> {
+    let mut v = Vec::with_capacity(off[n_local()] - off[0]);
+    for e in 0..n_local() {
+        let mut rows: Vec<usize> = (off[e]..off[e + 1]).collect();
+        rows.sort_by_key(|&i| stid[i]);
+        v.extend(rows);
+    }
+    v
+}
+
+/// 2026-10-11: [`fnv64`] of the BF16 rows `rows` (in that order) of a `[*, width]` buffer.
+fn hash_rows(b: &[u8], rows: &[usize], width: usize) -> u64 {
+    let w = width * 2;
+    fnv64(rows.iter().map(|&i| &b[i * w..(i + 1) * w]))
+}
+
+/// 2026-10-11: `GLM_W4A4_MT_RPE_SWEEP`: rows-per-expert values (blanks or commas between).
+fn rpe_values() -> Result<Vec<usize>> {
+    let Ok(v) = std::env::var("GLM_W4A4_MT_RPE_SWEEP") else {
+        return Ok(Vec::new());
+    };
+    v.split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .map(|t| match t.parse::<usize>() {
+            Ok(r) if r > 0 => Ok(r),
+            _ => bail!("GLM_W4A4_MT_RPE_SWEEP: {t:?} is not a positive row count"),
+        })
+        .collect()
+}
+
+/// 2026-10-11: The GEMM-only rows-per-expert sweep (see the module doc). Every local expert has
+/// exactly `r` rows; row `e * r + j` reads token `(e * r + j) % tokens`, `tokens = ceil(local * r /
+/// TOP_K)`, so an expert never reads a token twice. Problems go to `problems`.
+#[allow(clippy::too_many_arguments)]
+fn rpe_sweep(
+    g: &dyn GpuBackend,
+    k_swiglu: KernelHandle,
+    experts: &[Glm5NextExpertWeights],
+    cache: &SfbCache,
+    chan: &[f32],
+    values: &[usize],
+    iters: usize,
+    problems: &mut Vec<String>,
+) -> Result<()> {
+    let mut r = Rng(0xD1B5_4A32_D192_ED03);
+    let nl = n_local();
+    let tables = MoeTables::build(E, 0..nl, experts, &cache.layout(), true);
+    let (_, fb_start) = cutlass::w4a4_gemm_tile_stats();
+    for &rpe in values {
+        let te = nl * rpe;
+        let tokens = te.div_ceil(TOP_K);
+        let x: Vec<u8> = (0..tokens * H)
+            .flat_map(|i| {
+                bf16::from_f32(r.normal() as f32 * 0.5 * chan[i % H])
+                    .to_bits()
+                    .to_le_bytes()
+            })
+            .collect();
+        let off_i32: Vec<i32> = (0..=E).map(|e| (e.min(nl) * rpe) as i32).collect();
+        let stid: Vec<i32> = (0..te).map(|i| (i % tokens) as i32).collect();
+        let d_x = up(g, &x)?;
+        let d_stid = up(g, &le(&stid, i32::to_le_bytes))?;
+        let a_gate = g.alloc(te * mi() * 2)?;
+        let a_up = g.alloc(te * mi() * 2)?;
+        let act = g.alloc(te * mi() * 2)?;
+        let out = g.alloc(te * H * 2)?;
+        let args = RunArgs {
+            swiglu: k_swiglu,
+            x: d_x,
+            sorted_token_ids: d_stid,
+            a_gate,
+            a_up,
+            a_act: act,
+            expert_out: out,
+            te,
+            hidden: H,
+            moe_intermediate: mi(),
+            swiglu_limit: LIMIT,
+            offsets: &off_i32,
+            tables: &tables,
+            skip_down: false,
+            swiglu_rows: 0..te,
+            tokens,
+            pack_once: false,
+            swiglu_amax: KernelHandle(0),
+            amax_slot: DevicePtr(0),
+        };
+        let res = (|| -> Result<()> {
+            for p in [a_gate, a_up, act] {
+                g.memset_async(p, 0, te * mi() * 2, 0)?;
+            }
+            g.memset_async(out, 0, te * H * 2, 0)?;
+            run(g, &args, 0)?;
+            g.synchronize(0)?;
+            let (gh, uh, oh) = (
+                fnv64([dn(g, a_gate, te * mi() * 2)?.as_slice()]),
+                fnv64([dn(g, a_up, te * mi() * 2)?.as_slice()]),
+                fnv64([dn(g, out, te * H * 2)?.as_slice()]),
+            );
+            run(g, &args, 0)?;
+            g.synchronize(0)?;
+            cutlass::w4a4_gemm_timing_take()?;
+            cutlass::set_w4a4_gemm_timing(true);
+            let timed = (0..iters).try_for_each(|_| run(g, &args, 0));
+            cutlass::set_w4a4_gemm_timing(false);
+            timed?;
+            g.synchronize(0)?;
+            let t = cutlass::w4a4_gemm_timing_take()?;
+            let (last, _) = cutlass::w4a4_gemm_tile_stats();
+            let tile_name = last.map_or("none", cutlass::W4a4GemmTile::name);
+            for (slot, proj) in ["gate", "up", "down"].into_iter().enumerate() {
+                let (n, k) = if slot < 2 { (mi(), H) } else { (H, mi()) };
+                let ts = &t[slot];
+                let ms = ts.mean_ms();
+                let bytes = (nl * n * k / 2) as f64;
+                let flop = 2.0 * (nl * rpe) as f64 * (n * k) as f64;
+                println!(
+                    "RPE r={rpe} proj={proj} tile={tile_name} ms={ms:.4} ms_min={:.4} \
+                     weight_GBps={:.1} TFLOPps={:.1}",
+                    ts.min_ms,
+                    bytes / (ms * 1e6),
+                    flop / (ms * 1e9)
+                );
+                if ts.count != iters as u64 {
+                    problems.push(format!(
+                        "RPE r={rpe} {proj}: {} GEMMs timed, want {iters}",
+                        ts.count
+                    ));
+                }
+            }
+            println!(
+                "HASH case=rpe{rpe} mode=dynamic tile={tile_name} gate={gh:016x} up={uh:016x} \
+                 out={oh:016x} rows={te}"
+            );
+            Ok(())
+        })();
+        cutlass::set_w4a4_gemm_timing(false);
+        for p in [d_x, d_stid, a_gate, a_up, act, out] {
+            g.free(p)?;
+        }
+        if let Err(e) = res {
+            problems.push(format!("RPE r={rpe}: {e:#}"));
+            println!("RPE r={rpe} error: {e:#}");
+        }
+    }
+    let (_, fb_end) = cutlass::w4a4_gemm_tile_stats();
+    println!(
+        "RPE_TILE lever={} fallbacks={}",
+        cutlass::w4a4_gemm_tile_lever().name(),
+        fb_end - fb_start
+    );
+    if fb_end != fb_start {
+        problems.push(format!(
+            "RPE sweep: {} GEMMs fell back to the default tile (timing is not the variant's)",
+            fb_end - fb_start
+        ));
+    }
+    Ok(())
+}
+
 /// 2026-10-03: Distinct top-8 ids per token from a skewed popularity: expert `e` has weight
 /// 1 / (rank[e] + 1)^0.9, `rank` a random permutation.
 fn make_routing(r: &mut Rng, rows: usize) -> Vec<i32> {
@@ -227,7 +436,12 @@ fn make_routing(r: &mut Rng, rows: usize) -> Vec<i32> {
     let mut acc = 0.0;
     let mut cum = Vec::with_capacity(E);
     for &k in &rank {
-        acc += 1.0 / ((k + 1) as f64).powf(0.9);
+        // 2026-10-11: `GLM_W4A4_MT_ROUTING=uniform` weighs every expert equally.
+        acc += if routing_uniform() {
+            1.0
+        } else {
+            1.0 / ((k + 1) as f64).powf(0.9)
+        };
         cum.push(acc);
     }
     for c in cum.iter_mut() {
@@ -571,6 +785,52 @@ fn main() -> Result<()> {
 
     let mut problems: Vec<String> = Vec::new();
     let mut summary: Vec<String> = Vec::new();
+    // 2026-10-11: GLM_W4A4_MT_ROUTING / GLM_W4A4_MT_RPE_SWEEP / GLM_W4A4_MT_RPE_ONLY.
+    match routing_env() {
+        Some(true) => println!("ROUTING uniform"),
+        Some(false) => {
+            println!("FAIL: GLM_W4A4_MT_ROUTING must be zipf or uniform");
+            bail!("glm_moe_w4a4_cutlass_microtest: bad GLM_W4A4_MT_ROUTING");
+        }
+        None => {}
+    }
+    let rpe = match rpe_values() {
+        Ok(v) => v,
+        Err(e) => {
+            println!("FAIL: {e:#}");
+            return Err(e);
+        }
+    };
+    if !rpe.is_empty() {
+        rpe_sweep(
+            g,
+            k_swiglu,
+            &experts_for(0.0, 0.0),
+            &cache,
+            &chan,
+            &rpe,
+            iters,
+            &mut problems,
+        )?;
+        if env_usize("GLM_W4A4_MT_RPE_ONLY", 0) == 1 {
+            for p in owned {
+                g.free(p)?;
+            }
+            if !problems.is_empty() {
+                println!("FAIL: {}", problems.join("; "));
+                bail!(
+                    "glm_moe_w4a4_cutlass_microtest: {} problem(s)",
+                    problems.len()
+                );
+            }
+            println!(
+                "PASS: RPE sweep r={:?} tile={} every GEMM timed {iters}x, no fallback",
+                rpe,
+                cutlass::w4a4_gemm_tile_lever().name()
+            );
+            return Ok(());
+        }
+    }
     for tokens in TOKEN_WINDOWS {
         let te = tokens * TOP_K;
         let x_f: Vec<f32> = (0..tokens * H)
@@ -761,6 +1021,18 @@ fn main() -> Result<()> {
             }
             let got_act_b = dn(g, act_b, te * mi() * 2)?;
             let got_out_b = dn(g, out_b, te * H * 2)?;
+            // 2026-10-11: Bitwise fingerprint of arm (b) for cross-run tile comparison; `tile` is
+            // the variant the last GEMM launched (a fallback shows as pp128).
+            let canon = canonical_local_rows(&off, &stid);
+            println!(
+                "HASH case=t{tokens} mode={mode} tile={} out={:016x} act={:016x} rows={}",
+                cutlass::w4a4_gemm_tile_stats()
+                    .0
+                    .map_or("none", cutlass::W4a4GemmTile::name),
+                hash_rows(&got_out_b, &canon, H),
+                hash_rows(&got_act_b, &canon, mi()),
+                canon.len()
+            );
             // 2026-10-06: Arm (b-local), `METRALE_GLM_MOE_SWIGLU_LOCAL_ROWS`: the SwiGLU over the
             // local experts' rows only (activation pre-filled with a 0x5A sentinel) must give a
             // byte-identical expert_out (whole buffer) and local activation rows; the known-bad

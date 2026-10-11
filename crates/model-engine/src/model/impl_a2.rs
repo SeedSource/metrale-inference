@@ -222,6 +222,10 @@ impl TransformerModel {
         // both ranks pop the same free list in the same order, and a mismatch
         // is an error rather than a silent KV mix-up.
         if cmd == 0xFFFFFFF1 {
+            if metrale_model_layers::ssm_reserve::ep_worker_lazy_slots() {
+                self.ep_worker_release_lazy(slots, slot_idx)?;
+                return Ok(true);
+            }
             if let Some(mut old) = slots[slot_idx].take() {
                 self.free_sequence(&mut old)?;
             }
@@ -238,6 +242,8 @@ impl TransformerModel {
             return Ok(true);
         }
 
+        // 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: first use of an index-reserved slot.
+        self.ep_worker_materialize(slots, slot_idx)?;
         let seq = slots[slot_idx].as_mut().ok_or_else(|| {
             anyhow::anyhow!(
                 "ep_worker_step: cmd {:#x} arrived for unallocated slot {} \
@@ -460,6 +466,8 @@ impl TransformerModel {
             if !seen.insert(id) {
                 anyhow::bail!("ep_worker_decode_batch: duplicate seq_id {} in batch", id);
             }
+            // 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: first use of an index-reserved slot.
+            self.ep_worker_materialize(slots, idx)?;
         }
 
         // 2026-09-25: Collect `(idx, &mut)` for the populated slots and take

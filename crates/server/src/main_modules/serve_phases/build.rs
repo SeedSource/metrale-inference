@@ -267,16 +267,32 @@ pub(crate) fn maybe_run_ep_worker(
         // `alloc_sequence`.
         let mut slots: Vec<Option<metrale_model_engine::traits::SequenceState>> =
             (0..max_batch_size).map(|_| None).collect();
-        for slot in slots.iter_mut() {
-            *slot = Some(
-                model_owned
-                    .alloc_sequence()
-                    .expect("Failed to allocate EP worker sequence"),
-            );
+        // 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS=1`: reserve each slot's index in the same
+        // order and leave it empty; its per-layer states are allocated when a command first
+        // addresses it (`ep_worker_materialize`). The free list ends up empty either way.
+        let lazy = model_owned.ep_worker_lazy_slots();
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if lazy {
+                let got = model_owned
+                    .ep_worker_reserve_slot()
+                    .expect("Failed to reserve EP worker slot");
+                assert_eq!(got, i, "EP worker slot reservation out of order");
+            } else {
+                *slot = Some(
+                    model_owned
+                        .alloc_sequence()
+                        .expect("Failed to allocate EP worker sequence"),
+                );
+            }
         }
         tracing::info!(
-            "EP worker ready (rank {rank}, {} slots), waiting for commands",
-            slots.len()
+            "EP worker ready (rank {rank}, {} slots{}), waiting for commands",
+            slots.len(),
+            if lazy {
+                ", METRALE_EP_WORKER_LAZY_SLOTS: ENGAGED, slot states allocated on first use"
+            } else {
+                ""
+            }
         );
         loop {
             match model_owned.ep_worker_step(&mut slots) {

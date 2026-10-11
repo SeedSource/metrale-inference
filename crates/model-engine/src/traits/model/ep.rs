@@ -27,6 +27,19 @@ pub trait ModelEp {
         Ok(true)
     }
 
+    /// 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: whether the EP worker reserves slot indices
+    /// at boot ([`Self::ep_worker_reserve_slot`]) instead of allocating every slot's sequence.
+    /// Default `false`.
+    fn ep_worker_lazy_slots(&self) -> bool {
+        false
+    }
+
+    /// 2026-10-11: Claim the next SSM slot index for an EP worker slot without allocating its
+    /// per-layer states. Default: an error (no lazy worker slots).
+    fn ep_worker_reserve_slot(&self) -> Result<usize> {
+        anyhow::bail!("ep_worker_reserve_slot: not supported by this model")
+    }
+
     /// 2026-09-25: Whether the model runs the multi-rank command protocol. The scheduler then
     /// turns off its single-GPU fused paths, the mixed forward among them. Default `false`.
     fn is_ep(&self) -> bool {

@@ -21,6 +21,14 @@ impl ModelEp for TransformerModel {
         self.is_ep_dispatch()
     }
 
+    fn ep_worker_lazy_slots(&self) -> bool {
+        metrale_model_layers::ssm_reserve::ep_worker_lazy_slots()
+    }
+
+    fn ep_worker_reserve_slot(&self) -> Result<usize> {
+        self.ep_worker_reserve_slot_dispatch()
+    }
+
     fn ep_broadcast_cmd(&self, cmd: u32) -> Result<()> {
         self.ep_broadcast_cmd_dispatch(cmd)
     }

@@ -304,6 +304,10 @@ impl TransformerModel {
                 !self.verify_hidden_stash.is_null(),
                 "ep_worker_propose_batch: verify stash not allocated"
             );
+            // 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: first use of an index-reserved slot.
+            for &idx in &meta.slots {
+                self.ep_worker_materialize(slots, idx)?;
+            }
             let refs = propose_batch_refs(slots, &meta.slots)?;
             Ok((meta, proposer, refs))
         });

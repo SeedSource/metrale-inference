@@ -385,6 +385,10 @@ impl TransformerModel {
         slots: &'a mut [Option<SequenceState>],
         slot_ids: &[usize],
     ) -> Result<Vec<&'a mut SequenceState>> {
+        // 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: first use of an index-reserved slot.
+        for &idx in slot_ids {
+            self.ep_worker_materialize(slots, idx)?;
+        }
         // 2026-10-02: Disjoint `&mut` refs ordered as the head's `slots[]`, by the
         // `swap_remove` walk `ep_worker_decode_batch` uses.
         let mut slot_refs: Vec<(usize, &mut SequenceState)> = slots

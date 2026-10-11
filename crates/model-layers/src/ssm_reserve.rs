@@ -79,6 +79,15 @@ pub fn mtp_pool_cap() -> bool {
     })
 }
 
+/// 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS=1`: the EP worker allocates a slot's per-layer
+/// states (321.6 MB each on GLM-5.3) when a command first addresses the slot, not for every
+/// `max_batch_size` slot at boot, and drops them on release. Slot indices are still claimed
+/// at boot, so the worker's free list and claim order match the default path.
+pub fn ep_worker_lazy_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("METRALE_EP_WORKER_LAZY_SLOTS").as_deref() == Ok("1"))
+}
+
 /// 2026-10-10: Env-free core of [`mtp_state_slots`] under [`mtp_pool_cap`]:
 /// `min(max_batch_size, spec_dispatch_cap)`, at least 1.
 pub fn mtp_state_slots_capped(max_batch_size: usize, spec_dispatch_cap: usize) -> usize {

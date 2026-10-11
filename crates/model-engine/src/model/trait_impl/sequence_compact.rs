@@ -299,10 +299,24 @@ impl TransformerModel {
             .ok_or_else(|| anyhow::anyhow!("ep_worker_migrate_slot: no sequence on slot {from}"))?;
         if let Some(mut phantom) = slots[to].take() {
             self.free_sequence(&mut phantom)?;
+        } else if metrale_model_layers::ssm_reserve::ep_worker_lazy_slots() {
+            // 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: an empty slot is index-reserved
+            // (`ep_worker_reserve_slot`); hand the index back so the compaction claims it.
+            self.ssm_pool.release_slot(to);
         }
         let moved = self.migrate_slot_local(&mut seq, to);
         slots[to] = Some(seq);
         moved?;
+        if metrale_model_layers::ssm_reserve::ep_worker_lazy_slots() {
+            // 2026-10-11: Re-reserve the source index instead of allocating a phantom's states.
+            if !self.ssm_pool.claim_specific(from) {
+                bail!(
+                    "ep_worker_migrate_slot: slot {from} not free after the migration \
+                     — claim_slot ordering invariant violated"
+                );
+            }
+            return Ok(true);
+        }
         let phantom = self.alloc_sequence()?;
         if phantom.slot_idx != from {
             bail!(
@@ -313,6 +327,69 @@ impl TransformerModel {
         }
         slots[from] = Some(phantom);
         Ok(true)
+    }
+
+    /// 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: claim the next SSM slot index for an EP
+    /// worker slot without allocating its per-layer states. Called once per slot at worker
+    /// boot, in slot order, so the worker's free list stays empty exactly as when every slot
+    /// held an allocated sequence.
+    pub(crate) fn ep_worker_reserve_slot_dispatch(&self) -> Result<usize> {
+        self.ssm_pool.claim_slot()
+    }
+
+    /// 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS`: allocate the sequence on an index-reserved
+    /// worker slot the first time a command addresses it. The released index is the only free
+    /// one on this rank, so `alloc_sequence` claims it under either claim rule. No-op with the
+    /// lever off or when the slot already holds a sequence.
+    pub(crate) fn ep_worker_materialize(
+        &self,
+        slots: &mut [Option<SequenceState>],
+        i: usize,
+    ) -> Result<()> {
+        if !metrale_model_layers::ssm_reserve::ep_worker_lazy_slots()
+            || i >= slots.len()
+            || slots[i].is_some()
+        {
+            return Ok(());
+        }
+        self.ssm_pool.release_slot(i);
+        let seq = match self.alloc_sequence() {
+            Ok(seq) => seq,
+            Err(e) => {
+                // 2026-10-11: Keep the index reserved so a retry does not release it twice.
+                self.ssm_pool.claim_specific(i);
+                return Err(e);
+            }
+        };
+        if seq.slot_idx != i {
+            bail!(
+                "ep_worker_materialize: SSM-pool slot {} doesn't match slot {i} \
+                 — claim_slot ordering invariant violated",
+                seq.slot_idx
+            );
+        }
+        slots[i] = Some(seq);
+        Ok(())
+    }
+
+    /// 2026-10-11: `METRALE_EP_WORKER_LAZY_SLOTS` side of the release command (`0xFFFFFFF1`):
+    /// free the occupant and keep only its index reserved, instead of allocating a fresh
+    /// sequence's states right away (`ep_worker_materialize` does that on first use).
+    pub(crate) fn ep_worker_release_lazy(
+        &self,
+        slots: &mut [Option<SequenceState>],
+        i: usize,
+    ) -> Result<()> {
+        if let Some(mut old) = slots[i].take() {
+            self.free_sequence(&mut old)?;
+            if !self.ssm_pool.claim_specific(i) {
+                bail!(
+                    "ep_worker_release_lazy: slot {i} not free after free_sequence \
+                     — claim_slot ordering invariant violated"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// 2026-10-10: The per-rank half of a cap migration (see

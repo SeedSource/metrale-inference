@@ -90,3 +90,33 @@ fn the_row_loop_skips_per_row_selection_only_under_group() {
     assert!(loop_start < pass && pass < attend);
     assert_eq!(src.matches("select_rows_ceiling(").count(), 1);
 }
+
+/// 2026-10-12: `METRALE_GLM_DSA_IDX_ROWBATCH`: the one-sequence `PreIndexer` is built only from
+/// `group` (never from the lever alone), before the row loop and after the `batch_select &&
+/// src.pre` bail; the lever is read behind `dsa_idx_rowbatch()` in one place, and the
+/// cross-sequence group runs the same shared projection block.
+#[test]
+fn idx_rowbatch_pre_is_built_only_under_group_before_the_loop() {
+    let src = include_str!("decode_k.rs");
+    let bail = src
+        .find("if batch_select && src.pre.is_some() {")
+        .expect("bail");
+    let group = src.find("let group = self.ceiling_rows_for(").expect("group");
+    let pre = src
+        .find("self.idx_rowbatch_pre(gpu, group, hidden, src, k, stream)?")
+        .expect("pre build");
+    let loop_start = src.find("for row in 0..k {").expect("row loop");
+    assert!(bail < group && group < pre && pre < loop_start);
+    assert_eq!(src.matches("idx_rowbatch_pre(").count(), 1);
+    let m = include_str!("idx_rowbatch.rs");
+    assert!(m.contains("if !group || !dsa_idx_rowbatch() || src.pre.is_some() {"));
+    assert_eq!(m.matches("std::env::var(\"METRALE_GLM_DSA_IDX_ROWBATCH\")").count(), 1);
+    // wk / compress_gate through `gemm`, weights_proj / wq_b through `batchm_rows`.
+    let from = m.find("pub fn indexer_project_rows").expect("fn");
+    let body = &m[from..from + m[from..].find("pub fn indexer_qidx_one").expect("end")];
+    assert_eq!(body.matches("gemm(\n            gpu,").count(), 2);
+    assert_eq!(body.matches("batchm_rows(").count(), 2);
+    let g = include_str!("xseq/group.rs");
+    assert!(g.contains("self.indexer_project_rows("));
+    assert!(!g.contains("batchm_rows("));
+}

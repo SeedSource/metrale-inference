@@ -268,6 +268,22 @@ impl Glm5NextDsaLayer {
         };
         let replay_safe = self.replay_safe(ctx.graph_capture, call_meta.is_some());
         let group = self.ceiling_rows_for(st, call_meta, replay_safe, batch_select, src, k);
+        // 2026-10-12: `METRALE_GLM_DSA_IDX_ROWBATCH=1` and `group` (so not `batch_select`): the
+        // indexer projections of the k rows once, here, as this sequence's `PreIndexer`; the row
+        // loop then stores row `r` from it and `select_rows_ceiling` reads its queries and
+        // head weights. Otherwise `src` is untouched.
+        let idx_pre = self.idx_rowbatch_pre(gpu, group, hidden, src, k, stream)?;
+        let idx_src;
+        let src = match idx_pre {
+            Some(p) => {
+                idx_src = RowSrc {
+                    pre: Some(p),
+                    ..*src
+                };
+                &idx_src
+            }
+            None => src,
+        };
         for row in 0..k {
             let pos = seq_len + row;
             let block_size = kv_cache.config().block_size;

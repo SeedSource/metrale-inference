@@ -18,7 +18,7 @@
 //!   buffer the step metadata or the workspace already holds (no host copy, no sync).
 
 use anyhow::Result;
-use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_model_layers::layer::AttnMetadataDev;
 
 use super::super::select::{
@@ -26,7 +26,7 @@ use super::super::select::{
 };
 use super::super::state::{Glm5NextDsaState, max_dsa_context};
 use super::row_src::RowSrc;
-use super::{Glm5NextDsaLayer, gemm};
+use super::Glm5NextDsaLayer;
 
 /// 2026-10-12: What [`ceiling_rows_group`] decides from, all known on the host before the
 /// row loop's first launch.
@@ -133,18 +133,10 @@ impl Glm5NextDsaLayer {
             None => {
                 let nq = cfg.index_heads * cfg.index_head_dim;
                 for row in 0..k {
-                    gemm(
+                    self.indexer_qidx_one(
                         gpu,
-                        self.kernels.gemm_f32,
-                        self.kernels.gemv_f32,
-                        // 2026-09-25: No FP32-out batched GEMV kernel exists.
-                        KernelHandle(0),
                         src.q_resid.offset(row * cfg.q_lora_rank * 2),
-                        self.weights.wq_b,
                         w.q_idx_rows.offset(row * nq * 4),
-                        1,
-                        nq,
-                        cfg.q_lora_rank,
                         stream,
                     )?;
                 }

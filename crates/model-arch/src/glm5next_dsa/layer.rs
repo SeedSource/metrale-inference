@@ -51,6 +51,7 @@ use metrale_model_layers::layer::{ForwardContext, LayerState, TransformerLayer};
 mod ceiling_verify;
 mod ctx_rows;
 mod decode_k;
+mod idx_rowbatch;
 mod proj_gemm;
 mod row_batch;
 mod row_src;
@@ -61,6 +62,7 @@ mod workspace;
 mod xseq;
 
 use proj_gemm::gemm;
+pub use idx_rowbatch::{IndexerRowsOut, idx_batchm_f32_kernel};
 pub use wide::DsaWideArena;
 pub use workspace::Glm5NextDsaWorkspace;
 pub(crate) use workspace::batch_select_enabled;
@@ -214,6 +216,25 @@ impl Glm5NextDsaLayer {
             }
         };
 
+        self.indexer_project_one(gpu, hidden, k_dst, gate_dst, head_weights, stream)?;
+
+        self.store_indexer_row(gpu, state, pos_dev, pos, d, stream)
+    }
+
+    /// 2026-10-12: The four-launch projection block of [`Self::indexer_forward_to`] for ONE row
+    /// (M = 1): `wk` into `k_dst` then `k_norm` in place, `compress_gate` into `gate_dst`, and
+    /// `weights_proj` (FP32) into `head_weights`. Moved out of `indexer_forward_to` unchanged
+    /// so the row-batch microtest (`dsa_idx_rowbatch_microtest`) runs the production launches.
+    pub fn indexer_project_one(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        k_dst: DevicePtr,
+        gate_dst: DevicePtr,
+        head_weights: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let d = self.cfg.index_head_dim;
         gemm(
             gpu,
             self.kernels.gemm,
@@ -272,8 +293,7 @@ impl Glm5NextDsaLayer {
             self.cfg.hidden,
             stream,
         )?;
-
-        self.store_indexer_row(gpu, state, pos_dev, pos, d, stream)
+        Ok(())
     }
 
     /// 2026-09-25: The gather-attend for all `rows` query rows in one launch.

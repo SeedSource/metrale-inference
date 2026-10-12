@@ -294,10 +294,12 @@ extern "C" __global__ void F32B_NAME(
     // read after it.
     {
         if (active && lane < K / VEC_SIZE) {
-            uint4 t;
+            // PTX-scoped destination registers: no C++ variable is set and left unused
+            // (nvcc --Werror all-warnings rejects #550-D).
             const uint4* tp = ((const uint4*)(B + (unsigned long long)n * K)) + lane;
-            asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
-                         : "=r"(t.x), "=r"(t.y), "=r"(t.z), "=r"(t.w) : "l"(tp));
+            asm volatile("{ .reg .b32 t0, t1, t2, t3;\n\t"
+                         "ld.volatile.global.v4.u32 {t0, t1, t2, t3}, [%0]; }"
+                         :: "l"(tp) : "memory");
         }
         F32B_PDL_WAIT();
     }

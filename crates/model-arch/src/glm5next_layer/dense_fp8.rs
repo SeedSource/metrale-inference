@@ -68,7 +68,17 @@
 //!   to FP8. Memory: the NVFP4 copies are extra (`n k / 2 + n k / 16` bytes each, allocated at load
 //!   before the KV pool is sized). Class split prior art: the SparkGLM decode profile
 //!   (architecture read only; `runs/race/sparkglm-prof-L34/SG-VS-C10.md` in spark-bench).
-//! - Weights deliberately left BF16: the MoE router (expert selection), the DSA indexer
+//! - 2026-10-12: `METRALE_GLM_KDA_FAB_FP8=1` (inert, warned once, without
+//!   `METRALE_GLM_DENSE_FP8=1`; default off): [`register_layer`] also converts the KDA `f_a`
+//!   `[head_dim, hidden]`, `f_b` `[qkv, head_dim]` and `b_proj` `[heads, hidden]` (registered as
+//!   `Class::Gate`), exactly as `g_a` / `g_b`: `quantize_bf16_to_fp8` per-row E4M3, the BF16
+//!   original freed. Their only reader is `Glm5NextKdaLayer::gemm` -> [`route`] (audited
+//!   2026-10-12: `front_end_with` is the sole user of the three fields). 1..=16 rows take
+//!   `dense_gemv_tcm_fp8w` under `METRALE_GLM_GEMV_TC=1` (else `dense_gemv_fp8w*`); wider calls
+//!   read the BF16 dequant in the arena and never the W8A8 GEMM (`Class::Gate`). With the lever
+//!   off these three stay BF16 as listed in the next item.
+//! - Weights deliberately left BF16 (unless `METRALE_GLM_KDA_FAB_FP8=1` converts the KDA
+//!   `f_a` / `f_b` / `b_proj`): the MoE router (expert selection), the DSA indexer
 //!   (`wk`, `compress_gate`, `weights_proj`, `wq_b`: top-k token selection), the KDA
 //!   recurrence gates `f_a`, `f_b` (forget-gate decay) and `b_proj` (beta), `embed_tokens`,
 //!   `lm_head` (its FP8 option is `--lm-head-dtype fp8`), the mHC `hc_fn` (not a GEMV), the
@@ -190,6 +200,30 @@ pub fn dense_fp8_w8a8() -> bool {
     })
 }
 
+/// 2026-10-12: `METRALE_GLM_KDA_FAB_FP8=1` opts in; read once. [`register_layer`] then also
+/// converts the KDA `f_a`, `f_b` and `b_proj` (module doc). False, with a warning, when set
+/// without `METRALE_GLM_DENSE_FP8=1` (the conversion is that lever's machinery).
+pub fn kda_fab_fp8() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        if std::env::var("METRALE_GLM_KDA_FAB_FP8").as_deref() != Ok("1") {
+            return false;
+        }
+        if !dense_fp8() {
+            tracing::warn!(
+                "METRALE_GLM_KDA_FAB_FP8=1 is ignored without METRALE_GLM_DENSE_FP8=1 (it adds \
+                 the KDA f_a / f_b / b_proj to that lever's conversion list)"
+            );
+            return false;
+        }
+        tracing::warn!(
+            "METRALE_GLM_KDA_FAB_FP8=1 - GLM-5.3 KDA f_a, f_b and b_proj keep only FP8 E4M3 copies \
+             (per-row scale; BF16 originals freed); NOT byte-identical to BF16"
+        );
+        true
+    })
+}
+
 /// 2026-10-05: The tensor classes `METRALE_GLM_DENSE_NVFP4` gives an NVFP4 decode copy
 /// (module doc). Prior art for the class split: the SparkGLM decode profile (race-decode
 /// 2026-10-05, `runs/race/sparkglm-prof-L34/SG-VS-C10.md`, read for architecture only).
@@ -223,7 +257,7 @@ impl Nvfp4Classes {
             Class::Shared => self.shared,
             Class::Mlp => self.mlp,
             Class::Mtp => self.mtp,
-            Class::Keep => false,
+            Class::Keep | Class::Gate => false,
         }
     }
 }
@@ -248,6 +282,10 @@ pub enum Class {
     Mtp,
     /// No class (KDA `g_a` / `g_b`; the class-less `convert_weight*` helpers).
     Keep,
+    /// 2026-10-12: KDA `f_a`, `f_b`, `b_proj` (`METRALE_GLM_KDA_FAB_FP8`): like `Keep` (no NVFP4
+    /// copy), but a wide call never takes the W8A8 arm, so prefill reads the BF16 dequant of the
+    /// weight only (the weight-only quantization the `kda_fb` fake-quant tested).
+    Gate,
 }
 
 impl Class {
@@ -261,6 +299,7 @@ impl Class {
             Class::Mlp => "mlp",
             Class::Mtp => "mtp",
             Class::Keep => "keep",
+            Class::Gate => "gate",
         }
     }
 }
@@ -950,8 +989,11 @@ pub fn route(
     }
     // 2026-10-05: `METRALE_GLM_DENSE_FP8_W8A8=1`: a wide call runs the W8A8 GEMM into `c`
     // when it can (module doc), else falls through to the dequant.
+    // 2026-10-12: a `Class::Gate` weight (KDA f_a / f_b / b_proj) never takes it: prefill reads
+    // its BF16 dequant, as the weight-only `kda_fb` fake-quant did.
     if dense_fp8_w8a8()
         && m > ops::DENSE_GEMV_FP8W_BATCHM_MAX_M as usize
+        && e.class != Class::Gate
         && w8a8(gpu, gemv.0 == kk.bf16_gemv.0, a, &e, c, m, stream, None)?
     {
         return Ok(Route::Done);
@@ -1524,6 +1566,14 @@ pub fn register_layer(
             list.push((&mut w.g_a.weight, hd, hid, Class::Keep, "g_a"));
             list.push((&mut w.g_b.weight, qkv, hd, Class::Keep, "g_b"));
             list.push((&mut w.o_proj.weight, hid, qkv, Class::Kda, "o_proj"));
+            // 2026-10-12: `METRALE_GLM_KDA_FAB_FP8=1`: the recurrence gates' projections too (same
+            // per-row E4M3 quantizer as every weight here). `cfg.heads` is `b_proj`'s N, as the
+            // `gemm` call in `front_end_with` passes it.
+            if kda_fab_fp8() {
+                list.push((&mut w.f_a.weight, hd, hid, Class::Gate, "f_a"));
+                list.push((&mut w.f_b.weight, qkv, hd, Class::Gate, "f_b"));
+                list.push((&mut w.b_proj.weight, cfg.heads, hid, Class::Gate, "b_proj"));
+            }
         }
         Glm5NextMixer::Dsa(l) => {
             // Shapes as `decode_k` / `decode_k_wide` pass them to `gemm`.

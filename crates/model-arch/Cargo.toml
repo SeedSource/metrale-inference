@@ -129,6 +129,10 @@ name = "dsa_idx_rowbatch_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm_idx_wqb_nv4_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_kpool_once_microtest"
 required-features = ["cuda", "gpu-examples"]
 

@@ -55,20 +55,23 @@ impl Glm5NextDsaLayer {
             Some(p) => (p.q_idx, p.head_weights),
             None => {
                 // 2026-09-25: The selector query `q_idx`, FP32 out.
-                gemm(
-                    gpu,
-                    self.kernels.gemm_f32,
-                    self.kernels.gemv_f32,
-                    // 2026-09-25: No FP32-out batched GEMV kernel exists.
-                    KernelHandle(0),
-                    q_resid_row,
-                    self.weights.wq_b,
-                    w.q_idx,
-                    1,
-                    self.cfg.index_heads * self.cfg.index_head_dim,
-                    self.cfg.q_lora_rank,
-                    stream,
-                )?;
+                // 2026-10-12: `METRALE_GLM_IDX_WQB_NV4=1` (`idx_wqb_nv4.rs`).
+                if !self.wq_b_nv4_rows(gpu, KernelHandle(0), q_resid_row, w.q_idx, 1, stream)? {
+                    gemm(
+                        gpu,
+                        self.kernels.gemm_f32,
+                        self.kernels.gemv_f32,
+                        // 2026-09-25: No FP32-out batched GEMV kernel exists.
+                        KernelHandle(0),
+                        q_resid_row,
+                        self.weights.wq_b,
+                        w.q_idx,
+                        1,
+                        self.cfg.index_heads * self.cfg.index_head_dim,
+                        self.cfg.q_lora_rank,
+                        stream,
+                    )?;
+                }
                 // 2026-09-25: `head_weights` comes from `indexer_forward`, which has the layer
                 // input.
                 (w.q_idx, w.head_weights)

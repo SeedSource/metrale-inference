@@ -52,6 +52,7 @@ mod ceiling_verify;
 mod ctx_rows;
 mod decode_k;
 mod idx_rowbatch;
+mod idx_wqb_nv4;
 mod proj_gemm;
 mod row_batch;
 mod row_src;
@@ -63,6 +64,7 @@ mod xseq;
 
 use proj_gemm::gemm;
 pub use idx_rowbatch::{IndexerRowsOut, idx_batchm_f32_kernel};
+pub use idx_wqb_nv4::{BF16_MAX_M, CORE_MAX_M, NV4_MAX_M, WqbRoute, idx_wqb_nv4, wqb_route};
 pub use wide::DsaWideArena;
 pub use workspace::Glm5NextDsaWorkspace;
 pub(crate) use workspace::batch_select_enabled;

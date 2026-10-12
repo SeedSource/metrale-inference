@@ -650,6 +650,12 @@ impl Glm5NextWeightLoader {
             .with_context(|| format!("glm5_next: FP8 dense copies of layer {idx}"))?;
             fp8_total.fp8_bytes += fp8.fp8_bytes;
             fp8_total.bf16_freed += fp8.bf16_freed;
+            // 2026-10-12: `METRALE_GLM_IDX_WQB_NV4=1`: an NVFP4 copy of the DSA indexer `wq_b` for
+            // decode / verify rows (the BF16 weight stays); a no-op when the lever is off.
+            if let Glm5NextMixer::Dsa(l) = &mixer {
+                l.register_wq_b_nv4(gpu)
+                    .with_context(|| format!("glm5_next: METRALE_GLM_IDX_WQB_NV4 layer {idx}"))?;
+            }
             // 2026-10-11: Load-prefetch sites, after the copies exist (no-op with the lever off).
             crate::glm5next_layer::loadpf::attach(
                 gpu,

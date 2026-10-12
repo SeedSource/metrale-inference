@@ -56,6 +56,8 @@
 
 
 
+#ifndef F32B_BODY_PASS
+
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
@@ -225,7 +227,35 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
 // by the GLM DSA indexer row batch (METRALE_GLM_DSA_ROW_BATCH=1); gated by
 // crates/model-arch/examples/dsa_rowbatch_bitparity_microtest.rs.
 
-extern "C" __global__ void dense_gemv_bf16_fp32out_batchm(
+// 2026-10-12: The entry points. Each includes this file once more with F32B_BODY_PASS set, which
+// compiles the kernel text at the end of the file under that entry's name (F32B_V: 0 production,
+// 1 _pdl, 2 _pdl_touch), so the production kernel is the body written out directly.
+#define F32B_BODY_PASS 1
+#define F32B_NAME dense_gemv_bf16_fp32out_batchm
+#define F32B_V 0
+#include "dense_gemv_bf16_batchm.cu"
+#undef F32B_NAME
+#undef F32B_V
+#if !defined(__SCALE__) && !defined(__HIP_PLATFORM_AMD__) && defined(__CUDACC__)
+#define F32B_PDL_TRIGGER() asm volatile("griddepcontrol.launch_dependents;" ::: "memory")
+#define F32B_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#define F32B_NAME dense_gemv_bf16_fp32out_batchm_pdl
+#define F32B_V 1
+#include "dense_gemv_bf16_batchm.cu"
+#undef F32B_NAME
+#undef F32B_V
+#define F32B_NAME dense_gemv_bf16_fp32out_batchm_pdl_touch
+#define F32B_V 2
+#include "dense_gemv_bf16_batchm.cu"
+#undef F32B_NAME
+#undef F32B_V
+#endif
+#undef F32B_BODY_PASS
+
+#else  // F32B_BODY_PASS
+
+// 2026-10-12: the dense_gemv_bf16_fp32out_batchm body (see the entry points above).
+extern "C" __global__ void F32B_NAME(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     float* __restrict__ C,
@@ -234,6 +264,13 @@ extern "C" __global__ void dense_gemv_bf16_fp32out_batchm(
     unsigned int K,
     unsigned int out_stride
 ) {
+#if F32B_V != 0
+    // 2026-10-12: PDL variants (see the entry points). P0: trigger at start.
+    F32B_PDL_TRIGGER();
+#endif
+#if F32B_V == 1
+    F32B_PDL_WAIT();  // _pdl: nothing is read before the producer is complete
+#endif
     // 2026-09-27: With gridDim.y > 1, block row y takes rows [y * R, min((y + 1) * R, M)),
     // R = ceil(M / gridDim.y); each row's arithmetic is the same in every block.
     const unsigned int rows_per_y = (M + gridDim.y - 1) / gridDim.y;
@@ -250,6 +287,21 @@ extern "C" __global__ void dense_gemv_bf16_fp32out_batchm(
     // 2026-09-25: A mask, not a return: every thread of a partial last block has to reach
     // the __syncthreads() calls in the staging loop.
     const bool active = (n < N);
+
+#if F32B_V == 2
+    // _pdl_touch: this thread's first weight vector (real load, kept by an empty asm) is issued
+    // before the wait (ld.volatile, so it is not dead-code eliminated); the activation is first
+    // read after it.
+    {
+        if (active && lane < K / VEC_SIZE) {
+            uint4 t;
+            const uint4* tp = ((const uint4*)(B + (unsigned long long)n * K)) + lane;
+            asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(t.x), "=r"(t.y), "=r"(t.z), "=r"(t.w) : "l"(tp));
+        }
+        F32B_PDL_WAIT();
+    }
+#endif
 
     const unsigned int m = (M > MAX_M) ? MAX_M : M;
 
@@ -357,3 +409,5 @@ extern "C" __global__ void dense_gemv_bf16_fp32out_batchm(
         }
     }
 }
+
+#endif  // F32B_BODY_PASS

@@ -57,6 +57,16 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 
+// 2026-10-12: Programmatic dependent launch (PDL) variants of the BF16 entry, see
+// TCM_ENTRY_PDL below; the macros are empty off CUDA.
+#if !defined(__SCALE__) && !defined(__HIP_PLATFORM_AMD__) && defined(__CUDACC__)
+#define TCM_PDL_TRIGGER() asm volatile("griddepcontrol.launch_dependents;" ::: "memory")
+#define TCM_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define TCM_PDL_TRIGGER()
+#define TCM_PDL_WAIT()
+#endif
+
 #define TCM_WARPS 8
 #define TCM_THREADS (TCM_WARPS * 32)
 // 2026-10-04: Token tiles of 8: rows 0..7 and 8..15. Mirrored by TCM_MAX_M in
@@ -113,7 +123,10 @@ __device__ __forceinline__ uint32_t tcm_e4m3x2_bf16x2(uint32_t pair) {
 }
 #endif
 
-template <bool FP8, int NT, int KU>
+// 2026-10-12: PDLV 0 = production (no PDL code); 1 = `_pdl`: launch_dependents at start, then
+// griddepcontrol.wait before anything is read; 2 = `_pdl_touch`: the warp's first k-block of
+// every weight row it owns is loaded (real loads, kept by an empty asm) before the wait.
+template <bool FP8, int NT, int KU, int PDLV = 0>
 __device__ __forceinline__ void tcm_impl(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W,
@@ -121,6 +134,12 @@ __device__ __forceinline__ void tcm_impl(
     __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride)
 {
+    if (PDLV != 0) {
+        TCM_PDL_TRIGGER();
+    }
+    if (PDLV == 1) {
+        TCM_PDL_WAIT();
+    }
     // 2026-10-04: Elements per k-block: 128 weight bytes per row in both kinds.
     constexpr unsigned int KBE = FP8 ? 128u : 64u;
     constexpr unsigned int WBYTES = FP8 ? 1u : 2u;
@@ -144,6 +163,27 @@ __device__ __forceinline__ void tcm_impl(
             live[i][h] = n < N;
             wrow[i][h] = W + (unsigned long long)(live[i][h] ? n : 0u) * row_bytes + t * 16u;
         }
+    }
+    if (PDLV == 2) {
+        // The first trip of the K loop below loads k-block `warp` of each live row; load it now.
+        if (warp < num_kb) {
+            #pragma unroll
+            for (int i = 0; i < NT; i++) {
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    if (live[i][h]) {
+                        // ld.volatile so the otherwise-dead loads are kept.
+                        const unsigned char* tp = wrow[i][h] + (unsigned long long)warp * 128u;
+                        uint4 t0, t1;
+                        asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                                     : "=r"(t0.x), "=r"(t0.y), "=r"(t0.z), "=r"(t0.w) : "l"(tp));
+                        asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                                     : "=r"(t1.x), "=r"(t1.y), "=r"(t1.z), "=r"(t1.w) : "l"(tp + 64));
+                    }
+                }
+            }
+        }
+        TCM_PDL_WAIT();
     }
     // Token tile b is on iff its first row is < M (warp-uniform); inside an on tile a row
     // past M feeds zeros into its own column only.
@@ -300,3 +340,17 @@ TCM_ENTRY(dense_gemv_tcm_bf16_nt2, false, 2, 4, 1)
 TCM_ENTRY(dense_gemv_tcm_fp8w, true, 1, 4, 2)
 TCM_ENTRY(dense_gemv_tcm_fp8w_ku8, true, 1, 8, 1)
 TCM_ENTRY(dense_gemv_tcm_fp8w_nt2, true, 2, 4, 1)
+
+// 2026-10-12: PDL variants of the BF16 production entry (same body, PDLV 1 / 2). Launched as
+// plain kernels they behave like the base; the production entries above are unchanged.
+#define TCM_ENTRY_PDL(NAME, FP8, NT, KU, MINB, V)                                        \
+    extern "C" __global__ __launch_bounds__(TCM_THREADS, MINB) void NAME(                  \
+        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,          \
+        const float* __restrict__ row_scale, __nv_bfloat16* __restrict__ C,                \
+        unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {         \
+        tcm_impl<FP8, NT, KU, V>(A, W, row_scale, C, M, N, K, out_stride);                 \
+    }
+#if !defined(__SCALE__) && !defined(__HIP_PLATFORM_AMD__) && defined(__CUDACC__)
+TCM_ENTRY_PDL(dense_gemv_tcm_bf16_pdl, false, 1, 8, 1, 1)
+TCM_ENTRY_PDL(dense_gemv_tcm_bf16_pdl_touch, false, 1, 8, 1, 2)
+#endif

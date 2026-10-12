@@ -1,32 +1,52 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 2026-10-12: Gate 1 for programmatic dependent launch (PDL) on the decode GEMV chain
+//! 2026-10-12: Gate 1 for programmatic dependent launch (PDL) on decode GEMV chains
 //! (SeedHQ/seed-skills#80).
 //!
 //! Owner: model-arch examples.
-//! One layer's most numerous NVFP4 launches at M = 3 rows, `w4a16_gemv_batch3_staged`:
-//! KDA in-proj 4096x4096 (grid 1024) -> shared gate 1024x4096 (grid 256) -> shared up 1024x4096
-//! (grid 256) -> shared down 4096x1024 (grid 1024, reads the gate output). The down output
-//! feeds the next layer's in-proj. L = 42 layers with distinct weight buffers (cold-stream, ~0.7
-//! GB), so 168 launches and 167 boundaries. Numerics are irrelevant; only that the arms agree.
+//! Three chains, each timed and checked in three arms (A base, B `_pdl`, C `_pdl_touch`):
+//! - D (dense NV4, `w4a16_gemv_batch3_staged`, M = 3): per layer KDA in-proj 4096x4096 -> shared
+//!   gate 1024x4096 -> shared up 1024x4096 -> shared down 4096x1024 (reads the gate output), 42
+//!   layers, distinct weights per layer: 168 launches, 167 boundaries.
+//! - G (grouping): per layer one grouped launch N = 12288, K = 4096 (KDA q/k/v concatenated)
+//!   then one grouped shared gate+up launch N = 2048, K = 4096, 42 layers: 84 launches, 83
+//!   boundaries. Same kernel, so this is "grouping + PDL" measured.
+//! - S (small dense, picked from the c27c MTP verify trace, see below): GLM-5.3 has 45 layers,
+//!   attention is DSA when `l % 4 == 3` else KDA, the MoE router from layer 3 on.
+//!   KDA: `dense_gemv_tcm_bf16` 128x4096 (M = 3) -> `dense_gemv_tcm_bf16` 4096x128 (M = 3, reads
+//!   the previous output, writes the next layer's input). DSA, per row of 3: `dense_gemv_tcm_bf16`
+//!   128x4096 (indexer wk) and again (compress_gate), both M = 1, then `dense_gemv_bf16_fp32out`
+//!   4096x1536 (indexer wq_b, M = 1). Every layer l >= 3: `dense_gemv_bf16_fp32out_batchm` router
+//!   288x4096 (M = 3). 209 launches, 208 boundaries. Only the picked kernels are in the chain, so
+//!   a boundary here is picked-to-picked, adjacent in the graph, whereas in the real graph other
+//!   kernels sit between them.
 //!
-//! Arms, each captured by stream capture (relaxed mode, as the engine) into one CUDA graph:
-//! - A: `w4a16_gemv_batch3_staged`, `cuLaunchKernel`.
-//! - B: `w4a16_gemv_batch3_staged_pdl`, `cuLaunchKernelEx` with
-//!   `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION = 1` on every launch after the first
-//!   (kernel: `launch_dependents` at start, `griddepcontrol.wait` before any read).
-//! - C: `w4a16_gemv_batch3_staged_pdl_touch`, launched like B (kernel: the CTA's first weight word
-//!   and scale byte are loaded before the wait).
+//! Pick (nsys sqlite `ra-comb27c-n1n2-carmtp`, rank 0, 160 verify rounds, kernels before the
+//! round's first argmax; mean launches per round x mean duration): router batchm (72 grid) 42 x
+//! 21.6 us = 0.907 ms; fp32out grid 1024 33 x 25.0 us = 0.825 ms; tcm_bf16 grid 8 100 x 8.06 us =
+//! 0.806 ms; tcm_bf16 grid 256 34 x 9.11 us = 0.310 ms. Together 2.848 ms = 79.7 % of the 3.575 ms
+//! per round of the in-layer small BF16/FP8 dense GEMVs (also: tcm_fp8w grid 256 0.257, tcm_fp8w
+//! grid 8 0.215, tcm_bf16 grid 2 0.174, fp32out grid 8 0.081 ms; the one tcm_fp8w grid 4840 launch
+//! per round, 1.289 ms, is the LM head: not in-layer, one launch, left out). With the LM head in the
+//! denominator the four are 58.6 %. Shapes: tcm grid = ceil(N / 16), other kernels ceil(N / 4).
 //!
-//! Prints (one per line): `PDL_EDGES arm=X total=N programmatic=P` (cuGraphGetEdges_v2 on the
-//! captured graph; `PDL_EDGES_DROPPED arm=X` when B or C has no programmatic edge: a finding,
-//! not a crash), `PDL_CMP arm=X bytes_differ=N` (every layer's four output buffers, raw bytes,
-//! vs arm A), `PDL_RACE arm=X replays=5 bad=K` (five more replays, each compared with A),
-//! `PDL_T arm=X ms=M` (median graph replay, 3 rounds x 20 replays, order rotated per round,
-//! cold L2 by a read-only 72 MiB GEMV before every replay, outside the timed region),
-//! `PDL_BOUNDARY arm=X saving_us=S` ((A - X) / 167). Final line `PASS` iff every compare is
-//! equal and every line above was printed; else `FAIL <why>` and exit 1. Timing is only
-//! meaningful when run alone on a GPU.
+//! Each arm is captured by stream capture (relaxed mode, as the engine) into one CUDA graph:
+//! - A: base kernels, `cuLaunchKernel`.
+//! - B: `*_pdl` kernels, `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_
+//!   SERIALIZATION = 1` on every launch after the first (kernel: `launch_dependents` at start,
+//!   `griddepcontrol.wait` before any read).
+//! - C: `*_pdl_touch` kernels, launched like B (kernel: the thread's / warp's first weight vector
+//!   is loaded before the wait).
+//!
+//! Per chain prints `PDL_EDGES chain=X arm=Y total=N programmatic=P ...` (cuGraphGetEdges_v2;
+//! `PDL_EDGES_DROPPED chain=X arm=Y` when B or C has no programmatic edge: a finding),
+//! `PDL_CMP chain=X arm=Y bytes_differ=N` (all output buffers, raw bytes, vs A), `PDL_RACE`
+//! (five more replays each compared with A), `PDL_T chain=X arm=Y ms=M` (median graph replay, 3
+//! rounds x 20, order rotated per round, cold L2 by a read-only 72 MiB GEMV before every replay,
+//! outside the timed region), `PDL_BOUNDARY chain=X arm=Y saving_us=S boundaries=N` ((A - Y) / N),
+//! and `PDL_TRACE` with the real-trace launch counts to scale a per-boundary saving to ms per
+//! round. Final line `PASS` iff every chain is bitwise clean in every replay, else `FAIL <why>`
+//! (exit 1). Timing is only meaningful when run alone on a GPU.
 //!
 //! Run (GPU):
 //!   METRALE_TARGET_HW=gb10 METRALE_TARGET_MODEL=glm-5.3-flash METRALE_TARGET_QUANT=nvfp4 \
@@ -125,17 +145,16 @@ fn ck(rc: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Layers, rows, the per-layer GEMV shapes (n, k) in launch order, and the timing plan.
-const LAYERS: usize = 42;
 const M: usize = 3;
-/// (n, k): in-proj, gate, up, down.
-const SHAPES: [(usize, usize); 4] = [(4096, 4096), (1024, 4096), (1024, 4096), (4096, 1024)];
 const ROUNDS: usize = 3;
 const REPLAYS: usize = 20;
 const WARMUP: usize = 3;
 const RACE_REPLAYS: usize = 5;
 const FLUSH_N: usize = 4096;
 const FLUSH_K: usize = 32768;
+/// Layers: D and G use 42 (the shared-expert chains of the earlier plan), S uses the model's 45.
+const LAYERS_DG: usize = 42;
+const LAYERS_S: usize = 45;
 
 struct Lcg(u64);
 impl Lcg {
@@ -159,11 +178,27 @@ struct W {
     s2: f32,
 }
 
-/// One launch of the chain: input, weight, output, shape.
+/// Kernel families; the index is the row of the kernel table.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// `w4a16_gemv_batch3_staged(a, w, s, s2, c, n, k)`, grid ceil(n/4).
+    Nv4,
+    /// `dense_gemv_tcm_bf16(a, w, null, c, m, n, k, out_stride)`, grid ceil(n/16).
+    Tcm,
+    /// `dense_gemv_bf16_fp32out(a, w, c, n, k)`, grid ceil(n/4), FP32 out.
+    F32,
+    /// `dense_gemv_bf16_fp32out_batchm(a, w, c, m, n, k, out_stride)`, grid ceil(n/4).
+    F32B,
+}
+const KINDS: [Kind; 4] = [Kind::Nv4, Kind::Tcm, Kind::F32, Kind::F32B];
+
+/// One launch of a chain.
 struct Step {
+    kind: Kind,
     a: u64,
     w: W,
     c: u64,
+    m: usize,
     n: usize,
     k: usize,
 }
@@ -184,20 +219,50 @@ impl Arm {
     }
 }
 
-/// Launch `step` with kernel `f` on `stream`; `pdl` adds the programmatic-serialization attribute.
-fn launch(f: KernelHandle, st: &Step, stream: u64, pdl: bool) -> Result<()> {
-    let (mut a, mut w, mut s, mut s2, mut c) = (st.a, st.w.w, st.w.s, st.w.s2, st.c);
-    let (mut n, mut k) = (st.n as u32, st.k as u32);
-    let mut params: [*mut c_void; 7] = [
-        &mut a as *mut u64 as *mut c_void,
-        &mut w as *mut u64 as *mut c_void,
-        &mut s as *mut u64 as *mut c_void,
-        &mut s2 as *mut f32 as *mut c_void,
-        &mut c as *mut u64 as *mut c_void,
-        &mut n as *mut u32 as *mut c_void,
-        &mut k as *mut u32 as *mut c_void,
-    ];
-    let grid = (st.n as u32).div_ceil(4);
+/// Kernel handles: `[kind][arm]`.
+type Ks = [[KernelHandle; 3]; 4];
+
+/// Launch `st` on `stream` with the arm's kernel; `pdl` adds the programmatic-serialization attribute.
+fn launch(ks: &Ks, arm: Arm, st: &Step, stream: u64, pdl: bool) -> Result<()> {
+    let f = ks[KINDS.iter().position(|&k| k == st.kind).unwrap()][arm as usize];
+    let (mut a, mut w, mut s, mut s2, mut c, mut nul) = (st.a, st.w.w, st.w.s, st.w.s2, st.c, 0u64);
+    let (mut m, mut n, mut k) = (st.m as u32, st.n as u32, st.k as u32);
+    let mut out_stride = st.n as u32;
+    let p = |x: &mut u64| x as *mut u64 as *mut c_void;
+    let q = |x: &mut u32| x as *mut u32 as *mut c_void;
+    let mut params: Vec<*mut c_void> = match st.kind {
+        Kind::Nv4 => vec![
+            p(&mut a),
+            p(&mut w),
+            p(&mut s),
+            &mut s2 as *mut f32 as *mut c_void,
+            p(&mut c),
+            q(&mut n),
+            q(&mut k),
+        ],
+        Kind::Tcm => vec![
+            p(&mut a),
+            p(&mut w),
+            p(&mut nul),
+            p(&mut c),
+            q(&mut m),
+            q(&mut n),
+            q(&mut k),
+            q(&mut out_stride),
+        ],
+        Kind::F32 => vec![p(&mut a), p(&mut w), p(&mut c), q(&mut n), q(&mut k)],
+        Kind::F32B => vec![
+            p(&mut a),
+            p(&mut w),
+            p(&mut c),
+            q(&mut m),
+            q(&mut n),
+            q(&mut k),
+            q(&mut out_stride),
+        ],
+    };
+    let per_cta = if st.kind == Kind::Tcm { 16 } else { 4 };
+    let grid = (st.n as u32).div_ceil(per_cta);
     if !pdl {
         // SAFETY: `params` points at live locals of the kernel's argument types; the driver
         // copies the values during the call (also under stream capture).
@@ -242,8 +307,7 @@ fn launch(f: KernelHandle, st: &Step, stream: u64, pdl: bool) -> Result<()> {
 }
 
 /// Capture the whole chain for `arm` into a graph; returns (graph, exec).
-fn capture(arm: Arm, ks: [KernelHandle; 3], steps: &[Step], stream: u64) -> Result<(u64, u64)> {
-    let f = ks[arm as usize];
+fn capture(ks: &Ks, arm: Arm, steps: &[Step], stream: u64) -> Result<(u64, u64)> {
     // SAFETY: mode 2 = CU_STREAM_CAPTURE_MODE_RELAXED, as the engine's begin_capture.
     ck(
         unsafe { cuStreamBeginCapture(stream, 2) },
@@ -251,7 +315,7 @@ fn capture(arm: Arm, ks: [KernelHandle; 3], steps: &[Step], stream: u64) -> Resu
     )?;
     let mut res = Ok(());
     for (i, st) in steps.iter().enumerate() {
-        res = launch(f, st, stream, arm != Arm::A && i > 0);
+        res = launch(ks, arm, st, stream, arm != Arm::A && i > 0);
         if res.is_err() {
             break;
         }
@@ -273,7 +337,7 @@ fn capture(arm: Arm, ks: [KernelHandle; 3], steps: &[Step], stream: u64) -> Resu
     Ok((graph, exec))
 }
 
-/// (total edges, programmatic edges, edges leaving a programmatic port).
+/// (total edges, programmatic edges, edges leaving a nonzero port).
 fn edges(graph: u64) -> Result<(usize, usize, usize)> {
     let mut n = 0usize;
     // SAFETY: count query (null arrays) as the driver documents.
@@ -324,10 +388,7 @@ fn quantize(
     n: usize,
     k: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, f32)> {
-    let mut host = Vec::with_capacity(n * k * 2);
-    for _ in 0..n * k {
-        host.extend_from_slice(&bf16::from_f64(rng.n() * 0.02).to_bits().to_le_bytes());
-    }
+    let host = bf16_bytes(rng, n * k, 0.02);
     let tmp = g.alloc(host.len())?;
     g.copy_h2d(&host, tmp)?;
     let q = metrale_model_layers::weight_map::quantize_to_nvfp4(
@@ -350,19 +411,128 @@ fn quantize(
     Ok((w, s, q.weight_scale_2))
 }
 
+/// `count` BF16 values ~ N(0, std^2), little-endian bytes.
+fn bf16_bytes(rng: &mut Lcg, count: usize, std: f64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(count * 2);
+    for _ in 0..count {
+        v.extend_from_slice(&bf16::from_f64(rng.n() * std).to_bits().to_le_bytes());
+    }
+    v
+}
+
 fn up(g: &dyn GpuBackend, b: &[u8]) -> Result<u64> {
     let p = g.alloc(b.len())?;
     g.copy_h2d(b, p)?;
     Ok(p.0)
 }
 
+/// A bump allocator over one chain's output arena (base 0 first, to size it).
+struct Bump {
+    base: u64,
+    off: usize,
+}
+impl Bump {
+    fn take(&mut self, bytes: usize) -> u64 {
+        let p = self.base + self.off as u64;
+        self.off += bytes.div_ceil(256) * 256;
+        p
+    }
+}
+
+/// NVFP4 weights of one layer-slot per layer: the base bytes rotated per (layer, slot).
+fn nv4_layers(
+    g: &dyn GpuBackend,
+    base: &(Vec<u8>, Vec<u8>, f32),
+    layers: usize,
+    slot: usize,
+    slots: usize,
+) -> Result<Vec<W>> {
+    let mut out = Vec::new();
+    for l in 0..layers {
+        let mut w = base.0.clone();
+        let mut s = base.1.clone();
+        let r = (l * slots + slot) * 7919;
+        let (rw, rs) = (r % w.len(), r % s.len());
+        w.rotate_left(rw);
+        s.rotate_left(rs);
+        out.push(W {
+            w: up(g, &w)?,
+            s: up(g, &s)?,
+            s2: base.2,
+        });
+    }
+    Ok(out)
+}
+
+/// BF16 weights `[n, k]`, one per layer: base bytes rotated by an even offset per (layer, slot).
+fn bf16_layers(
+    g: &dyn GpuBackend,
+    rng: &mut Lcg,
+    n: usize,
+    k: usize,
+    layers: usize,
+    slot: usize,
+) -> Result<Vec<W>> {
+    let base = bf16_bytes(rng, n * k, 0.02);
+    let mut out = Vec::new();
+    for l in 0..layers {
+        let mut w = base.clone();
+        let len = w.len();
+        w.rotate_left(((l * 8 + slot) * 7918) % len & !1);
+        out.push(W {
+            w: up(g, &w)?,
+            s: 0,
+            s2: 0.0,
+        });
+    }
+    Ok(out)
+}
+
+/// A chain: a name, its launches, and the arena all outputs live in.
+struct Chain {
+    name: &'static str,
+    steps: Vec<Step>,
+    arena: u64,
+    arena_bytes: usize,
+}
+
+/// Build a chain twice: once on a zero-based bump to size the arena, then for real.
+fn build(
+    g: &dyn GpuBackend,
+    name: &'static str,
+    f: &dyn Fn(&mut Bump) -> Vec<Step>,
+) -> Result<Chain> {
+    let mut sizing = Bump { base: 0, off: 0 };
+    f(&mut sizing);
+    let arena = g.alloc(sizing.off)?.0;
+    let mut real = Bump {
+        base: arena,
+        off: 0,
+    };
+    let steps = f(&mut real);
+    Ok(Chain {
+        name,
+        steps,
+        arena,
+        arena_bytes: sizing.off,
+    })
+}
+
 fn run() -> Result<(bool, String)> {
     let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
-    let ks = [
-        g.kernel("w4a16_gemv", "w4a16_gemv_batch3_staged")?,
-        g.kernel("w4a16_gemv", "w4a16_gemv_batch3_staged_pdl")?,
-        g.kernel("w4a16_gemv", "w4a16_gemv_batch3_staged_pdl_touch")?,
+    let mk = |module: &str, base: &str| -> Result<[KernelHandle; 3]> {
+        Ok([
+            g.kernel(module, base)?,
+            g.kernel(module, &format!("{base}_pdl"))?,
+            g.kernel(module, &format!("{base}_pdl_touch"))?,
+        ])
+    };
+    let ks: Ks = [
+        mk("w4a16_gemv", "w4a16_gemv_batch3_staged")?,
+        mk("dense_gemv_tcm", "dense_gemv_tcm_bf16")?,
+        mk("dense_gemv_bf16", "dense_gemv_bf16_fp32out")?,
+        mk("dense_gemv_bf16_batchm", "dense_gemv_bf16_fp32out_batchm")?,
     ];
     let gemv1 = g.kernel("w4a16_gemv", "w4a16_gemv")?;
     let absmax = g.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
@@ -370,68 +540,138 @@ fn run() -> Result<(bool, String)> {
     let stream = g.default_stream();
     let mut rng = Lcg(0x7064_6c63_6861_696e);
 
-    // Base quantized weights per shape (gate and up share the shape and the base bytes); each
-    // layer's copy is the base rotated by a layer- and slot-dependent byte offset, so the 168
-    // buffers differ and are distinct allocations.
-    let base: Vec<(Vec<u8>, Vec<u8>, f32)> = [SHAPES[0], SHAPES[1], SHAPES[3]]
-        .iter()
-        .map(|&(n, k)| quantize(g, absmax, quant, &mut rng, n, k))
-        .collect::<Result<_>>()?;
-    let mut weights: Vec<[W; 4]> = Vec::new();
-    for l in 0..LAYERS {
-        let mut row = [W {
-            w: 0,
-            s: 0,
-            s2: 0.0,
-        }; 4];
-        for (slot, wr) in row.iter_mut().enumerate() {
-            let b = &base[[0, 1, 1, 2][slot]];
-            let mut w = b.0.clone();
-            let mut s = b.1.clone();
-            let r = (l * 4 + slot) * 7919;
-            let (rw, rs) = (r % w.len(), r % s.len());
-            w.rotate_left(rw);
-            s.rotate_left(rs);
-            *wr = W {
-                w: up(g, &w)?,
-                s: up(g, &s)?,
-                s2: b.2,
-            };
-        }
-        weights.push(row);
+    let act = |g: &dyn GpuBackend, rng: &mut Lcg, count: usize| -> Result<u64> {
+        up(g, &bf16_bytes(rng, count, 1.0))
+    };
+    let mut chains: Vec<Chain> = Vec::new();
+
+    // ---- Chain D: in-proj, shared gate, up, down; 42 layers. ----
+    {
+        let shapes = [
+            (4096usize, 4096usize),
+            (1024, 4096),
+            (1024, 4096),
+            (4096, 1024),
+        ];
+        let base: Vec<_> = [shapes[0], shapes[1], shapes[3]]
+            .iter()
+            .map(|&(n, k)| quantize(g, absmax, quant, &mut rng, n, k))
+            .collect::<Result<_>>()?;
+        let ws: Vec<Vec<W>> = (0..4)
+            .map(|slot| nv4_layers(g, &base[[0, 1, 1, 2][slot]], LAYERS_DG, slot, 4))
+            .collect::<Result<_>>()?;
+        let a0 = act(g, &mut rng, M * 4096)?;
+        chains.push(build(g, "D", &|bump| {
+            let mut steps = Vec::new();
+            let mut x = a0;
+            for l in 0..LAYERS_DG {
+                let o: Vec<u64> = shapes.iter().map(|&(n, _)| bump.take(M * n * 2)).collect();
+                let ins = [x, o[0], o[0], o[1]];
+                for i in 0..4 {
+                    steps.push(Step {
+                        kind: Kind::Nv4,
+                        a: ins[i],
+                        w: ws[i][l],
+                        c: o[i],
+                        m: M,
+                        n: shapes[i].0,
+                        k: shapes[i].1,
+                    });
+                }
+                x = o[3];
+            }
+            steps
+        })?);
     }
 
-    // Activations: layer 0 input, then one output arena [layer][in, gate, up, down] x M rows.
-    let mut a0 = Vec::with_capacity(M * 4096 * 2);
-    for _ in 0..M * 4096 {
-        a0.extend_from_slice(&bf16::from_f64(rng.n()).to_bits().to_le_bytes());
+    // ---- Chain G: grouped q/k/v (12288 x 4096) then grouped gate+up (2048 x 4096). ----
+    {
+        let bq = quantize(g, absmax, quant, &mut rng, 12288, 4096)?;
+        let bg = quantize(g, absmax, quant, &mut rng, 2048, 4096)?;
+        let wq = nv4_layers(g, &bq, LAYERS_DG, 0, 2)?;
+        let wg = nv4_layers(g, &bg, LAYERS_DG, 1, 2)?;
+        let a0 = act(g, &mut rng, M * 4096)?;
+        chains.push(build(g, "G", &|bump| {
+            let mut steps = Vec::new();
+            let mut x = a0;
+            for l in 0..LAYERS_DG {
+                let o_qkv = bump.take(M * 12288 * 2);
+                // The gate+up output is padded to 3 x 4096 so the next layer reads K = 4096.
+                let o_gu = bump.take(M * 4096 * 2);
+                steps.push(Step {
+                    kind: Kind::Nv4,
+                    a: x,
+                    w: wq[l],
+                    c: o_qkv,
+                    m: M,
+                    n: 12288,
+                    k: 4096,
+                });
+                steps.push(Step {
+                    kind: Kind::Nv4,
+                    a: o_qkv,
+                    w: wg[l],
+                    c: o_gu,
+                    m: M,
+                    n: 2048,
+                    k: 4096,
+                });
+                x = o_gu;
+            }
+            steps
+        })?);
     }
-    let a0 = up(g, &a0)?;
-    let per_layer: usize = SHAPES.iter().map(|&(n, _)| M * n * 2).sum();
-    let arena_bytes = LAYERS * per_layer;
-    let arena = g.alloc(arena_bytes)?.0;
-    let mut steps = Vec::new();
-    let mut x = a0;
-    for (l, wl) in weights.iter().enumerate() {
-        let o = arena + (l * per_layer) as u64;
-        let o_in = o;
-        let o_gate = o_in + (M * SHAPES[0].0 * 2) as u64;
-        let o_up = o_gate + (M * SHAPES[1].0 * 2) as u64;
-        let o_down = o_up + (M * SHAPES[2].0 * 2) as u64;
-        let mk = |a: u64, i: usize, c: u64| Step {
-            a,
-            w: wl[i],
-            c,
-            n: SHAPES[i].0,
-            k: SHAPES[i].1,
-        };
-        steps.push(mk(x, 0, o_in));
-        steps.push(mk(o_in, 1, o_gate));
-        steps.push(mk(o_in, 2, o_up));
-        steps.push(mk(o_gate, 3, o_down));
-        x = o_down;
+
+    // ---- Chain S: the picked small dense GEMVs of the verify round, 45 layers. ----
+    {
+        let l = LAYERS_S;
+        let w_kda_a = bf16_layers(g, &mut rng, 128, 4096, l, 0)?;
+        let w_kda_b = bf16_layers(g, &mut rng, 4096, 128, l, 1)?;
+        let w_wk = bf16_layers(g, &mut rng, 128, 4096, l, 2)?;
+        let w_cg = bf16_layers(g, &mut rng, 128, 4096, l, 3)?;
+        let w_wqb = bf16_layers(g, &mut rng, 4096, 1536, l, 4)?;
+        let w_rt = bf16_layers(g, &mut rng, 288, 4096, l, 5)?;
+        let a0 = act(g, &mut rng, M * 4096)?;
+        chains.push(build(g, "S", &|bump| {
+            let mut steps = Vec::new();
+            let mut x = a0;
+            let st = |kind, a, w, c, m, n, k| Step {
+                kind,
+                a,
+                w,
+                c,
+                m,
+                n,
+                k,
+            };
+            for i in 0..l {
+                if i % 4 == 3 {
+                    // DSA indexer, per row r of 3 (M = 1 launches, as in the trace).
+                    for r in 0..M {
+                        let xr = x + (r * 4096 * 2) as u64;
+                        let o1 = bump.take(128 * 2);
+                        let o2 = bump.take(128 * 2);
+                        let o3 = bump.take(4096 * 4);
+                        steps.push(st(Kind::Tcm, xr, w_wk[i], o1, 1, 128, 4096));
+                        steps.push(st(Kind::Tcm, xr, w_cg[i], o2, 1, 128, 4096));
+                        steps.push(st(Kind::F32, xr, w_wqb[i], o3, 1, 4096, 1536));
+                    }
+                } else {
+                    // KDA: g_a (128 x 4096) then g_b (4096 x 128); the output is the next input.
+                    let o1 = bump.take(M * 128 * 2);
+                    let o2 = bump.take(M * 4096 * 2);
+                    steps.push(st(Kind::Tcm, x, w_kda_a[i], o1, M, 128, 4096));
+                    steps.push(st(Kind::Tcm, o1, w_kda_b[i], o2, M, 4096, 128));
+                    x = o2;
+                }
+                if i >= 3 {
+                    let o = bump.take(M * 288 * 4);
+                    steps.push(st(Kind::F32B, x, w_rt[i], o, M, 288, 4096));
+                }
+            }
+            steps
+        })?);
     }
-    let boundaries = steps.len() - 1;
 
     // Cold-L2 flush: a read-only M = 1 GEMV over a 72 MiB all-zero weight.
     let fw = W {
@@ -444,129 +684,154 @@ fn run() -> Result<(bool, String)> {
     let fa = g.alloc(FLUSH_K * 2)?.0;
     let fc = g.alloc(FLUSH_N * 2)?.0;
     g.memset(DevicePtr(fa), 0, FLUSH_K * 2)?;
+    let flush_ks: Ks = [[gemv1; 3]; 4];
     let flush_step = Step {
+        kind: Kind::Nv4,
         a: fa,
         w: fw,
         c: fc,
+        m: 1,
         n: FLUSH_N,
         k: FLUSH_K,
     };
 
     let arms = [Arm::A, Arm::B, Arm::C];
-    let mut execs = Vec::new();
-    let mut why: Vec<String> = Vec::new();
-    for &arm in &arms {
-        let (graph, exec) = capture(arm, ks, &steps, stream)?;
-        let (total, prog, port) = edges(graph)?;
-        println!(
-            "PDL_EDGES arm={} total={total} programmatic={prog} from_port_nonzero={port}",
-            arm.name()
-        );
-        if arm != Arm::A && prog == 0 {
-            println!("PDL_EDGES_DROPPED arm={}", arm.name());
-        }
-        // SAFETY: the template graph is no longer needed once instantiated.
-        unsafe { cuGraphDestroy(graph) };
-        execs.push(exec);
-    }
-
-    let run_once = |exec: u64| -> Result<Vec<u8>> {
-        g.memset(DevicePtr(arena), 0xA5, arena_bytes)?;
-        // SAFETY: replays an instantiated graph on the capture stream, then waits.
-        ck(unsafe { cuGraphLaunch(exec, stream) }, "cuGraphLaunch")?;
-        ck(
-            unsafe { cuStreamSynchronize(stream) },
-            "cuStreamSynchronize",
-        )?;
-        let mut out = vec![0u8; arena_bytes];
-        g.copy_d2h(DevicePtr(arena), &mut out)?;
-        Ok(out)
-    };
-    let reference = run_once(execs[0])?;
-    let diff = |o: &[u8]| o.iter().zip(&reference).filter(|(a, b)| a != b).count();
-    if reference.iter().all(|&b| b == 0xA5) {
-        why.push("arm A wrote nothing".into());
-    }
-    for (i, &arm) in arms.iter().enumerate().skip(1) {
-        let d = diff(&run_once(execs[i])?);
-        println!("PDL_CMP arm={} bytes_differ={d}", arm.name());
-        if d != 0 {
-            why.push(format!("arm {} differs from A in {d} bytes", arm.name()));
-        }
-        let mut bad = 0;
-        for _ in 0..RACE_REPLAYS {
-            if diff(&run_once(execs[i])?) != 0 {
-                bad += 1;
-            }
-        }
-        println!(
-            "PDL_RACE arm={} replays={RACE_REPLAYS} bad={bad}",
-            arm.name()
-        );
-        if bad != 0 {
-            why.push(format!(
-                "arm {} differed in {bad} of {RACE_REPLAYS} replays",
-                arm.name()
-            ));
-        }
-    }
-
-    // Timing.
     let mut ev = [0u64; 2];
     for e in ev.iter_mut() {
         // SAFETY: creates one event handle into `e`.
         ck(unsafe { cuEventCreate(e, 0) }, "cuEventCreate")?;
     }
-    let mut times: Vec<Vec<f64>> = vec![Vec::new(); 3];
-    let one = |exec: u64| -> Result<f64> {
-        launch(gemv1, &flush_step, stream, false)?;
-        // SAFETY: events created above; the interval holds exactly one graph launch.
-        unsafe {
-            ck(cuEventRecord(ev[0], stream), "cuEventRecord")?;
-            ck(cuGraphLaunch(exec, stream), "cuGraphLaunch")?;
-            ck(cuEventRecord(ev[1], stream), "cuEventRecord")?;
-            ck(cuEventSynchronize(ev[1]), "cuEventSynchronize")?;
-            let mut ms = 0f32;
-            ck(
-                cuEventElapsedTime(&mut ms, ev[0], ev[1]),
-                "cuEventElapsedTime",
-            )?;
-            Ok(ms as f64)
-        }
-    };
-    for round in 0..ROUNDS {
-        for j in 0..3 {
-            let i = (round + j) % 3;
-            for _ in 0..WARMUP {
-                one(execs[i])?;
+    let mut why: Vec<String> = Vec::new();
+
+    for ch in &chains {
+        let cn = ch.name;
+        let boundaries = ch.steps.len() - 1;
+        println!(
+            "PDL_CHAIN chain={cn} launches={} boundaries={boundaries}",
+            ch.steps.len()
+        );
+        let mut execs = Vec::new();
+        for &arm in &arms {
+            let (graph, exec) = capture(&ks, arm, &ch.steps, stream)?;
+            let (total, prog, port) = edges(graph)?;
+            println!(
+                "PDL_EDGES chain={cn} arm={} total={total} programmatic={prog} from_port_nonzero={port}",
+                arm.name()
+            );
+            if arm != Arm::A && prog == 0 {
+                println!("PDL_EDGES_DROPPED chain={cn} arm={}", arm.name());
             }
-            let mut t = Vec::with_capacity(REPLAYS);
-            for _ in 0..REPLAYS {
-                t.push(one(execs[i])?);
+            // SAFETY: the template graph is no longer needed once instantiated.
+            unsafe { cuGraphDestroy(graph) };
+            execs.push(exec);
+        }
+        let run_once = |exec: u64| -> Result<Vec<u8>> {
+            g.memset(DevicePtr(ch.arena), 0xA5, ch.arena_bytes)?;
+            // SAFETY: replays an instantiated graph on the capture stream, then waits.
+            ck(unsafe { cuGraphLaunch(exec, stream) }, "cuGraphLaunch")?;
+            ck(
+                unsafe { cuStreamSynchronize(stream) },
+                "cuStreamSynchronize",
+            )?;
+            let mut out = vec![0u8; ch.arena_bytes];
+            g.copy_d2h(DevicePtr(ch.arena), &mut out)?;
+            Ok(out)
+        };
+        let reference = run_once(execs[0])?;
+        let diff = |o: &[u8]| o.iter().zip(&reference).filter(|(a, b)| a != b).count();
+        if reference.iter().all(|&b| b == 0xA5) {
+            why.push(format!("chain {cn}: arm A wrote nothing"));
+        }
+        for (i, &arm) in arms.iter().enumerate().skip(1) {
+            let d = diff(&run_once(execs[i])?);
+            println!("PDL_CMP chain={cn} arm={} bytes_differ={d}", arm.name());
+            if d != 0 {
+                why.push(format!(
+                    "chain {cn}: arm {} differs from A in {d} bytes",
+                    arm.name()
+                ));
+            }
+            let mut bad = 0;
+            for _ in 0..RACE_REPLAYS {
+                if diff(&run_once(execs[i])?) != 0 {
+                    bad += 1;
+                }
             }
             println!(
-                "PDL_T_ROUND round={round} arm={} ms={:.4}",
-                arms[i].name(),
-                median(t.clone())
+                "PDL_RACE chain={cn} arm={} replays={RACE_REPLAYS} bad={bad}",
+                arm.name()
             );
-            times[i].extend(t);
+            if bad != 0 {
+                why.push(format!(
+                    "chain {cn}: arm {} differed in {bad} of {RACE_REPLAYS} replays",
+                    arm.name()
+                ));
+            }
+        }
+
+        let mut times: Vec<Vec<f64>> = vec![Vec::new(); 3];
+        let one = |exec: u64| -> Result<f64> {
+            launch(&flush_ks, Arm::A, &flush_step, stream, false)?;
+            // SAFETY: events created above; the interval holds exactly one graph launch.
+            unsafe {
+                ck(cuEventRecord(ev[0], stream), "cuEventRecord")?;
+                ck(cuGraphLaunch(exec, stream), "cuGraphLaunch")?;
+                ck(cuEventRecord(ev[1], stream), "cuEventRecord")?;
+                ck(cuEventSynchronize(ev[1]), "cuEventSynchronize")?;
+                let mut ms = 0f32;
+                ck(
+                    cuEventElapsedTime(&mut ms, ev[0], ev[1]),
+                    "cuEventElapsedTime",
+                )?;
+                Ok(ms as f64)
+            }
+        };
+        for round in 0..ROUNDS {
+            for j in 0..3 {
+                let i = (round + j) % 3;
+                for _ in 0..WARMUP {
+                    one(execs[i])?;
+                }
+                let mut t = Vec::with_capacity(REPLAYS);
+                for _ in 0..REPLAYS {
+                    t.push(one(execs[i])?);
+                }
+                println!(
+                    "PDL_T_ROUND chain={cn} round={round} arm={} ms={:.4}",
+                    arms[i].name(),
+                    median(t.clone())
+                );
+                times[i].extend(t);
+            }
+        }
+        let ms: Vec<f64> = times.into_iter().map(median).collect();
+        for (i, &arm) in arms.iter().enumerate() {
+            println!("PDL_T chain={cn} arm={} ms={:.4}", arm.name(), ms[i]);
+        }
+        for (i, &arm) in arms.iter().enumerate().skip(1) {
+            println!(
+                "PDL_BOUNDARY chain={cn} arm={} saving_us={:.3} boundaries={boundaries}",
+                arm.name(),
+                (ms[0] - ms[i]) * 1e3 / boundaries as f64
+            );
+        }
+        for e in execs {
+            // SAFETY: destroys an executable graph created above.
+            unsafe { cuGraphExecDestroy(e) };
         }
     }
-    let ms: Vec<f64> = times.into_iter().map(median).collect();
-    for (i, &arm) in arms.iter().enumerate() {
-        println!("PDL_T arm={} ms={:.4}", arm.name(), ms[i]);
-    }
-    for (i, &arm) in arms.iter().enumerate().skip(1) {
-        println!(
-            "PDL_BOUNDARY arm={} saving_us={:.3}",
-            arm.name(),
-            (ms[0] - ms[i]) * 1e3 / boundaries as f64
-        );
-    }
-    for e in execs {
-        // SAFETY: destroys an executable graph created above.
-        unsafe { cuGraphExecDestroy(e) };
-    }
+
+    // Real-trace launch counts per verify round (nsys sqlite ra-comb27c-n1n2-carmtp, rank 0,
+    // mean over 160 rounds, measured 2026-10-12) to scale a per-boundary saving to ms per round.
+    println!(
+        "PDL_TRACE chain=S launches_per_round=209 (router_batchm 42, fp32out_wq_b 33, tcm_bf16_N128 100, tcm_bf16_N4096_K128 34) coverage_pct_of_small_dense=79.7 ms_per_round=2.848"
+    );
+    println!(
+        "PDL_TRACE chain=D nv4_staged_grid1024_launches_per_round=192 (kda qkvo 136, shared down 42, other 14) nv4_staged_grid256_launches_per_round=84 (shared gate+up)"
+    );
+    println!(
+        "PDL_TRACE chain=G nv4_staged_launches_per_round_replaced=kda q/k/v 3 x 34 = 102 by 34 grouped; shared gate+up 84 by 42 grouped"
+    );
     if why.is_empty() {
         Ok((true, "PASS".into()))
     } else {

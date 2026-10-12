@@ -17,6 +17,8 @@
 
 
 
+#ifndef F32O_BODY_PASS
+
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
@@ -117,19 +119,69 @@ extern "C" __global__ void dense_gemv_bf16(
 
 
 
-extern "C" __global__ void dense_gemv_bf16_fp32out(
+// 2026-10-12: The entry points. Each includes this file once more with F32O_BODY_PASS set, which
+// compiles the kernel text at the end of the file under that entry's name (F32O_V: 0 production,
+// 1 _pdl, 2 _pdl_touch), so the production kernel is the body written out directly.
+#define F32O_BODY_PASS 1
+#define F32O_NAME dense_gemv_bf16_fp32out
+#define F32O_V 0
+#include "dense_gemv_bf16.cu"
+#undef F32O_NAME
+#undef F32O_V
+#if !defined(__SCALE__) && !defined(__HIP_PLATFORM_AMD__) && defined(__CUDACC__)
+#define F32O_PDL_TRIGGER() asm volatile("griddepcontrol.launch_dependents;" ::: "memory")
+#define F32O_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#define F32O_NAME dense_gemv_bf16_fp32out_pdl
+#define F32O_V 1
+#include "dense_gemv_bf16.cu"
+#undef F32O_NAME
+#undef F32O_V
+#define F32O_NAME dense_gemv_bf16_fp32out_pdl_touch
+#define F32O_V 2
+#include "dense_gemv_bf16.cu"
+#undef F32O_NAME
+#undef F32O_V
+#endif
+#undef F32O_BODY_PASS
+
+#else  // F32O_BODY_PASS
+
+// 2026-10-12: the dense_gemv_bf16_fp32out body (see the entry points above).
+extern "C" __global__ void F32O_NAME(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     float* __restrict__ C,
     unsigned int N,
     unsigned int K
 ) {
+#if F32O_V != 0
+    // 2026-10-12: PDL variants (see the entry points). P0: trigger at start.
+    F32O_PDL_TRIGGER();
+#endif
+#if F32O_V == 1
+    F32O_PDL_WAIT();  // _pdl: nothing is read before the producer is complete
+#endif
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
     if (n >= N) return;
+
+#if F32O_V == 2
+    // _pdl_touch: this thread's first weight vector (real load, kept by an empty asm) is issued
+    // before the wait (ld.volatile, so it is not dead-code eliminated); the activation is first
+    // read after it.
+    {
+        if (n < N && lane < K / VEC_SIZE) {
+            uint4 t;
+            const uint4* tp = ((const uint4*)(B + (unsigned long long)n * K)) + lane;
+            asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(t.x), "=r"(t.y), "=r"(t.z), "=r"(t.w) : "l"(tp));
+        }
+        F32O_PDL_WAIT();
+    }
+#endif
 
     float acc = 0.0f;
 
@@ -184,3 +236,5 @@ extern "C" __global__ void dense_gemv_bf16_fp32out(
         C[n] = result;
     }
 }
+
+#endif  // F32O_BODY_PASS

@@ -1110,12 +1110,30 @@ pub fn nv4_gemv_uncounted(
     k: usize,
     stream: u64,
 ) -> Result<()> {
-    let Some(kk) = nv4_kernels(gpu) else {
-        bail!("METRALE_GLM_DENSE_NVFP4: a weight has an NVFP4 copy but the kernels are missing");
-    };
     if super::dense_nv4_tc::try_launch(gpu, a, q, c, m, n, k, stream)? {
         return Ok(());
     }
+    nv4_gemv_cuda_core(gpu, a, q, c, m, n, k, stream)
+}
+
+/// 2026-10-12: [`nv4_gemv_uncounted`]'s CUDA-core tiers (`w4a16_gemv` / `w4a16_gemv_batch*`)
+/// without the `METRALE_GLM_NV4_TC` tensor-core route, for a caller that picks the tier itself
+/// (`glm5next_lm_head_nv4`). Same grid, block and arguments as the fall-through of
+/// [`nv4_gemv_uncounted`].
+#[allow(clippy::too_many_arguments)]
+pub fn nv4_gemv_cuda_core(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    let Some(kk) = nv4_kernels(gpu) else {
+        bail!("METRALE_GLM_DENSE_NVFP4: a weight has an NVFP4 copy but the kernels are missing");
+    };
     let (h, takes_m) = match m {
         1 => (kk.gemv1, false),
         2 => (kk.b2, false),

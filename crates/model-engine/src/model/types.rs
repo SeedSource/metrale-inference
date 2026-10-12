@@ -82,6 +82,9 @@ pub struct TransformerModel {
     /// Installed by `set_lm_head_q6k` when the store's `lm_head.weight` is
     /// Q6_K; `None` otherwise.
     pub(super) lm_head_q6k: Option<super::lm_head_q6k::LmHeadQ6k>,
+    /// 2026-10-12: `METRALE_GLM_LM_HEAD_NV4_SHARD=1`: this rank's NVFP4 vocab shard of the
+    /// target head (`install_lm_head_nv4_shard`); `None` otherwise.
+    pub(super) lm_head_nv4_shard: Option<super::lm_head_nv4_shard::LmHeadNv4Shard>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     /// 2026-09-25: `true` when any layer's `decode_graph_unsupported()` is true,
     /// so decode stays eager. Computed once at construction from `layers`.

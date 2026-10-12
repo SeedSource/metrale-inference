@@ -658,5 +658,9 @@ required-features = ["cuda", "gpu-examples"]
 name = "w8a16t_microtest"
 required-features = ["cuda", "gpu-examples"]
 
+[[example]]
+name = "glm_lm_head_nv4_shard_microtest"
+required-features = ["cuda", "gpu-examples"]
+
 [lints]
 workspace = true

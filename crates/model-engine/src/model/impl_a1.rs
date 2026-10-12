@@ -355,6 +355,7 @@ impl TransformerModel {
             lm_head_nvfp4_t,
             lm_head_fp8,
             lm_head_q6k: None,
+            lm_head_nv4_shard: None,
             // 2026-09-25: Computed before `layers` moves into the struct, since
             // the veto is a fold over the layers.
             decode_graph_veto: layers.iter().any(|l| l.decode_graph_unsupported()),

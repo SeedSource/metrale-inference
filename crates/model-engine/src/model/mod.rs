@@ -31,6 +31,7 @@ pub(crate) mod kda_defer;
 mod impl_lora_rotate;
 pub(crate) mod impl_lora_swap;
 mod impl_ngram;
+pub(crate) mod lm_head_nv4_shard;
 pub(crate) mod lm_head_q6k;
 pub(crate) mod mtp_stage;
 pub(crate) mod pinned_pack;

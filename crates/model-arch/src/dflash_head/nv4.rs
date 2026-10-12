@@ -53,6 +53,7 @@ pub(super) const NV4_ROWS_MAX: usize = dense_fp8::NV4_MAX_M;
 static HEAD_LOG: Once = Once::new();
 static LAYERS_LOG: Once = Once::new();
 static AUX_LOG: Once = Once::new();
+static TC_LOG: Once = Once::new();
 
 /// 2026-10-12: One layer's NVFP4 copies (`METRALE_DFLASH_NV4_LAYERS` for the seven GEMMs,
 /// `METRALE_DFLASH_NV4_AUX` for the two conv kernel projections); `None` = not built.
@@ -88,6 +89,9 @@ pub struct HeadNv4 {
     pub selector_hidden_proj: Option<QuantizedWeight>,
     /// 2026-10-12: Why the head lever did not build its copy, when the FP8 arm knew it.
     pub head_skip: Option<&'static str>,
+    /// 2026-10-12: `METRALE_DFLASH_NV4_TC` engaged: every NVFP4 copy above and in the layers is
+    /// read by the tensor-core kernels ([`gemv`]).
+    pub tc: bool,
 }
 
 /// 2026-10-12: Bytes of an NVFP4 copy of `[n, k]`: packed E2M1 (k/2 per row) plus one E4M3
@@ -265,8 +269,10 @@ pub(super) fn quantize_layer(
 }
 
 /// 2026-10-12: `C[m, n] = A[m, k] @ W[n, k]^T` over the NVFP4 copy `q` on the CUDA-core tiers
-/// (`dense_fp8::nv4_gemv_cuda_core`), `A` packed at stride `k`, `C` (BF16) at stride `n`.
-/// Errors outside 1..=[`NV4_ROWS_MAX`] rows: the weight may have no other copy.
+/// (`dense_fp8::nv4_gemv_cuda_core`), or with `tc` (`METRALE_DFLASH_NV4_TC` engaged) on the
+/// tensor-core `w4a16_gemv_tc8/tc16` (`dense_fp8::nv4_gemv_tensor_core`, same copy). `A` packed
+/// at stride `k`, `C` (BF16) at stride `n`. Errors outside 1..=[`NV4_ROWS_MAX`] rows: the weight
+/// may have no other copy.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn gemv(
     gpu: &dyn GpuBackend,
@@ -277,6 +283,7 @@ pub(super) fn gemv(
     n: u32,
     k: u32,
     stream: u64,
+    tc: bool,
 ) -> Result<()> {
     if !(1..=NV4_ROWS_MAX).contains(&(m as usize)) {
         bail!(
@@ -284,7 +291,22 @@ pub(super) fn gemv(
              row bound (nv4::block_rows_max) was violated"
         );
     }
-    dense_fp8::nv4_gemv_cuda_core(gpu, a, q, c, m as usize, n as usize, k as usize, stream)
+    let (m, n, k) = (m as usize, n as usize, k as usize);
+    if tc {
+        dense_fp8::nv4_gemv_tensor_core(gpu, a, q, c, m, n, k, stream)
+    } else {
+        dense_fp8::nv4_gemv_cuda_core(gpu, a, q, c, m, n, k, stream)
+    }
+}
+
+/// 2026-10-12: The `[n, k]` shapes `METRALE_DFLASH_NV4_TC` would read with the tensor-core
+/// route that fail its depth rule (`K % 128 == 0`), as `name [n x k]`.
+pub(super) fn tc_k_misses(shapes: &[(&str, usize, usize)]) -> Vec<String> {
+    shapes
+        .iter()
+        .filter(|(_, _, k)| !k.is_multiple_of(128))
+        .map(|(name, n, k)| format!("{name} [{n}x{k}]"))
+        .collect()
 }
 
 /// 2026-10-12: Megabytes, for the log lines.
@@ -452,6 +474,93 @@ impl BlockDiffusionDraftHead {
         });
     }
 
+    /// 2026-10-12: Every NVFP4 copy built on this head, `(name, n, k)` (layer GEMMs and conv
+    /// projections once per distinct shape).
+    fn nv4_built_shapes(&self) -> Vec<(&'static str, usize, usize)> {
+        let mut v = Vec::new();
+        if self.nv4.lm_head.is_some() {
+            v.push(("lm_head", self.vocab_size, self.hidden_size));
+        }
+        let shapes = self.nv4_layer_shapes();
+        for (i, s) in shapes.iter().enumerate() {
+            if self.layers.iter().any(|l| l.nv4.gemms()[i].is_some()) {
+                v.push((s.name, s.n, s.k));
+            }
+        }
+        for s in super::aux_fp8::aux_shapes(self.aux_geom()) {
+            let built = match s.name {
+                "attention_conv_proj" => self
+                    .layers
+                    .iter()
+                    .any(|l| l.nv4.attention_conv_proj.is_some()),
+                "mlp_conv_proj" => self.layers.iter().any(|l| l.nv4.mlp_conv_proj.is_some()),
+                "fc" => self.nv4.fc.is_some(),
+                "fused_kv" => self.nv4.fused_kv.is_some(),
+                _ => self.nv4.selector_hidden_proj.is_some(),
+            };
+            if built {
+                v.push((s.name, s.n, s.k));
+            }
+        }
+        v
+    }
+
+    /// 2026-10-12: `METRALE_DFLASH_NV4_TC=1`: route every NVFP4 copy to the tensor-core kernels
+    /// when each copy's shape passes the route (`K % 128 == 0`, checked per shape, and
+    /// `dense_nv4_tc::explicit_route` at this head's widest block); logs ENGAGED once per rank,
+    /// or NOT ENGAGED with the reason (the CUDA-core tiers stay). Runs after every NVFP4 arm.
+    pub(super) fn arm_nv4_tc(&mut self, gpu: &dyn GpuBackend) {
+        if !self.levers.nv4_tc {
+            return;
+        }
+        let shapes = self.nv4_built_shapes();
+        let rows = self.nv4_rows_max();
+        let reason = if shapes.is_empty() {
+            Some(
+                "no NVFP4 drafter copies were built (needs METRALE_DFLASH_NV4_HEAD, _NV4_LAYERS \
+                 or _NV4_AUX engaged)"
+                    .to_string(),
+            )
+        } else {
+            let misses = tc_k_misses(&shapes);
+            if !misses.is_empty() {
+                Some(format!("K % 128 != 0 on {}", misses.join(", ")))
+            } else if let Some((name, n, k)) = shapes.iter().find(|(_, n, k)| {
+                !(crate::glm5next_layer::dense_nv4_tc::explicit_route(gpu, 1, *n, *k)
+                    && crate::glm5next_layer::dense_nv4_tc::explicit_route(gpu, rows, *n, *k))
+            }) {
+                Some(format!(
+                    "the tensor-core route declines {name} [{n}x{k}] at 1..={rows} rows \
+                     (w4a16_gemv_tc8/tc16 missing from this image, or METRALE_NO_W4A16_TC set)"
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(r) = reason {
+            tracing::warn!(
+                "METRALE_DFLASH_NV4_TC=1: NOT ENGAGED: {r}; NVFP4 drafter copies stay on the \
+                 CUDA-core w4a16_gemv tiers"
+            );
+            return;
+        }
+        self.nv4.tc = true;
+        let rank = self.tp.as_ref().map_or(0, |t| t.rank());
+        let list: Vec<String> = shapes
+            .iter()
+            .map(|(name, n, k)| format!("{name} [{n}x{k}]"))
+            .collect();
+        TC_LOG.call_once(|| {
+            tracing::warn!(
+                "METRALE_DFLASH_NV4_TC=1: ENGAGED (rank {rank}: NVFP4 drafter GEMVs on \
+                 w4a16_gemv_tc8 (<= 8 rows) / tc16 (<= 16), up to {rows} rows; K % 128 checked \
+                 on {}; same NVFP4 copies, no repack; not byte-identical to the CUDA-core tiers; \
+                 drafts only)",
+                list.join(", ")
+            );
+        });
+    }
+
     /// 2026-10-12: [`layer_shapes`] of this head (local dims, TP2 slices from the plan).
     pub(super) fn nv4_layer_shapes(&self) -> [Nv4Shape; 7] {
         let dims = (
@@ -514,6 +623,26 @@ mod tests {
         let s = layer_shapes((4096, 4096, 1024, 12288), None, None);
         assert_eq!(s[3], Nv4Shape::rows("o", 4096, 4096));
         assert_eq!(s[6], Nv4Shape::rows("down", 4096, 12288));
+    }
+
+    /// 2026-10-12: Every GLM-5.3 TP2 drafter depth passes the tensor-core rule (K % 128).
+    #[test]
+    fn tc_depth_rule_per_shape() {
+        let s = layer_shapes(
+            (4096, 2048, 512, 6144),
+            Some((4096, (2048, 2048))),
+            Some((12288, (6144, 6144))),
+        );
+        let mut all: Vec<(&str, usize, usize)> = s.iter().map(|x| (x.name, x.n, x.k)).collect();
+        all.extend([
+            ("lm_head", 77440, 4096),
+            ("conv", 1024, 4096),
+            ("fc", 2048, 20480),
+            ("fused_kv", 5120, 4096),
+            ("selector", 256, 4096),
+        ]);
+        assert!(tc_k_misses(&all).is_empty());
+        assert_eq!(tc_k_misses(&[("x", 8, 4112)]), ["x [8x4112]"]);
     }
 
     #[test]

@@ -319,7 +319,7 @@ impl BlockDiffusionDraftHead {
         if let Some(q) = nv4
             && nv4_takes(true, fp8.is_some(), bf16_kept, m)?
         {
-            return super::nv4::gemv(gpu, input, q, output, m, n, k, stream);
+            return super::nv4::gemv(gpu, input, q, output, m, n, k, stream, self.nv4.tc);
         }
         let kernels = (
             self.kernels.fp8_gemv_rt2.0 != 0,

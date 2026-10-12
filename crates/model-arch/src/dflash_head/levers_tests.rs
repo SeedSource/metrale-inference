@@ -44,7 +44,7 @@ fn defaults_are_spelled_out_not_derived() {
 fn every_opt_in_is_off_until_it_is_exactly_one() {
     // 2026-09-25: `=1` arms and no other spelling does. One row per field, so
     // a field read from the wrong variable fails its own row.
-    let cases: [(&str, fn(&DFlashLevers) -> bool); 22] = [
+    let cases: [(&str, fn(&DFlashLevers) -> bool); 23] = [
         ("METRALE_DFLASH_DEBUG_DUMP", |l| l.debug_dump),
         ("METRALE_DFLASH_DEBUG_DUMP_FULL", |l| l.debug_dump_full),
         ("METRALE_DFLASH_LOG_DRAFTS", |l| l.log_drafts),
@@ -69,6 +69,7 @@ fn every_opt_in_is_off_until_it_is_exactly_one() {
         ("METRALE_DFLASH_NV4_HEAD", |l| l.nv4_head),
         ("METRALE_DFLASH_NV4_LAYERS", |l| l.nv4_layers),
         ("METRALE_DFLASH_NV4_AUX", |l| l.nv4_aux),
+        ("METRALE_DFLASH_NV4_TC", |l| l.nv4_tc),
     ];
     for (var, read) in cases {
         assert!(!read(&resolve(&[])), "{var} armed with nothing set");
@@ -235,6 +236,7 @@ fn the_nv4_levers_are_declared() {
         "METRALE_DFLASH_NV4_HEAD",
         "METRALE_DFLASH_NV4_LAYERS",
         "METRALE_DFLASH_NV4_AUX",
+        "METRALE_DFLASH_NV4_TC",
     ];
     assert!(metrale_config::levers::undeclared(keys).is_empty());
     let src = include_str!("levers.rs");

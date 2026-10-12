@@ -142,6 +142,47 @@ pub fn try_launch(
             std::env::var("METRALE_GLM_NV4_TC").unwrap_or_default()
         );
     });
+    launch_tc(gpu, (h, grid_x), a, q, c, (m, n, k), stream)?;
+    Ok(true)
+}
+
+/// 2026-10-12: [`try_launch`] without the lever and its scope: the tensor-core kernel takes the
+/// launch whenever the route takes the shape (`gemv_tc::tc_kernel`: 1..=16 rows, `K % 128 == 0`,
+/// kernels present, `METRALE_NO_W4A16_TC` unset). For callers that choose the route themselves
+/// (the DFlash drafter, `METRALE_DFLASH_NV4_TC`). `Ok(false)` when the route declines.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_explicit(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<bool> {
+    let Some(hk) = gemv_tc::tc_kernel(gpu, m as u32, n as u32, k as u32) else {
+        return Ok(false);
+    };
+    launch_tc(gpu, hk, a, q, c, (m, n, k), stream)?;
+    Ok(true)
+}
+
+/// 2026-10-12: Whether [`launch_explicit`] would take an `m`-row `[n, k]` launch now.
+pub fn explicit_route(gpu: &dyn GpuBackend, m: usize, n: usize, k: usize) -> bool {
+    gemv_tc::tc_kernel(gpu, m as u32, n as u32, k as u32).is_some()
+}
+
+/// 2026-10-12: The tensor-core launch [`try_launch`] and [`launch_explicit`] share.
+fn launch_tc(
+    gpu: &dyn GpuBackend,
+    (h, grid_x): (metrale_gpu_runtime::gpu::KernelHandle, u32),
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    (m, n, k): (usize, usize, usize),
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, h)
         .grid([grid_x, 1, 1])
         .block([gemv_tc::TC_BLOCK, 1, 1])
@@ -153,8 +194,7 @@ pub fn try_launch(
         .arg_u32(m as u32)
         .arg_u32(n as u32)
         .arg_u32(k as u32)
-        .launch(stream)?;
-    Ok(true)
+        .launch(stream)
 }
 
 #[cfg(test)]

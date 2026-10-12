@@ -484,6 +484,8 @@ impl BlockDiffusionDraftHead {
         head.arm_aux_fp8(gpu)?;
         // 2026-10-12: METRALE_DFLASH_NV4_* ENGAGED / NOT ENGAGED lines (copies built above).
         head.report_nv4();
+        // 2026-10-12: METRALE_DFLASH_NV4_TC: the tensor-core route for the copies above.
+        head.arm_nv4_tc(gpu);
         head.arm_draft_gemv(gpu);
         head.tp_validate()?;
         head.log_tp_graphs_lever();

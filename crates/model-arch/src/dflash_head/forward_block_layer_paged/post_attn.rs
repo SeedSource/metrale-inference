@@ -85,7 +85,17 @@ impl BlockDiffusionDraftHead {
             // 2026-10-12: METRALE_DFLASH_NV4_LAYERS (`nv4.rs`): the NVFP4 copy when built (its
             // FP8 mirror was not), on the CUDA-core tiers.
             if let Some(q) = w_nv4 {
-                return crate::dflash_head::nv4::gemv(gpu, src, q, dst, g, n_out, k_in, stream);
+                return crate::dflash_head::nv4::gemv(
+                    gpu,
+                    src,
+                    q,
+                    dst,
+                    g,
+                    n_out,
+                    k_in,
+                    stream,
+                    self.nv4.tc,
+                );
             }
             if use_fp8 && let Some(fp8) = w_fp8 {
                 if self.kernels.fp8_gemv_rt2.0 != 0

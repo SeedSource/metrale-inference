@@ -97,6 +97,7 @@ impl BlockDiffusionDraftHead {
                 self.vocab_size as u32,
                 h_local,
                 stream,
+                self.nv4.tc,
             )?;
         } else if lm_head_fp8 {
             if let Some(fp8) = self.lm_head_shared_fp8.as_ref() {

@@ -108,6 +108,9 @@ pub struct DFlashLevers {
     /// ctx K/V and the selector's hidden projection as NVFP4 copies in place of the
     /// `METRALE_DFLASH_AUX_FP8` mirrors, up to 16 rows (`nv4.rs`, `aux_fp8.rs`).
     pub nv4_aux: bool,
+    /// 2026-10-12: `METRALE_DFLASH_NV4_TC=1`: the NVFP4 copies the three levers above build are
+    /// read by the tensor-core `w4a16_gemv_tc8/tc16` instead of the CUDA-core tiers (`nv4.rs`).
+    pub nv4_tc: bool,
 
     /// 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: after a single-sequence DFlash2 propose, read
     /// the selector's top-16 logits back (one blocking D2H) for the verify step's
@@ -217,6 +220,7 @@ fn from_values(
         nv4_head: opt_in(value("METRALE_DFLASH_NV4_HEAD").as_deref()),
         nv4_layers: opt_in(value("METRALE_DFLASH_NV4_LAYERS").as_deref()),
         nv4_aux: opt_in(value("METRALE_DFLASH_NV4_AUX").as_deref()),
+        nv4_tc: opt_in(value("METRALE_DFLASH_NV4_TC").as_deref()),
 
         conf_log: opt_in(value("METRALE_DFLASH_CONF_LOG").as_deref()),
         dflash_conf_tau: parse_conf_tau(value("METRALE_DFLASH_CONF_TAU").as_deref()),

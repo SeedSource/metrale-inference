@@ -1,29 +1,32 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 2026-10-12: Gate for `METRALE_DFLASH_NV4_HEAD` / `METRALE_DFLASH_NV4_LAYERS`: the DFlash2
-//! drafter's per-rank GEMMs (GLM-5.3, `METRALE_DFLASH_DRAFT_TP2`, gamma 8) on their NVFP4 copy
-//! (`dense_fp8::quantize_nvfp4_copy` + `dense_fp8::nv4_gemv_cuda_core`, the levers' path) against
-//! today's FP8 row-scaled copy (`quantize_bf16_to_fp8` + `fp8_gemv_rowscale_batch8_rt2`) and an
-//! f64 host reference over the BF16 weights. Design reference only: no code copied or ported
-//! from TensorFold/Mia (Apache-2.0); kernels are Metrale's own head_nv4 / nv4_gemv_uncounted.
+//! 2026-10-12: Gate for `METRALE_DFLASH_NV4_HEAD` / `METRALE_DFLASH_NV4_LAYERS` (and
+//! `METRALE_DFLASH_NV4_TC`): the DFlash2 drafter's per-rank GEMMs (GLM-5.3,
+//! `METRALE_DFLASH_DRAFT_TP2`, gamma 8) on three routes: today's FP8 row-scaled copy
+//! (`quantize_bf16_to_fp8` + `fp8_gemv_rowscale_batch8_rt2`), the NVFP4 copy
+//! (`dense_fp8::quantize_nvfp4_copy`) on the CUDA-core tiers (`dense_fp8::nv4_gemv_cuda_core`,
+//! "NVFP4-cc") and the same copy on the tensor-core `w4a16_gemv_tc8/tc16`
+//! (`dense_fp8::nv4_gemv_tensor_core`, "NVFP4-tc", `METRALE_DFLASH_NV4_TC`), against an f64 host
+//! reference over the BF16 weights. Design reference only: no code copied or ported from
+//! TensorFold/Mia (Apache-2.0); kernels are Metrale's own head_nv4 / nv4_gemv_uncounted.
 //!
 //! Owner: model-arch examples (DFlash drafter).
 //! Checks, per shape (lm_head shard [77440, 4096]; per layer q [2048, 4096], k / v
 //! [512, 4096], o [4096, 2048] (row-parallel slice), gate / up [6144, 4096], down
 //! [4096, 6144] (row-parallel slice)), Gaussian weights (std 0.02) and N(0, 1) activations:
-//! - `ACC`: at M in {1, 2, 4, 8}, NVFP4 and FP8 against the host reference on up to 1024
-//!   sampled output columns (every row): max relative error (max |err| / max |ref|) and cosine.
-//! - `BITWISE-ROWINV`: every row of the NVFP4 M = 8 launch equals, bit for bit, the M = 1 launch
-//!   on that row and the same row of the M = 2 and M = 4 launches.
+//! - `ACC`: at M in {1, 2, 4, 8}, each route against the host reference on up to 1024 sampled
+//!   output columns (every row): max relative error (max |err| / max |ref|) and cosine.
+//! - `BITWISE-ROWINV <route>`: for NVFP4-cc and NVFP4-tc, every row of the M = 8 launch equals,
+//!   bit for bit, the M = 1 launch on that row and the same row of the M = 2 and M = 4 launches.
+//!   Information only (the drafter path is acceptance-only): printed honestly, not gated.
 //! - `TIME`: cold L2 (a 72 MiB read-only flush before each launch), CUDA events around one
-//!   launch, median of 60 (5 warm-ups dropped), FP8 and NVFP4 interleaved, M = 8: ms and GB/s
+//!   launch, median of 60 (5 warm-ups dropped), the three routes interleaved, M = 8: ms and GB/s
 //!   over the weight bytes the launch reads (FP8: 1 B/weight + 4 B/row; NVFP4: 0.5625 B/weight).
 //!   A `VOID` line when a rate exceeds 255 GB/s (above the GB10 measured max: L2 was not cold).
-//! - `ROUND`: the per-propose-round sum (head x1 + each layer GEMM x5), FP8 vs NVFP4.
-//! - Final line `PASS dflash_nv4 (...)` when every shape is ROWINV PASS, NVFP4 cosine >= 0.98 at
-//!   every M (sanity bound: a broken copy, not the acceptance gate, which is the serve),
-//!   NVFP4 is faster in the round sum and no timing is VOID; else `FAIL dflash_nv4 (...)`
-//!   (exit 1), or exit 2 when a kernel is missing.
+//! - `ROUND <route>`: the per-propose-round sum (head x1 + each layer GEMM x5) per route.
+//! - Final line `PASS dflash_nv4 (winner <route>, ...)` when the round saving FP8 - best NVFP4
+//!   route is >= 0.8 ms, that route's cosine is >= 0.98 at every M and shape, and no timing is
+//!   VOID; else `FAIL dflash_nv4 (...)` (exit 1), or exit 2 when a kernel is missing.
 //!
 //! Run (GB10, under a lane lock):
 //!   METRALE_TARGET_HW=gb10 METRALE_TARGET_MODEL=glm-5.3-flash METRALE_TARGET_QUANT=nvfp4 \
@@ -55,6 +58,10 @@ const M_TIME: usize = 8;
 const SAMPLE_COLS: usize = 1024;
 const COS_MIN: f64 = 0.98;
 const GBS_VOID: f64 = 255.0;
+/// Round saving (FP8 - best NVFP4 route, ms) the gate needs (race-lead 2026-10-12).
+const SAVING_MIN_MS: f64 = 0.8;
+/// The routes, in column order.
+const ROUTES: [&str; 3] = ["FP8", "NVFP4-cc", "NVFP4-tc"];
 
 // CUDA driver event API, declared as in `glm5next_moe_gateup_m3_staged_microtest/timing.rs`.
 unsafe extern "C" {
@@ -270,12 +277,12 @@ struct Kernels {
     rt2_8: KernelHandle,
 }
 
-/// One shape's outcome: row-invariance, worst NVFP4 cosine, (FP8, NVFP4) cold ms at M = 8,
-/// and whether a rate was VOID.
+/// One shape's outcome per route ([`ROUTES`] order): row-invariance (FP8 not tested: `true`),
+/// worst cosine, cold ms at M = 8; and whether a rate was VOID.
 struct ShapeOut {
-    rowinv: bool,
-    nv4_cos_min: f64,
-    ms: (f64, f64),
+    rowinv: [bool; 3],
+    cos_min: [f64; 3],
+    ms: [f64; 3],
     void: bool,
 }
 
@@ -299,13 +306,17 @@ fn run_shape(
     else {
         bail!("{label}: quantize_nvfp4_copy built nothing (NVFP4 kernels missing?)");
     };
+    if !kk.is_multiple_of(128) {
+        bail!("{label}: K {kk} % 128 != 0, the tensor-core route cannot take it");
+    }
     let mmax = *MS.iter().max().expect("MS");
     let ah: Vec<bf16> = (0..mmax * kk)
         .map(|_| bf16::from_f32(rng.normal()))
         .collect();
     let a = up(g, &ah)?;
-    let c8 = g.alloc(mmax * n * 2)?;
-    let c4 = g.alloc(mmax * n * 2)?;
+    let outs: Vec<DevicePtr> = (0..ROUTES.len())
+        .map(|_| g.alloc(mmax * n * 2))
+        .collect::<Result<_>>()?;
     let cols: Vec<usize> = if n <= SAMPLE_COLS {
         (0..n).collect()
     } else {
@@ -331,91 +342,105 @@ fn run_shape(
             .flat_map(|t| cols.iter().map(move |&col| v[t * n + col]))
             .collect()
     };
-    let fp8 = |m: usize, a: DevicePtr, c: DevicePtr, s: u64| {
-        ops::fp8_gemv_rowscale_batch8_rt2(g, k.rt2_8, a, &w8, c, m as u32, n as u32, kk as u32, s)
+    let launch = |route: usize, m: usize, a: DevicePtr, c: DevicePtr, s: u64| match route {
+        0 => ops::fp8_gemv_rowscale_batch8_rt2(
+            g, k.rt2_8, a, &w8, c, m as u32, n as u32, kk as u32, s,
+        ),
+        1 => dense_fp8::nv4_gemv_cuda_core(g, a, &q, c, m, n, kk, s),
+        _ => dense_fp8::nv4_gemv_tensor_core(g, a, &q, c, m, n, kk, s),
     };
-    let nv4 = |m: usize, a: DevicePtr, c: DevicePtr, s: u64| {
-        dense_fp8::nv4_gemv_cuda_core(g, a, &q, c, m, n, kk, s)
-    };
-    let mut nv4_cos_min = f64::INFINITY;
-    let mut rows_by_m: Vec<(usize, Vec<u16>)> = Vec::new();
+    let mut cos_min = [f64::INFINITY; 3];
+    // Per route, the output bits at each M.
+    let mut rows_by_m: Vec<Vec<(usize, Vec<u16>)>> = vec![Vec::new(); ROUTES.len()];
     for &m in MS {
-        fp8(m, a, c8, s)?;
-        nv4(m, a, c4, s)?;
-        g.synchronize(s)?;
-        let (h8, h4) = (bits(g, c8, m * n)?, bits(g, c4, m * n)?);
-        let w_m = &want[..m * cols.len()];
-        let (r8, cos8) = rel_cos(&pick(&to_f64(&h8), m), w_m);
-        let (r4, cos4) = rel_cos(&pick(&to_f64(&h4), m), w_m);
-        nv4_cos_min = nv4_cos_min.min(cos4);
+        let mut line = Vec::new();
+        for (route, &c) in outs.iter().enumerate() {
+            launch(route, m, a, c, s)?;
+            g.synchronize(s)?;
+            let h = bits(g, c, m * n)?;
+            let (r, cos) = rel_cos(&pick(&to_f64(&h), m), &want[..m * cols.len()]);
+            cos_min[route] = cos_min[route].min(cos);
+            line.push(format!("{} max_rel {r:.3e} cos {cos:.6}", ROUTES[route]));
+            rows_by_m[route].push((m, h));
+        }
         println!(
-            "ACC {label:<8} [{n}x{kk}] M={m}: NVFP4 max_rel {r4:.3e} cos {cos4:.6} | FP8 max_rel \
-             {r8:.3e} cos {cos8:.6} | vs BF16 host ref, {} cols",
+            "ACC {label:<8} [{n}x{kk}] M={m}: {} | vs BF16 host ref, {} cols",
+            line.join(" | "),
             cols.len()
         );
-        rows_by_m.push((m, h4));
     }
-    // Row invariance: M = 1 per row, and the M = 2 / 4 rows, against the M = 8 launch.
-    let full = &rows_by_m.last().expect("MS").1;
-    let mut mism = 0usize;
-    for r in 0..mmax {
-        nv4(1, a.offset(r * kk * 2), c4, s)?;
-        g.synchronize(s)?;
-        let one = bits(g, c4, n)?;
-        mism += usize::from(one[..] != full[r * n..(r + 1) * n]);
-    }
-    for (m, h) in &rows_by_m {
-        for r in 0..*m {
-            mism += usize::from(h[r * n..(r + 1) * n] != full[r * n..(r + 1) * n]);
+    // Row invariance per NVFP4 route: M = 1 per row, and the M = 2 / 4 rows, against M = 8.
+    let mut rowinv = [true; 3];
+    for route in 1..ROUTES.len() {
+        let full = &rows_by_m[route].last().expect("MS").1;
+        let c = outs[route];
+        let mut mism = 0usize;
+        for r in 0..mmax {
+            launch(route, 1, a.offset(r * kk * 2), c, s)?;
+            g.synchronize(s)?;
+            let one = bits(g, c, n)?;
+            mism += usize::from(one[..] != full[r * n..(r + 1) * n]);
         }
+        for (m, h) in &rows_by_m[route] {
+            for r in 0..*m {
+                mism += usize::from(h[r * n..(r + 1) * n] != full[r * n..(r + 1) * n]);
+            }
+        }
+        rowinv[route] = mism == 0;
+        println!(
+            "BITWISE-ROWINV {} {label:<8} [{n}x{kk}] {} ({mism} row mismatches; M=1 x{mmax} rows \
+             and M=1,2,4 prefixes vs M={mmax}; information only)",
+            ROUTES[route],
+            if rowinv[route] { "PASS" } else { "FAIL" }
+        );
     }
-    let rowinv = mism == 0;
-    println!(
-        "BITWISE-ROWINV {label:<8} [{n}x{kk}] {} ({mism} row mismatches; M=1 x{mmax} rows and \
-         M=1,2,4 prefixes vs M={mmax})",
-        if rowinv { "PASS" } else { "FAIL" }
-    );
-    // Cold-L2 timing at M = 8.
-    let arm8 = |st: u64| fp8(M_TIME, a, c8, st);
-    let arm4 = |st: u64| nv4(M_TIME, a, c4, st);
-    let t = time_cold(g, ev, fl, s, &[&arm8, &arm4])?;
-    let (ms8, ms4) = (t[0] / 1e3, t[1] / 1e3);
-    let gbs = |b: usize, ms: f64| b as f64 / (ms * 1e-3) / 1e9;
-    let (g8, g4) = (gbs(fp8_bytes(n, kk), ms8), gbs(nv4_bytes(n, kk), ms4));
-    println!(
-        "TIME {label:<8} [{n}x{kk}] M={M_TIME} cold-L2 median of {REPS}: FP8 {ms8:.4} ms \
-         {g8:.1} GB/s ({:.1} MB) | NVFP4 {ms4:.4} ms {g4:.1} GB/s ({:.1} MB) | NVFP4/FP8 {:.3}x \
-         time",
-        fp8_bytes(n, kk) as f64 / 1e6,
-        nv4_bytes(n, kk) as f64 / 1e6,
-        ms4 / ms8
-    );
+    // Cold-L2 timing at M = 8, the three routes interleaved.
+    let arm0 = |st: u64| launch(0, M_TIME, a, outs[0], st);
+    let arm1 = |st: u64| launch(1, M_TIME, a, outs[1], st);
+    let arm2 = |st: u64| launch(2, M_TIME, a, outs[2], st);
+    let t = time_cold(g, ev, fl, s, &[&arm0, &arm1, &arm2])?;
+    let ms = [t[0] / 1e3, t[1] / 1e3, t[2] / 1e3];
+    let bytes = [fp8_bytes(n, kk), nv4_bytes(n, kk), nv4_bytes(n, kk)];
     let mut void = false;
-    for (arm, rate) in [("FP8", g8), ("NVFP4", g4)] {
+    let mut line = Vec::new();
+    for route in 0..ROUTES.len() {
+        let rate = bytes[route] as f64 / (ms[route] * 1e-3) / 1e9;
+        line.push(format!(
+            "{} {:.4} ms {rate:.1} GB/s ({:.1} MB)",
+            ROUTES[route],
+            ms[route],
+            bytes[route] as f64 / 1e6
+        ));
         if rate > GBS_VOID {
             void = true;
             println!(
-                "VOID {label} {arm} {rate:.1} GB/s > {GBS_VOID} (above the GB10 measured max: \
-                 L2 not cold, timing not valid)"
+                "VOID {label} {} {rate:.1} GB/s > {GBS_VOID} (above the GB10 measured max: \
+                 L2 not cold, timing not valid)",
+                ROUTES[route]
             );
         }
     }
-    for p in [
+    println!(
+        "TIME {label:<8} [{n}x{kk}] M={M_TIME} cold-L2 median of {REPS}: {} | cc/FP8 {:.3}x \
+         tc/FP8 {:.3}x time",
+        line.join(" | "),
+        ms[1] / ms[0],
+        ms[2] / ms[0]
+    );
+    for p in outs.iter().copied().chain([
         a,
-        c8,
-        c4,
         w.weight,
         w8.weight,
         w8.row_scale,
         q.weight,
         q.weight_scale,
-    ] {
+    ]) {
         g.free(p)?;
     }
     Ok(ShapeOut {
         rowinv,
-        nv4_cos_min,
-        ms: (ms8, ms4),
+        cos_min,
+        ms,
         void,
     })
 }
@@ -429,6 +454,8 @@ fn run() -> Result<i32> {
         ("w4a16_gemv", "w4a16_gemv"),
         ("w4a16_gemv", "w4a16_gemv_batch8"),
         ("quantize_nvfp4", "quantize_bf16_to_nvfp4_mse"),
+        ("w4a16_gemv_tc", "w4a16_gemv_tc8"),
+        ("w4a16_gemv_tc", "w4a16_gemv_tc16"),
     ];
     let mut hs = Vec::new();
     for (module, name) in names {
@@ -450,41 +477,57 @@ fn run() -> Result<i32> {
     };
     let (ev, fl) = (Events::new()?, Flush::new(g)?);
     let mut rng = Rng(0x0064_666e_7634_0001);
-    let (mut rowinv_fail, mut cos_fail, mut voids) = (Vec::new(), Vec::new(), 0usize);
-    let (mut round8, mut round4) = (0f64, 0f64);
+    let mut rowinv_fail: [Vec<&str>; 3] = Default::default();
+    let mut cos_fail: [Vec<&str>; 3] = Default::default();
+    let (mut voids, mut round) = (0usize, [0f64; 3]);
     for &(label, n, kk, count) in SHAPES {
         let o = run_shape(g, &k, &mut rng, (label, n, kk), (&ev, &fl))?;
-        if !o.rowinv {
-            rowinv_fail.push(label);
-        }
-        if o.nv4_cos_min < COS_MIN {
-            cos_fail.push(label);
+        for route in 0..ROUTES.len() {
+            if !o.rowinv[route] {
+                rowinv_fail[route].push(label);
+            }
+            if o.cos_min[route] < COS_MIN {
+                cos_fail[route].push(label);
+            }
+            round[route] += count as f64 * o.ms[route];
         }
         voids += usize::from(o.void);
-        round8 += count as f64 * o.ms.0;
-        round4 += count as f64 * o.ms.1;
         println!(
-            "SAVING {label:<8} x{count}: {:+.4} ms per round (FP8 - NVFP4)",
-            count as f64 * (o.ms.0 - o.ms.1)
+            "SAVING {label:<8} x{count}: NVFP4-cc {:+.4} ms, NVFP4-tc {:+.4} ms per round (FP8 - \
+             route)",
+            count as f64 * (o.ms[0] - o.ms[1]),
+            count as f64 * (o.ms[0] - o.ms[2])
         );
     }
     fl.free(g)?;
-    println!(
-        "ROUND per-rank propose GEMMs at M={M_TIME} (head x1 + q,k,v,o,gate,up,down x5, cold L2): \
-         FP8 {round8:.3} ms, NVFP4 {round4:.3} ms, saving {:.3} ms (P3 desk projection 1.44-1.75 \
-         ms incl. warm-L2 effects)",
-        round8 - round4
-    );
-    let faster = round4 < round8;
-    let ok = rowinv_fail.is_empty() && cos_fail.is_empty() && faster && voids == 0;
+    for route in 0..ROUTES.len() {
+        println!(
+            "ROUND {} per-rank propose GEMMs at M={M_TIME} (head x1 + q,k,v,o,gate,up,down x5, \
+             cold L2): {:.3} ms, saving vs FP8 {:.3} ms; ROWINV fail {:?}; cos < {COS_MIN} {:?}",
+            ROUTES[route],
+            round[route],
+            round[0] - round[route],
+            rowinv_fail[route],
+            cos_fail[route]
+        );
+    }
+    let best = if round[2] < round[1] { 2 } else { 1 };
+    let saving = round[0] - round[best];
+    let ok = saving >= SAVING_MIN_MS && cos_fail[best].is_empty() && voids == 0;
     let summary = format!(
-        "{} shapes x M {:?}; ROWINV fail {:?}; NVFP4 cos < {COS_MIN} {:?}; round FP8 {round8:.3} \
-         -> NVFP4 {round4:.3} ms, saving {:.3} ms; VOID timings {voids}",
+        "winner {}: round FP8 {:.3} -> {:.3} ms, saving {saving:.3} ms (need >= {SAVING_MIN_MS}); \
+         NVFP4-cc {:.3} ms, NVFP4-tc {:.3} ms; winner cos < {COS_MIN} {:?}; ROWINV fail cc {:?} \
+         tc {:?} (info); VOID timings {voids}; {} shapes x M {:?}",
+        ROUTES[best],
+        round[0],
+        round[best],
+        round[1],
+        round[2],
+        cos_fail[best],
+        rowinv_fail[1],
+        rowinv_fail[2],
         SHAPES.len(),
-        MS,
-        rowinv_fail,
-        cos_fail,
-        round8 - round4
+        MS
     );
     if ok {
         println!("PASS dflash_nv4 ({summary})");

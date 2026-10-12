@@ -1085,6 +1085,30 @@ pub fn nv4_gemv_cuda_core(
     nv4_gemv_tiers(gpu, a, q, c, (m, n, k), stream, false)
 }
 
+/// 2026-10-12: The tensor-core NVFP4 GEMV (`w4a16_gemv_tc8` up to 8 rows, `tc16` up to 16) on
+/// the same NVFP4 copy the CUDA-core tiers read (the `.cu` permutes K in registers, so the
+/// `[n, k/2]` E2M1 + `[n, k/16]` E4M3 layout needs no repack), chosen by the caller
+/// (`METRALE_DFLASH_NV4_TC`) regardless of `METRALE_GLM_NV4_TC`. Errors when the route declines
+/// (`K % 128 != 0`, rows outside 1..=16, kernels missing, `METRALE_NO_W4A16_TC`): the caller
+/// checked the route at load (`dense_nv4_tc::explicit_route`). NOT byte-identical to the
+/// CUDA-core tiers. Capture-safe.
+#[allow(clippy::too_many_arguments)]
+pub fn nv4_gemv_tensor_core(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    if !super::dense_nv4_tc::launch_explicit(gpu, a, q, c, m, n, k, stream)? {
+        bail!("NVFP4 tensor-core GEMV declined {m} rows of {n}x{k} (K % 128, rows, kernels)");
+    }
+    Ok(())
+}
+
 /// 2026-10-12: The body of [`nv4_gemv_uncounted`] (`target_levers`: the tensor-core and
 /// batchm-staged levers may take the launch) and [`nv4_gemv_cuda_core`] (they may not).
 fn nv4_gemv_tiers(

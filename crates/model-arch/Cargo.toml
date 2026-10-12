@@ -57,6 +57,10 @@ name = "pdl_chain_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_nv4_group_ceiling_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_dense_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
 

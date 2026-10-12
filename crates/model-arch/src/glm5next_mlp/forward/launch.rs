@@ -433,6 +433,22 @@ pub(super) fn router_logits(
     stream: u64,
 ) -> Result<()> {
     let (bm, m) = router_batchm(gpu, n);
+    if m == n
+        && n >= 2
+        && let Some((h, y)) = router_ysplit(gpu, bm, n)
+    {
+        return KernelLaunch::new(gpu, h)
+            .grid([div_ceil(experts as u32, 4), y, 1])
+            .block([256, 1, 1])
+            .arg_ptr(x)
+            .arg_ptr(router)
+            .arg_ptr(logits)
+            .arg_u32(n as u32)
+            .arg_u32(experts as u32)
+            .arg_u32(hidden as u32)
+            .arg_u32(experts as u32)
+            .launch(stream);
+    }
     for r in (0..n).step_by(m) {
         gemm(
             gpu,
@@ -449,6 +465,65 @@ pub(super) fn router_logits(
         )?;
     }
     Ok(())
+}
+
+/// 2026-10-12: Parsed `METRALE_GLM_ROUTER_YSPLIT`: `(pf, y)` with `y` = 0 for "one row per block
+/// row" (`rows`). `None` = off (unset, empty, `0`, or unparsable).
+pub(super) fn parse_router_ysplit(raw: Option<&str>) -> Option<(bool, u32)> {
+    let v = raw?.trim();
+    let (pf, rest) = match v.strip_prefix("pf") {
+        Some(r) => (true, r),
+        None => (false, v),
+    };
+    match rest {
+        "rows" => Some((pf, 0)),
+        "" if pf => Some((true, 1)),
+        _ => match rest.parse::<u32>() {
+            Ok(0) if !pf => None,
+            Ok(y) if (1..=16).contains(&y) => Some((pf, y)),
+            _ => None,
+        },
+    }
+}
+
+/// 2026-10-12: `METRALE_GLM_ROUTER_YSPLIT`: the batched router launch (see [`router_batchm`],
+/// which must be engaged) gets `gridDim.y = y` (rows split over block rows, each row's
+/// arithmetic unchanged, so bit-identical), and `pf` selects the software-pipelined twin
+/// `dense_gemv_bf16_fp32out_batchm_pf`. Returns the kernel and `y` for `rows` rows, or `None`
+/// (lever off, or the `pf` kernel missing) to keep the production launch.
+fn router_ysplit(
+    gpu: &dyn GpuBackend,
+    bm: KernelHandle,
+    rows: usize,
+) -> Option<(KernelHandle, u32)> {
+    static SPEC: OnceLock<Option<(bool, u32)>> = OnceLock::new();
+    static PF: OnceLock<KernelHandle> = OnceLock::new();
+    let (pf, y) = (*SPEC.get_or_init(|| {
+        let spec = parse_router_ysplit(std::env::var("METRALE_GLM_ROUTER_YSPLIT").ok().as_deref());
+        if let Some((pf, y)) = spec {
+            tracing::warn!(
+                "METRALE_GLM_ROUTER_YSPLIT: ENGAGED - router launch pf={pf} y={} \
+                 (0 = one row per block row), bit-identical",
+                y
+            );
+        }
+        spec
+    }))?;
+    if bm.0 == 0 {
+        return None;
+    }
+    let y = if y == 0 { rows as u32 } else { y.min(rows as u32) };
+    if !pf {
+        return Some((bm, y));
+    }
+    let h = *PF.get_or_init(|| {
+        metrale_model_layers::layers::try_kernel(
+            gpu,
+            "dense_gemv_bf16_batchm",
+            "dense_gemv_bf16_fp32out_batchm_pf",
+        )
+    });
+    (h.0 != 0).then_some((h, y))
 }
 
 /// 2026-10-08: `METRALE_GLM_MOE_ROUTER_BATCHM=1`: the router logits of 2..=16 rows run as one
@@ -510,4 +585,26 @@ pub(super) fn union_kernel(gpu: &dyn GpuBackend, default: KernelHandle) -> Kerne
         h
     });
     if h.0 != 0 { h } else { default }
+}
+
+#[cfg(test)]
+mod router_ysplit_tests {
+    use super::parse_router_ysplit as p;
+
+    /// 2026-10-12: the `METRALE_GLM_ROUTER_YSPLIT` grammar.
+    #[test]
+    fn router_ysplit_spec_parses() {
+        assert_eq!(p(None), None);
+        assert_eq!(p(Some("")), None);
+        assert_eq!(p(Some("0")), None);
+        assert_eq!(p(Some("junk")), None);
+        assert_eq!(p(Some("17")), None);
+        assert_eq!(p(Some("1")), Some((false, 1)));
+        assert_eq!(p(Some("4")), Some((false, 4)));
+        assert_eq!(p(Some("rows")), Some((false, 0)));
+        assert_eq!(p(Some("pf")), Some((true, 1)));
+        assert_eq!(p(Some("pf2")), Some((true, 2)));
+        assert_eq!(p(Some("pf0")), None);
+        assert_eq!(p(Some("pfrows")), Some((true, 0)));
+    }
 }

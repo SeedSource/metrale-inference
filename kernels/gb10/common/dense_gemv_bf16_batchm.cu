@@ -357,3 +357,181 @@ extern "C" __global__ void dense_gemv_bf16_fp32out_batchm(
         }
     }
 }
+
+// 2026-10-12: Software-pipelined twin of dense_gemv_bf16_fp32out_batchm (lever
+// METRALE_GLM_ROUTER_YSPLIT=pf[<y>]). The arithmetic is the body above token for token: the
+// same lane/kv ownership (kv = base + lane, stride 64), the same lo-then-hi add order per
+// row, the same shuffle tree, the same smem partial order, the same y-split, and --fmad=false.
+// Only the issue order of the loads differs: each thread loads the B vectors of PF_SLABS
+// consecutive slabs up front (independent of the staging barriers), and the A slab of the
+// next iteration is loaded into registers before the current slab is computed, so the
+// staging store of iteration i+1 does not wait on a global load issued after the barrier.
+// Gated by crates/model-arch/examples/glm5next_router_ysplit_microtest.rs (bitwise vs the
+// production kernel at M = 1..16).
+#define PF_SLABS 8
+#define A_PER_THREAD (MAX_M * (BLOCK_SIZE / N_PER_BLOCK) / BLOCK_SIZE)
+
+extern "C" __global__ void dense_gemv_bf16_fp32out_batchm_pf(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    float* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride
+) {
+    const unsigned int rows_per_y = (M + gridDim.y - 1) / gridDim.y;
+    const unsigned int r0 = blockIdx.y * rows_per_y;
+    if (r0 >= M) return;
+    A += (unsigned long long)r0 * K;
+    C += (unsigned long long)r0 * out_stride;
+    M = min(rows_per_y, M - r0);
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool active = (n < N);
+
+    const unsigned int m = (M > MAX_M) ? MAX_M : M;
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int t = 0; t < MAX_M; t++) acc[t] = 0.0f;
+
+    const unsigned int K_VEC = K / VEC_SIZE;
+    const uint4* B_vec = (const uint4*)(B + (unsigned long long)(active ? n : 0) * K);
+
+    __shared__ uint4 As[MAX_M][BLOCK_SIZE / N_PER_BLOCK];
+
+    // A slab registers: the staging pairs (t, l) = (idx / 64, idx % 64) of this thread for
+    // idx = threadIdx.x + q * BLOCK_SIZE, exactly the set the production staging loop visits.
+    uint4 a_next[A_PER_THREAD];
+    #pragma unroll
+    for (int q = 0; q < A_PER_THREAD; q++) a_next[q] = make_uint4(0, 0, 0, 0);
+
+    #pragma unroll
+    for (int q = 0; q < A_PER_THREAD; q++) {
+        const unsigned int idx = threadIdx.x + q * BLOCK_SIZE;
+        if (idx < m * threads_per_out) {
+            const unsigned int t = idx / threads_per_out;
+            const unsigned int l = idx % threads_per_out;
+            if (l < K_VEC) {
+                a_next[q] = ((const uint4*)(A + (unsigned long long)t * K))[l];
+            }
+        }
+    }
+
+    for (unsigned int g = 0; g < K_VEC; g += PF_SLABS * threads_per_out) {
+        uint4 b_pre[PF_SLABS];
+        #pragma unroll
+        for (int j = 0; j < PF_SLABS; j++) {
+            const unsigned int kv = g + j * threads_per_out + lane;
+            b_pre[j] = make_uint4(0, 0, 0, 0);
+            if (kv < K_VEC && active) b_pre[j] = B_vec[kv];
+        }
+
+        #pragma unroll
+        for (int j = 0; j < PF_SLABS; j++) {
+            const unsigned int base = g + j * threads_per_out;
+            if (base < K_VEC) {
+                #pragma unroll
+                for (int q = 0; q < A_PER_THREAD; q++) {
+                    const unsigned int idx = threadIdx.x + q * BLOCK_SIZE;
+                    if (idx < m * threads_per_out) {
+                        const unsigned int l = idx % threads_per_out;
+                        if (base + l < K_VEC) As[idx / threads_per_out][l] = a_next[q];
+                    }
+                }
+                __syncthreads();
+
+                // Next slab's A rows, in flight while this slab is computed.
+                const unsigned int nbase = base + threads_per_out;
+                if (nbase < K_VEC) {
+                    #pragma unroll
+                    for (int q = 0; q < A_PER_THREAD; q++) {
+                        const unsigned int idx = threadIdx.x + q * BLOCK_SIZE;
+                        if (idx < m * threads_per_out) {
+                            const unsigned int t = idx / threads_per_out;
+                            const unsigned int l = idx % threads_per_out;
+                            if (nbase + l < K_VEC) {
+                                a_next[q] = ((const uint4*)(A + (unsigned long long)t * K))[nbase + l];
+                            }
+                        }
+                    }
+                }
+
+                const unsigned int kv = base + lane;
+                if (kv < K_VEC && active) {
+                    const unsigned int b_raw[4] = {b_pre[j].x, b_pre[j].y, b_pre[j].z, b_pre[j].w};
+
+                    float bf[8];
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        __nv_bfloat16 b_lo, b_hi;
+                        *(unsigned short*)&b_lo = (unsigned short)(b_raw[i] & 0xFFFF);
+                        *(unsigned short*)&b_hi = (unsigned short)(b_raw[i] >> 16);
+                        bf[2 * i] = __bfloat162float(b_lo);
+                        bf[2 * i + 1] = __bfloat162float(b_hi);
+                    }
+
+                    for (unsigned int t = 0; t < m; t++) {
+                        uint4 a_data = As[t][lane];
+                        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+                        float a = acc[t];
+                        #pragma unroll
+                        for (int i = 0; i < 4; i++) {
+                            __nv_bfloat16 a_lo, a_hi;
+                            *(unsigned short*)&a_lo = (unsigned short)(a_raw[i] & 0xFFFF);
+                            *(unsigned short*)&a_hi = (unsigned short)(a_raw[i] >> 16);
+
+                            a += __bfloat162float(a_lo) * bf[2 * i];
+                            a += __bfloat162float(a_hi) * bf[2 * i + 1];
+                        }
+                        acc[t] = a;
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    if (active) {
+        const unsigned int tail_start = K_VEC * VEC_SIZE;
+        const __nv_bfloat16* B_row = B + (unsigned long long)n * K;
+        for (unsigned int k = tail_start + lane; k < K; k += threads_per_out) {
+            const float bfv = __bfloat162float(B_row[k]);
+            for (unsigned int t = 0; t < m; t++) {
+                acc[t] += __bfloat162float(A[(unsigned long long)t * K + k]) * bfv;
+            }
+        }
+    }
+
+    if (!active) return;
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+
+    for (unsigned int t = 0; t < m; t++) {
+        float a = acc[t];
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+        }
+        acc[t] = a;
+    }
+
+    __shared__ float smem[MAX_M][N_PER_BLOCK * 2];
+
+    if (warp_lane == 0) {
+        const unsigned int smem_idx = local_out * 2 + (lane / WARP_SIZE);
+        for (unsigned int t = 0; t < m; t++) smem[t][smem_idx] = acc[t];
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        for (unsigned int t = 0; t < m; t++) {
+            const float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
+            C[(unsigned long long)t * out_stride + n] = r;
+        }
+    }
+}

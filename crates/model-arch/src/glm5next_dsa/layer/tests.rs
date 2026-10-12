@@ -524,12 +524,17 @@ fn dsa_tiled_gemv_split_kernels_carry_the_y_split() {
     let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../kernels/gb10/common/dense_gemv_bf16_batchm.cu");
     let src = std::fs::read_to_string(&cu).expect("dense_gemv_bf16_batchm.cu readable");
-    for entry in ["dense_gemv_bf16_batchm(", "dense_gemv_bf16_fp32out_batchm("] {
+    // 2026-10-12: `_pf` is the pipelined router twin (METRALE_GLM_ROUTER_YSPLIT=pf).
+    for entry in [
+        "dense_gemv_bf16_batchm(",
+        "dense_gemv_bf16_fp32out_batchm(",
+        "dense_gemv_bf16_fp32out_batchm_pf(",
+    ] {
         let head = format!("extern \"C\" __global__ void {entry}");
         assert!(src.contains(&head), "{cu:?} lacks {entry}");
     }
     let prologue = "const unsigned int r0 = blockIdx.y * rows_per_y;";
-    assert_eq!(src.matches(prologue).count(), 2, "{cu:?}: y-split prologue per entry");
+    assert_eq!(src.matches(prologue).count(), 3, "{cu:?}: y-split prologue per entry");
     let rb = include_str!("row_batch.rs");
     assert!(rb.contains("if rows > 0 && crate::glm5next_layer::levers::dsa_gemv_split() {"));
 }

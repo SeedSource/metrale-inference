@@ -436,6 +436,9 @@ pub struct Glm5NextKdaLayer {
     pub cfg: Glm5NextKdaConfig,
     pub weights: Glm5NextKdaWeights,
     pub kernels: Glm5NextKdaKernels,
+    /// 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF`: the `o_proj` load-prefetch site, forked after
+    /// the decode front end and joined before `o_proj`; `None` (the default) does nothing.
+    pub loadpf: Option<crate::glm5next_layer::loadpf::LoadPfSite>,
 }
 
 impl Glm5NextKdaLayer {
@@ -451,6 +454,7 @@ impl Glm5NextKdaLayer {
             cfg,
             weights,
             kernels,
+            loadpf: None,
         })
     }
 
@@ -764,11 +768,15 @@ impl Glm5NextKdaLayer {
                         .arg_ptr(a_scale)
                         .arg_u32(c.head_dim as u32)
                         .arg_f32(c.rms_norm_eps)
-                        .launch(stream)
+                        .launch(stream)?;
+                    // 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF`: join right before `o_proj`.
+                    crate::glm5next_layer::loadpf::join(self.loadpf.as_ref(), gpu, stream)
                 },
             )?
         {
-            return Ok(());
+            // 2026-10-11: Closes a fork the fused path did not join (no-op otherwise), so a
+            // capture never ends with an unjoined branch.
+            return crate::glm5next_layer::loadpf::join(self.loadpf.as_ref(), gpu, stream);
         }
         KernelLaunch::new(gpu, o_norm)
             .grid([(t * c.heads) as u32, 1, 1])
@@ -780,6 +788,9 @@ impl Glm5NextKdaLayer {
             .arg_u32(c.head_dim as u32)
             .arg_f32(c.rms_norm_eps)
             .launch(stream)?;
+        // 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF`: the main stream waits for the `o_proj`
+        // load-prefetch forked after the front end (no-op when none is pending).
+        crate::glm5next_layer::loadpf::join(self.loadpf.as_ref(), gpu, stream)?;
         self.gemm(
             gpu,
             ws.o_norm_out,

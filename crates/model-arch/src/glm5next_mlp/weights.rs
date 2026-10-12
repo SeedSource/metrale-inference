@@ -89,4 +89,8 @@ pub struct Glm5NextMoeWeights {
     /// 2026-09-25: Global-id-indexed pointer tables over the same experts, for the
     /// device-dispatched forward. Null entries mark remote ids.
     pub ptrs: Glm5NextMoePtrTables,
+    /// 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF_SHARED`: the shared-expert gate/up
+    /// load-prefetch site, forked after the router top-k and joined before the shared GEMVs;
+    /// `None` (the default) does nothing.
+    pub loadpf_shared: Option<crate::glm5next_layer::loadpf::LoadPfSite>,
 }

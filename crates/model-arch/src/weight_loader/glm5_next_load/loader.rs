@@ -516,6 +516,8 @@ impl Glm5NextWeightLoader {
         );
         let mut built: Vec<(Glm5NextLayer, Vec<crate::glm5next_layer::L2Span>)> =
             Vec::with_capacity(skeleton.layers.len());
+        // 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF`: side streams and events, created once.
+        let mut loadpf_lanes = crate::glm5next_layer::loadpf::LoadPfLanes::default();
 
         // 2026-10-01: DFlash tap layers (`config.dflash_capture_layers`, the drafter's
         // `target_layer_ids`) collapse their highway into `hidden` for the engine's capture.
@@ -648,6 +650,14 @@ impl Glm5NextWeightLoader {
             .with_context(|| format!("glm5_next: FP8 dense copies of layer {idx}"))?;
             fp8_total.fp8_bytes += fp8.fp8_bytes;
             fp8_total.bf16_freed += fp8.bf16_freed;
+            // 2026-10-11: Load-prefetch sites, after the copies exist (no-op with the lever off).
+            crate::glm5next_layer::loadpf::attach(
+                gpu,
+                &mut loadpf_lanes,
+                &mut mixer,
+                &mut mlp,
+                &mlp_cfg,
+            )?;
             // 2026-10-01: `mixer_head`: the mixer's FIRST decode projection as the `[n, k]`
             // extent its GEMV reads (KDA `front_end` `q_proj`, DSA `decode_k` `q_a_proj`). Only
             // the first: the projection after it streams more than the 24 MB L2 and would evict

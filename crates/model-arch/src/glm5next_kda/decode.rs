@@ -292,6 +292,8 @@ impl Glm5NextKdaLayer {
         stream: u64,
     ) -> Result<()> {
         self.front_end(gpu, hidden, 1, ws, stream)?;
+        // 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF`: `o_proj` into L2 during the recurrence.
+        crate::glm5next_layer::loadpf::fork(self.loadpf.as_ref(), gpu, 1, stream)?;
         self.stateful_row(gpu, 0, state, ws, stream)?;
         self.back_end(gpu, 1, ws, stream)
     }
@@ -378,6 +380,11 @@ impl Glm5NextKdaLayer {
         let t_front = profile::start();
         self.front_end(gpu, hidden, k, ws, stream)?;
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
+        // 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF`, on a verify only (it takes snapshots and
+        // no in-pass capture); a prefill sub-chunk reaches here with neither and never forks.
+        if !snapshots.is_empty() && capture.is_none() {
+            crate::glm5next_layer::loadpf::fork(self.loadpf.as_ref(), gpu, k, stream)?;
+        }
         let t_recur = profile::start();
         // 2026-10-01: Opt-in (`METRALE_GLM_KDA_TOKEN_LOOP=1`): two launches for all rows when no
         // snapshot is asked for; otherwise, or when the target lacks the row kernels, the walk.
@@ -448,6 +455,8 @@ impl Glm5NextKdaLayer {
         let t_front = profile::start();
         self.front_end(gpu, hidden, n, ws, stream)?;
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
+        // 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF` (multi-sequence decode).
+        crate::glm5next_layer::loadpf::fork(self.loadpf.as_ref(), gpu, n, stream)?;
         let t_recur = profile::start();
         for (row, state) in states.iter().enumerate() {
             self.stateful_row(gpu, row, state, ws, stream)?;
@@ -500,6 +509,8 @@ impl Glm5NextKdaLayer {
         let t_front = profile::start();
         self.front_end(gpu, hidden, r, ws, stream)?;
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
+        // 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF` (batched verify, `r` rows).
+        crate::glm5next_layer::loadpf::fork(self.loadpf.as_ref(), gpu, r, stream)?;
         let t_recur = profile::start();
         let fuse = super::snap_fuse::kda_snap_fuse();
         let mut base = 0usize;

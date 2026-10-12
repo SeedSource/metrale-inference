@@ -5,7 +5,7 @@
 //!
 //! * `dense_gemv_bf16_fp32out_batchm` against one `dense_gemv_bf16_fp32out` launch per row
 //!   (`weights_proj`, `wq_b`), and `dense_gemv_bf16_batchm` against one `dense_gemv_bf16`
-//!   launch per row (`wk`, `compress_gate`), at M in {1, 2, 5, 16}, over the GLM-5.3 indexer
+//!   launch per row (`wk`, `compress_gate`), at M in {1, 2, 3, 5, 16}, over the GLM-5.3 indexer
 //!   shapes and three others, two seeds;
 //! * `glm5next_mla_latent_write_fp8` over `k` blocks with a `k`-entry slot array against `k`
 //!   one-block launches, each reading a one-entry slot buffer rewritten per row;
@@ -46,7 +46,7 @@ const SHAPES: &[(usize, usize, &str)] = &[
     (77, 520, "N % 4 != 0, short K"),
     (4, 64, "one block, one slab"),
 ];
-const MS: &[usize] = &[1, 2, 5, 16];
+const MS: &[usize] = &[1, 2, 3, 5, 16];
 const MAX_M: usize = 16;
 const POISON_REF: u8 = 0xA5;
 const POISON_NEW: u8 = 0x5A;

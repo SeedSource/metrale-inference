@@ -160,6 +160,10 @@ impl Glm5NextDsaLayer {
             stream,
         )?;
         let nq = heads * d;
+        // 2026-10-12: `METRALE_GLM_IDX_WQB_NV4=1`: wq_b on its NVFP4 copy (`idx_wqb_nv4.rs`).
+        if self.wq_b_nv4_rows(gpu, f32k, q_resid, out.q_idx, rows, stream)? {
+            return Ok(());
+        }
         batchm_rows(
             gpu, f32k, 4, q_resid, wt.wq_b, out.q_idx, rows, nq, ql, stream,
         )
@@ -176,6 +180,10 @@ impl Glm5NextDsaLayer {
         stream: u64,
     ) -> Result<()> {
         let cfg = &self.cfg;
+        // 2026-10-12: `METRALE_GLM_IDX_WQB_NV4=1` (`idx_wqb_nv4.rs`).
+        if self.wq_b_nv4_rows(gpu, KernelHandle(0), q_resid_row, out, 1, stream)? {
+            return Ok(());
+        }
         gemm(
             gpu,
             self.kernels.gemm_f32,

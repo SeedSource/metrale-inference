@@ -165,6 +165,12 @@ pub fn load_glm5next_mtp_module(
     // `eh_proj`, read through `dense_fp8::route`; a no-op with the lever off.
     crate::glm5next_layer::dense_fp8::register_mtp(gpu, &mut layer, &mut eh_proj)
         .context("glm5_next MTP: METRALE_GLM_DENSE_FP8")?;
+    // 2026-10-12: `METRALE_GLM_IDX_WQB_NV4=1`: NVFP4 copy of the MTP block's indexer `wq_b` (no-op
+    // when the lever is off).
+    if let crate::glm5next_layer::Glm5NextMixer::Dsa(l) = &layer.mixer {
+        l.register_wq_b_nv4(gpu)
+            .context("glm5_next MTP: METRALE_GLM_IDX_WQB_NV4")?;
+    }
     Ok(Some(Glm5NextMtpModule {
         layer,
         eh_proj,

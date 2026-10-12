@@ -72,6 +72,13 @@ pub struct Glm5NextMhcKernels {
     /// arguments and grid, hc_mult 4; `METRALE_GLM_HC_FINISH_WARP`). Optional (`try_kernel`, 0
     /// when absent: `hc_finish` runs).
     pub hc_finish_warp: KernelHandle,
+    /// 2026-10-12: `glm5next_hc_mix_bf16_ilp{8,16,32,64}`: `hc_mix_bf16` with batched loads, the
+    /// same bytes (`METRALE_GLM_HC_MIX_ILP=<N>`). Optional (0 when absent: `hc_mix_bf16` runs).
+    pub hc_mix_bf16_ilp: [KernelHandle; 4],
+    /// 2026-10-12: `glm5next_hc_mix_bf16_splitk{4,8,16}`: split-K mix with a last-block-done
+    /// combine in the same launch (`METRALE_GLM_HC_MIX_ILP=splitk<S>`); NOT byte-identical.
+    /// Optional (0 when absent: `hc_mix_bf16` runs).
+    pub hc_mix_bf16_splitk: [KernelHandle; 3],
 }
 
 /// 2026-09-25: The kernel module every GLM mHC kernel resolves from.
@@ -124,6 +131,12 @@ impl Glm5NextMhcKernels {
                 GLM5NEXT_MHC_MODULE,
                 "glm5next_hc_finish_warp",
             ),
+            hc_mix_bf16_ilp: ["glm5next_hc_mix_bf16_ilp8", "glm5next_hc_mix_bf16_ilp16",
+                "glm5next_hc_mix_bf16_ilp32", "glm5next_hc_mix_bf16_ilp64"]
+            .map(|n| metrale_model_layers::layers::try_kernel(gpu, GLM5NEXT_MHC_MODULE, n)),
+            hc_mix_bf16_splitk: ["glm5next_hc_mix_bf16_splitk4", "glm5next_hc_mix_bf16_splitk8",
+                "glm5next_hc_mix_bf16_splitk16"]
+            .map(|n| metrale_model_layers::layers::try_kernel(gpu, GLM5NEXT_MHC_MODULE, n)),
         })
     }
 }
@@ -511,6 +524,40 @@ pub fn glm_hc_pre_sliced_mix(
     } else {
         (mix_kernel, mix_hc)
     };
+    // 2026-10-12: METRALE_GLM_HC_MIX_ILP: decode/verify calls only (below the token-major
+    // threshold, not token-major), BF16 `hc_fn`, handle resolved; otherwise `mix_kernel` as before.
+    let (mix_kernel, mix_grid_z, mix_scratch) = {
+        let mut pick = (mix_kernel, 1u32, None);
+        let hc_dim = hidden_size as usize * hc_mult as usize;
+        let eligible = !tok
+            && !tokmajor
+            && w.hc_fn_bf16
+            && kernels.hc_mix_bf16.0 != 0
+            && num_tokens < MHC_TOKMAJOR_MIN_ROWS
+            && mix_kernel.0 == kernels.hc_mix_bf16.0;
+        if eligible {
+            match hc_mix_ilp() {
+                HcMixIlp::Ilp(n) => {
+                    let h = kernels.hc_mix_bf16_ilp[[8u32, 16, 32, 64].iter().position(|&x| x == n).unwrap_or(0)];
+                    if h.0 != 0 {
+                        pick.0 = h;
+                    }
+                }
+                HcMixIlp::SplitK(sk) if mix_hc == 24 && hc_dim == 16384 && num_tokens <= MHC_SPLITK_ROWS => {
+                    let h = kernels.hc_mix_bf16_splitk[[4u32, 8, 16].iter().position(|&x| x == sk).unwrap_or(0)];
+                    if h.0 != 0 {
+                        pick = (
+                            h,
+                            sk,
+                            Some(w.mix.offset(mhc_mix_max_tokens() * mix_hc as usize * 4)),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        pick
+    };
     let (h, hc) = (hidden_size as usize, hc_mult as usize);
     let finish_kernel = if hc_finish_warp_usable(kernels, hc_mult) {
         static ENGAGED: std::sync::Once = std::sync::Once::new();
@@ -529,12 +576,17 @@ pub fn glm_hc_pre_sliced_mix(
         // `y` `[H]`, FP32 `post` `[hc]` and `comb` `[hc, hc]`.
         let s_streams = streams.offset(t0 * hc * h * 4);
         let s_mix = w.mix.offset(t0 * mix_hc as usize * 4);
-        KernelLaunch::new(gpu, mix_kernel)
-            .grid([k, mix_grid_y, 1])
+        let mix_launch = KernelLaunch::new(gpu, mix_kernel)
+            .grid([k, mix_grid_y, mix_grid_z])
             .block([256, 1, 1])
             .arg_ptr(s_streams)
             .arg_ptr(w.hc_fn)
-            .arg_ptr(s_mix)
+            .arg_ptr(s_mix);
+        let mix_launch = match mix_scratch {
+            Some(sc) => mix_launch.arg_ptr(sc),
+            None => mix_launch,
+        };
+        mix_launch
             .arg_u32(hidden_size)
             .arg_u32(hc_mult)
             .arg_f32(norm_eps)
@@ -727,6 +779,64 @@ pub fn hc_finish_warp() -> bool {
     *E.get_or_init(|| {
         parse_hc_finish_warp(std::env::var("METRALE_GLM_HC_FINISH_WARP").ok().as_deref())
     })
+}
+
+/// 2026-10-12: `METRALE_GLM_HC_MIX_ILP` choice for the decode/verify mix launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HcMixIlp {
+    /// Production `glm5next_hc_mix_bf16`.
+    Off,
+    /// Batched loads, `n` in {8, 16, 32, 64}; byte-identical.
+    Ilp(u32),
+    /// Split-K over `s` in {4, 8, 16} CTAs; not byte-identical.
+    SplitK(u32),
+}
+
+/// 2026-10-12: Parse `METRALE_GLM_HC_MIX_ILP`: `0`/unset/anything unknown is `Off`; `8`, `16`,
+/// `32`, `64` select the ILP variant; `splitk4`, `splitk8`, `splitk16` the split-K one.
+pub(crate) fn parse_hc_mix_ilp(v: Option<&str>) -> HcMixIlp {
+    match v.map(str::trim) {
+        Some(x @ ("8" | "16" | "32" | "64")) => HcMixIlp::Ilp(x.parse().unwrap_or(0)),
+        Some(x @ ("splitk4" | "splitk8" | "splitk16")) => {
+            HcMixIlp::SplitK(x["splitk".len()..].parse().unwrap_or(0))
+        }
+        _ => HcMixIlp::Off,
+    }
+}
+
+/// 2026-10-12: `METRALE_GLM_HC_MIX_ILP`, read once.
+pub fn hc_mix_ilp() -> HcMixIlp {
+    static E: std::sync::OnceLock<HcMixIlp> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_HC_MIX_ILP").ok();
+        let m = parse_hc_mix_ilp(raw.as_deref());
+        if m != HcMixIlp::Off {
+            tracing::warn!("METRALE_GLM_HC_MIX_ILP={m:?}: decode/verify hc_mix_bf16 variant");
+        } else if let Some(r) = raw.as_deref().filter(|r| !r.is_empty() && r.trim() != "0") {
+            tracing::warn!("METRALE_GLM_HC_MIX_ILP={r} not understood - hc_mix_bf16 runs");
+        }
+        m
+    })
+}
+
+/// 2026-10-12: Rows the split-K mix supports (`GLM_HC_SPLITK_ROWS` in the `.cu`).
+pub const MHC_SPLITK_ROWS: u32 = 16;
+
+/// 2026-10-12: Bytes of split-K scratch after a site's `mix`: `MHC_SPLITK_ROWS * 24 * 16 * 2` f32
+/// partials, then `MHC_SPLITK_ROWS * 24` u32 counters (zero before the first launch; the kernel
+/// resets them).
+pub const MHC_SPLITK_SCRATCH_BYTES: usize = MHC_SPLITK_ROWS as usize * 24 * 16 * 2 * 4
+    + MHC_SPLITK_ROWS as usize * 24 * 4;
+
+/// 2026-10-12: Bytes the loader allocates for a site's `mix`: the `[mhc_mix_max_tokens(), mix_hc]`
+/// FP32 scratch, plus the split-K scratch when `METRALE_GLM_HC_MIX_ILP=splitk<S>` is set.
+pub fn mhc_mix_alloc_bytes(hc_mult: usize) -> usize {
+    mhc_mix_max_tokens() * mix_hc(hc_mult) * 4 + mhc_splitk_tail_bytes()
+}
+
+/// 2026-10-12: The split-K tail size (0 unless the lever picks split-K).
+pub fn mhc_splitk_tail_bytes() -> usize {
+    if matches!(hc_mix_ilp(), HcMixIlp::SplitK(_)) { MHC_SPLITK_SCRATCH_BYTES } else { 0 }
 }
 
 /// 2026-10-11: Whether the warp `hc_finish` runs: lever on, `hc_mult == 4` (the entry writes
@@ -1128,6 +1238,31 @@ mod mhc_shape_tests {
         for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("01")] {
             assert!(!parse_hc_post_mix_fast(v), "{v:?}");
         }
+    }
+
+    /// 2026-10-12: `METRALE_GLM_HC_MIX_ILP` parses the ILP widths and split-K counts only.
+    #[test]
+    fn hc_mix_ilp_lever_parses() {
+        assert_eq!(parse_hc_mix_ilp(None), HcMixIlp::Off);
+        assert_eq!(parse_hc_mix_ilp(Some("0")), HcMixIlp::Off);
+        assert_eq!(parse_hc_mix_ilp(Some("7")), HcMixIlp::Off);
+        assert_eq!(parse_hc_mix_ilp(Some(" 32 ")), HcMixIlp::Ilp(32));
+        assert_eq!(parse_hc_mix_ilp(Some("splitk8")), HcMixIlp::SplitK(8));
+        assert_eq!(parse_hc_mix_ilp(Some("splitk3")), HcMixIlp::Off);
+        let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../kernels/gb10/common/glm5next_mhc.cu");
+        let cu = std::fs::read_to_string(cu).expect("glm5next_mhc.cu");
+        for n in [8, 16, 32, 64] {
+            assert!(cu.contains(&format!("GLM_HC_MIX_ILP_ENTRY({n})")), "ilp{n}");
+        }
+        for n in [4, 8, 16] {
+            assert!(cu.contains(&format!("GLM_HC_MIX_SPLITK_ENTRY({n})")), "splitk{n}");
+        }
+        let src = include_str!("glm5next_mhc.rs");
+        for n in ["ilp8", "ilp16", "ilp32", "ilp64", "splitk4", "splitk8", "splitk16"] {
+            assert!(src.contains(&format!("\"glm5next_hc_mix_bf16_{n}\"")), "{n}");
+        }
+        assert!(cu.contains(&format!("#define GLM_HC_SPLITK_ROWS {MHC_SPLITK_ROWS}")));
     }
 
     /// 2026-10-11: `METRALE_GLM_HC_FINISH_WARP` is on only for `1`; the dispatch needs the

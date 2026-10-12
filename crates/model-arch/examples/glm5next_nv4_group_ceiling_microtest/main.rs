@@ -18,6 +18,13 @@
 //! Final line `PASS group_ceiling ...` (exit 0), `FAIL ...` on a bitwise mismatch (exit 1) or
 //! a missing kernel (exit 2); timing is information only.
 //!
+//! 2026-10-12: PROD lines (`prod.rs`): the production `METRALE_GLM_NV4_B3_GROUP` entry
+//! (`dense_nv4_group::try_group`) against the production per-projection `dense_fp8::route` on
+//! loader-registered weights with distinct per-member `weight_scale_2`: M = 3 bitwise equal,
+//! M = 1, 2 declined. The ceiling arms above share ONE scale2 across members, so they do not
+//! show that a plain N-concatenation would be exact on real weights (it would not be).
+//! `w4a16_gemv_batch3_staged_group` missing is a FAIL (exit 2); a PROD failure is exit 1.
+//!
 //! Run (GPU):
 //!   METRALE_TARGET_HW=gb10 METRALE_TARGET_MODEL=glm-5.3-flash METRALE_TARGET_QUANT=nvfp4 \
 //!     cargo run -p metrale-model-arch --release --features cuda,gpu-examples \
@@ -29,6 +36,7 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use metrale_gpu_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 mod data;
+mod prod;
 mod timing;
 use data::{Lcg, dn_u16, gen_act, gen_packed, up_bf16, up_bytes};
 use timing::{Events, REPS, time_arms};
@@ -195,6 +203,7 @@ fn run_group(
 }
 
 fn run() -> Result<i32> {
+    prod::set_env();
     let backend = MetraleCudaBackend::new(0, &metrale_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
     let (Ok(k1), Ok(k3)) = (
@@ -204,6 +213,10 @@ fn run() -> Result<i32> {
         println!("FAIL missing kernel w4a16_gemv / w4a16_gemv_batch3_staged in this image");
         return Ok(2);
     };
+    if g.kernel("w4a16_gemv", "w4a16_gemv_batch3_staged_group").is_err() {
+        println!("FAIL missing kernel w4a16_gemv_batch3_staged_group in this image");
+        return Ok(2);
+    }
     println!(
         "SETUP reps {REPS} (median), cold = 72 MiB read-only flush, chain = one 9 MiB GEMV before"
     );
@@ -248,6 +261,10 @@ fn run() -> Result<i32> {
             sums[i] / TOKENS_PER_ROUND
         );
     }
+    let gemv1 = g.kernel("w4a16_gemv", "w4a16_gemv")?;
+    let cold = |s: u64| launch(g, gemv1, pre.a, &pre.flush, pre.c, s);
+    let chain = |s: u64| launch(g, gemv1, pre.a, &pre.chain, pre.c, s);
+    let prod_bad = prod::run(g, &ev, &mut rng, [&cold, &chain])?;
     g.free(pre.flush.w)?;
     g.free(pre.flush.s)?;
     g.free(pre.chain.w)?;
@@ -258,7 +275,11 @@ fn run() -> Result<i32> {
         println!("FAIL group_ceiling: {bad} group(s) with output rows not bitwise equal");
         return Ok(1);
     }
-    println!("PASS group_ceiling (bitwise; timing is information)");
+    if prod_bad > 0 {
+        println!("FAIL group_ceiling PROD: {prod_bad} failed check(s)");
+        return Ok(1);
+    }
+    println!("PASS group_ceiling (bitwise; PROD M=3 bitwise, M=1,2 declined; timing is information)");
     Ok(0)
 }
 

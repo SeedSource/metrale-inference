@@ -574,6 +574,7 @@ impl Glm5NextKdaLayer {
         // 2026-09-25: Three separate `[T, qkv]` projections, then one pack (see the module doc).
         // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: all three read `hidden` and write their own
         // part, so they may run as one grouped launch (`dense_nv4_group`, same bytes).
+        // 2026-10-12: or, at 3 rows, `METRALE_GLM_NV4_B3_GROUP=1` (`dense_nv4_b3_group`, kda_qkv).
         let ws_part = |i: usize| ws.qkv_parts.offset(i * t * qkv * 2);
         let grouped = {
             use crate::glm5next_layer::dense_nv4_group::{Proj, enabled, try_group};

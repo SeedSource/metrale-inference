@@ -737,20 +737,24 @@ extern "C" __global__ void w4a16_gemv_batch3(
 #endif
 #define NV4B3_JW (NV4B3_WCH / 128)
 
-extern "C" __global__ void w4a16_gemv_batch3_staged(
+// 2026-10-12: The body of w4a16_gemv_batch3_staged for block `blk` of a launch over N outputs
+// (blockIdx.x replaced by `blk`; every other line as before), shared by the per-projection entry
+// and w4a16_gemv_batch3_staged_group (METRALE_GLM_NV4_B3_GROUP) below.
+__device__ __forceinline__ void w4a16_b3s_block(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,
     const unsigned char* __restrict__ B_scale,
     const float scale2,
     __nv_bfloat16* __restrict__ C,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int blk
 ) {
     static_assert(NV4B3_WCH % 128 == 0, "window must hold whole 128-chunk strides");
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;
-    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const unsigned int n = blk * N_PER_BLOCK + local_out;
     const bool valid = n < N;  // uniform per warp (64 threads share an output)
 
     __shared__ float s_lut[16];
@@ -889,6 +893,67 @@ extern "C" __global__ void w4a16_gemv_batch3_staged(
             C[(unsigned long long)t * N + n] = __float2bfloat16(r);
         }
     }
+}
+
+extern "C" __global__ void w4a16_gemv_batch3_staged(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_b3s_block(A, B_packed, B_scale, scale2, C, N, K, blockIdx.x);
+}
+
+// 2026-10-12: METRALE_GLM_NV4_B3_GROUP. Up to three NVFP4 projections of the same three BF16
+// rows A [3, K] in ONE launch: member j has its own packed weight [N_j, K/2], E4M3 scales
+// [N_j, K/16], FP32 tensor scale scale2_j and output C_j [3, N_j] (row stride N_j). The grid is
+// ceil(N_0/4) + ceil(N_1/4) + ceil(N_2/4) blocks; block b belongs to the first member whose
+// cumulative block count exceeds b (block-uniform, so every thread of a block takes the same
+// branch), and runs w4a16_b3s_block on that member's operands with blk = b minus the blocks of
+// the members before it. That is exactly the block that member's own w4a16_gemv_batch3_staged
+// launch runs at blockIdx.x = blk, so every output byte equals the per-projection launch (same
+// operands, same FP operations in the same order). A member with N_j = 0 owns no block (pass
+// N_2 = 0 for a two-member group). The per-member scale2 is why the members cannot simply be
+// concatenated along N under one launch: each NVFP4 copy has its own tensor scale.
+extern "C" __global__ void w4a16_gemv_batch3_staged_group(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed0,
+    const unsigned char* __restrict__ B_scale0,
+    const float scale2_0,
+    __nv_bfloat16* __restrict__ C0,
+    unsigned int N0,
+    const unsigned char* __restrict__ B_packed1,
+    const unsigned char* __restrict__ B_scale1,
+    const float scale2_1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N1,
+    const unsigned char* __restrict__ B_packed2,
+    const unsigned char* __restrict__ B_scale2,
+    const float scale2_2,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N2,
+    unsigned int K
+) {
+    const unsigned int b0 = (N0 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    const unsigned int b1 = (N1 + N_PER_BLOCK - 1) / N_PER_BLOCK;
+    unsigned int blk = blockIdx.x;
+    const unsigned char* bp = B_packed0;
+    const unsigned char* bs = B_scale0;
+    float s2 = scale2_0;
+    __nv_bfloat16* c = C0;
+    unsigned int n = N0;
+    if (blk >= b0) {
+        blk -= b0;
+        bp = B_packed1; bs = B_scale1; s2 = scale2_1; c = C1; n = N1;
+        if (blk >= b1) {
+            blk -= b1;
+            bp = B_packed2; bs = B_scale2; s2 = scale2_2; c = C2; n = N2;
+        }
+    }
+    w4a16_b3s_block(A, bp, bs, s2, c, n, K, blk);
 }
 
 

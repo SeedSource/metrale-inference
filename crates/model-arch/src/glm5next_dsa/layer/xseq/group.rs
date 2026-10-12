@@ -82,6 +82,7 @@ impl Glm5NextDsaLayer {
         // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: q_a and kv_a both read `hidden`, and the q
         // chain below neither reads `a.kv_a` nor writes `hidden`, so kv_a may run with q_a as
         // one grouped launch here (`dense_nv4_group`, same bytes) and is then skipped below.
+        // 2026-10-12: or, at 3 rows, `METRALE_GLM_NV4_B3_GROUP=1` (`dense_nv4_b3_group`).
         let grouped = crate::glm5next_layer::dense_nv4_group::enabled()
             && self.try_group_q_a_kv_a(gpu, hidden, a.q_a, a.kv_a, r, stream)?;
         if !grouped {

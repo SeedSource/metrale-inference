@@ -264,7 +264,19 @@ impl Glm5NextLayer {
                 dense_slice,
                 &self.mlp_ws,
                 stream,
-            )?,
+            )
+            .and_then(|()| {
+                // 2026-10-11: `METRALE_GLM_MOE_ACTDUMP` (off by default; returns at once).
+                crate::glm5next_mlp::forward::actdump::maybe_dump(
+                    ctx.gpu,
+                    &self.mlp_cfg,
+                    &self.mlp_ws,
+                    self.layer_idx,
+                    normed,
+                    rows,
+                    stream,
+                )
+            })?,
         }
         profile::end(profile::MLP_DENSE, t_dense, ctx.gpu, stream);
         Ok(())

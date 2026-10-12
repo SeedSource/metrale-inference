@@ -18,6 +18,8 @@ use super::forward_prefill_gemm;
 use super::weights::Glm5NextMoeWeights;
 use super::{Glm5NextMlpConfig, Glm5NextMlpKernels};
 
+// 2026-10-11: `METRALE_GLM_MOE_ACTDUMP` (measurement tool, see the module).
+pub mod actdump;
 mod dense;
 mod launch;
 mod moe_experts;

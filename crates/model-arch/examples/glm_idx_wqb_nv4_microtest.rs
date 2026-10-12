@@ -158,11 +158,27 @@ fn launch(
     l.arg_u32(N as u32).arg_u32(K as u32).launch(s)
 }
 
-fn new_core(g: &dyn GpuBackend, k: &Kern, a: DevicePtr, q: &QuantizedWeight, c: DevicePtr, m: usize, s: u64) -> Result<()> {
+fn new_core(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    s: u64,
+) -> Result<()> {
     launch(g, k.core[tier(m)], 4, true, a, q, c, m, s)
 }
 
-fn new_tc(g: &dyn GpuBackend, k: &Kern, a: DevicePtr, q: &QuantizedWeight, c: DevicePtr, m: usize, s: u64) -> Result<()> {
+fn new_tc(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    s: u64,
+) -> Result<()> {
     if m <= 8 {
         launch(g, k.tc8, 8, true, a, q, c, m, s)
     } else {
@@ -171,11 +187,27 @@ fn new_tc(g: &dyn GpuBackend, k: &Kern, a: DevicePtr, q: &QuantizedWeight, c: De
 }
 
 /// The production BF16-out CUDA-core NVFP4 tier (`takes_m` for the 4..=16 tiers only).
-fn prod_core(g: &dyn GpuBackend, k: &Kern, a: DevicePtr, q: &QuantizedWeight, c: DevicePtr, m: usize, s: u64) -> Result<()> {
+fn prod_core(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    s: u64,
+) -> Result<()> {
     launch(g, k.prod[tier(m)], 4, m >= 4, a, q, c, m, s)
 }
 
-fn prod_tc(g: &dyn GpuBackend, k: &Kern, a: DevicePtr, q: &QuantizedWeight, c: DevicePtr, m: usize, s: u64) -> Result<()> {
+fn prod_tc(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    s: u64,
+) -> Result<()> {
     if m <= 8 {
         launch(g, k.prod_tc8, 8, true, a, q, c, m, s)
     } else {
@@ -185,16 +217,43 @@ fn prod_tc(g: &dyn GpuBackend, k: &Kern, a: DevicePtr, q: &QuantizedWeight, c: D
 
 /// The BF16 FP32-out path `wq_b` runs today: `dense_mm_bf16` at M = 1, the FP32-out batched GEMV
 /// above (`batchm_rows`).
-fn old_bf16(g: &dyn GpuBackend, k: &Kern, a: DevicePtr, w: DevicePtr, c: DevicePtr, m: usize, s: u64) -> Result<()> {
+fn old_bf16(
+    g: &dyn GpuBackend,
+    k: &Kern,
+    a: DevicePtr,
+    w: DevicePtr,
+    c: DevicePtr,
+    m: usize,
+    s: u64,
+) -> Result<()> {
     if m == 1 {
         ops::dense_mm_bf16(
             g,
-            &DenseMmKernels { gemm: k.gemm_f32, gemv: k.gemv_f32, batchm: KernelHandle(0) },
-            a, w, c, 1, N, K, s,
+            &DenseMmKernels {
+                gemm: k.gemm_f32,
+                gemv: k.gemv_f32,
+                batchm: KernelHandle(0),
+            },
+            a,
+            w,
+            c,
+            1,
+            N,
+            K,
+            s,
         )
     } else {
         ops::dense_gemv_batchm_fp32out(
-            g, k.batchm_f32, a, &DenseWeight { weight: w }, c, m as u32, N as u32, K as u32, N as u32, s,
+            g,
+            k.batchm_f32,
+            a,
+            &DenseWeight { weight: w },
+            c,
+            m as u32,
+            N as u32,
+            K as u32,
+            N as u32,
+            s,
         )
     }
 }
@@ -202,7 +261,13 @@ fn old_bf16(g: &dyn GpuBackend, k: &Kern, a: DevicePtr, w: DevicePtr, c: DeviceP
 fn quantize(g: &dyn GpuBackend, k: &Kern, w: DevicePtr) -> Result<QuantizedWeight> {
     let s = g.default_stream();
     let q = metrale_model_layers::weight_map::quantize_to_nvfp4(
-        &DenseWeight { weight: w }, N, K, g, k.absmax, k.quant, s,
+        &DenseWeight { weight: w },
+        N,
+        K,
+        g,
+        k.absmax,
+        k.quant,
+        s,
     )?;
     g.synchronize(s)?;
     Ok(q)
@@ -214,7 +279,11 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 /// Median per-launch microseconds of `LAUNCHES` launches captured in one graph, `REPLAYS` replays.
-fn time_graph(g: &dyn GpuBackend, s: u64, f: &mut dyn FnMut(usize, u64) -> Result<()>) -> Result<f64> {
+fn time_graph(
+    g: &dyn GpuBackend,
+    s: u64,
+    f: &mut dyn FnMut(usize, u64) -> Result<()>,
+) -> Result<f64> {
     g.begin_capture(s)?;
     for i in 0..LAUNCHES {
         if let Err(e) = f(i, s) {
@@ -264,7 +333,7 @@ fn run() -> Result<i32> {
         }
     };
     let s = g.default_stream();
-    let mut rng = Lcg(0x7771_6277_6e76_34);
+    let mut rng = Lcg(0x0077_7162_776e_7634);
     let mut rep = Report { fails: 0 };
 
     // Weights: N(0, 0.02) BF16 [N, K]; activations N(0, 1) BF16 [16, K] (RMS-normed q_resid scale).
@@ -299,7 +368,10 @@ fn run() -> Result<i32> {
 
     // (a) Exactness, bitwise, M = 1..=16.
     for m in 1..=16usize {
-        let mut cmp = |label: &str, new: &dyn Fn() -> Result<()>, old: &dyn Fn() -> Result<()>| -> Result<()> {
+        let mut cmp = |label: &str,
+                       new: &dyn Fn() -> Result<()>,
+                       old: &dyn Fn() -> Result<()>|
+         -> Result<()> {
             g.copy_h2d(&vec![0xA5u8; 16 * N * 4], out32)?;
             g.copy_h2d(&vec![0xA5u8; 16 * N * 2], out16)?;
             new()?;
@@ -322,16 +394,12 @@ fn run() -> Result<i32> {
             rep.check(diff == 0 && clean, format!("exact {label} M={m}: BF16(f32out) == BF16-out kernel bitwise ({diff} of {} differ), row M untouched {clean}", m * N));
             Ok(())
         };
-        cmp(
-            "core",
-            &|| new_core(g, &k, a_dev, &q, out32, m, s),
-            &|| prod_core(g, &k, a_dev, &q, out16, m, s),
-        )?;
-        cmp(
-            "tc  ",
-            &|| new_tc(g, &k, a_dev, &q, out32, m, s),
-            &|| prod_tc(g, &k, a_dev, &q, out16, m, s),
-        )?;
+        cmp("core", &|| new_core(g, &k, a_dev, &q, out32, m, s), &|| {
+            prod_core(g, &k, a_dev, &q, out16, m, s)
+        })?;
+        cmp("tc  ", &|| new_tc(g, &k, a_dev, &q, out32, m, s), &|| {
+            prod_tc(g, &k, a_dev, &q, out16, m, s)
+        })?;
     }
 
     // (b) Tolerance against the FP64 reference.
@@ -345,7 +413,8 @@ fn run() -> Result<i32> {
             }
             g.synchronize(s)?;
             let f = down(g, out32, m * N * 4)?;
-            let (mut dot, mut nn, mut rr, mut maxd, mut maxr, mut nonfinite) = (0f64, 0f64, 0f64, 0f64, 0f64, 0usize);
+            let (mut dot, mut nn, mut rr, mut maxd, mut maxr, mut nonfinite) =
+                (0f64, 0f64, 0f64, 0f64, 0f64, 0usize);
             for (i, c) in f.chunks_exact(4).enumerate() {
                 let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                 if !v.is_finite() {
@@ -369,7 +438,9 @@ fn run() -> Result<i32> {
     }
 
     // (c) Cold-pool timing.
-    let w_copies: Vec<DevicePtr> = (0..BF16_COPIES).map(|_| up(g, &bf_bytes(&w))).collect::<Result<_>>()?;
+    let w_copies: Vec<DevicePtr> = (0..BF16_COPIES)
+        .map(|_| up(g, &bf_bytes(&w)))
+        .collect::<Result<_>>()?;
     let mut q_copies = Vec::new();
     for _ in 0..NV4_COPIES {
         let t = up(g, &bf_bytes(&w))?;
@@ -379,12 +450,28 @@ fn run() -> Result<i32> {
     let bytes_bf16 = (N * K * 2) as f64;
     let bytes_nv4 = (N * K / 2 + N * K / 16) as f64;
     let gbs = |bytes: f64, us: f64| bytes / (us * 1e-6) / 1e9;
-    let fmt = |v: f64| if v > 255.0 { format!("{v:.0}VOID") } else { format!("{v:.1}") };
+    let fmt = |v: f64| {
+        if v > 255.0 {
+            format!("{v:.0}VOID")
+        } else {
+            format!("{v:.1}")
+        }
+    };
     for &m in &MS {
-        let old = time_graph(g, s, &mut |i, st| old_bf16(g, &k, a_dev, w_copies[i % BF16_COPIES], out32, m, st))?;
-        let core = time_graph(g, s, &mut |i, st| new_core(g, &k, a_dev, &q_copies[i % NV4_COPIES], out32, m, st))?;
-        let tc = time_graph(g, s, &mut |i, st| new_tc(g, &k, a_dev, &q_copies[i % NV4_COPIES], out32, m, st))?;
-        let (new_us, winner) = if core <= tc { (core, "core") } else { (tc, "tc") };
+        let old = time_graph(g, s, &mut |i, st| {
+            old_bf16(g, &k, a_dev, w_copies[i % BF16_COPIES], out32, m, st)
+        })?;
+        let core = time_graph(g, s, &mut |i, st| {
+            new_core(g, &k, a_dev, &q_copies[i % NV4_COPIES], out32, m, st)
+        })?;
+        let tc = time_graph(g, s, &mut |i, st| {
+            new_tc(g, &k, a_dev, &q_copies[i % NV4_COPIES], out32, m, st)
+        })?;
+        let (new_us, winner) = if core <= tc {
+            (core, "core")
+        } else {
+            (tc, "tc")
+        };
         println!(
             "M={m} old_us={old:.2} new_us={new_us:.2} old_GBs={} new_GBs={} (core_us={core:.2} core_GBs={} tc_us={tc:.2} tc_GBs={})",
             fmt(gbs(bytes_bf16, old)),
@@ -400,7 +487,11 @@ fn run() -> Result<i32> {
         };
         println!(
             "ROUTE M={m} fastest={best} provisional_map={prov} (BF16_MAX_M={BF16_MAX_M} CORE_MAX_M={CORE_MAX_M}) {}",
-            if best == prov { "AGREE" } else { "DIFFERS: retune the constants" }
+            if best == prov {
+                "AGREE"
+            } else {
+                "DIFFERS: retune the constants"
+            }
         );
     }
 

@@ -58,6 +58,7 @@ pub enum WqbRoute {
 
 /// 2026-10-12: The kernel for a chunk of `m` rows (`1..=16`; anything else is BF16) at inner size
 /// `k`, from the PROVISIONAL constants above.
+#[allow(clippy::absurd_extreme_comparisons)] // BF16_MAX_M is 0 until the microtest says otherwise
 pub fn wqb_route(m: usize, k: usize) -> WqbRoute {
     if m == 0 || m > NV4_MAX_M || m <= BF16_MAX_M {
         WqbRoute::Bf16
@@ -226,7 +227,12 @@ impl Glm5NextDsaLayer {
         if !idx_wqb_nv4() || rows == 0 {
             return Ok(false);
         }
-        let Some(q) = registry().read().unwrap().get(&self.weights.wq_b.0).copied() else {
+        let Some(q) = registry()
+            .read()
+            .unwrap()
+            .get(&self.weights.wq_b.0)
+            .copied()
+        else {
             return Ok(false);
         };
         let Some(kn) = kernels(gpu) else {
@@ -256,7 +262,9 @@ impl Glm5NextDsaLayer {
                 )?,
                 WqbRoute::Bf16 => {
                     if f32k.0 == 0 {
-                        bail!("wq_b: BF16-routed chunk of {m} rows without an FP32-out batched GEMV");
+                        bail!(
+                            "wq_b: BF16-routed chunk of {m} rows without an FP32-out batched GEMV"
+                        );
                     }
                     batchm_rows(gpu, f32k, 4, a_r, self.weights.wq_b, c_r, m, n, k, stream)?
                 }
@@ -281,6 +289,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::absurd_extreme_comparisons)]
     fn route_map_is_a_partition_of_1_to_16() {
         for m in 1..=16 {
             let r = wqb_route(m, 1536);
@@ -296,7 +305,14 @@ mod tests {
         assert_eq!(wqb_route(17, 1536), WqbRoute::Bf16);
         // The tensor-core kernel needs K % 128 == 0.
         assert_eq!(wqb_route(8, 1500), WqbRoute::Core);
-        assert_eq!(wqb_route(8, 1536), if CORE_MAX_M >= 8 { WqbRoute::Core } else { WqbRoute::Tc });
+        assert_eq!(
+            wqb_route(8, 1536),
+            if CORE_MAX_M >= 8 {
+                WqbRoute::Core
+            } else {
+                WqbRoute::Tc
+            }
+        );
     }
 
     #[test]

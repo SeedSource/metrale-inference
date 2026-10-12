@@ -31,6 +31,8 @@ mod contig_attn;
 mod post_attn;
 mod pre_attn;
 
+pub(super) use post_attn::PostAttnPart;
+
 /// 2026-09-25: Inputs to the paged layer body, built by `forward_block` for each layer.
 #[allow(clippy::too_many_arguments)]
 pub(super) struct PagedLayerArgs {

@@ -17,7 +17,29 @@ use crate::dflash_head::BlockDiffusionDraftHead;
 
 impl BlockDiffusionDraftHead {
     /// 2026-09-26: Final RMSNorm of the block rows, lm_head and token selection.
+    ///
+    /// 2026-10-12: Runs [`Self::block_tail_logits`], the two-rank top-16 merge (DFlash2
+    /// only; a no-op without TP), then [`Self::block_tail_pick`]: the launches the single
+    /// body issued, in its order. `METRALE_DFLASH_TP_GRAPHS` captures the two halves and
+    /// runs the merge eagerly between them.
     pub(super) fn block_tail_select(
+        &self,
+        d: &BlockDims<'_>,
+        ctx: &ForwardContext,
+        stream: u64,
+        stream_noise_local: DevicePtr,
+        norm_noise_local: DevicePtr,
+    ) -> Result<()> {
+        self.block_tail_logits(d, ctx, stream, stream_noise_local, norm_noise_local)?;
+        if self.dflash2_active() {
+            self.tp_merge_top16(ctx, d.g as usize, stream)?;
+        }
+        self.block_tail_pick(d, ctx, stream, norm_noise_local)
+    }
+
+    /// 2026-10-12: Final RMSNorm, lm_head and, on the DFlash2 path, the per-row top-16.
+    /// Device launches only.
+    pub(super) fn block_tail_logits(
         &self,
         d: &BlockDims<'_>,
         ctx: &ForwardContext,
@@ -28,10 +50,8 @@ impl BlockDiffusionDraftHead {
         let BlockDims {
             gpu,
             n_seq,
-            width,
             g,
             h: h_local,
-            bf16: bf16_local,
             ..
         } = *d;
         ops::rms_norm(
@@ -157,11 +177,33 @@ impl BlockDiffusionDraftHead {
                 stream,
             )?;
         }
-        // 2026-09-25: DFlash2: per-row top-16 and the chain walk (dflash2.rs), device
-        // work only, so it captures with the tail. Row 0 of each band is not
-        // written; propose drops it.
+        // 2026-09-25: DFlash2: per-row top-16 (dflash2.rs), device work only.
         if self.dflash2_active() {
-            self.dflash2_select_block(ctx, norm_noise_local, n_seq as u32, stream)?;
+            self.dflash2_topk_block(ctx, n_seq as u32, stream)?;
+        }
+        Ok(())
+    }
+
+    /// 2026-10-12: Token selection after the logits: the DFlash2 selector projection and
+    /// chain walk, the DSpark Markov chain, or per-row argmax. Device launches only.
+    pub(super) fn block_tail_pick(
+        &self,
+        d: &BlockDims<'_>,
+        ctx: &ForwardContext,
+        stream: u64,
+        norm_noise_local: DevicePtr,
+    ) -> Result<()> {
+        let BlockDims {
+            gpu,
+            n_seq,
+            width,
+            bf16: bf16_local,
+            ..
+        } = *d;
+        // 2026-09-25: DFlash2: the chain walk over the top-16 (dflash2.rs). Row 0 of
+        // each band is not written; propose drops it.
+        if self.dflash2_active() {
+            self.dflash2_walk_block(ctx, norm_noise_local, n_seq as u32, stream)?;
         } else
         // 2026-09-25: DSpark: with a Markov head (`markov_active`),
         // `markov_argmax_block` (markov.rs) picks the tokens left to right with the

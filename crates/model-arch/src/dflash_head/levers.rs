@@ -89,6 +89,11 @@ pub struct DFlashLevers {
     /// 2026-10-09: `METRALE_DFLASH_DRAFT_TP2=1`: on a two-rank serve, split the drafter
     /// across both ranks (`tp.rs`). Off: rank 0 proposes alone.
     pub draft_tp2: bool,
+    /// 2026-10-12: `METRALE_DFLASH_TP_GRAPHS=1`: under `draft_tp2`, capture the propose's
+    /// layer and tail pieces between the collectives as CUDA graphs
+    /// (`forward_block/tp_graphs.rs`). Every NCCL call stays eager. Off: the TP propose
+    /// runs fully eagerly, as before.
+    pub tp_graphs: bool,
 
     /// 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: after a single-sequence DFlash2 propose, read
     /// the selector's top-16 logits back (one blocking D2H) for the verify step's
@@ -193,6 +198,7 @@ fn from_values(
         draft_cap: parsed(value("METRALE_DFLASH_DRAFT_CAP").as_deref()),
         draft_gemv: opt_in(value("METRALE_DFLASH_DRAFT_GEMV").as_deref()),
         draft_tp2: opt_in(value("METRALE_DFLASH_DRAFT_TP2").as_deref()),
+        tp_graphs: opt_in(value("METRALE_DFLASH_TP_GRAPHS").as_deref()),
 
         conf_log: opt_in(value("METRALE_DFLASH_CONF_LOG").as_deref()),
         dflash_conf_tau: parse_conf_tau(value("METRALE_DFLASH_CONF_TAU").as_deref()),

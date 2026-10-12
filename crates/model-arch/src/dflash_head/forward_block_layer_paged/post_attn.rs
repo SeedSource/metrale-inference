@@ -12,6 +12,22 @@ use super::PagedLayerArgs;
 use crate::dflash_head::{BlockDiffusionDraftHead, DflashLayer};
 use metrale_model_layers::layer::ForwardContext;
 
+/// 2026-10-12: The three pieces of the post-attention call, split at its two row-parallel
+/// all-reduces (`tp_reduce_rows`), so `METRALE_DFLASH_TP_GRAPHS` can capture each piece while
+/// every collective stays eager. `post_attn_layer` runs them in this order with the
+/// all-reduces between them, launch for launch what the single body issued before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::dflash_head) enum PostAttnPart {
+    /// 2026-10-12: o_proj into `stream_acc` (the first all-reduce follows).
+    OProj,
+    /// 2026-10-12: attention conv finish, residual add, post_attention_layernorm, MLP conv
+    /// prepare, gate/up, SiLU-mul and down_proj into `stream_acc` (the second all-reduce
+    /// follows).
+    Mlp,
+    /// 2026-10-12: MLP conv finish, residual add, and the per-layer block dump when armed.
+    Out,
+}
+
 impl BlockDiffusionDraftHead {
     /// 2026-09-26: The body of `forward_block_layer_post_attn`.
     pub(super) fn post_attn_layer(
@@ -19,6 +35,25 @@ impl BlockDiffusionDraftHead {
         layer: &DflashLayer,
         args: &PagedLayerArgs,
         ctx: &ForwardContext,
+    ) -> Result<()> {
+        let g = self.block_g() as u32 * args.n_seq.max(1);
+        self.post_attn_part(layer, args, ctx, PostAttnPart::OProj)?;
+        // 2026-10-09: Two-rank drafter: o_proj is row-parallel, so sum the partials.
+        self.tp_reduce_rows(ctx, self.scratch.stream_acc, g, args.stream)?;
+        self.post_attn_part(layer, args, ctx, PostAttnPart::Mlp)?;
+        // 2026-10-09: Two-rank drafter: down_proj is row-parallel.
+        self.tp_reduce_rows(ctx, self.scratch.stream_acc, g, args.stream)?;
+        self.post_attn_part(layer, args, ctx, PostAttnPart::Out)
+    }
+
+    /// 2026-10-12: One piece of the post-attention call (see [`PostAttnPart`]). Device
+    /// launches only, except the block dump of `Out`, whose lever keeps capture off.
+    pub(in crate::dflash_head) fn post_attn_part(
+        &self,
+        layer: &DflashLayer,
+        args: &PagedLayerArgs,
+        ctx: &ForwardContext,
+        part: PostAttnPart,
     ) -> Result<()> {
         use metrale_model_layers::layers::ops;
 
@@ -97,137 +132,138 @@ impl BlockDiffusionDraftHead {
             self.draft_gemm_bf16(gpu, src, w_bf16, dst, g, n_out, k_in, stream)
         };
 
-        // 2026-09-25: stream_acc = o_proj(attn_out). stream_buf still holds the layer
-        // input: pre_attn read it into norm_buf and did not write it.
-        gemm_swap(
-            &layer.o_proj,
-            &layer.o_proj_fp8,
-            self.scratch.attn_out,
-            self.scratch.stream_acc,
-            h,
-            q_dim,
-        )?;
-        // 2026-10-09: Two-rank drafter: o_proj is row-parallel, so sum the partials.
-        self.tp_reduce_rows(ctx, self.scratch.stream_acc, g, stream)?;
+        match part {
+            PostAttnPart::OProj => {
+                // 2026-09-25: stream_acc = o_proj(attn_out). stream_buf still holds the
+                // layer input: pre_attn read it into norm_buf and did not write it.
+                gemm_swap(
+                    &layer.o_proj,
+                    &layer.o_proj_fp8,
+                    self.scratch.attn_out,
+                    self.scratch.stream_acc,
+                    h,
+                    q_dim,
+                )
+            }
+            PostAttnPart::Mlp => {
+                // 2026-09-25: DFlash2 attention conv finish on the o_proj output, with the
+                // dynamic slice computed in pre_attn.
+                let attn_res_src = self.conv_finish(
+                    layer,
+                    crate::dflash_head::dflash2::ConvSite::Attention,
+                    self.scratch.stream_acc,
+                    ctx,
+                    args.n_seq.max(1),
+                    stream,
+                )?;
 
-        // 2026-09-25: DFlash2 attention conv finish on the o_proj output, with the
-        // dynamic slice computed in pre_attn.
-        let attn_res_src = self.conv_finish(
-            layer,
-            crate::dflash_head::dflash2::ConvSite::Attention,
-            self.scratch.stream_acc,
-            ctx,
-            args.n_seq.max(1),
-            stream,
-        )?;
+                // 2026-09-25: stream_buf += attn_res_src (the o_proj output, convolved
+                // when DFlash2 is active).
+                ops::residual_add(
+                    gpu,
+                    self.kernels.residual_add,
+                    self.scratch.stream_buf,
+                    attn_res_src,
+                    g * h,
+                    stream,
+                )?;
 
-        // 2026-09-25: stream_buf += attn_res_src (the o_proj output, convolved when
-        // DFlash2 is active).
-        ops::residual_add(
-            gpu,
-            self.kernels.residual_add,
-            self.scratch.stream_buf,
-            attn_res_src,
-            g * h,
-            stream,
-        )?;
+                // 2026-09-25: stream_buf is both the MLP's residual and the input to
+                // post_attention_layernorm, whose output goes to norm_buf.
+                ops::rms_norm(
+                    gpu,
+                    self.kernels.rms_norm,
+                    self.scratch.stream_buf,
+                    &layer.post_attention_layernorm,
+                    self.scratch.norm_buf,
+                    g,
+                    h,
+                    self.rms_norm_eps,
+                    stream,
+                )?;
 
-        // 2026-09-25: stream_buf is both the MLP's residual and the input to
-        // post_attention_layernorm, whose output goes to norm_buf.
-        ops::rms_norm(
-            gpu,
-            self.kernels.rms_norm,
-            self.scratch.stream_buf,
-            &layer.post_attention_layernorm,
-            self.scratch.norm_buf,
-            g,
-            h,
-            self.rms_norm_eps,
-            stream,
-        )?;
+                // 2026-09-25: DFlash2 MLP conv prepare. It overwrites scratch.conv_dyn,
+                // which the attention conv finish above has already read.
+                let mlp_src = self.conv_prepare(
+                    layer,
+                    crate::dflash_head::dflash2::ConvSite::Mlp,
+                    self.scratch.norm_buf,
+                    ctx,
+                    args.n_seq.max(1),
+                    stream,
+                )?;
 
-        // 2026-09-25: DFlash2 MLP conv prepare. It overwrites scratch.conv_dyn, which
-        // the attention conv finish above has already read.
-        let mlp_src = self.conv_prepare(
-            layer,
-            crate::dflash_head::dflash2::ConvSite::Mlp,
-            self.scratch.norm_buf,
-            ctx,
-            args.n_seq.max(1),
-            stream,
-        )?;
+                // 2026-09-25: MLP: down(silu(gate(x)) * up(x)) with x = mlp_src.
+                // silu_mul writes into mlp_intermediate, down_proj into stream_acc.
+                gemm_swap(
+                    &layer.gate_proj,
+                    &layer.gate_proj_fp8,
+                    mlp_src,
+                    self.scratch.mlp_intermediate,
+                    inter,
+                    h,
+                )?;
+                gemm_swap(
+                    &layer.up_proj,
+                    &layer.up_proj_fp8,
+                    mlp_src,
+                    self.scratch.mlp_up,
+                    inter,
+                    h,
+                )?;
+                ops::silu_mul(
+                    gpu,
+                    self.kernels.silu_mul,
+                    self.scratch.mlp_intermediate,
+                    self.scratch.mlp_up,
+                    self.scratch.mlp_intermediate,
+                    g * inter,
+                    stream,
+                )?;
+                gemm_swap(
+                    &layer.down_proj,
+                    &layer.down_proj_fp8,
+                    self.scratch.mlp_intermediate,
+                    self.scratch.stream_acc,
+                    h,
+                    inter,
+                )
+            }
+            PostAttnPart::Out => {
+                // 2026-09-25: DFlash2 MLP conv finish on the down_proj output.
+                let mlp_res_src = self.conv_finish(
+                    layer,
+                    crate::dflash_head::dflash2::ConvSite::Mlp,
+                    self.scratch.stream_acc,
+                    ctx,
+                    args.n_seq.max(1),
+                    stream,
+                )?;
 
-        // 2026-09-25: MLP: down(silu(gate(x)) * up(x)) with x = mlp_src. silu_mul writes
-        // into mlp_intermediate, down_proj into stream_acc.
-        gemm_swap(
-            &layer.gate_proj,
-            &layer.gate_proj_fp8,
-            mlp_src,
-            self.scratch.mlp_intermediate,
-            inter,
-            h,
-        )?;
-        gemm_swap(
-            &layer.up_proj,
-            &layer.up_proj_fp8,
-            mlp_src,
-            self.scratch.mlp_up,
-            inter,
-            h,
-        )?;
-        ops::silu_mul(
-            gpu,
-            self.kernels.silu_mul,
-            self.scratch.mlp_intermediate,
-            self.scratch.mlp_up,
-            self.scratch.mlp_intermediate,
-            g * inter,
-            stream,
-        )?;
-        gemm_swap(
-            &layer.down_proj,
-            &layer.down_proj_fp8,
-            self.scratch.mlp_intermediate,
-            self.scratch.stream_acc,
-            h,
-            inter,
-        )?;
-        // 2026-10-09: Two-rank drafter: down_proj is row-parallel.
-        self.tp_reduce_rows(ctx, self.scratch.stream_acc, g, stream)?;
+                // 2026-09-25: stream_buf += mlp_res_src. stream_buf is then the layer
+                // output, read by the next layer or the tail.
+                ops::residual_add(
+                    gpu,
+                    self.kernels.residual_add,
+                    self.scratch.stream_buf,
+                    mlp_res_src,
+                    g * h,
+                    stream,
+                )?;
 
-        // 2026-09-25: DFlash2 MLP conv finish on the down_proj output.
-        let mlp_res_src = self.conv_finish(
-            layer,
-            crate::dflash_head::dflash2::ConvSite::Mlp,
-            self.scratch.stream_acc,
-            ctx,
-            args.n_seq.max(1),
-            stream,
-        )?;
-
-        // 2026-09-25: stream_buf += mlp_res_src. stream_buf is then the layer output,
-        // read by the next layer or the tail.
-        ops::residual_add(
-            gpu,
-            self.kernels.residual_add,
-            self.scratch.stream_buf,
-            mlp_res_src,
-            g * h,
-            stream,
-        )?;
-
-        if args.block_dump {
-            self.block_dump_buf(
-                ctx,
-                self.scratch.stream_buf,
-                args.layer_idx,
-                "layer_out",
-                g,
-                h,
-                stream,
-            )?;
+                if args.block_dump {
+                    self.block_dump_buf(
+                        ctx,
+                        self.scratch.stream_buf,
+                        args.layer_idx,
+                        "layer_out",
+                        g,
+                        h,
+                        stream,
+                    )?;
+                }
+                Ok(())
+            }
         }
-
-        Ok(())
     }
 }

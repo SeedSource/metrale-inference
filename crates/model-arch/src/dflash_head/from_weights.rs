@@ -475,6 +475,7 @@ impl BlockDiffusionDraftHead {
         fp8_weights::arm_drafter_fp8(&mut head, gpu, q_dim, kv_dim, lm_head_native_fp8)?;
         head.arm_draft_gemv(gpu);
         head.tp_validate()?;
+        head.log_tp_graphs_lever();
 
         Ok(head)
     }

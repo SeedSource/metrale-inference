@@ -19,6 +19,7 @@ mod embed;
 mod graphs;
 mod host_drafts;
 mod tail;
+mod tp_graphs;
 
 use dims::BlockDims;
 
@@ -193,6 +194,17 @@ impl BlockDiffusionDraftHead {
             && !levers.any_diagnostic_armed
             // 2026-10-09: The two-rank drafter's collectives run eagerly.
             && self.tp.is_none();
+        // 2026-10-12: METRALE_DFLASH_TP_GRAPHS: under TP the same conditions take the
+        // segment graphs of `tp_graphs.rs`, which keep every collective eager.
+        let tp_graph_eligible = option_b_on
+            && n_seq == 1
+            && !self
+                .suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !debug_dump
+            && !levers.any_diagnostic_armed
+            && levers.tp_graphs
+            && self.tp.is_some();
 
         let warmup_target = levers.propose_warmup_n;
 
@@ -333,7 +345,16 @@ impl BlockDiffusionDraftHead {
             run_tail()
         };
 
-        if graph_eligible && option_b_on {
+        if tp_graph_eligible {
+            self.forward_block_tp_graphed(
+                &d,
+                ctx,
+                stream,
+                &make_paged_args,
+                stream_noise_local,
+                norm_noise_local,
+            )?;
+        } else if graph_eligible && option_b_on {
             // 2026-09-25: Subgraph slots: [pre_0, post_0, ..., pre_{N-1}, post_{N-1}, tail],
             // 2 × num_layers + 1 in all.
             let num_layers = self.layers.len();

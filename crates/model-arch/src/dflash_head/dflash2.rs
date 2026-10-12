@@ -193,11 +193,35 @@ impl BlockDiffusionDraftHead {
         Ok(self.scratch.conv_tmp)
     }
 
-    /// 2026-09-25: Selector tail over `n_seq` bands: top-16 per row (overwriting the
-    /// selected entries of `scratch.logits`), the H(h_t) projection, then one
-    /// chain-walk launch writing rows 1.. of each band of `draft_tokens_dev`. Row 0 of
-    /// each band is not written.
-    pub(super) fn dflash2_select_block(
+    // 2026-09-25: The selector tail over `n_seq` bands: top-16 per row (overwriting the
+    // selected entries of `scratch.logits`), the H(h_t) projection, then one chain-walk
+    // launch writing rows 1.. of each band of `draft_tokens_dev` (row 0 of each band is
+    // not written). 2026-10-12: split into `dflash2_topk_block` and `dflash2_walk_block`;
+    // `block_tail_select` (forward_block/tail.rs) runs the two-rank top-16 merge between
+    // them, in the order the single body ran, so `METRALE_DFLASH_TP_GRAPHS` can capture
+    // each side.
+
+    /// 2026-10-12: The per-row top-16 over `scratch.logits` (writes `sel_vals` and
+    /// `sel_idx`, leaves `draft_tokens_dev` alone). One launch.
+    pub(super) fn dflash2_topk_block(
+        &self,
+        ctx: &ForwardContext,
+        n_seq: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let rows = self.block_g() as u32 * n_seq.max(1);
+        KernelLaunch::new(ctx.gpu, self.kernels.dflash2_topk16)
+            .grid([rows, 1, 1])
+            .block([1024, 1, 1])
+            .arg_ptr(self.scratch.logits)
+            .arg_ptr(self.scratch.sel_vals)
+            .arg_ptr(self.scratch.sel_idx)
+            .arg_u32(self.vocab_size as u32)
+            .launch(stream)
+    }
+
+    /// 2026-10-12: The H(h_t) projection, then the chain walk from row 1 of each band.
+    pub(super) fn dflash2_walk_block(
         &self,
         ctx: &ForwardContext,
         norm_noise: DevicePtr,
@@ -208,7 +232,6 @@ impl BlockDiffusionDraftHead {
         let n = n_seq.max(1);
         let g = self.block_g() as u32;
         let rows = g * n;
-        let vocab = self.vocab_size as u32;
         let rank = self.selector_rank as u32;
         let hproj = self
             .selector_hidden_proj
@@ -222,20 +245,6 @@ impl BlockDiffusionDraftHead {
             .selector_succ
             .as_ref()
             .expect("dflash2_active() checked selector_succ");
-
-        // 2026-09-25: Order: top-16 (writes sel_vals and sel_idx, leaves
-        // draft_tokens_dev alone), the H(h_t) GEMM, then the walk.
-        KernelLaunch::new(gpu, self.kernels.dflash2_topk16)
-            .grid([rows, 1, 1])
-            .block([1024, 1, 1])
-            .arg_ptr(self.scratch.logits)
-            .arg_ptr(self.scratch.sel_vals)
-            .arg_ptr(self.scratch.sel_idx)
-            .arg_u32(vocab)
-            .launch(stream)?;
-        // 2026-10-09: Two-rank drafter: `vocab` is this rank's shard; merge every rank's
-        // top-16 into the global one before the walk reads it (`tp/collectives.rs`).
-        self.tp_merge_top16(ctx, rows as usize, stream)?;
 
         // 2026-09-25: H(h_t): [rows, hidden] → [rows, rank].
         self.draft_gemm_bf16(

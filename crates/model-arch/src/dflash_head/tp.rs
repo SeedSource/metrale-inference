@@ -34,8 +34,10 @@
 //! Owner: model-arch (DFlash drafter).
 //! Invariants:
 //! - Single sequence only: `propose_batch` declines and `propose_batch_max` is 1.
-//! - The propose runs eagerly (no CUDA graphs), on the communicator's legacy stream (the
-//!   GPU default stream), so collectives and kernels are ordered on one stream.
+//! - The propose runs on the communicator's legacy stream (the GPU default stream), so
+//!   collectives and kernels are ordered on one stream. It runs eagerly unless
+//!   `METRALE_DFLASH_TP_GRAPHS=1`, which graphs only the pieces between collectives
+//!   (`forward_block/tp_graphs.rs`); no collective is ever captured.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 

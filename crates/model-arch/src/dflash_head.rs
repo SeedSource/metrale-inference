@@ -94,6 +94,11 @@ pub struct DflashLayer {
 pub struct ProposeGraphs {
     pub by_width: std::collections::HashMap<usize, Vec<metrale_gpu_runtime::gpu::GraphHandle>>,
     pub warmup: std::collections::HashMap<usize, usize>,
+    /// 2026-10-12: `METRALE_DFLASH_TP_GRAPHS`: the two-rank propose's segment graphs per
+    /// block width (`4 * num_layers + 2`, `forward_block/tp_graphs.rs`) and their warm-up
+    /// counts. Each rank keeps its own; no collective is ever captured.
+    pub tp_by_width: std::collections::HashMap<usize, Vec<metrale_gpu_runtime::gpu::GraphHandle>>,
+    pub tp_warmup: std::collections::HashMap<usize, usize>,
 }
 
 /// 2026-09-25: Block-diffusion draft head; its public API is the

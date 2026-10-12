@@ -374,3 +374,53 @@ fn reasoning_effort_strings_render_template_safe() {
         Some(ReasoningEffort::Medium)
     );
 }
+
+/// 2026-10-12: Other engines' clients spell the switch `thinking` (SGLang) or
+/// `thinking_mode` (MiniMax) inside `chat_template_kwargs`; sparkDash sends all
+/// three, SparkGLM's `staggered_openai.py` sends `thinking` + `enable_thinking`.
+#[test]
+fn chat_template_kwargs_thinking_spellings() {
+    let directive = |kwargs: serde_json::Value| {
+        let mut b = base_body();
+        b["chat_template_kwargs"] = kwargs;
+        chat_req(b).client_thinking_directive()
+    };
+    use serde_json::json;
+    assert_eq!(
+        directive(json!({"thinking": false})),
+        ThinkingDirective::Off
+    );
+    assert_eq!(
+        directive(json!({"thinking_mode": "disabled"})),
+        ThinkingDirective::Off
+    );
+    assert_eq!(
+        directive(
+            json!({"enable_thinking": false, "thinking": false, "thinking_mode": "disabled"})
+        ),
+        ThinkingDirective::Off
+    );
+    assert_eq!(
+        directive(json!({"thinking": true})),
+        ThinkingDirective::On { budget: None }
+    );
+    assert_eq!(
+        directive(json!({"thinking_mode": "enabled"})),
+        ThinkingDirective::On { budget: None }
+    );
+    // 2026-10-12: `enable_thinking` wins over the alternate spellings.
+    assert_eq!(
+        directive(json!({"enable_thinking": true, "thinking": false})),
+        ThinkingDirective::On { budget: None }
+    );
+    // 2026-10-12: An unknown `thinking_mode` string is ignored.
+    assert_eq!(
+        directive(json!({"thinking_mode": "auto"})),
+        ThinkingDirective::Unspecified
+    );
+    // 2026-10-12: `thinking_budget` still outranks the switch.
+    assert_eq!(
+        directive(json!({"thinking": false, "thinking_budget": 512})),
+        ThinkingDirective::On { budget: Some(512) }
+    );
+}

@@ -220,6 +220,26 @@ pub struct ChatTemplateKwargs {
     /// `reasoning.effort` and the top-level `reasoning_effort`. Within this
     /// object, `thinking_budget` and `enable_thinking: false` win over it.
     pub reasoning_effort: Option<String>,
+    /// 2026-10-12: Alternate spellings of `enable_thinking` sent by other
+    /// engines' clients (SGLang-style `thinking`, MiniMax-style
+    /// `thinking_mode: "enabled" | "disabled"`); read only when
+    /// `enable_thinking` is absent. See [`Self::thinking_switch`].
+    pub thinking: Option<bool>,
+    pub thinking_mode: Option<String>,
+}
+
+impl ChatTemplateKwargs {
+    /// 2026-10-12: The on/off switch: `enable_thinking`, then `thinking`,
+    /// then `thinking_mode` (`"enabled"` / `"disabled"`; any other string is
+    /// ignored).
+    fn thinking_switch(&self) -> Option<bool> {
+        let mode = match self.thinking_mode.as_deref() {
+            Some("enabled") => Some(true),
+            Some("disabled") => Some(false),
+            _ => None,
+        };
+        self.enable_thinking.or(self.thinking).or(mode)
+    }
 }
 
 impl ChatCompletionRequest {
@@ -339,7 +359,7 @@ impl ChatCompletionRequest {
                     ThinkingDirective::Off
                 };
             }
-            if let Some(enabled) = kwargs.enable_thinking {
+            if let Some(enabled) = kwargs.thinking_switch() {
                 if !enabled {
                     return ThinkingDirective::Off;
                 }

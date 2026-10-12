@@ -82,6 +82,10 @@ pub struct DflashLayer {
     pub attention_conv_proj: Option<DenseWeight>,
     pub mlp_conv_base: Option<DenseWeight>,
     pub mlp_conv_proj: Option<DenseWeight>,
+    /// 2026-10-12: FP8 mirrors of the two conv kernel projections
+    /// (`METRALE_DFLASH_AUX_FP8`, `aux_fp8.rs`); `None` otherwise.
+    pub attention_conv_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    pub mlp_conv_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
 }
 
 #[allow(dead_code)]
@@ -176,6 +180,11 @@ pub struct BlockDiffusionDraftHead {
     /// `layers[i]` at construction, so `precompute_ctx_kv` computes every
     /// layer's ctx K/V with one GEMM.
     pub fused_kv_weight: Option<DevicePtr>,
+    /// 2026-10-12: `METRALE_DFLASH_AUX_FP8` (`aux_fp8.rs`): FP8 mirrors of `fc`, the fused
+    /// ctx K/V weight and the selector's hidden projection; `None` otherwise.
+    pub fc_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    pub fused_kv_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    pub selector_hidden_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
 
     /// 2026-09-25: The drafter's paged bf16 KV cache: one cache holding all
     /// `num_layers` drafter layers, block-table-keyed like the target's.
@@ -257,6 +266,7 @@ pub struct BlockDiffusionDraftHead {
 }
 
 mod attn_width;
+mod aux_fp8;
 mod dflash2;
 pub mod conf_log;
 mod draft_gemm;

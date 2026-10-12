@@ -126,10 +126,11 @@ impl BlockDiffusionDraftHead {
         // `[K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}]`.
         let fused_w = DenseWeight { weight: fused_kv };
         let fused_n_cols = (l_total as u32) * 2 * kv_dim;
-        self.draft_gemm_bf16(
+        // 2026-10-12: METRALE_DFLASH_AUX_FP8: up to 16 rows on the FP8 mirror; BF16 kept.
+        self.draft_gemm_aux(
             gpu,
             self.scratch.fc_proj,
-            &fused_w,
+            (&fused_w, self.fused_kv_fp8.as_ref(), true),
             self.scratch.fused_kv_out,
             n,
             fused_n_cols,

@@ -50,11 +50,13 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         let gpu = ctx.gpu;
         let h = self.hidden_size;
+        // 2026-10-12: METRALE_DFLASH_AUX_FP8: up to 16 rows on the FP8 mirror; BF16 kept.
+        let fc = (&self.fc, self.fc_fp8.as_ref(), true);
         let Some(tp) = self.tp.as_ref() else {
-            return self.draft_gemm_bf16(
+            return self.draft_gemm_aux(
                 gpu,
                 src,
-                &self.fc,
+                fc,
                 self.scratch.fc_proj,
                 n,
                 h as u32,
@@ -64,10 +66,10 @@ impl BlockDiffusionDraftHead {
         };
         let comm = tp_comm(ctx, tp)?;
         anyhow::ensure!(n as usize <= self.ctx_window, "fc_project: {n} rows");
-        self.draft_gemm_bf16(
+        self.draft_gemm_aux(
             gpu,
             src,
-            &self.fc,
+            fc,
             tp.fc_local,
             n,
             tp.fc_len as u32,

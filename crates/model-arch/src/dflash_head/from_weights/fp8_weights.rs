@@ -215,6 +215,15 @@ const BF16_LAYER_SUFFIXES: [&str; 7] = [
     ".mlp.down_proj.weight",
 ];
 
+/// 2026-10-12: Store-name suffixes of the BF16 tensors `METRALE_DFLASH_AUX_FP8` replaces
+/// (`aux_fp8.rs`): the two conv kernel projections per layer, then the selector's hidden
+/// projection.
+const AUX_CONV_SUFFIXES: [&str; 2] = [
+    ".attention_conv.kernel_projection.weight",
+    ".mlp_conv.kernel_projection.weight",
+];
+const AUX_SELECTOR_SUFFIX: &str = "candidate_selector.hidden_projection.weight";
+
 impl BlockDiffusionDraftHead {
     /// 2026-10-10: Frees the BF16 copies of the layers' seven dense GEMM weights once the
     /// head runs on their FP8 mirrors (#82 hybrid memory, P2). Returns the freed (tensors,
@@ -227,6 +236,13 @@ impl BlockDiffusionDraftHead {
     /// present. The fused ctx K/V weight is its own copy, made in `from_weights`.
     /// Only BF16 store tensors are freed: an NVFP4-packed tensor was dequantized into
     /// another allocation.
+    ///
+    /// 2026-10-12: Under `METRALE_DFLASH_AUX_FP8` it also frees the conv kernel projections
+    /// (when every layer that has them holds both mirrors) and the selector's hidden
+    /// projection (when mirrored): their only readers, `conv_prepare` and
+    /// `dflash2_walk_block`, route a mirrored projection to FP8 at every row count
+    /// (`aux_fp8::aux_route` with the BF16 copy not kept). `fc` and the fused K/V keep
+    /// their BF16 copies.
     ///
     /// The head's BF16 pointers are set to null first, so a read that this audit missed
     /// faults with an illegal address instead of reading freed memory.
@@ -244,12 +260,24 @@ impl BlockDiffusionDraftHead {
                 && l.up_proj_fp8.is_some()
                 && l.down_proj_fp8.is_some()
         });
-        if self.quant != DflashQuantization::Fp8Weights || !self.levers.option_b || !mirrored {
-            return Ok(None);
-        }
+        let layers_go =
+            self.quant == DflashQuantization::Fp8Weights && self.levers.option_b && mirrored;
+        let conv_go = self
+            .layers
+            .iter()
+            .any(|l| l.attention_conv_proj_fp8.is_some())
+            && self.layers.iter().all(|l| {
+                (l.attention_conv_proj.is_none() || l.attention_conv_proj_fp8.is_some())
+                    && (l.mlp_conv_proj.is_none() || l.mlp_conv_proj_fp8.is_some())
+            });
+        let selector_go = self.selector_hidden_proj_fp8.is_some();
         let doomed: std::collections::HashSet<String> = store
             .names()
-            .filter(|n| BF16_LAYER_SUFFIXES.iter().any(|s| n.ends_with(s)))
+            .filter(|n| {
+                (layers_go && BF16_LAYER_SUFFIXES.iter().any(|s| n.ends_with(s)))
+                    || (conv_go && AUX_CONV_SUFFIXES.iter().any(|s| n.ends_with(s)))
+                    || (selector_go && n.ends_with(AUX_SELECTOR_SUFFIX))
+            })
             .filter(|n| {
                 store
                     .get(n)
@@ -266,13 +294,25 @@ impl BlockDiffusionDraftHead {
             weight: metrale_gpu_runtime::gpu::DevicePtr::NULL,
         };
         for l in &mut self.layers {
-            l.q_proj = null;
-            l.k_proj = null;
-            l.v_proj = null;
-            l.o_proj = null;
-            l.gate_proj = null;
-            l.up_proj = null;
-            l.down_proj = null;
+            if layers_go {
+                l.q_proj = null;
+                l.k_proj = null;
+                l.v_proj = null;
+                l.o_proj = null;
+                l.gate_proj = null;
+                l.up_proj = null;
+                l.down_proj = null;
+            }
+            if conv_go {
+                for p in [&mut l.attention_conv_proj, &mut l.mlp_conv_proj] {
+                    if let Some(w) = p.as_mut() {
+                        *w = null;
+                    }
+                }
+            }
+        }
+        if selector_go && let Some(w) = self.selector_hidden_proj.as_mut() {
+            *w = null;
         }
         store.free_matching(gpu, |n| doomed.contains(n)).map(Some)
     }

@@ -76,6 +76,17 @@ impl BlockDiffusionDraftHead {
         }
     }
 
+    /// 2026-10-12: The FP8 mirror of `site`'s kernel projection (`METRALE_DFLASH_AUX_FP8`).
+    fn conv_proj_fp8(
+        layer: &DflashLayer,
+        site: ConvSite,
+    ) -> Option<&metrale_model_layers::weight_map::Fp8DenseWeight> {
+        match site {
+            ConvSite::Attention => layer.attention_conv_proj_fp8.as_ref(),
+            ConvSite::Mlp => layer.mlp_conv_proj_fp8.as_ref(),
+        }
+    }
+
     /// 2026-09-25: One conv application. `x` and `out` must be distinct buffers
     /// (row t reads x[t-1]). `application` is 0 for prepare and 1 for finish;
     /// `n_seq` is the number of sequences packed seq-major (1 on the single-sequence
@@ -141,10 +152,15 @@ impl BlockDiffusionDraftHead {
         let groups = h / self.conv_group_size as u32;
         let dyn_cols = 2 * self.conv_kernel_size as u32 * groups;
         // 2026-09-25: Dynamic kernels for both applications, from the pre-conv hidden.
-        self.draft_gemm_bf16(
+        // 2026-10-12: On the FP8 mirror under METRALE_DFLASH_AUX_FP8 (BF16 freed).
+        self.draft_gemm_aux(
             ctx.gpu,
             hidden_in,
-            &metrale_model_layers::weight_map::DenseWeight { weight: proj },
+            (
+                &metrale_model_layers::weight_map::DenseWeight { weight: proj },
+                Self::conv_proj_fp8(layer, site),
+                false,
+            ),
             self.scratch.conv_dyn,
             g,
             dyn_cols,
@@ -246,11 +262,12 @@ impl BlockDiffusionDraftHead {
             .as_ref()
             .expect("dflash2_active() checked selector_succ");
 
-        // 2026-09-25: H(h_t): [rows, hidden] → [rows, rank].
-        self.draft_gemm_bf16(
+        // 2026-09-25: H(h_t): [rows, hidden] → [rows, rank]. 2026-10-12: on the FP8
+        // mirror under METRALE_DFLASH_AUX_FP8 (BF16 freed).
+        self.draft_gemm_aux(
             gpu,
             norm_noise,
-            hproj,
+            (hproj, self.selector_hidden_proj_fp8.as_ref(), false),
             self.scratch.sel_hproj,
             rows,
             rank,

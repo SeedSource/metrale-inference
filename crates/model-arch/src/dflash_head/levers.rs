@@ -94,6 +94,10 @@ pub struct DFlashLevers {
     /// (`forward_block/tp_graphs.rs`). Every NCCL call stays eager. Off: the TP propose
     /// runs fully eagerly, as before.
     pub tp_graphs: bool,
+    /// 2026-10-12: `METRALE_DFLASH_AUX_FP8=1`: FP8 row-scaled mirrors of the conv kernel
+    /// projections, `fc`, the fused ctx K/V weight and the selector's hidden projection
+    /// (`aux_fp8.rs`). Drafter numerics only.
+    pub aux_fp8: bool,
 
     /// 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: after a single-sequence DFlash2 propose, read
     /// the selector's top-16 logits back (one blocking D2H) for the verify step's
@@ -199,6 +203,7 @@ fn from_values(
         draft_gemv: opt_in(value("METRALE_DFLASH_DRAFT_GEMV").as_deref()),
         draft_tp2: opt_in(value("METRALE_DFLASH_DRAFT_TP2").as_deref()),
         tp_graphs: opt_in(value("METRALE_DFLASH_TP_GRAPHS").as_deref()),
+        aux_fp8: opt_in(value("METRALE_DFLASH_AUX_FP8").as_deref()),
 
         conf_log: opt_in(value("METRALE_DFLASH_CONF_LOG").as_deref()),
         dflash_conf_tau: parse_conf_tau(value("METRALE_DFLASH_CONF_TAU").as_deref()),

@@ -368,9 +368,14 @@ impl BlockDiffusionDraftHead {
                     attention_conv_proj: l.attention_conv_proj,
                     mlp_conv_base: l.mlp_conv_base,
                     mlp_conv_proj: l.mlp_conv_proj,
+                    attention_conv_proj_fp8: None,
+                    mlp_conv_proj_fp8: None,
                 })
                 .collect(),
             fused_kv_weight: Some(fused_kv_weight),
+            fc_fp8: None,
+            fused_kv_fp8: None,
+            selector_hidden_proj_fp8: None,
             kv_cache: Mutex::new(kv_cache),
             scratch,
             kernels,
@@ -473,6 +478,8 @@ impl BlockDiffusionDraftHead {
             head.tp = Some(super::tp::DraftTp::new(p, &head, gpu)?);
         }
         fp8_weights::arm_drafter_fp8(&mut head, gpu, q_dim, kv_dim, lm_head_native_fp8)?;
+        // 2026-10-12: METRALE_DFLASH_AUX_FP8 mirrors (needs the FP8 head armed above).
+        head.arm_aux_fp8(gpu)?;
         head.arm_draft_gemv(gpu);
         head.tp_validate()?;
         head.log_tp_graphs_lever();

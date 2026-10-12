@@ -28,15 +28,14 @@ use metrale_model_layers::weight_map::QuantizedWeight;
 
 use crate::glm5next_layer::{dense_fp8, dense_nv4_tc};
 
-/// First row count that takes the tensor-core tier. PROVISIONAL: the CUDA-core batch4+ tiers are
-/// compute-bound (dfnv4mt 2026-10-12, M = 8); the break-even against the CUDA-core tier at M = 4..=8
-/// is not measured on this shape until `glm_lm_head_nv4_shard_microtest` runs on GB10.
-pub const TC_FROM_M: usize = 4;
+/// First row count that takes the tensor-core tier. Measured 2026-10-12 (phcmt2, ra-pf-phc2,
+/// glm_lm_head_nv4_shard_microtest, cold 77440x4096 shard): M=2 tc 799.7 vs CUDA-core 796.8 us,
+/// M=3 tc 778.0 vs 801.8 us; the CUDA-core tier falls to 149 GB/s at M=8 and 81 GB/s at M=16.
+pub const TC_FROM_M: usize = 3;
 
 /// Largest row count routed to the NVFP4 shard; larger counts keep the FP8 shard sweep.
-/// PROVISIONAL: 16 (every row count the NVFP4 tiers cover, `dense_fp8::NV4_MAX_M`) until the
-/// microtest's per-M `old_us` / `new_us` rows show a row count where FP8 wins; then lower this to
-/// the last M where NVFP4 is faster. Both copies are resident either way.
+/// Measured 2026-10-12 (phcmt2): the best NVFP4 tier beats FP8 at every M = 1..=16
+/// (FP8 1352-1410 us vs NVFP4 735-881 us), so every count the NVFP4 tiers cover routes here.
 pub const ROUTE_MAX_M: usize = 16;
 
 /// `METRALE_GLM_LM_HEAD_NV4_SHARD=1` opts in; read once.

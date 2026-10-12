@@ -486,6 +486,8 @@ impl BlockDiffusionDraftHead {
         head.report_nv4();
         // 2026-10-12: METRALE_DFLASH_NV4_TC: the tensor-core route for the copies above.
         head.arm_nv4_tc(gpu);
+        // 2026-10-12: METRALE_DFLASH_NV4_GROUP: grouped q/k/v and gate/up on that route.
+        head.arm_nv4_group();
         head.arm_draft_gemv(gpu);
         head.tp_validate()?;
         head.log_tp_graphs_lever();

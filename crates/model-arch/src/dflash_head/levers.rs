@@ -111,6 +111,14 @@ pub struct DFlashLevers {
     /// 2026-10-12: `METRALE_DFLASH_NV4_TC=1`: the NVFP4 copies the three levers above build are
     /// read by the tensor-core `w4a16_gemv_tc8/tc16` instead of the CUDA-core tiers (`nv4.rs`).
     pub nv4_tc: bool,
+    /// 2026-10-12: `METRALE_DFLASH_TOPK_REG=1`: the selector's top-16 runs the one-scan
+    /// `dflash2_topk16_reg` in place of `dflash2_topk16` (same picks; `dflash2.rs`).
+    pub topk_reg: bool,
+    /// 2026-10-12: `METRALE_DFLASH_NV4_GROUP=1`: with `METRALE_DFLASH_NV4_TC` engaged, each
+    /// layer's q/k/v and gate/up NVFP4 copies run as one grouped persistent tensor-core launch
+    /// per input (`nv4.rs`, `gemv_tc::tc_group_launch`), bytes equal to the per-projection
+    /// launches.
+    pub nv4_group: bool,
 
     /// 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: after a single-sequence DFlash2 propose, read
     /// the selector's top-16 logits back (one blocking D2H) for the verify step's
@@ -221,6 +229,8 @@ fn from_values(
         nv4_layers: opt_in(value("METRALE_DFLASH_NV4_LAYERS").as_deref()),
         nv4_aux: opt_in(value("METRALE_DFLASH_NV4_AUX").as_deref()),
         nv4_tc: opt_in(value("METRALE_DFLASH_NV4_TC").as_deref()),
+        topk_reg: opt_in(value("METRALE_DFLASH_TOPK_REG").as_deref()),
+        nv4_group: opt_in(value("METRALE_DFLASH_NV4_GROUP").as_deref()),
 
         conf_log: opt_in(value("METRALE_DFLASH_CONF_LOG").as_deref()),
         dflash_conf_tau: parse_conf_tau(value("METRALE_DFLASH_CONF_TAU").as_deref()),

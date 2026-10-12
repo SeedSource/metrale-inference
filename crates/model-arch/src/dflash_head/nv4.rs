@@ -41,6 +41,7 @@ use std::sync::Once;
 
 use anyhow::{Result, bail, ensure};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
+use metrale_model_layers::layers::ops::gemv_tc::{self, TcGroupMember};
 use metrale_model_layers::weight_map::{DenseWeight, QuantizedWeight};
 
 use super::{BlockDiffusionDraftHead, DflashLayer, DflashQuantization};
@@ -54,6 +55,8 @@ static HEAD_LOG: Once = Once::new();
 static LAYERS_LOG: Once = Once::new();
 static AUX_LOG: Once = Once::new();
 static TC_LOG: Once = Once::new();
+static GROUP_LOG: Once = Once::new();
+static GROUP_DECLINED_LOG: Once = Once::new();
 
 /// 2026-10-12: One layer's NVFP4 copies (`METRALE_DFLASH_NV4_LAYERS` for the seven GEMMs,
 /// `METRALE_DFLASH_NV4_AUX` for the two conv kernel projections); `None` = not built.
@@ -92,6 +95,9 @@ pub struct HeadNv4 {
     /// 2026-10-12: `METRALE_DFLASH_NV4_TC` engaged: every NVFP4 copy above and in the layers is
     /// read by the tensor-core kernels ([`gemv`]).
     pub tc: bool,
+    /// 2026-10-12: `METRALE_DFLASH_NV4_GROUP` engaged: each layer's q/k/v and gate/up copies
+    /// run as one grouped tensor-core launch per input ([`group_launch`]).
+    pub group: bool,
 }
 
 /// 2026-10-12: Bytes of an NVFP4 copy of `[n, k]`: packed E2M1 (k/2 per row) plus one E4M3
@@ -297,6 +303,48 @@ pub(super) fn gemv(
     } else {
         dense_fp8::nv4_gemv_cuda_core(gpu, a, q, c, m, n, k, stream)
     }
+}
+
+/// 2026-10-12: `METRALE_DFLASH_NV4_GROUP`: `c_i[m, n_i] = a[m, k] @ W_i^T` for every member
+/// (an NVFP4 copy, its output, its `n`) as one `gemv_tc::tc_group_launch` (the
+/// `w4a16_gemv_tc{8,16}_group` kernels of METRALE_GLM_NV4_TC_GROUP), each output byte equal to
+/// the member's own tc8/tc16 launch ([`gemv`] with `tc`). `Ok(false)` launches nothing: a
+/// member without a copy, a row count outside 1..=[`NV4_ROWS_MAX`], or a group the route
+/// declines (warned once); the caller then runs its per-projection launches.
+pub(super) fn group_launch(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    members: &[(Option<QuantizedWeight>, DevicePtr, u32)],
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<bool> {
+    if !(1..=NV4_ROWS_MAX).contains(&(m as usize)) {
+        return Ok(false);
+    }
+    let mut group = Vec::with_capacity(members.len());
+    for (q, c, n) in members {
+        let Some(q) = q.as_ref() else {
+            return Ok(false);
+        };
+        group.push(TcGroupMember {
+            weight: q,
+            out: *c,
+            n: *n,
+        });
+    }
+    let launched = gemv_tc::tc_group_launch(gpu, a, &group, m, k, stream)?;
+    if !launched {
+        GROUP_DECLINED_LOG.call_once(|| {
+            let ns: Vec<u32> = members.iter().map(|(_, _, n)| *n).collect();
+            tracing::warn!(
+                "METRALE_DFLASH_NV4_GROUP=1: grouped launch declined at {m} rows, K {k}, n \
+                 {ns:?} (w4a16_gemv_tc*_group missing, or the members route to different \
+                 entries); those projections run per launch"
+            );
+        });
+    }
+    Ok(launched)
 }
 
 /// 2026-10-12: The `[n, k]` shapes `METRALE_DFLASH_NV4_TC` would read with the tensor-core
@@ -557,6 +605,43 @@ impl BlockDiffusionDraftHead {
                  on {}; same NVFP4 copies, no repack; not byte-identical to the CUDA-core tiers; \
                  drafts only)",
                 list.join(", ")
+            );
+        });
+    }
+
+    /// 2026-10-12: `METRALE_DFLASH_NV4_GROUP=1`: engage the grouped q/k/v and gate/up launches
+    /// when `METRALE_DFLASH_NV4_TC` engaged and some layer has all five copies; logs ENGAGED once
+    /// per rank, or NOT ENGAGED with the reason. Runs after [`Self::arm_nv4_tc`].
+    pub(super) fn arm_nv4_group(&mut self) {
+        if !self.levers.nv4_group {
+            return;
+        }
+        let reason = if !self.nv4.tc {
+            Some("needs METRALE_DFLASH_NV4_TC engaged (see its line)")
+        } else if !self.layers.iter().any(|l| {
+            let n = &l.nv4;
+            n.q.is_some() && n.k.is_some() && n.v.is_some() && n.gate.is_some() && n.up.is_some()
+        }) {
+            Some(
+                "no layer has NVFP4 copies of q, k, v, gate and up (needs \
+                 METRALE_DFLASH_NV4_LAYERS engaged)",
+            )
+        } else {
+            None
+        };
+        if let Some(r) = reason {
+            tracing::warn!(
+                "METRALE_DFLASH_NV4_GROUP=1: NOT ENGAGED: {r}; per-projection launches stay"
+            );
+            return;
+        }
+        self.nv4.group = true;
+        let rank = self.tp.as_ref().map_or(0, |t| t.rank());
+        GROUP_LOG.call_once(|| {
+            tracing::warn!(
+                "METRALE_DFLASH_NV4_GROUP=1: ENGAGED (rank {rank}: q/k/v and gate/up as one \
+                 w4a16_gemv_tc*_group launch per input in each layer; bytes equal to the \
+                 per-projection tc launches)"
             );
         });
     }

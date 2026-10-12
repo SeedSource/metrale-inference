@@ -81,6 +81,9 @@ pub struct DflashKernels {
     /// 2026-09-25: DFlash2 per-row top-16 over the drafter logits; overwrites each
     /// selected logit.
     pub dflash2_topk16: KernelHandle,
+    /// 2026-10-12: The one-scan top-16 (`METRALE_DFLASH_TOPK_REG`), same contract as
+    /// `dflash2_topk16`; `.0 == 0` when the module lacks it.
+    pub dflash2_topk16_reg: KernelHandle,
     /// 2026-09-25: DFlash2 candidate-selector chain walk, one launch, one block per
     /// sequence.
     pub dflash2_selector_walk: KernelHandle,

@@ -162,17 +162,36 @@ impl BlockDiffusionDraftHead {
             self.draft_gemm_bf16(gpu, src, w_bf16, dst, g, n_out, k_in, stream)
         };
 
+        // 2026-10-12: METRALE_DFLASH_NV4_GROUP: q, k and v in one grouped launch (bytes equal
+        // to the three launches below, which it then skips). Nothing between them writes
+        // `qkv_src`, and the norms and RoPE below read only their own buffers.
+        let grouped = self.nv4.group
+            && crate::dflash_head::nv4::group_launch(
+                gpu,
+                qkv_src,
+                &[
+                    (layer.nv4.q, self.scratch.q_buf, q_dim),
+                    (layer.nv4.k, self.scratch.k_buf, kv_dim),
+                    (layer.nv4.v, self.scratch.v_buf, kv_dim),
+                ],
+                g,
+                h,
+                stream,
+            )?;
+
         // 2026-09-25: Q is `[g, q_dim]`, one row per token; q_norm treats it as
         // `[g * num_q_heads, head_dim]`.
-        gemm_swap(
-            &layer.q_proj,
-            &layer.q_proj_fp8,
-            &layer.nv4.q,
-            qkv_src,
-            self.scratch.q_buf,
-            q_dim,
-            h,
-        )?;
+        if !grouped {
+            gemm_swap(
+                &layer.q_proj,
+                &layer.q_proj_fp8,
+                &layer.nv4.q,
+                qkv_src,
+                self.scratch.q_buf,
+                q_dim,
+                h,
+            )?;
+        }
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
@@ -210,15 +229,17 @@ impl BlockDiffusionDraftHead {
         // 2026-09-25: k_norm normalises each token's heads independently, so norming the
         // block K here and the ctx K in `precompute_ctx_kv` (same `k_norm` weight) equals
         // norming them together.
-        gemm_swap(
-            &layer.k_proj,
-            &layer.k_proj_fp8,
-            &layer.nv4.k,
-            qkv_src,
-            self.scratch.k_buf,
-            kv_dim,
-            h,
-        )?;
+        if !grouped {
+            gemm_swap(
+                &layer.k_proj,
+                &layer.k_proj_fp8,
+                &layer.nv4.k,
+                qkv_src,
+                self.scratch.k_buf,
+                kv_dim,
+                h,
+            )?;
+        }
         if args.block_dump {
             self.block_dump_buf(
                 ctx,
@@ -254,15 +275,17 @@ impl BlockDiffusionDraftHead {
         }
 
         // 2026-09-25: V has no norm.
-        gemm_swap(
-            &layer.v_proj,
-            &layer.v_proj_fp8,
-            &layer.nv4.v,
-            qkv_src,
-            self.scratch.v_buf,
-            kv_dim,
-            h,
-        )?;
+        if !grouped {
+            gemm_swap(
+                &layer.v_proj,
+                &layer.v_proj_fp8,
+                &layer.nv4.v,
+                qkv_src,
+                self.scratch.v_buf,
+                kv_dim,
+                h,
+            )?;
+        }
 
         // 2026-09-25: RoPE on Q and the block K at `position_ids`, each sequence's
         // `[position, position + block_g)` as `forward_block` wrote them. The ctx K was

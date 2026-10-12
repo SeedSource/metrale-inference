@@ -222,7 +222,9 @@ impl BlockDiffusionDraftHead {
     // each side.
 
     /// 2026-10-12: The per-row top-16 over `scratch.logits` (writes `sel_vals` and
-    /// `sel_idx`, leaves `draft_tokens_dev` alone). One launch.
+    /// `sel_idx`, leaves `draft_tokens_dev` alone). One launch: `dflash2_topk16_reg` under
+    /// `METRALE_DFLASH_TOPK_REG` when the module has it (same picks, one scan), else
+    /// `dflash2_topk16`.
     pub(super) fn dflash2_topk_block(
         &self,
         ctx: &ForwardContext,
@@ -230,7 +232,12 @@ impl BlockDiffusionDraftHead {
         stream: u64,
     ) -> Result<()> {
         let rows = self.block_g() as u32 * n_seq.max(1);
-        KernelLaunch::new(ctx.gpu, self.kernels.dflash2_topk16)
+        let kernel = topk_kernel(
+            self.levers.topk_reg,
+            self.kernels.dflash2_topk16_reg,
+            self.kernels.dflash2_topk16,
+        );
+        KernelLaunch::new(ctx.gpu, kernel)
             .grid([rows, 1, 1])
             .block([1024, 1, 1])
             .arg_ptr(self.scratch.logits)
@@ -303,5 +310,49 @@ impl BlockDiffusionDraftHead {
         // 2026-09-25: Row 0 of each band is not rewritten: propose (propose.rs) and
         // the batched split (proposer.rs) drop row 0 whenever `mask_token_id != 0`.
         Ok(())
+    }
+}
+
+/// 2026-10-12: `METRALE_DFLASH_TOPK_REG` engaged / not-engaged line, once per process.
+static TOPK_REG_LOG: std::sync::Once = std::sync::Once::new();
+
+/// 2026-10-12: The top-16 entry `dflash2_topk_block` launches: the one-scan `reg` when the
+/// lever is on and the module has it, else `old` (with a NOT ENGAGED warning when the lever
+/// asked for it).
+fn topk_kernel(
+    lever: bool,
+    reg: metrale_gpu_runtime::gpu::KernelHandle,
+    old: metrale_gpu_runtime::gpu::KernelHandle,
+) -> metrale_gpu_runtime::gpu::KernelHandle {
+    if !lever {
+        return old;
+    }
+    let engaged = reg.0 != 0;
+    TOPK_REG_LOG.call_once(|| {
+        if engaged {
+            tracing::info!("METRALE_DFLASH_TOPK_REG=1: ENGAGED (dflash2_topk16_reg)");
+        } else {
+            tracing::warn!(
+                "METRALE_DFLASH_TOPK_REG=1: NOT ENGAGED: the dflash2 module has no \
+                 dflash2_topk16_reg entry; dflash2_topk16 stays"
+            );
+        }
+    });
+    if engaged { reg } else { old }
+}
+
+#[cfg(test)]
+mod topk_kernel_tests {
+    use super::topk_kernel;
+    use metrale_gpu_runtime::gpu::KernelHandle;
+
+    #[test]
+    fn lever_picks_reg_only_when_present() {
+        // 2026-10-12: Off: the old entry whatever the module has. On: `reg` when it exists,
+        // the old entry when it does not (never a null handle).
+        let (reg, old) = (KernelHandle(7), KernelHandle(3));
+        assert_eq!(topk_kernel(false, reg, old).0, 3);
+        assert_eq!(topk_kernel(true, reg, old).0, 7);
+        assert_eq!(topk_kernel(true, KernelHandle(0), old).0, 3);
     }
 }

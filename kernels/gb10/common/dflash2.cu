@@ -113,6 +113,118 @@ extern "C" __global__ void dflash2_topk16(
     }
 }
 
+// 2026-10-12: `dflash2_topk16` in one scan (METRALE_DFLASH_TOPK_REG). Same launch (one block
+// of 1024 threads per row), same outputs, same -1e30 writes into `logits`, and the same
+// picks: thread tid scans i = tid, tid + 1024, ... and keeps its 16 best in registers,
+// sorted by value with ties in scan order (strict >, as the old per-thread scan); then 16
+// passes pop the head of the thread whose head is largest. Ties between threads go where
+// the old tree sends them: it folds halves (tid vs tid + off, off = 512 .. 1) and keeps tid
+// on ties, so two tied threads meet at their lowest differing bit and the one with a 0
+// there wins, i.e. the lower bit-reversed tid wins. The old kernel rescans the row 16
+// times; this one reads it once. One difference, only when a row has fewer than 16 values
+// above -1e30: the old kernel can pick an entry it already overwrote, this one pops the
+// (-1e30, 0) fill.
+// Needs blockDim.x == 1024 (the scan order and the 32 warp slots).
+
+__device__ __forceinline__ void dflash2_top_better(
+    float& v, unsigned int& t, float ov, unsigned int ot
+) {
+    if (ov > v || (ov == v && __brev(ot) < __brev(t))) {
+        v = ov;
+        t = ot;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(1024) dflash2_topk16_reg(
+    __nv_bfloat16* __restrict__ logits,
+    float* __restrict__ top_vals,
+    unsigned int* __restrict__ top_idx,
+    unsigned int n
+) {
+    __shared__ float s_val[32];
+    __shared__ unsigned int s_tid[32];
+    __shared__ unsigned int s_win;
+
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    __nv_bfloat16* lrow = logits + (size_t)row * n;
+
+    float v[16];
+    unsigned int ix[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        v[j] = -1e30f;
+        ix[j] = 0u;
+    }
+    for (unsigned int i = tid; i < n; i += 1024u) {
+        const float x = __bfloat162float(lrow[i]);
+        if (x > v[15]) {
+            bool placed = false;
+#pragma unroll
+            for (int j = 15; j > 0; --j) {
+                if (!placed) {
+                    if (x > v[j - 1]) {
+                        v[j] = v[j - 1];
+                        ix[j] = ix[j - 1];
+                    } else {
+                        v[j] = x;
+                        ix[j] = i;
+                        placed = true;
+                    }
+                }
+            }
+            if (!placed) {
+                v[0] = x;
+                ix[0] = i;
+            }
+        }
+    }
+
+    for (unsigned int k = 0; k < 16; ++k) {
+        float bv = v[0];
+        unsigned int bt = tid;
+#pragma unroll
+        for (unsigned int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+            const unsigned int ot = __shfl_down_sync(0xffffffffu, bt, off);
+            dflash2_top_better(bv, bt, ov, ot);
+        }
+        if (lane == 0) {
+            s_val[warp] = bv;
+            s_tid[warp] = bt;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            bv = s_val[lane];
+            bt = s_tid[lane];
+#pragma unroll
+            for (unsigned int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+                const unsigned int ot = __shfl_down_sync(0xffffffffu, bt, off);
+                dflash2_top_better(bv, bt, ov, ot);
+            }
+            if (lane == 0) {
+                s_win = bt;
+            }
+        }
+        __syncthreads();
+        if (tid == s_win) {
+            top_vals[(size_t)row * 16 + k] = v[0];
+            top_idx[(size_t)row * 16 + k] = ix[0];
+            lrow[ix[0]] = __float2bfloat16(-1e30f);
+#pragma unroll
+            for (int j = 0; j < 15; ++j) {
+                v[j] = v[j + 1];
+                ix[j] = ix[j + 1];
+            }
+            v[15] = -1e30f;
+            ix[15] = 0u;
+        }
+    }
+}
+
 // 2026-09-25: Candidate-selector chain walk, one block per sequence band:
 //   S_t(a, b) = U_t(b) + sum_r pred[a][r] * hproj[t][r] * succ[b][r]
 // U_t is top_vals and the candidates b are top_idx. Block i walks rows first_row..rows-1

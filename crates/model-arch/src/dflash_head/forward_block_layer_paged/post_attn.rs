@@ -212,24 +212,40 @@ impl BlockDiffusionDraftHead {
 
                 // 2026-09-25: MLP: down(silu(gate(x)) * up(x)) with x = mlp_src.
                 // silu_mul writes into mlp_intermediate, down_proj into stream_acc.
-                gemm_swap(
-                    &layer.gate_proj,
-                    &layer.gate_proj_fp8,
-                    &layer.nv4.gate,
-                    mlp_src,
-                    self.scratch.mlp_intermediate,
-                    inter,
-                    h,
-                )?;
-                gemm_swap(
-                    &layer.up_proj,
-                    &layer.up_proj_fp8,
-                    &layer.nv4.up,
-                    mlp_src,
-                    self.scratch.mlp_up,
-                    inter,
-                    h,
-                )?;
+                // 2026-10-12: METRALE_DFLASH_NV4_GROUP: gate and up in one grouped launch
+                // (bytes equal to the two launches, which it then skips).
+                let grouped = self.nv4.group
+                    && crate::dflash_head::nv4::group_launch(
+                        gpu,
+                        mlp_src,
+                        &[
+                            (layer.nv4.gate, self.scratch.mlp_intermediate, inter),
+                            (layer.nv4.up, self.scratch.mlp_up, inter),
+                        ],
+                        g,
+                        h,
+                        stream,
+                    )?;
+                if !grouped {
+                    gemm_swap(
+                        &layer.gate_proj,
+                        &layer.gate_proj_fp8,
+                        &layer.nv4.gate,
+                        mlp_src,
+                        self.scratch.mlp_intermediate,
+                        inter,
+                        h,
+                    )?;
+                    gemm_swap(
+                        &layer.up_proj,
+                        &layer.up_proj_fp8,
+                        &layer.nv4.up,
+                        mlp_src,
+                        self.scratch.mlp_up,
+                        inter,
+                        h,
+                    )?;
+                }
                 ops::silu_mul(
                     gpu,
                     self.kernels.silu_mul,

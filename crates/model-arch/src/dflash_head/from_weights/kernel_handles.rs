@@ -127,6 +127,11 @@ pub(super) fn load_kernels(gpu: &dyn GpuBackend, head_dim: usize) -> Result<Dfla
         // loads other drafters; `dflash2_active` is then false.
         dflash2_conv2: metrale_model_layers::layers::try_kernel(gpu, "dflash2", "dflash2_conv2"),
         dflash2_topk16: metrale_model_layers::layers::try_kernel(gpu, "dflash2", "dflash2_topk16"),
+        dflash2_topk16_reg: metrale_model_layers::layers::try_kernel(
+            gpu,
+            "dflash2",
+            "dflash2_topk16_reg",
+        ),
         dflash2_selector_walk: metrale_model_layers::layers::try_kernel(
             gpu,
             "dflash2",

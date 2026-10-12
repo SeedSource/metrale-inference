@@ -166,8 +166,8 @@ mod tests {
 
     #[test]
     fn routing_constants_are_consistent() {
-        assert!(TC_FROM_M >= 1 && TC_FROM_M <= ROUTE_MAX_M);
-        assert!(ROUTE_MAX_M <= dense_fp8::NV4_MAX_M);
+        const { assert!(TC_FROM_M >= 1 && TC_FROM_M <= ROUTE_MAX_M) };
+        const { assert!(ROUTE_MAX_M <= dense_fp8::NV4_MAX_M) };
         assert!(!routes(0) && routes(1) && routes(ROUTE_MAX_M) && !routes(ROUTE_MAX_M + 1));
     }
 }

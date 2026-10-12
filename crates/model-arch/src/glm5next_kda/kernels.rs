@@ -102,6 +102,9 @@ impl Glm5NextKdaKernels {
     pub const ENTRY_POINTS: usize = 14;
 
     pub fn resolve(gpu: &dyn GpuBackend) -> Result<Self> {
+        // 2026-10-12: `METRALE_GLM_KDA_STATE_ROUND`: resolve its kernel and allocate its
+        // statistics once; a no-op (no allocation) when the lever is off, an error on a bad value.
+        super::state_round::init(gpu)?;
         Ok(Self {
             gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,

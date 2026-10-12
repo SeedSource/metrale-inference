@@ -641,6 +641,11 @@ impl Glm5NextWeightLoader {
             };
 
             let t_mlp = t_layer.elapsed();
+            // 2026-10-12: `METRALE_GLM_NUMERICS_FAKEQ`: fake-quantize the listed families' BF16
+            // weights in place (before `register_layer`, which leaves `g_a` / `g_b` alone when
+            // `kda_g` is listed); a no-op, with nothing resolved, when the lever is unset.
+            crate::glm5next_numerics::apply_layer(gpu, &mixer, &mlp, &mlp_cfg, idx)
+                .with_context(|| format!("glm5_next: METRALE_GLM_NUMERICS_FAKEQ layer {idx}"))?;
             // 2026-10-03: `METRALE_GLM_DENSE_FP8=1`: FP8 copies of this text layer's dense
             // projections replace the BF16 originals, which are freed and whose fields now name
             // the copies (`glm5next_layer::dense_fp8`); a no-op when the lever is off.
@@ -698,6 +703,10 @@ impl Glm5NextWeightLoader {
             } else {
                 None
             };
+            // 2026-10-12: `METRALE_GLM_NUMERICS_FAKEQ` family `hc_fn` (no-op when unset).
+            if let Some(m) = mhc.as_ref() {
+                crate::glm5next_numerics::apply_mhc(gpu, m, config.hidden_size, idx)?;
+            }
 
             // 2026-10-01: Prefetch heads. Attention: the attention-site `hc_fn`, then the mixer
             // head. FFN: the FFN-site `hc_fn`, then the router `[num_experts, hidden]` (MoE) or

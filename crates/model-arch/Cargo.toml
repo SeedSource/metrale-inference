@@ -125,6 +125,10 @@ name = "dsa_ceiling_rows_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_router_ysplit_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_grid_stride_microtest"
 required-features = ["cuda", "gpu-examples"]
 

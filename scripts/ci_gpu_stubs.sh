@@ -140,6 +140,12 @@ int cuGraphInstantiateWithFlags(void **a, void *b, unsigned long long c) {
     (void)a; (void)b; (void)c; return 100;
 }
 int cuGraphLaunch(void *a, void *b) { (void)a; (void)b; return 100; }
+int cuGraphGetEdges_v2(void *g, void *from, void *to, void *edge_data, unsigned long *n) {
+    (void)g; (void)from; (void)to; (void)edge_data; (void)n; return 100;
+}
+int cuLaunchKernelEx(const void *config, void *f, void **params, void **extra) {
+    (void)config; (void)f; (void)params; (void)extra; return 100;
+}
 int cuGraphExecDestroy(void *a) { (void)a; return 100; }
 int cuGraphDestroy(void *a) { (void)a; return 100; }
 EOF

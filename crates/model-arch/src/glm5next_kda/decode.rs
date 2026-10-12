@@ -104,7 +104,9 @@ impl Glm5NextKdaLayer {
                 .launch(stream)?;
         }
 
-        Ok(())
+        // 2026-10-12: `METRALE_GLM_KDA_STATE_ROUND`: round the state this row just wrote (no
+        // launch with the lever off).
+        self.state_round_after(gpu, state, super::state_round::Phase::Decode, stream)
     }
 
     /// 2026-10-01: The opt-in token loop (`METRALE_GLM_KDA_TOKEN_LOOP=1`): rows `0..k` of
@@ -388,13 +390,18 @@ impl Glm5NextKdaLayer {
         let t_recur = profile::start();
         // 2026-10-01: Opt-in (`METRALE_GLM_KDA_TOKEN_LOOP=1`): two launches for all rows when no
         // snapshot is asked for; otherwise, or when the target lacks the row kernels, the walk.
+        // 2026-10-12: Not while `METRALE_GLM_KDA_STATE_ROUND` is on: the token loop keeps the state
+        // in FP32 across rows, and the lever rounds it after every row.
+        let rounding = super::state_round::state_round().is_some();
         let looped = snapshots.is_empty()
             && k > 1
             && kda_token_loop()
+            && !rounding
             && self.stateful_rows(gpu, k, capture, state, ws, stream)?;
         // 2026-10-06: Fused snapshots (snap_fuse.rs): the same row kernels, each row writing its
         // snapshot slot directly; never with an in-pass capture.
         let fused = !looped
+            && !rounding
             && fuse_snaps
             && capture.is_none()
             && !snapshots.is_empty()
@@ -518,6 +525,7 @@ impl Glm5NextKdaLayer {
             // 2026-10-06: `METRALE_GLM_KDA_SNAP_FUSE=1`: this sequence's walk with fused
             // snapshots (snap_fuse.rs); the loop below when it cannot run.
             if fuse
+                && super::state_round::state_round().is_none()
                 && !snaps.is_empty()
                 && self.snap_walk(gpu, base, k, state, ws, snaps, stream)?
             {

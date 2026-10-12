@@ -44,6 +44,7 @@ mod prefill_flashkda;
 mod prefill_tc;
 mod prefill_tc_fuse;
 mod snap_fuse;
+pub mod state_round;
 pub use config::{Glm5NextKdaConfig, Glm5NextKdaWeights};
 pub use kernels::Glm5NextKdaKernels;
 

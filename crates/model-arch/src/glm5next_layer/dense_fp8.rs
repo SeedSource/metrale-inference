@@ -1521,8 +1521,14 @@ pub fn register_layer(
             list.push((&mut w.q_proj.weight, qkv, hid, Class::Kda, "q_proj"));
             list.push((&mut w.k_proj.weight, qkv, hid, Class::Kda, "k_proj"));
             list.push((&mut w.v_proj.weight, qkv, hid, Class::Kda, "v_proj"));
-            list.push((&mut w.g_a.weight, hd, hid, Class::Keep, "g_a"));
-            list.push((&mut w.g_b.weight, qkv, hd, Class::Keep, "g_b"));
+            // 2026-10-12: `METRALE_GLM_NUMERICS_FAKEQ` family `kda_g`: g_a / g_b were fake-quantized
+            // in place to BF16 (`glm5next_numerics`), so they stay BF16 here; converting them would
+            // stack a second quantization. `route` reads an unregistered weight through the BF16
+            // path. Without the family listed, both convert as before.
+            if !crate::glm5next_numerics::lists(crate::glm5next_numerics::Family::KdaG) {
+                list.push((&mut w.g_a.weight, hd, hid, Class::Keep, "g_a"));
+                list.push((&mut w.g_b.weight, qkv, hd, Class::Keep, "g_b"));
+            }
             list.push((&mut w.o_proj.weight, hid, qkv, Class::Kda, "o_proj"));
         }
         Glm5NextMixer::Dsa(l) => {

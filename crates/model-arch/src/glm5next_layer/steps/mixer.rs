@@ -91,6 +91,10 @@ impl Glm5NextLayer {
                 let flashkda = chunkable
                     && crate::glm5next_kda::kda_prefill_flashkda()
                     && layer.prefill_flashkda(gpu, normed, k, kda, ws, stream)?;
+                // 2026-10-12: `METRALE_GLM_KDA_STATE_ROUND`: true when one of the three chunked arms
+                // below wrote the state, which is then rounded once after the arm (the per-row walk
+                // arms round every row inside `stateful_row`).
+                let mut chunk_arm = true;
                 if flashkda {
                     // 2026-10-03: FlashKDA ran the recurrence; the partial is in `final_out`.
                 } else if chunkable && crate::glm5next_kda::kda_prefill_chunked_tc() {
@@ -106,6 +110,7 @@ impl Glm5NextLayer {
                 } else if chunkable && kda_chunk_prefill() {
                     layer.prefill(gpu, normed, k, kda, ws, stream)?;
                 } else if let (Some(cap), Some(mc)) = (capture, ctx.midchunk_capture.as_ref()) {
+                    chunk_arm = false;
                     // 2026-10-03: The same launches as `decode_k` below, with the state copied
                     // into the reserved snapshot slot after row `cap.row - 1`. FlashKDA and the
                     // FP32 chunked scan above never capture; the model enables the in-pass
@@ -115,7 +120,11 @@ impl Glm5NextLayer {
                     layer.decode_k_capture(gpu, normed, k, kda, ws, cap, stream)?;
                     mc.captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
+                    chunk_arm = false;
                     layer.decode_k(gpu, normed, k, kda, ws, snaps, stream)?;
+                }
+                if chunk_arm {
+                    layer.state_round_prefill(gpu, kda, stream)?;
                 }
                 ws.final_out
             }

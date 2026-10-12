@@ -45,6 +45,34 @@ pub(super) fn setup_lm_heads(
         .and_then(|k| store.get(k).ok())
         .is_some_and(|w| w.dtype == metrale_model_weights::weights::WeightDtype::UInt8);
 
+    // 2026-10-12: `METRALE_GLM_NUMERICS_FAKEQ`: the `lm_head` family fake-quantizes the BF16 head in
+    // place, which only makes sense when the head stays BF16 (`--lm-head-dtype bf16`); any other
+    // head would be quantized a second time below, so it fails the load. By now every layer and
+    // the MTP block have been through the other families, so the per-family summary prints here.
+    // Unset: `validate` and `fakeq` return at once and nothing else runs.
+    {
+        use metrale_model_arch::glm5next_numerics as nq;
+        nq::validate()?;
+        if !nq::fakeq().is_empty() {
+            let kind = if lm_head_prepacked_nvfp4 {
+                nq::HeadKind::PrepackedNvfp4
+            } else if config.skip_lm_head_quantization() {
+                nq::HeadKind::Bf16
+            } else if config.lm_head_fp8 {
+                nq::HeadKind::Fp8
+            } else {
+                nq::HeadKind::Nvfp4
+            };
+            if config.tie_word_embeddings && nq::lists(nq::Family::LmHead) {
+                anyhow::bail!(
+                    "METRALE_GLM_NUMERICS_FAKEQ lists lm_head, but this model ties lm_head to the                      embedding; the in-place fake-quant would change the embedding too"
+                );
+            }
+            nq::apply_lm_head(gpu, lm_head.weight, config.vocab_size, config.hidden_size, kind)?;
+            nq::log_summary();
+        }
+    }
+
     let mut lm_head_fp8: Option<Fp8DenseWeight> = None;
     let lm_head_nvfp4 = if lm_head_prepacked_nvfp4 {
         // 2026-09-25: No BF16 lm_head exists in the checkpoint, so a BF16 or FP8 request cannot

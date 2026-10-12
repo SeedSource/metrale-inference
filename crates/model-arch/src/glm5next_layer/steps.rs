@@ -239,6 +239,8 @@ impl Glm5NextLayer {
         let t_dense = matches!(self.mlp, Glm5NextMlpSite::Dense(_))
             .then(profile::start)
             .flatten();
+        // 2026-10-11: The layer index for `METRALE_GLM_MOE_UNION_LOG`'s per-call line (no-op off).
+        crate::glm5next_mlp::forward::union_log::set_layer(self.layer_idx);
         match &self.mlp {
             Glm5NextMlpSite::Dense(w) => forward_dense_sliced(
                 ctx.gpu,

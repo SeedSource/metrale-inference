@@ -21,7 +21,7 @@ use super::{Glm5NextMlpConfig, Glm5NextMlpKernels};
 mod dense;
 mod launch;
 mod moe_experts;
-mod union_log;
+pub(crate) mod union_log;
 mod workspace;
 
 use dense::row_slices;

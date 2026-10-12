@@ -31,7 +31,7 @@ use crate::glm5next_kda::tp::KdaTpPlan;
 use crate::glm5next_kda::tp_bind::KdaShardedSource;
 use crate::glm5next_kda::{Glm5NextKdaConfig, Glm5NextKdaKernels, Glm5NextKdaLayer};
 use crate::glm5next_layer::{Glm5NextLayer, Glm5NextMhc, Glm5NextMixer, Glm5NextMlpSite};
-use crate::glm5next_mhc::{Glm5NextMhcKernels, Glm5NextMhcSiteWeights, mhc_mix_max_tokens, mix_hc};
+use crate::glm5next_mhc::{Glm5NextMhcKernels, Glm5NextMhcSiteWeights, mhc_mix_alloc_bytes, mhc_splitk_tail_bytes, mix_hc};
 use crate::glm5next_mlp::weights::{Glm5NextExpertWeights, Nvfp4Proj};
 use crate::glm5next_mlp::{Glm5NextMlpConfig, Glm5NextMlpKernels, build as mlp_build};
 use crate::glm5next_skeleton::{Glm5NextTextSkeleton, Mixer, Mlp};
@@ -417,7 +417,15 @@ fn bind_mhc_site(
         hc_base: upload_f32(gpu, &base)?,
         // 2026-09-25: The `hc_mix` to `hc_finish` scratch; one per site, so a
         // layer's two sites never share it.
-        mix: gpu.alloc(mhc_mix_max_tokens() * mix_hc(hc_mult) * 4)?,
+        mix: {
+            // 2026-10-12: METRALE_GLM_HC_MIX_ILP=splitk<S> appends the split-K scratch; its
+            // counters must start at zero.
+            let p = gpu.alloc(mhc_mix_alloc_bytes(hc_mult))?;
+            if mhc_splitk_tail_bytes() != 0 {
+                gpu.memset(p, 0, mhc_mix_alloc_bytes(hc_mult))?;
+            }
+            p
+        },
     })
 }
 

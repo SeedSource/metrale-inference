@@ -103,6 +103,10 @@ impl TpPlan {
             option_b,
             "METRALE_DFLASH_DRAFT_TP2 needs the paged drafter cache (METRALE_DFLASH_OPTION_B)"
         );
+        // 2026-10-12: This refuses the target CHECKPOINT's NVFP4 lm_head (`lm_head_nvfp4`,
+        // read whole by `w4a16_gemm`). `METRALE_DFLASH_NV4_HEAD`'s NVFP4 copy is accepted: it
+        // is quantized later (`fp8_weights.rs`, `nv4.rs`) from this rank's BF16 rows
+        // (`lm_head_rows`), so it is already the vocab shard and `nvfp4_lm_head` is false.
         ensure!(
             !nvfp4_lm_head,
             "METRALE_DFLASH_DRAFT_TP2 does not split an NVFP4 lm_head"

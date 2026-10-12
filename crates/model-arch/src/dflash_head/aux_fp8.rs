@@ -35,7 +35,7 @@ use std::sync::Once;
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 use metrale_model_layers::layers::ops;
-use metrale_model_layers::weight_map::{DenseWeight, Fp8DenseWeight};
+use metrale_model_layers::weight_map::{DenseWeight, Fp8DenseWeight, QuantizedWeight};
 
 use super::{BlockDiffusionDraftHead, DflashQuantization};
 
@@ -162,7 +162,7 @@ pub(super) fn aux_shapes(g: AuxGeom) -> Vec<AuxShape> {
 
 impl BlockDiffusionDraftHead {
     /// 2026-10-12: This head's [`AuxGeom`] (local dims under TP).
-    fn aux_geom(&self) -> AuxGeom {
+    pub(super) fn aux_geom(&self) -> AuxGeom {
         AuxGeom {
             hidden: self.hidden_size,
             layers: self.layers.len(),
@@ -181,58 +181,105 @@ impl BlockDiffusionDraftHead {
 
     /// 2026-10-12: Build the mirrors under `METRALE_DFLASH_AUX_FP8=1` on an `Fp8Weights`
     /// head; otherwise warn (lever on) or do nothing.
+    ///
+    /// 2026-10-12: Under `METRALE_DFLASH_NV4_AUX=1` (`nv4.rs`) each tensor first gets an NVFP4
+    /// copy, and then no FP8 mirror; a tensor without one gets its FP8 mirror only under
+    /// `METRALE_DFLASH_AUX_FP8=1`. With NV4_AUX off this is the AUX_FP8 arm as before.
     pub(super) fn arm_aux_fp8(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
-        if !self.levers.aux_fp8 {
+        if !self.levers.aux_fp8 && !self.levers.nv4_aux {
             return Ok(());
         }
         if self.quant != DflashQuantization::Fp8Weights || self.kernels.quantize_bf16_to_fp8.0 == 0
         {
-            tracing::warn!(
-                "METRALE_DFLASH_AUX_FP8=1: IDLE (the drafter is not on FP8 weights; needs \
-                 METRALE_DFLASH_DRAFTER_FP8 and its kernels): conv, fc, fused K/V and selector \
-                 projections stay BF16"
-            );
+            if self.levers.aux_fp8 {
+                tracing::warn!(
+                    "METRALE_DFLASH_AUX_FP8=1: IDLE (the drafter is not on FP8 weights; needs \
+                     METRALE_DFLASH_DRAFTER_FP8 and its kernels): conv, fc, fused K/V and \
+                     selector projections stay BF16"
+                );
+            }
             return Ok(());
         }
         let quant_k = self.kernels.quantize_bf16_to_fp8;
         let stream = 0u64;
+        let fp8_on = self.levers.aux_fp8;
+        let nv4_on = self.nv4_armed(self.levers.nv4_aux);
         let g = self.aux_geom();
         let shapes = aux_shapes(g);
         let shape = |name: &str| *shapes.iter().find(|s| s.name == name).expect("aux shape");
+        // 2026-10-12: (NVFP4 copy, FP8 mirror) of one BF16 tensor, per the two levers.
+        type Copies = (Option<QuantizedWeight>, Option<Fp8DenseWeight>);
+        let build = |w: &DenseWeight, s: AuxShape| -> Result<Copies> {
+            let q = if nv4_on {
+                super::nv4::quantize_rows(gpu, w.weight, s.n, s.k)?
+            } else {
+                None
+            };
+            let f = if q.is_none() && fp8_on {
+                Some(w.quantize_to_fp8(gpu, quant_k, s.n, s.k, stream)?)
+            } else {
+                None
+            };
+            Ok((q, f))
+        };
         if g.conv_kernel_size > 0 && g.conv_group_size > 0 {
             let s = shape("attention_conv_proj");
             for layer in self.layers.iter_mut() {
                 if let Some(w) = layer.attention_conv_proj.as_ref() {
-                    layer.attention_conv_proj_fp8 =
-                        Some(w.quantize_to_fp8(gpu, quant_k, s.n, s.k, stream)?);
+                    (layer.nv4.attention_conv_proj, layer.attention_conv_proj_fp8) = build(w, s)?;
                 }
                 if let Some(w) = layer.mlp_conv_proj.as_ref() {
-                    layer.mlp_conv_proj_fp8 =
-                        Some(w.quantize_to_fp8(gpu, quant_k, s.n, s.k, stream)?);
+                    (layer.nv4.mlp_conv_proj, layer.mlp_conv_proj_fp8) = build(w, s)?;
                 }
             }
         }
-        let s = shape("fc");
-        self.fc_fp8 = Some(self.fc.quantize_to_fp8(gpu, quant_k, s.n, s.k, stream)?);
+        (self.nv4.fc, self.fc_fp8) = build(&self.fc, shape("fc"))?;
         if let Some(fused) = self.fused_kv_weight {
-            let s = shape("fused_kv");
-            self.fused_kv_fp8 = Some(
-                DenseWeight { weight: fused }.quantize_to_fp8(gpu, quant_k, s.n, s.k, stream)?,
-            );
+            (self.nv4.fused_kv, self.fused_kv_fp8) =
+                build(&DenseWeight { weight: fused }, shape("fused_kv"))?;
         }
         if let Some(w) = self.selector_hidden_proj.as_ref() {
-            let s = shape("selector_hidden_proj");
-            self.selector_hidden_proj_fp8 =
-                Some(w.quantize_to_fp8(gpu, quant_k, s.n, s.k, stream)?);
+            (self.nv4.selector_hidden_proj, self.selector_hidden_proj_fp8) =
+                build(w, shape("selector_hidden_proj"))?;
         }
-        let mirror_mb = shapes.iter().map(AuxShape::fp8_bytes).sum::<usize>() as f64 / 1e6;
-        let freed_mb = shapes
+        // 2026-10-12: The AUX_FP8 line counts the FP8 mirrors built (all of them unless
+        // NV4_AUX took some; `nv4.rs` reports those).
+        let fp8_built = |s: &AuxShape| -> usize {
+            match s.name {
+                "attention_conv_proj" => self
+                    .layers
+                    .iter()
+                    .filter(|l| l.attention_conv_proj_fp8.is_some())
+                    .count(),
+                "mlp_conv_proj" => self
+                    .layers
+                    .iter()
+                    .filter(|l| l.mlp_conv_proj_fp8.is_some())
+                    .count(),
+                "fc" => usize::from(self.fc_fp8.is_some()),
+                "fused_kv" => usize::from(self.fused_kv_fp8.is_some()),
+                _ => usize::from(self.selector_hidden_proj_fp8.is_some()),
+            }
+        };
+        let built: Vec<AuxShape> = shapes
+            .iter()
+            .map(|s| AuxShape {
+                count: fp8_built(s),
+                ..*s
+            })
+            .filter(|s| s.count > 0)
+            .collect();
+        if built.is_empty() {
+            return Ok(());
+        }
+        let mirror_mb = built.iter().map(AuxShape::fp8_bytes).sum::<usize>() as f64 / 1e6;
+        let freed_mb = built
             .iter()
             .filter(|s| s.replaces_bf16)
             .map(AuxShape::bf16_bytes)
             .sum::<usize>() as f64
             / 1e6;
-        let list: Vec<String> = shapes
+        let list: Vec<String> = built
             .iter()
             .map(|s| format!("{}x{} [{}x{}]", s.name, s.count, s.n, s.k))
             .collect();
@@ -250,18 +297,30 @@ impl BlockDiffusionDraftHead {
 
     /// 2026-10-12: `C[m, n] = A[m, k] @ W[n, k]^T` for an auxiliary projection: on its FP8
     /// mirror when [`aux_route`] says so, else `draft_gemm_bf16` on `bf16`.
+    ///
+    /// 2026-10-12: First, the NVFP4 copy (`METRALE_DFLASH_NV4_AUX`) when [`nv4_takes`] says so.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draft_gemm_aux(
         &self,
         gpu: &dyn GpuBackend,
         input: DevicePtr,
-        (bf16, fp8, bf16_kept): (&DenseWeight, Option<&Fp8DenseWeight>, bool),
+        (bf16, fp8, nv4, bf16_kept): (
+            &DenseWeight,
+            Option<&Fp8DenseWeight>,
+            Option<&QuantizedWeight>,
+            bool,
+        ),
         output: DevicePtr,
         m: u32,
         n: u32,
         k: u32,
         stream: u64,
     ) -> Result<()> {
+        if let Some(q) = nv4
+            && nv4_takes(true, fp8.is_some(), bf16_kept, m)?
+        {
+            return super::nv4::gemv(gpu, input, q, output, m, n, k, stream);
+        }
         let kernels = (
             self.kernels.fp8_gemv_rt2.0 != 0,
             self.kernels.fp8_gemv_rt2_16.0 != 0,
@@ -304,6 +363,25 @@ impl BlockDiffusionDraftHead {
             _ => self.draft_gemm_bf16(gpu, input, bf16, output, m, n, k, stream),
         }
     }
+}
+
+/// 2026-10-12: Whether an auxiliary projection of `m` rows takes its NVFP4 copy (`nv4`: one
+/// exists): yes for 1..=16 rows. Outside that the FP8 mirror or the kept BF16 copy takes it
+/// ([`aux_route`]); with neither (a conv / selector projection whose BF16 copy was freed) it is
+/// an error, never a read of freed memory.
+pub(super) fn nv4_takes(nv4: bool, fp8: bool, bf16_kept: bool, m: u32) -> Result<bool> {
+    if !nv4 {
+        return Ok(false);
+    }
+    if (1..=super::nv4::NV4_ROWS_MAX).contains(&(m as usize)) {
+        return Ok(true);
+    }
+    anyhow::ensure!(
+        fp8 || bf16_kept,
+        "DFlash NVFP4 aux projection: {m} rows outside 1..={} and no FP8 or BF16 copy",
+        super::nv4::NV4_ROWS_MAX
+    );
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -393,6 +471,18 @@ mod tests {
         assert_eq!(extra, 2048 * 20480 + 4 * 2048 + 5120 * 4096 + 4 * 5120);
         assert_eq!(freed, 10 * 1024 * 4096 * 2 + 256 * 4096 * 2);
         assert!(freed > freed_fp8);
+    }
+
+    #[test]
+    fn nv4_takes_up_to_16_rows_else_a_live_copy() {
+        assert!(!nv4_takes(false, false, false, 8).unwrap(), "no NVFP4 copy");
+        assert!(nv4_takes(true, false, false, 1).unwrap());
+        assert!(nv4_takes(true, false, false, 8).unwrap());
+        assert!(nv4_takes(true, true, true, 16).unwrap());
+        assert!(!nv4_takes(true, false, true, 17).unwrap(), "fc/fused K/V: BF16 kept");
+        assert!(!nv4_takes(true, true, false, 17).unwrap(), "FP8 mirror present");
+        assert!(nv4_takes(true, false, false, 17).is_err(), "conv/selector: BF16 freed");
+        assert!(nv4_takes(true, false, false, 0).is_err());
     }
 
     #[test]

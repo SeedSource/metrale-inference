@@ -86,6 +86,9 @@ pub struct DflashLayer {
     /// (`METRALE_DFLASH_AUX_FP8`, `aux_fp8.rs`); `None` otherwise.
     pub attention_conv_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
     pub mlp_conv_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    /// 2026-10-12: NVFP4 copies (`METRALE_DFLASH_NV4_LAYERS` / `_AUX`, `nv4.rs`); all `None`
+    /// unless a lever built them.
+    pub nv4: nv4::LayerNv4,
 }
 
 #[allow(dead_code)]
@@ -185,6 +188,10 @@ pub struct BlockDiffusionDraftHead {
     pub fc_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
     pub fused_kv_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
     pub selector_hidden_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    /// 2026-10-12: NVFP4 copies of the lm_head (`METRALE_DFLASH_NV4_HEAD`) and of `fc`, the
+    /// fused ctx K/V and the selector's hidden projection (`METRALE_DFLASH_NV4_AUX`), `nv4.rs`;
+    /// all `None` unless a lever built them.
+    pub nv4: nv4::HeadNv4,
 
     /// 2026-09-25: The drafter's paged bf16 KV cache: one cache holding all
     /// `num_layers` drafter layers, block-table-keyed like the target's.
@@ -268,6 +275,7 @@ pub struct BlockDiffusionDraftHead {
 mod attn_width;
 mod aux_fp8;
 mod dflash2;
+mod nv4;
 pub mod conf_log;
 mod draft_gemm;
 /// 2026-09-25: Rows the batched ctx precompute staging holds per step.

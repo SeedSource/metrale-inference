@@ -51,7 +51,12 @@ impl BlockDiffusionDraftHead {
         let gpu = ctx.gpu;
         let h = self.hidden_size;
         // 2026-10-12: METRALE_DFLASH_AUX_FP8: up to 16 rows on the FP8 mirror; BF16 kept.
-        let fc = (&self.fc, self.fc_fp8.as_ref(), true);
+        let fc = (
+            &self.fc,
+            self.fc_fp8.as_ref(),
+            self.nv4.fc.as_ref(),
+            true,
+        );
         let Some(tp) = self.tp.as_ref() else {
             return self.draft_gemm_aux(
                 gpu,

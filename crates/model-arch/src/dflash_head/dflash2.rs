@@ -159,6 +159,10 @@ impl BlockDiffusionDraftHead {
             (
                 &metrale_model_layers::weight_map::DenseWeight { weight: proj },
                 Self::conv_proj_fp8(layer, site),
+                match site {
+                    ConvSite::Attention => layer.nv4.attention_conv_proj.as_ref(),
+                    ConvSite::Mlp => layer.nv4.mlp_conv_proj.as_ref(),
+                },
                 false,
             ),
             self.scratch.conv_dyn,
@@ -267,7 +271,12 @@ impl BlockDiffusionDraftHead {
         self.draft_gemm_aux(
             gpu,
             norm_noise,
-            (hproj, self.selector_hidden_proj_fp8.as_ref(), false),
+            (
+                hproj,
+                self.selector_hidden_proj_fp8.as_ref(),
+                self.nv4.selector_hidden_proj.as_ref(),
+                false,
+            ),
             self.scratch.sel_hproj,
             rows,
             rank,

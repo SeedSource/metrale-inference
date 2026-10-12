@@ -98,6 +98,16 @@ pub struct DFlashLevers {
     /// projections, `fc`, the fused ctx K/V weight and the selector's hidden projection
     /// (`aux_fp8.rs`). Drafter numerics only.
     pub aux_fp8: bool,
+    /// 2026-10-12: `METRALE_DFLASH_NV4_HEAD=1`: the drafter's lm_head (this rank's vocab
+    /// shard) as an NVFP4 copy in place of its FP8 copy (`nv4.rs`). Drafter numerics only.
+    pub nv4_head: bool,
+    /// 2026-10-12: `METRALE_DFLASH_NV4_LAYERS=1`: the seven per-layer GEMMs (q, k, v, o,
+    /// gate, up, down) as NVFP4 copies in place of their FP8 mirrors (`nv4.rs`).
+    pub nv4_layers: bool,
+    /// 2026-10-12: `METRALE_DFLASH_NV4_AUX=1`: the conv kernel projections, `fc`, the fused
+    /// ctx K/V and the selector's hidden projection as NVFP4 copies in place of the
+    /// `METRALE_DFLASH_AUX_FP8` mirrors, up to 16 rows (`nv4.rs`, `aux_fp8.rs`).
+    pub nv4_aux: bool,
 
     /// 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: after a single-sequence DFlash2 propose, read
     /// the selector's top-16 logits back (one blocking D2H) for the verify step's
@@ -204,6 +214,9 @@ fn from_values(
         draft_tp2: opt_in(value("METRALE_DFLASH_DRAFT_TP2").as_deref()),
         tp_graphs: opt_in(value("METRALE_DFLASH_TP_GRAPHS").as_deref()),
         aux_fp8: opt_in(value("METRALE_DFLASH_AUX_FP8").as_deref()),
+        nv4_head: opt_in(value("METRALE_DFLASH_NV4_HEAD").as_deref()),
+        nv4_layers: opt_in(value("METRALE_DFLASH_NV4_LAYERS").as_deref()),
+        nv4_aux: opt_in(value("METRALE_DFLASH_NV4_AUX").as_deref()),
 
         conf_log: opt_in(value("METRALE_DFLASH_CONF_LOG").as_deref()),
         dflash_conf_tau: parse_conf_tau(value("METRALE_DFLASH_CONF_TAU").as_deref()),

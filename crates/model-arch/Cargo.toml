@@ -41,6 +41,10 @@ metrale-gpu-runtime = { path = "../gpu-runtime", default-features = false, featu
 metrale-kernels = { path = "../kernels", default-features = false }
 
 [[example]]
+name = "dflash_nv4_drafter_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "bf16_batch_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 

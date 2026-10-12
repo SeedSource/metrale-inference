@@ -71,7 +71,8 @@ impl BlockDiffusionDraftHead {
         );
         // 2026-09-25: lm_head: NVFP4 when the target's lm_head is NVFP4
         // (`lm_head_shared` is valid only for a BF16 lm_head), else FP8 with
-        // `Fp8Weights` and an FP8 copy present, else BF16.
+        // `Fp8Weights` and an FP8 copy present, else BF16. 2026-10-12: before FP8, the
+        // METRALE_DFLASH_NV4_HEAD copy when built.
         if let Some(q) = self.lm_head_nvfp4.as_ref() {
             ops::w4a16_gemm(
                 gpu,
@@ -80,6 +81,19 @@ impl BlockDiffusionDraftHead {
                 q,
                 self.scratch.logits,
                 self.gamma as u32,
+                self.vocab_size as u32,
+                h_local,
+                stream,
+            )?;
+        } else if let Some(q) = self.nv4.lm_head.as_ref() {
+            // 2026-10-12: METRALE_DFLASH_NV4_HEAD (`nv4.rs`): this rank's NVFP4 head copy on
+            // the CUDA-core tiers, `[g, vocab]` BF16 logits at stride vocab like the FP8 sweep.
+            crate::dflash_head::nv4::gemv(
+                gpu,
+                norm_noise_local,
+                q,
+                self.scratch.logits,
+                g,
                 self.vocab_size as u32,
                 h_local,
                 stream,

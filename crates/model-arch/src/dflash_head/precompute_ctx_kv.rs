@@ -130,7 +130,12 @@ impl BlockDiffusionDraftHead {
         self.draft_gemm_aux(
             gpu,
             self.scratch.fc_proj,
-            (&fused_w, self.fused_kv_fp8.as_ref(), true),
+            (
+                &fused_w,
+                self.fused_kv_fp8.as_ref(),
+                self.nv4.fused_kv.as_ref(),
+                true,
+            ),
             self.scratch.fused_kv_out,
             n,
             fused_n_cols,

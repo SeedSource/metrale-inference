@@ -101,47 +101,72 @@ fn quantize_drafter_fp8(
     let o_cols = head.tp.as_ref().map(|t| t.plan.o_cols());
     let down_cols = head.tp.as_ref().map(|t| t.plan.down_cols());
     let quantize_cols = crate::dflash_head::tp::shard_weights::quantize_cols;
+    // 2026-10-12: METRALE_DFLASH_NV4_LAYERS (`nv4.rs`): NVFP4 copies first, from the BF16
+    // weights (still live: they are released after this arm); the FP8 mirror is built only
+    // for a weight that got none.
+    let nv4_shapes = head
+        .nv4_armed(head.levers.nv4_layers)
+        .then(|| head.nv4_layer_shapes());
     for (layer_idx, layer) in head.layers.iter_mut().enumerate() {
-        layer.q_proj_fp8 =
-            Some(
+        let nv4 = match nv4_shapes.as_ref() {
+            Some(shapes) => crate::dflash_head::nv4::quantize_layer(gpu, layer, shapes)?,
+            None => [false; 7],
+        };
+        if !nv4[0] {
+            layer.q_proj_fp8 = Some(
                 layer
                     .q_proj
                     .quantize_to_fp8(gpu, quant_k, q_dim_local, h, stream)?,
             );
-        layer.k_proj_fp8 =
-            Some(
+        }
+        if !nv4[1] {
+            layer.k_proj_fp8 = Some(
                 layer
                     .k_proj
                     .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
             );
-        layer.v_proj_fp8 =
-            Some(
+        }
+        if !nv4[2] {
+            layer.v_proj_fp8 = Some(
                 layer
                     .v_proj
                     .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
             );
-        layer.o_proj_fp8 = Some(match o_cols {
-            Some((k_full, cols)) => quantize_cols(gpu, quant_k, &layer.o_proj, h, k_full, cols)?,
-            None => layer
-                .o_proj
-                .quantize_to_fp8(gpu, quant_k, h, q_dim_local, stream)?,
-        });
-        layer.gate_proj_fp8 = Some(
-            layer
-                .gate_proj
-                .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
-        );
-        layer.up_proj_fp8 = Some(
-            layer
-                .up_proj
-                .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
-        );
-        layer.down_proj_fp8 = Some(match down_cols {
-            Some((k_full, cols)) => quantize_cols(gpu, quant_k, &layer.down_proj, h, k_full, cols)?,
-            None => layer
-                .down_proj
-                .quantize_to_fp8(gpu, quant_k, h, inter, stream)?,
-        });
+        }
+        if !nv4[3] {
+            layer.o_proj_fp8 = Some(match o_cols {
+                Some((k_full, cols)) => {
+                    quantize_cols(gpu, quant_k, &layer.o_proj, h, k_full, cols)?
+                }
+                None => layer
+                    .o_proj
+                    .quantize_to_fp8(gpu, quant_k, h, q_dim_local, stream)?,
+            });
+        }
+        if !nv4[4] {
+            layer.gate_proj_fp8 = Some(
+                layer
+                    .gate_proj
+                    .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
+            );
+        }
+        if !nv4[5] {
+            layer.up_proj_fp8 = Some(
+                layer
+                    .up_proj
+                    .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
+            );
+        }
+        if !nv4[6] {
+            layer.down_proj_fp8 = Some(match down_cols {
+                Some((k_full, cols)) => {
+                    quantize_cols(gpu, quant_k, &layer.down_proj, h, k_full, cols)?
+                }
+                None => layer
+                    .down_proj
+                    .quantize_to_fp8(gpu, quant_k, h, inter, stream)?,
+            });
+        }
         tracing::debug!(
             target: "metrale_model_arch::dflash_head::from_weights",
             "DFlash Phase G: layer {} quantized", layer_idx
@@ -176,6 +201,26 @@ fn quantize_drafter_fp8(
             head.hidden_size
         );
         head.lm_head_shared_fp8 = Some(shared);
+        head.nv4.head_skip = Some(
+            "the drafter shares the checkpoint's native FP8 lm_head (no BF16 rows to quantize)",
+        );
+    } else if let Some(q) = head
+        .nv4_armed(head.levers.nv4_head && head.lm_head_nvfp4.is_none())
+        .then(|| {
+            crate::dflash_head::nv4::quantize_rows(
+                gpu,
+                head.lm_head_shared,
+                head.vocab_size,
+                head.hidden_size,
+            )
+        })
+        .transpose()?
+        .flatten()
+    {
+        // 2026-10-12: METRALE_DFLASH_NV4_HEAD (`nv4.rs`): an NVFP4 copy of this rank's BF16
+        // head rows in place of the FP8 copy, which is not built. The target's head is
+        // untouched.
+        head.nv4.lm_head = Some(q);
     } else {
         tracing::info!(
             target: "metrale_model_arch::dflash_head::from_weights",
@@ -251,26 +296,33 @@ impl BlockDiffusionDraftHead {
         store: &mut metrale_model_weights::weights::WeightStore,
         gpu: &dyn GpuBackend,
     ) -> Result<Option<(usize, usize)>> {
+        // 2026-10-12: A weight is mirrored by its FP8 copy or its NVFP4 copy
+        // (METRALE_DFLASH_NV4_LAYERS / _AUX, `nv4.rs`), whose readers take it at every row
+        // count they see.
         let mirrored = self.layers.iter().all(|l| {
-            l.q_proj_fp8.is_some()
-                && l.k_proj_fp8.is_some()
-                && l.v_proj_fp8.is_some()
-                && l.o_proj_fp8.is_some()
-                && l.gate_proj_fp8.is_some()
-                && l.up_proj_fp8.is_some()
-                && l.down_proj_fp8.is_some()
+            (l.q_proj_fp8.is_some() || l.nv4.q.is_some())
+                && (l.k_proj_fp8.is_some() || l.nv4.k.is_some())
+                && (l.v_proj_fp8.is_some() || l.nv4.v.is_some())
+                && (l.o_proj_fp8.is_some() || l.nv4.o.is_some())
+                && (l.gate_proj_fp8.is_some() || l.nv4.gate.is_some())
+                && (l.up_proj_fp8.is_some() || l.nv4.up.is_some())
+                && (l.down_proj_fp8.is_some() || l.nv4.down.is_some())
         });
         let layers_go =
             self.quant == DflashQuantization::Fp8Weights && self.levers.option_b && mirrored;
-        let conv_go = self
-            .layers
-            .iter()
-            .any(|l| l.attention_conv_proj_fp8.is_some())
+        let att = |l: &crate::dflash_head::DflashLayer| {
+            l.attention_conv_proj_fp8.is_some() || l.nv4.attention_conv_proj.is_some()
+        };
+        let mlp = |l: &crate::dflash_head::DflashLayer| {
+            l.mlp_conv_proj_fp8.is_some() || l.nv4.mlp_conv_proj.is_some()
+        };
+        let conv_go = self.layers.iter().any(att)
             && self.layers.iter().all(|l| {
-                (l.attention_conv_proj.is_none() || l.attention_conv_proj_fp8.is_some())
-                    && (l.mlp_conv_proj.is_none() || l.mlp_conv_proj_fp8.is_some())
+                (l.attention_conv_proj.is_none() || att(l))
+                    && (l.mlp_conv_proj.is_none() || mlp(l))
             });
-        let selector_go = self.selector_hidden_proj_fp8.is_some();
+        let selector_go =
+            self.selector_hidden_proj_fp8.is_some() || self.nv4.selector_hidden_proj.is_some();
         let doomed: std::collections::HashSet<String> = store
             .names()
             .filter(|n| {

@@ -76,11 +76,17 @@ impl BlockDiffusionDraftHead {
         );
         let gemm_swap = |w_bf16: &metrale_model_layers::weight_map::DenseWeight,
                          w_fp8: &Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+                         w_nv4: &Option<metrale_model_layers::weight_map::QuantizedWeight>,
                          src: metrale_gpu_runtime::gpu::DevicePtr,
                          dst: metrale_gpu_runtime::gpu::DevicePtr,
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
+            // 2026-10-12: METRALE_DFLASH_NV4_LAYERS (`nv4.rs`): the NVFP4 copy when built (its
+            // FP8 mirror was not), on the CUDA-core tiers.
+            if let Some(q) = w_nv4 {
+                return crate::dflash_head::nv4::gemv(gpu, src, q, dst, g, n_out, k_in, stream);
+            }
             if use_fp8 && let Some(fp8) = w_fp8 {
                 if self.kernels.fp8_gemv_rt2.0 != 0
                     && g <= 8
@@ -139,6 +145,7 @@ impl BlockDiffusionDraftHead {
                 gemm_swap(
                     &layer.o_proj,
                     &layer.o_proj_fp8,
+                    &layer.nv4.o,
                     self.scratch.attn_out,
                     self.scratch.stream_acc,
                     h,
@@ -198,6 +205,7 @@ impl BlockDiffusionDraftHead {
                 gemm_swap(
                     &layer.gate_proj,
                     &layer.gate_proj_fp8,
+                    &layer.nv4.gate,
                     mlp_src,
                     self.scratch.mlp_intermediate,
                     inter,
@@ -206,6 +214,7 @@ impl BlockDiffusionDraftHead {
                 gemm_swap(
                     &layer.up_proj,
                     &layer.up_proj_fp8,
+                    &layer.nv4.up,
                     mlp_src,
                     self.scratch.mlp_up,
                     inter,
@@ -223,6 +232,7 @@ impl BlockDiffusionDraftHead {
                 gemm_swap(
                     &layer.down_proj,
                     &layer.down_proj_fp8,
+                    &layer.nv4.down,
                     self.scratch.mlp_intermediate,
                     self.scratch.stream_acc,
                     h,

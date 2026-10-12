@@ -66,7 +66,10 @@ impl Glm5NextKdaLayer {
         if !kda_defer_commit() {
             return false;
         }
-        let ok = kda_snap_fuse() && self.defer_walk_ready();
+        // 2026-10-12: Under `METRALE_GLM_KDA_STATE_F16=1` also the FP16 twins (state_f16.rs).
+        let ok = kda_snap_fuse()
+            && self.defer_walk_ready()
+            && (!super::super::state_f16::kda_state_f16() || self.state_f16_ready());
         if !ok {
             static W: std::sync::Once = std::sync::Once::new();
             W.call_once(|| {
@@ -107,12 +110,17 @@ impl Glm5NextKdaLayer {
         if snapshots[0].0 == state.recurrent || snapshots[0].1 == state.conv {
             bail!("KDA decode_k_defer: snapshot 0 is the live state");
         }
-        if !defer.h_stride.is_multiple_of(4) || !defer.conv_stride.is_multiple_of(4) {
-            bail!("KDA decode_k_defer: intermediate strides {defer:?} are not whole floats");
+        // 2026-10-12: The h intermediates hold the state's format: whole halves when FP16.
+        let h_elem = if state.recurrent_f16 { 2 } else { 4 };
+        if !defer.h_stride.is_multiple_of(h_elem) || !defer.conv_stride.is_multiple_of(4) {
+            bail!("KDA decode_k_defer: intermediate strides {defer:?} are not whole elements");
+        }
+        if state.recurrent_f16 && !self.state_f16_ready() {
+            bail!("KDA decode_k_defer: FP16 recurrent state without the kda_state_f16 twins");
         }
         use crate::glm5next_layer::profile;
         let c = &self.cfg;
-        let (h_bytes, conv_bytes) = (c.recurrent_state_elems() * 4, c.conv_state_elems() * 4);
+        let (h_bytes, conv_bytes) = (state.recurrent_bytes(c), c.conv_state_elems() * 4);
         let t_front = profile::start();
         self.front_end(gpu, hidden, k, ws, stream)?;
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
@@ -120,10 +128,15 @@ impl Glm5NextKdaLayer {
         for (t, io) in snap_fuse_plan(k, state, snapshots).iter().enumerate() {
             if t == 0 {
                 self.conv_row_defer(gpu, state.conv, io.c_out, defer, ws, stream)?;
-                self.recurrent_row_defer(gpu, state.recurrent, io.h_out, defer, ws, stream)?;
+                self.recurrent_row_defer(gpu, state, io.h_out, defer, ws, stream)?;
             } else {
                 self.conv_row_io(gpu, t, io.c_in, io.c_out, ws, stream)?;
-                self.recurrent_row_io(gpu, t, io.h_in, io.h_out, ws, stream)?;
+                // 2026-10-12: An FP16 state takes the FP16 twins.
+                if state.recurrent_f16 {
+                    self.recurrent_row_f16(gpu, t, io.h_in, io.h_out, ws, stream)?;
+                } else {
+                    self.recurrent_row_io(gpu, t, io.h_in, io.h_out, ws, stream)?;
+                }
             }
             if let Some((h_dst, conv_dst)) = io.copy_to {
                 gpu.copy_d2d_async(state.recurrent, h_dst, h_bytes, stream)?;
@@ -173,10 +186,12 @@ impl Glm5NextKdaLayer {
 
     /// 2026-10-09: `recurrent_row_io`'s out-of-place launch on row 0 with the input chosen on the
     /// device: `kda_recurrent_decode_bf16_smem_defer`, same grid, block and shared memory.
+    /// 2026-10-12: Its FP16 twin `kda_recurrent_decode_bf16_smem_defer_f16` for an FP16 `state`,
+    /// the intermediate stride then in halves.
     fn recurrent_row_defer(
         &self,
         gpu: &dyn GpuBackend,
-        live: DevicePtr,
+        state: &KdaSeqState,
         h_out: DevicePtr,
         defer: &SsmDeferSrc,
         ws: &Glm5NextKdaWorkspace,
@@ -187,7 +202,12 @@ impl Glm5NextKdaLayer {
         let d = c.head_dim;
         let vpb = KDA_V_PER_BLOCK.min(d);
         let smem = (3 * d + vpb * (d + 1)) * 4;
-        KernelLaunch::new(gpu, self.kernels.recurrent_defer)
+        let (kernel, h_elem) = if state.recurrent_f16 {
+            (self.kernels.recurrent_defer_f16, 2)
+        } else {
+            (self.kernels.recurrent_defer, 4)
+        };
+        KernelLaunch::new(gpu, kernel)
             .grid([c.heads as u32, (d / vpb) as u32, 1])
             .block([vpb as u32, 1, 1])
             .shared_mem(smem as u32)
@@ -196,9 +216,9 @@ impl Glm5NextKdaLayer {
             .arg_ptr(ws.conv_out.offset(qkv * 4))
             .arg_ptr(ws.gate)
             .arg_ptr(ws.beta)
-            .arg_ptr(live)
+            .arg_ptr(state.recurrent)
             .arg_ptr(defer.h_base)
-            .arg_u64((defer.h_stride / 4) as u64)
+            .arg_u64((defer.h_stride / h_elem) as u64)
             .arg_ptr(defer.idx)
             .arg_ptr(h_out)
             .arg_ptr(ws.core)
@@ -233,6 +253,7 @@ mod tests {
     const S: KdaSeqState = KdaSeqState {
         conv: DevicePtr(0x1000),
         recurrent: DevicePtr(0x2000),
+        recurrent_f16: false,
     };
 
     /// 2026-10-09: `n` distinct snapshot slots, as the engine's per-slot intermediates.

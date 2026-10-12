@@ -44,8 +44,10 @@ mod prefill_flashkda;
 mod prefill_tc;
 mod prefill_tc_fuse;
 mod snap_fuse;
+mod state_f16;
 pub use config::{Glm5NextKdaConfig, Glm5NextKdaWeights};
 pub use kernels::Glm5NextKdaKernels;
+pub use state_f16::{kda_state_f16, state_f16_refusal};
 
 use anyhow::{Result, bail};
 use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -280,7 +282,13 @@ pub struct KdaSeqState {
     /// 2026-09-25: `[conv_dim, conv_kernel]` FP32.
     pub conv: DevicePtr,
     /// 2026-09-25: `[heads, head_dim, head_dim]` FP32, K-major (`S[k * head_dim + v]`).
+    /// 2026-10-12: FP16, same layout, when `recurrent_f16`.
     pub recurrent: DevicePtr,
+    /// 2026-10-12: `METRALE_GLM_KDA_STATE_F16=1`: `recurrent` (and every snapshot slot handed to
+    /// a call with it) holds FP16 elements. Only the decode and verify entry points take such a
+    /// state (state_f16.rs); the prefill arms refuse it, since the model runs them on the FP32
+    /// staging blob. `false` everywhere else: FP32, as before.
+    pub recurrent_f16: bool,
 }
 
 /// 2026-09-25: Scratch for the forward path, sized once for `max_tokens` (prefill buffers padded

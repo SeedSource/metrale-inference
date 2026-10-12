@@ -216,6 +216,7 @@ impl Rig<'_> {
         let st = KdaSeqState {
             conv: up_f32(g, c0)?,
             recurrent: up_f32(g, h0)?,
+            recurrent_f16: false,
         };
         let ckpt = (up_bytes(g, &vec![poison; hb])?, up_bytes(g, &vec![poison; cb])?);
         let mut slots = Vec::with_capacity(nsnap);
@@ -401,6 +402,7 @@ fn timing(rig: &Rig, k: usize) -> Result<()> {
     let st = KdaSeqState {
         conv: up_f32(g, &r.vec(c.conv_state_elems(), 0.3))?,
         recurrent: up_f32(g, &r.vec(c.recurrent_state_elems(), 0.1))?,
+        recurrent_f16: false,
     };
     let mut slots = Vec::new();
     for _ in 0..k - 1 {

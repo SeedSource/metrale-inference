@@ -291,6 +291,13 @@ impl Glm5NextWeightLoader {
         let mlp_cfg = Glm5NextMlpConfig::from_config(config)?;
 
         let kda_kernels = Glm5NextKdaKernels::resolve(gpu)?;
+        // 2026-10-12: `METRALE_GLM_KDA_STATE_F16=1` is refused at boot where a decode or verify
+        // row would need an FP32 recurrent kernel (glm5next_kda/state_f16.rs).
+        if crate::glm5next_kda::kda_state_f16()
+            && let Some(why) = crate::glm5next_kda::state_f16_refusal(&kda_cfg, &kda_kernels)
+        {
+            bail!("METRALE_GLM_KDA_STATE_F16=1 refused: {why}");
+        }
         let dsa_kernels = Glm5NextDsaKernels::resolve(gpu)?;
         let dsa_layer_kernels = Glm5NextDsaLayerKernels::resolve(gpu)?;
         let mlp_kernels = Glm5NextMlpKernels::resolve(gpu)?;

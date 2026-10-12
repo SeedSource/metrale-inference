@@ -202,6 +202,7 @@ impl Rig<'_> {
             live: KdaSeqState {
                 conv: up_f32(g, c0)?,
                 recurrent: up_f32(g, h0)?,
+                recurrent_f16: false,
             },
             h_inter: up_bytes(g, &vec![poison; (MAX_ROWS - 1) * hb])?,
             conv_inter: up_bytes(g, &vec![poison; MAX_ROWS * cb])?,

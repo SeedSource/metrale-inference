@@ -161,10 +161,16 @@ impl Glm5NextKdaLayer {
             return Ok(false);
         }
         let c = &self.cfg;
-        let (h_bytes, conv_bytes) = (c.recurrent_state_elems() * 4, c.conv_state_elems() * 4);
+        // 2026-10-12: The last row's copy in the state's format (`* 4` unless FP16).
+        let (h_bytes, conv_bytes) = (state.recurrent_bytes(c), c.conv_state_elems() * 4);
         for (t, io) in snap_fuse_plan(k, state, snapshots).iter().enumerate() {
             self.conv_row_io(gpu, row0 + t, io.c_in, io.c_out, ws, stream)?;
-            self.recurrent_row_io(gpu, row0 + t, io.h_in, io.h_out, ws, stream)?;
+            // 2026-10-12: An FP16 state (and its FP16 snapshot slots) takes the FP16 twins.
+            if state.recurrent_f16 {
+                self.recurrent_row_f16(gpu, row0 + t, io.h_in, io.h_out, ws, stream)?;
+            } else {
+                self.recurrent_row_io(gpu, row0 + t, io.h_in, io.h_out, ws, stream)?;
+            }
             if let Some((h_dst, conv_dst)) = io.copy_to {
                 gpu.copy_d2d_async(state.recurrent, h_dst, h_bytes, stream)?;
                 gpu.copy_d2d_async(state.conv, conv_dst, conv_bytes, stream)?;
@@ -285,6 +291,7 @@ mod tests {
     const S: KdaSeqState = KdaSeqState {
         conv: DevicePtr(0x1000),
         recurrent: DevicePtr(0x2000),
+        recurrent_f16: false,
     };
 
     fn snaps(n: usize) -> Vec<(DevicePtr, DevicePtr)> {

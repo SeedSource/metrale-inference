@@ -7,6 +7,11 @@
 //! Owner: model-arch (GLM-5.3).
 //! Invariants: `attn_mixer` issues the launches `attn_half_inner` issued between the input
 //! norm and the all-reduce, in the same order.
+//! 2026-10-12: Under `METRALE_GLM_KDA_STATE_F16=1` (an FP16 slot, `h_is_f16`) a KDA prefill call
+//! runs every arm on the slot's FP32 staging blob: the state is widened into it before the arm
+//! and narrowed back (round to nearest even) after, so the prefill kernels see FP32 as before.
+//! A verify or decode passes the FP16 slot itself (glm5next_kda/state_f16.rs). Off, `h_is_f16`
+//! is false on every state the KDA mixer accepts (`kda_state`), so no launch changes.
 
 use super::*;
 
@@ -35,7 +40,7 @@ impl Glm5NextLayer {
     ) -> Result<DevicePtr> {
         let gpu = ctx.gpu;
         let kda_ctx = match &self.mixer {
-            Glm5NextMixer::Kda { ws, .. } => {
+            Glm5NextMixer::Kda { layer, ws, .. } => {
                 if k > ws.max_tokens() {
                     bail!(
                         "GLM layer {}: a {k}-token verify exceeds the KDA workspace built for {}",
@@ -66,21 +71,34 @@ impl Glm5NextLayer {
                 // 2026-10-09: `METRALE_GLM_KDA_DEFER_COMMIT=1`: the model sets `kda_defer` before
                 // a single-sequence verify; only a snapshot-taking walk reads it.
                 let defer = if take_snapshots { st.kda_defer } else { None };
-                Some((
-                    KdaSeqState {
+                // 2026-10-12: `METRALE_GLM_KDA_STATE_F16=1`: a prefill call runs on the FP32
+                // staging blob (module header); `(slot, stage)` to narrow back after the arm.
+                let staged = match st.h_prefill_stage {
+                    Some(stage) if st.h_is_f16 && is_prefill && !take_snapshots => {
+                        layer.widen_state(gpu, st.h_state, stage, stream)?;
+                        Some((st.h_state, stage))
+                    }
+                    _ => None,
+                };
+                let kda = match staged {
+                    Some((_, stage)) => KdaSeqState {
+                        conv: st.conv_state,
+                        recurrent: stage,
+                        recurrent_f16: false,
+                    },
+                    None => KdaSeqState {
                         conv: st.conv_state,
                         recurrent: st.h_state,
+                        recurrent_f16: st.h_is_f16,
                     },
-                    snaps,
-                    capture,
-                    defer,
-                ))
+                };
+                Some((kda, snaps, capture, defer, staged))
             }
             Glm5NextMixer::Dsa(_) => None,
         };
         let t = profile::start();
         let attn_out = match (&self.mixer, &kda_ctx) {
-            (Glm5NextMixer::Kda { layer, ws, .. }, Some((kda, snaps, capture, defer))) => {
+            (Glm5NextMixer::Kda { layer, ws, .. }, Some((kda, snaps, capture, defer, staged))) => {
                 // 2026-09-25: The chunked scan runs only for a prefill sub-chunk of more than
                 // one row that asked for no intermediates: it never materialises the state
                 // after an interior row, and its order differs from `decode_k`'s, which a
@@ -124,6 +142,10 @@ impl Glm5NextLayer {
                     layer.decode_k_defer(gpu, normed, k, kda, ws, snaps, d, stream)?;
                 } else {
                     layer.decode_k(gpu, normed, k, kda, ws, snaps, stream)?;
+                }
+                // 2026-10-12: The staged prefill's state back into the FP16 slot.
+                if let Some((slot, stage)) = *staged {
+                    layer.narrow_state(gpu, stage, slot, stream)?;
                 }
                 ws.final_out
             }

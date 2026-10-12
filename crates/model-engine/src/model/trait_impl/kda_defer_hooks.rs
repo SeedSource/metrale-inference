@@ -59,8 +59,14 @@ impl TransformerModel {
                 return false;
             }
             let p = &self.ssm_pool;
+            // 2026-10-12: FP32 intermediates, or FP16 ones under `METRALE_GLM_KDA_STATE_F16=1`
+            // (the `_defer_f16` twin reads them; glm5next_kda/state_f16.rs).
+            let width_ok = p.h_stored_bytes == p.h_bytes
+                || (metrale_model_layers::ssm_reserve::glm_kda_state_f16_for(
+                    &self.config.model_type,
+                ) && p.h_stored_bytes * 2 == p.h_bytes);
             let pool_ok = !p.h_intermediate_pools.is_empty()
-                && p.h_stored_bytes == p.h_bytes
+                && width_ok
                 && p.conv_bytes == self.kda_defer_conv_bytes()
                 && p.num_ssm_layers == kda.len()
                 && p.kda_defer.book.lock().slots() > 0;
@@ -74,7 +80,8 @@ impl TransformerModel {
             } else {
                 tracing::warn!(
                     "METRALE_GLM_KDA_DEFER_COMMIT ignored: {ready}/{} KDA layers ready, pool \
-                     ok={pool_ok} (FP32 intermediates needed); every commit keeps its copy",
+                     ok={pool_ok} (FP32 intermediates, or FP16 under METRALE_GLM_KDA_STATE_F16=1, \
+                     needed); every commit keeps its copy",
                     kda.len()
                 );
             }

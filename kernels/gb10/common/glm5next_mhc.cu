@@ -1592,3 +1592,204 @@ extern "C" __global__ void glm5next_hc_mix_finish_1pass(
         y_out[(size_t)t * H + d] = __float2bfloat16(a);
     }
 }
+
+
+// 2026-10-12: glm5next_hc_mix_bf16_ilpN (N = 8, 16, 32, 64): glm5next_hc_mix_bf16 with each thread's
+// hc_fn and x values loaded in unrolled batches of N before they are used, so N loads are in flight
+// per thread instead of one dependent chain step at a time. Every output bit equals
+// glm5next_hc_mix_bf16's:
+// - Ownership: thread tid handles k = tid + 256 j, j ascending, as there.
+// - Chains: ss += v * v and acc += bf16(w) * x each run in ascending j from 0.f, one rounded
+//   multiply then one rounded add per term (--fmad=false). Loading ahead changes no operand.
+//   x is read once and feeds both chains (they are independent registers).
+// - Tree: red[a][tid] += red[a][tid + s], s = 128 .. 1, one barrier per level: glm_hc_block_reduce's
+//   pairing, run on both arrays in the same loop.
+// - Epilogue: mix_out = r * rsqrtf(ssum / (float)hc_dim + norm_eps), the same expression.
+// Generic hc_dim: full batches while a whole batch fits, then a one-term tail loop in the same
+// order. blockDim.x must be GLM_HC_BLOCK; any other returns without writing (the host launches 256).
+// Same arguments and grid (T, mix_hc, 1) as glm5next_hc_mix_bf16.
+template <int U>
+__device__ __forceinline__ void glm_hc_mix_ilp_body(
+    const float* __restrict__ streams,
+    const __nv_bfloat16* __restrict__ hc_fn,
+    float* __restrict__ mix_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const float norm_eps
+) {
+    if (blockDim.x != GLM_HC_BLOCK) return;
+    const unsigned int t = blockIdx.x;
+    const unsigned int m = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int hc_dim = hc_mult * hidden_size;
+    const unsigned int mix_hc = (2 + hc_mult) * hc_mult;
+
+    const float* x = streams + (size_t)t * hc_dim;
+    const __nv_bfloat16* fn_row = hc_fn + (size_t)m * hc_dim;
+    __shared__ float red[2][GLM_HC_BLOCK];
+
+    float ss = 0.f;
+    float acc = 0.f;
+    unsigned int k = tid;
+    for (; k + GLM_HC_BLOCK * (U - 1) < hc_dim; k += GLM_HC_BLOCK * U) {
+        float xv[U];
+        __nv_bfloat16 wv[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            xv[u] = x[k + GLM_HC_BLOCK * u];
+            wv[u] = fn_row[k + GLM_HC_BLOCK * u];
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            ss += xv[u] * xv[u];
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            acc += __bfloat162float(wv[u]) * xv[u];
+        }
+    }
+    for (; k < hc_dim; k += GLM_HC_BLOCK) {
+        const float v = x[k];
+        ss += v * v;
+        acc += __bfloat162float(fn_row[k]) * v;
+    }
+    red[0][tid] = ss;
+    red[1][tid] = acc;
+    __syncthreads();
+    for (unsigned int s = GLM_HC_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[0][tid] += red[0][tid + s];
+            red[1][tid] += red[1][tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float rs = rsqrtf(red[0][0] / (float)hc_dim + norm_eps);
+        mix_out[(size_t)t * mix_hc + m] = red[1][0] * rs;
+    }
+}
+
+#define GLM_HC_MIX_ILP_ENTRY(N)                                                          \
+    extern "C" __global__ void __launch_bounds__(GLM_HC_BLOCK) glm5next_hc_mix_bf16_ilp##N( \
+        const float* __restrict__ streams,                                               \
+        const __nv_bfloat16* __restrict__ hc_fn,                                         \
+        float* __restrict__ mix_out,                                                     \
+        const unsigned int hidden_size,                                                  \
+        const unsigned int hc_mult,                                                      \
+        const float norm_eps                                                             \
+    ) {                                                                                  \
+        glm_hc_mix_ilp_body<N>(streams, hc_fn, mix_out, hidden_size, hc_mult, norm_eps); \
+    }
+GLM_HC_MIX_ILP_ENTRY(8)
+GLM_HC_MIX_ILP_ENTRY(16)
+GLM_HC_MIX_ILP_ENTRY(32)
+GLM_HC_MIX_ILP_ENTRY(64)
+
+
+// 2026-10-12: glm5next_hc_mix_bf16_splitkS (S = 4, 8, 16): split-K mix. NOT bit-identical to
+// glm5next_hc_mix_bf16: the add order changes (numerics variant, tolerance-gated).
+// Grid (T, 24, S), block 256. CTA (t, m, z) owns the contiguous K chunk [z * 16384 / S, +16384 / S):
+// thread tid loads its 64 / S x values and hc_fn values up front (one batch), forms the chunk's
+// partial ss and acc (ascending, separate mul and add), tree-reduces them (the 256-thread tree)
+// and writes (ss, acc) to scratch[((t * 24 + m) * 16 + z) * 2]. The LAST CTA of each (t, m) (an
+// atomic counter, __threadfence before the add) sums the S partials in z order on thread 0 and
+// writes mix_out[t, m] = acc_tot * rsqrtf(ss_tot / 16384 + eps), then resets its counter to 0, so
+// the next launch (and every CUDA-graph replay) starts clean with no extra node and no memset.
+// Scratch: GLM_HC_SPLITK_ROWS * 24 * 16 * 2 floats of partials, then GLM_HC_SPLITK_ROWS * 24 u32
+// counters, all zero before the first launch. Only hc_dim == 16384, mix_hc == 24 and T <= 16 are
+// supported; otherwise the kernel returns without writing (the host checks first).
+#define GLM_HC_SPLITK_ROWS 16
+
+template <int S>
+__device__ __forceinline__ void glm_hc_mix_splitk_body(
+    const float* __restrict__ streams,
+    const __nv_bfloat16* __restrict__ hc_fn,
+    float* __restrict__ mix_out,
+    float* scratch,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const float norm_eps
+) {
+    constexpr int U = 64 / S;
+    const unsigned int hc_dim = hc_mult * hidden_size;
+    if (blockDim.x != GLM_HC_BLOCK || hc_dim != 64 * GLM_HC_BLOCK || (2 + hc_mult) * hc_mult != 24 ||
+        gridDim.z != S || blockIdx.x >= GLM_HC_SPLITK_ROWS) return;
+    const unsigned int t = blockIdx.x;
+    const unsigned int m = blockIdx.y;
+    const unsigned int z = blockIdx.z;
+    const unsigned int tid = threadIdx.x;
+
+    const unsigned int chunk = hc_dim / S;
+    const float* x = streams + (size_t)t * hc_dim + (size_t)z * chunk;
+    const __nv_bfloat16* fn_row = hc_fn + (size_t)m * hc_dim + (size_t)z * chunk;
+    __shared__ float red[2][GLM_HC_BLOCK];
+    __shared__ unsigned int is_last;
+
+    float xv[U];
+    __nv_bfloat16 wv[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+        xv[u] = x[tid + GLM_HC_BLOCK * u];
+        wv[u] = fn_row[tid + GLM_HC_BLOCK * u];
+    }
+    float ss = 0.f;
+    float acc = 0.f;
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+        ss += xv[u] * xv[u];
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+        acc += __bfloat162float(wv[u]) * xv[u];
+    }
+    red[0][tid] = ss;
+    red[1][tid] = acc;
+    __syncthreads();
+    for (unsigned int s = GLM_HC_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[0][tid] += red[0][tid + s];
+            red[1][tid] += red[1][tid + s];
+        }
+        __syncthreads();
+    }
+    unsigned int* counters = (unsigned int*)(scratch + GLM_HC_SPLITK_ROWS * 24 * 16 * 2);
+    if (tid == 0) {
+        float* part = scratch + ((size_t)(t * 24 + m) * 16 + z) * 2;
+        part[0] = red[0][0];
+        part[1] = red[1][0];
+        __threadfence();
+        const unsigned int prev = atomicAdd(&counters[t * 24 + m], 1u);
+        is_last = (prev == S - 1) ? 1u : 0u;
+    }
+    __syncthreads();
+    if (is_last != 0 && tid == 0) {
+        __threadfence();
+        const float* base = scratch + (size_t)(t * 24 + m) * 16 * 2;
+        float ss_tot = 0.f;
+        float acc_tot = 0.f;
+        for (int i = 0; i < S; ++i) {
+            ss_tot += __ldcg(base + 2 * i);
+            acc_tot += __ldcg(base + 2 * i + 1);
+        }
+        counters[t * 24 + m] = 0u;
+        const float rs = rsqrtf(ss_tot / (float)hc_dim + norm_eps);
+        mix_out[(size_t)t * 24 + m] = acc_tot * rs;
+    }
+}
+
+#define GLM_HC_MIX_SPLITK_ENTRY(S)                                                             \
+    extern "C" __global__ void __launch_bounds__(GLM_HC_BLOCK) glm5next_hc_mix_bf16_splitk##S( \
+        const float* __restrict__ streams,                                                     \
+        const __nv_bfloat16* __restrict__ hc_fn,                                               \
+        float* __restrict__ mix_out,                                                           \
+        float* scratch,                                                                        \
+        const unsigned int hidden_size,                                                        \
+        const unsigned int hc_mult,                                                            \
+        const float norm_eps                                                                   \
+    ) {                                                                                        \
+        glm_hc_mix_splitk_body<S>(streams, hc_fn, mix_out, scratch, hidden_size, hc_mult,      \
+                                  norm_eps);                                                   \
+    }
+GLM_HC_MIX_SPLITK_ENTRY(4)
+GLM_HC_MIX_SPLITK_ENTRY(8)
+GLM_HC_MIX_SPLITK_ENTRY(16)

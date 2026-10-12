@@ -494,6 +494,10 @@ name = "hc_decode_fuse_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm_hc_mix_ilp_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_combine_local_bitparity_microtest"
 required-features = ["cuda", "gpu-examples"]
 

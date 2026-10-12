@@ -56,6 +56,7 @@ impl Glm5NextLayer {
                 let kda = KdaSeqState {
                     conv: ssm.conv_state,
                     recurrent: ssm.h_state,
+                    recurrent_f16: ssm.h_is_f16,
                 };
                 let t = profile::start();
                 layer.decode(ctx.gpu, normed, &kda, ws, stream)?;
@@ -356,7 +357,13 @@ impl Glm5NextLayer {
                     self.layer_idx
                 )
             })?;
-        if st.h_is_f16 || st.h_prefill_stage.is_some() {
+        // 2026-10-12: `METRALE_GLM_KDA_STATE_F16=1`: an FP16 slot (`h_is_f16`) with its FP32
+        // prefill staging blob is the KDA FP16 state (glm5next_kda/state_f16.rs); FP32 with no
+        // blob stays FP32. Off, the check is the one it was.
+        let f16_ok = crate::glm5next_kda::kda_state_f16()
+            && st.h_is_f16
+            && st.h_prefill_stage.is_some();
+        if !f16_ok && (st.h_is_f16 || st.h_prefill_stage.is_some()) {
             bail!(
                 "GLM layer {}: KDA recurrent state is FP32-only; --ssm-h-dtype f16 narrowed it",
                 self.layer_idx

@@ -140,6 +140,7 @@ impl Gpu<'_> {
         let st = KdaSeqState {
             conv: up_f32(g, conv_state4)?,
             recurrent: up_f32(g, state)?,
+            recurrent_f16: false,
         };
         let dh = up_bf16(g, hidden)?;
 

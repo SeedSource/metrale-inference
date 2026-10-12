@@ -19,6 +19,13 @@ pub use decode_ring::{
     published_decode_ring_slots, set_decode_ring_slots, watchdogs_disabled_from_value,
 };
 
+// 2026-10-12: `METRALE_GLM_KDA_STATE_F16`: the GLM-5.3 KDA FP16 state and the pool width.
+mod kda_state_f16;
+pub use kda_state_f16::{
+    glm_kda_state_f16, glm_kda_state_f16_for, glm_kda_state_f16_requested, is_glm_kda_model,
+    ssm_h_pool_f16, ssm_h_pool_f16_with,
+};
+
 mod rollback;
 pub use rollback::{
     SsmRollbackMode, set_ssm_rollback_mode, ssm_replay_ring_bytes, ssm_replay_row_bytes,

@@ -65,7 +65,9 @@ pub(crate) fn preflight_reserve(
     let ssm_h_stage_bytes = metrale_model_layers::ssm_reserve::ssm_h_prefill_stage_bytes(
         args.max_batch_size,
         h_state_bytes,
-        metrale_model_layers::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
+        // 2026-10-12: The pool's own width rule (`ssm_h_pool_f16`, also
+        // `METRALE_GLM_KDA_STATE_F16=1` on GLM-5.3); off, the Qwen flag.
+        metrale_model_layers::ssm_reserve::ssm_h_pool_f16(&config.model_type),
     );
     // 2026-09-26: A DFlash serve's verify pools are γ + 1 rows wide on every
     // slot, and the drafter loads after this preflight. γ here is
@@ -90,7 +92,8 @@ pub(crate) fn preflight_reserve(
         args.dflash,
         // 2026-09-26: The h-pool narrowing `SsmStatePool::new` applies under
         // `--ssm-h-dtype f16-pool`.
-        metrale_model_layers::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
+        // 2026-10-12: Or `METRALE_GLM_KDA_STATE_F16=1` on GLM-5.3 (`ssm_h_pool_f16`).
+        metrale_model_layers::ssm_reserve::ssm_h_pool_f16(&config.model_type),
         // 2026-09-26: `--ssm-rollback-mode`, published by `serve_flags` before
         // this runs. Replay mode reserves only the checkpoint blob per verify
         // slot; its input ring is the separate term below.

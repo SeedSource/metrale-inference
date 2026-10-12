@@ -17,6 +17,9 @@
 //!   [`Glm5NextKdaKernels::has_snap_fuse`] is false unless both resolved.
 //! - 2026-10-07: The two `kda_front_fuse` entry points resolve to handle 0 when absent;
 //!   [`Glm5NextKdaKernels::has_front_fuse`] is false unless both resolved.
+//! - 2026-10-12: The three `kda_state_f16` entry points and the two `ssm_h_dtype` conversions
+//!   resolve to handle 0 when absent; [`Glm5NextKdaKernels::has_state_f16`] is false unless all
+//!   five resolved.
 
 use super::*;
 
@@ -84,6 +87,16 @@ pub struct Glm5NextKdaKernels {
     /// the unfused launches.
     pub ff_prepare: KernelHandle,
     pub ff_tail: KernelHandle,
+    /// 2026-10-12: The FP16-storage twins of `recurrent_smem`, `recurrent_io` and
+    /// `recurrent_defer` (`METRALE_GLM_KDA_STATE_F16=1`, state_f16.rs),
+    /// kernels/gb10/common/kda_state_f16.cu, and the FP16 <-> FP32 state conversions the prefill
+    /// staging uses (ssm_h_dtype.cu). Resolved with `try_kernel`; any `0` makes the loader refuse
+    /// the lever ([`super::state_f16_refusal`]).
+    pub recurrent_smem_f16: KernelHandle,
+    pub recurrent_io_f16: KernelHandle,
+    pub recurrent_defer_f16: KernelHandle,
+    pub h_widen: KernelHandle,
+    pub h_narrow: KernelHandle,
     pub o_norm: KernelHandle,
     /// 2026-10-07: `kda_o_norm_gated_bf16_fp8q` and `kda_o_norm_gated_bf16in_fp8q`
     /// (kernels/gb10/common/kda_layer_ops.cu): `o_norm` and `flk_o_norm` that also write the FP8
@@ -198,6 +211,31 @@ impl Glm5NextKdaKernels {
                 "kda_front_fuse",
                 "kda_ff_conv_state_tail",
             ),
+            recurrent_smem_f16: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_state_f16",
+                "kda_recurrent_decode_bf16_smem_f16",
+            ),
+            recurrent_io_f16: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_state_f16",
+                "kda_recurrent_decode_bf16_smem_io_f16",
+            ),
+            recurrent_defer_f16: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_state_f16",
+                "kda_recurrent_decode_bf16_smem_defer_f16",
+            ),
+            h_widen: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "ssm_h_dtype",
+                "ssm_h_state_f16_to_f32",
+            ),
+            h_narrow: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "ssm_h_dtype",
+                "ssm_h_state_f32_to_f16",
+            ),
             o_norm: gpu.kernel("kda_layer_ops", "kda_o_norm_gated_bf16")?,
             o_norm_fp8q: metrale_model_layers::layers::try_kernel(
                 gpu,
@@ -251,6 +289,20 @@ impl Glm5NextKdaKernels {
     /// 2026-10-09: Whether both deferred-commit row-0 kernels resolved.
     pub fn has_defer_commit(&self) -> bool {
         self.conv_defer.0 != 0 && self.recurrent_defer.0 != 0
+    }
+
+    /// 2026-10-12: Whether the three FP16-storage row kernels and both state conversions
+    /// resolved (`METRALE_GLM_KDA_STATE_F16=1`).
+    pub fn has_state_f16(&self) -> bool {
+        [
+            self.recurrent_smem_f16,
+            self.recurrent_io_f16,
+            self.recurrent_defer_f16,
+            self.h_widen,
+            self.h_narrow,
+        ]
+        .iter()
+        .all(|h| h.0 != 0)
     }
 
     /// 2026-10-07: Whether both `kda_front_fuse` kernels resolved.

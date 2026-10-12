@@ -39,6 +39,8 @@ impl Glm5NextKdaLayer {
         pad_fill: f32,
         stream: u64,
     ) -> Result<()> {
+        // 2026-10-12: FP32 kernels: an FP16 state is staged by the model (state_f16.rs).
+        state.require_fp32("chunked prefill")?;
         let c = &self.cfg;
         let (qkv, cd, hd) = (c.qkv_dim(), c.conv_dim(), c.head_dim);
         if t == 0 || t > ws.max_tokens {

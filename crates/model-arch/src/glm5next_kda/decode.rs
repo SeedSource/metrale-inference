@@ -59,6 +59,12 @@ impl Glm5NextKdaLayer {
             stream,
         )?;
 
+        // 2026-10-12: An FP16 state takes the twin of the shared-memory kernel, in place, or is
+        // refused; never the FP32 kernels below (state_f16.rs).
+        if state.recurrent_f16 {
+            return self.recurrent_row_f16(gpu, row, state.recurrent, state.recurrent, ws, stream);
+        }
+
         let d = c.head_dim;
         // 2026-09-25: 1R+1W when the target has the shared-memory kernel. Each block owns `vpb`
         // V columns and grid.y covers the rest; the request is `3 * d` floats plus
@@ -147,7 +153,9 @@ impl Glm5NextKdaLayer {
         let smem_smem = (3 * d + vpb * (d + 1)) * 4;
         // 2026-10-01: Only where `stateful_row` would launch the shared-memory recurrent kernel,
         // the kernel whose arithmetic the row kernel copies. The conv-rows window holds 8 taps.
-        if self.kernels.conv_rows.0 == 0
+        // 2026-10-12: The token loop has no FP16 twin: an FP16 state walks its rows.
+        if state.recurrent_f16
+            || self.kernels.conv_rows.0 == 0
             || self.kernels.recurrent_rows.0 == 0
             || self.kernels.recurrent_smem.0 == 0
             || !d.is_multiple_of(vpb)
@@ -372,9 +380,15 @@ impl Glm5NextKdaLayer {
                 ws.max_tokens
             );
         }
+        // 2026-10-12: The in-pass capture copies an FP32 blob; an FP16 state never reaches it
+        // (the model stages prefill into FP32, and inpass_capture.rs skips an FP16 slot).
+        if capture.is_some() {
+            state.require_fp32("in-pass capture")?;
+        }
         use crate::glm5next_layer::profile;
         let c = &self.cfg;
-        let (h_bytes, conv_bytes) = (c.recurrent_state_elems() * 4, c.conv_state_elems() * 4);
+        // 2026-10-12: Snapshot copies in the state's format (`* 4` unless FP16).
+        let (h_bytes, conv_bytes) = (state.recurrent_bytes(c), c.conv_state_elems() * 4);
         // 2026-09-25: Three profile buckets (front, recurrence, back), each closed where its span
         // ends.
         let t_front = profile::start();
@@ -505,7 +519,7 @@ impl Glm5NextKdaLayer {
         }
         use crate::glm5next_layer::profile;
         let c = &self.cfg;
-        let (h_bytes, conv_bytes) = (c.recurrent_state_elems() * 4, c.conv_state_elems() * 4);
+        let conv_bytes = c.conv_state_elems() * 4;
         let t_front = profile::start();
         self.front_end(gpu, hidden, r, ws, stream)?;
         profile::end(profile::KDA_FRONT, t_front, gpu, stream);
@@ -524,6 +538,8 @@ impl Glm5NextKdaLayer {
                 base += k;
                 continue;
             }
+            // 2026-10-12: Snapshot copies in this state's format (`* 4` unless FP16).
+            let h_bytes = state.recurrent_bytes(c);
             for t in 0..k {
                 self.stateful_row(gpu, base + t, state, ws, stream)?;
                 if let Some((h_dst, conv_dst)) = snaps.get(t) {

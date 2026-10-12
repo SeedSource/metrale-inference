@@ -178,6 +178,8 @@ impl SsmStatePool {
     /// 2026-09-25: `h_f16_pool` is `qwen3_ssm::ssm_h_f16_pool_enabled()` at the
     /// one production call site (`impl_a1.rs`); it is a parameter so pool
     /// geometry is testable without the process-global flag.
+    /// 2026-10-12: That call now passes `ssm_reserve::ssm_h_pool_f16(model_type)`: the
+    /// same flag, or a GLM-5.3 model under `METRALE_GLM_KDA_STATE_F16=1`.
     pub(super) fn new(
         config: &ModelConfig,
         max_slots: usize,

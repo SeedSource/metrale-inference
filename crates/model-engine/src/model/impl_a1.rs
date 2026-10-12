@@ -151,7 +151,9 @@ impl TransformerModel {
             num_drafts,
             // 2026-09-25: h pools sized at 2 bytes per element
             // (`--ssm-h-dtype f16-pool`).
-            metrale_model_layers::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
+            // 2026-10-12: Or a GLM-5.3 model under `METRALE_GLM_KDA_STATE_F16=1`; off, the
+            // value above.
+            metrale_model_layers::ssm_reserve::ssm_h_pool_f16(&config.model_type),
             // 2026-09-25: `--ssm-rollback-mode`; `Snapshot` unless the server
             // published another mode.
             metrale_model_layers::ssm_reserve::ssm_rollback_mode(),

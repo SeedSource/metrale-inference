@@ -190,6 +190,7 @@ impl Rig<'_> {
         Ok(KdaSeqState {
             conv: up_f32(self.g, c0)?,
             recurrent: up_f32(self.g, h0)?,
+            recurrent_f16: false,
         })
     }
 

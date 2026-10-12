@@ -152,6 +152,7 @@ impl Glm5NextLayer {
                     seq_states.push(KdaSeqState {
                         conv: st.conv_state,
                         recurrent: st.h_state,
+                        recurrent_f16: st.h_is_f16,
                     });
                     snaps.push(
                         (0..k - 1)

@@ -152,6 +152,8 @@ impl Glm5NextKdaLayer {
         capture: Option<&InpassSplit>,
         stream: u64,
     ) -> Result<bool> {
+        // 2026-10-12: FP32 kernels: an FP16 state is staged by the model (state_f16.rs).
+        state.require_fp32("chunked-TC prefill")?;
         if k == 0 || k > ws.max_tokens {
             bail!(
                 "KDA chunked-TC prefill of {k} tokens does not fit a workspace built for {}",
@@ -208,6 +210,8 @@ impl Glm5NextKdaLayer {
         ws: &Glm5NextKdaWorkspace,
         stream: u64,
     ) -> Result<()> {
+        // 2026-10-12: FP32 kernels: an FP16 state is staged by the model (state_f16.rs).
+        state.require_fp32("chunked-TC arm")?;
         if k == 0 || k > ws.max_tokens {
             bail!("KDA chunked-TC arm of {k} rows: outside 1..={}", ws.max_tokens);
         }

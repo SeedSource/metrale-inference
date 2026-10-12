@@ -726,6 +726,7 @@ fn layer_run(
     let st = KdaSeqState {
         conv: up_f32(g, c0)?,
         recurrent: up_f32(g, h0)?,
+        recurrent_f16: false,
     };
     g.copy_h2d(&vec![0xCD; k * c.hidden * 2], ws.final_out)?;
     g.copy_h2d(&vec![0xCD; k * c.qkv_dim() * 4], ws.core)?;
@@ -801,6 +802,7 @@ fn layer_part(g: &dyn GpuBackend) -> Result<bool> {
             let st = KdaSeqState {
                 conv: up_f32(g, &c0)?,
                 recurrent: up_f32(g, &h0)?,
+                recurrent_f16: false,
             };
             let tu = time_ms(g, || {
                 layer.prefill_chunked_tc_arm(g, hidden, k, &st, &ws, false, 0)

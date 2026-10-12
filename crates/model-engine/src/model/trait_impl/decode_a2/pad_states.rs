@@ -37,7 +37,11 @@ impl TransformerModel {
                         conv_state_checkpoint: None,
                         h_state_intermediates: Vec::new(),
                         conv_state_intermediates: Vec::new(),
-                        h_is_f16: metrale_model_layers::layers::qwen3_ssm::ssm_h_fp16_enabled(),
+                        // 2026-10-12: Also FP16 when the pool is FP16-sized (a staging blob),
+                        // as a real slot is (`h_is_f16: stage.is_some()`, meta.rs); unchanged
+                        // whenever the pool is FP32-sized.
+                        h_is_f16: metrale_model_layers::layers::qwen3_ssm::ssm_h_fp16_enabled()
+                            || self.ssm_pool.h_prefill_stage(dummy_ssm_slot).is_some(),
                         // 2026-09-25: Never prefilled; set so the dummy row
                         // matches a real row's geometry.
                         h_prefill_stage: self.ssm_pool.h_prefill_stage(dummy_ssm_slot),

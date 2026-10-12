@@ -409,6 +409,11 @@ impl TransformerModel {
         let Some(ref fp8) = self.lm_head_fp8 else {
             return Ok(false);
         };
+        if self.lm_head_q6k.is_none() && self.lm_head_nv4_shard_run(hidden, rows, logits, stream)? {
+            // 2026-10-12: `METRALE_GLM_LM_HEAD_NV4_SHARD=1`: the NVFP4 vocab shard served this head
+            // (`lm_head_nv4_shard.rs`); the FP8 route below is the lever-off path.
+            return Ok(true);
+        }
         if self.lm_head_q6k.is_some()
             || !ops::dense_gemv_tcm::ready(self.gpu.as_ref(), rows, v, h, true)
         {
@@ -461,7 +466,7 @@ impl TransformerModel {
     /// `None` unless there is a communicator with at least 2 ranks and the vocab
     /// divides evenly by the world size, or when `METRALE_NO_LMHEAD_VOCAB_TP=1`
     /// (read once per process). Only the BF16 dense-head paths call it.
-    fn lmhead_vocab_shard(&self, v: u32) -> Option<(usize, usize)> {
+    pub(super) fn lmhead_vocab_shard(&self, v: u32) -> Option<(usize, usize)> {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *OFF.get_or_init(|| std::env::var("METRALE_NO_LMHEAD_VOCAB_TP").as_deref() == Ok("1")) {
             return None;

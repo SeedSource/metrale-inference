@@ -437,6 +437,10 @@ pub fn build_model(
         ssm_checkpoint_interval,
     )?;
 
+    // 2026-10-12: `METRALE_GLM_LM_HEAD_NV4_SHARD=1`: the NVFP4 vocab shard of the target head.
+    // Returns at once when the lever is off.
+    model.install_lm_head_nv4_shard()?;
+
     // 2026-09-25: A Q6_K `lm_head.weight` in the store (a DeepSeek-V4.1 GGUF,
     // kept Q6_K by the sidecar's `v41_kquant_resident_dtype`) is served by the
     // K-quant GEMV in model/lm_head_q6k.rs.

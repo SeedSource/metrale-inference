@@ -101,18 +101,40 @@ pub fn try_launch(
     if !takes(m) {
         return Ok(false);
     }
+    let launched = launch_tc(gpu, a, q, c, m, n, k, stream)?;
+    if launched {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_NV4_TC={}: ENGAGED - GLM NVFP4 GEMVs (K % 128 == 0) run \
+                 w4a16_gemv_tc8/tc16 (first: {m} rows, {n}x{k}); NOT byte-identical to the \
+                 CUDA-core tiers",
+                std::env::var("METRALE_GLM_NV4_TC").unwrap_or_default()
+            );
+        });
+    }
+    Ok(launched)
+}
+
+/// 2026-10-12: The tensor-core launch of [`try_launch`] without the `METRALE_GLM_NV4_TC` gate
+/// ([`takes`]): `Ok(true)` when the route takes the shape (`K % 128 == 0`, 1..=16 rows, kernels
+/// present, `METRALE_NO_W4A16_TC` unset), `Ok(false)` having launched nothing otherwise. Used by
+/// `glm5next_lm_head_nv4` (`METRALE_GLM_LM_HEAD_NV4_SHARD`), which picks the tier per row count
+/// itself. No allocation or sync, so it is capture-safe.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_tc(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<bool> {
     let Some((h, grid_x)) = gemv_tc::tc_kernel(gpu, m as u32, n as u32, k as u32) else {
         return Ok(false);
     };
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        tracing::warn!(
-            "METRALE_GLM_NV4_TC={}: ENGAGED - GLM NVFP4 GEMVs (K % 128 == 0) run \
-             w4a16_gemv_tc8/tc16 (first: {m} rows, {n}x{k}); NOT byte-identical to the \
-             CUDA-core tiers",
-            std::env::var("METRALE_GLM_NV4_TC").unwrap_or_default()
-        );
-    });
     KernelLaunch::new(gpu, h)
         .grid([grid_x, 1, 1])
         .block([gemv_tc::TC_BLOCK, 1, 1])

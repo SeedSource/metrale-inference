@@ -531,7 +531,7 @@ fn run() -> Result<(bool, String)> {
     let ks: Ks = [
         mk("w4a16_gemv", "w4a16_gemv_batch3_staged")?,
         mk("dense_gemv_tcm", "dense_gemv_tcm_bf16")?,
-        mk("dense_gemv_bf16", "dense_gemv_bf16_fp32out")?,
+        mk("gemv", "dense_gemv_bf16_fp32out")?,
         mk("dense_gemv_bf16_batchm", "dense_gemv_bf16_fp32out_batchm")?,
     ];
     let gemv1 = g.kernel("w4a16_gemv", "w4a16_gemv")?;

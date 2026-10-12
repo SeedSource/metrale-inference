@@ -113,6 +113,10 @@ name = "dsa_pool_cache_parity_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dsa_ceiling_rows_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_grid_stride_microtest"
 required-features = ["cuda", "gpu-examples"]
 

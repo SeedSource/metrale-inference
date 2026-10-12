@@ -107,7 +107,7 @@ impl Glm5NextKdaLayer {
         if snapshots[0].0 == state.recurrent || snapshots[0].1 == state.conv {
             bail!("KDA decode_k_defer: snapshot 0 is the live state");
         }
-        if defer.h_stride % 4 != 0 || defer.conv_stride % 4 != 0 {
+        if !defer.h_stride.is_multiple_of(4) || !defer.conv_stride.is_multiple_of(4) {
             bail!("KDA decode_k_defer: intermediate strides {defer:?} are not whole floats");
         }
         use crate::glm5next_layer::profile;

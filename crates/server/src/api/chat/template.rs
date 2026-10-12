@@ -538,15 +538,15 @@ mod think_tail_tests {
     }
 
     /// 2026-10-12: The real GLM-5.3 tokenizer and official zai-org chat template, from
-    /// `METRALE_TEST_GLM53_DIR` (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`;
+    /// `GLM53_TEST_DIR` (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`;
     /// without the config the loader falls back to ChatML); skipped when
     /// unset. The template renders the same tokens for `enable_thinking` absent, true and
     /// false (it has no such branch); the request-off prompt is that render plus exactly
     /// the `</think>` token, decoding to `...<|assistant|><think></think>`.
     #[test]
     fn glm53_official_template_off_is_render_plus_think_end() {
-        let Ok(dir) = std::env::var("METRALE_TEST_GLM53_DIR") else {
-            eprintln!("METRALE_TEST_GLM53_DIR unset; skipping");
+        let Ok(dir) = std::env::var("GLM53_TEST_DIR") else {
+            eprintln!("GLM53_TEST_DIR unset; skipping");
             return;
         };
         let tok = crate::tokenizer::ChatTokenizer::from_model_dir(

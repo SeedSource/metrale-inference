@@ -53,6 +53,10 @@ name = "glm5next_moe_fixcost_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "kernel_jitter_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_dense_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
 

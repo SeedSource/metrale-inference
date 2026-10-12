@@ -319,10 +319,12 @@ impl TransformerModel {
                 // broadcasts the tokens it verifies), but the drafter KV this
                 // writes stays in step because both ranks use the same
                 // `(last_token, position)` and the same saved hidden row.
-                let last_token = self.ep_broadcast_u32(0)?;
-                let position = self.ep_broadcast_u32(0)? as usize;
-                let num_drafts = self.ep_broadcast_u32(0)? as usize;
-                let hidden_idx = self.ep_broadcast_u32(0)? as usize;
+                // 2026-10-12: One packet under `METRALE_EP_C1_PACK=1` (`speculative_mtp.rs`).
+                let w = self.ep_broadcast_cmd_words(&[0; 4])?;
+                let last_token = w[0];
+                let position = w[1] as usize;
+                let num_drafts = w[2] as usize;
+                let hidden_idx = w[3] as usize;
                 // 2026-09-25: Save the hidden row the head saved
                 // (`save_hidden_for_mtp`), so both ranks feed the drafter the same
                 // input and its all-reduce sums partials of one vector.
@@ -348,9 +350,9 @@ impl TransformerModel {
             }
             0xFFFFFFF3 => {
                 // 2026-09-25: Verify K=3: 3 tokens, verify, then num_accepted (0..=2).
-                let t0 = self.ep_broadcast_u32(0)?;
-                let t1 = self.ep_broadcast_u32(0)?;
-                let t2 = self.ep_broadcast_u32(0)?;
+                // 2026-10-12: The tokens are one packet under `METRALE_EP_C1_PACK=1`.
+                let t = self.ep_broadcast_cmd_words(&[0; 3])?;
+                let (t0, t1, t2) = (t[0], t[1], t[2]);
                 self.sync_secondary()?;
                 self.decode_verify_graphed_k3(&[t0, t1, t2], seq, stream)?;
                 let num_accepted = self.ep_broadcast_u32(0)?;
@@ -374,10 +376,9 @@ impl TransformerModel {
             }
             0xFFFFFFF4 => {
                 // 2026-09-25: Verify K=4: 4 tokens, verify, then num_accepted (0..=3).
-                let t0 = self.ep_broadcast_u32(0)?;
-                let t1 = self.ep_broadcast_u32(0)?;
-                let t2 = self.ep_broadcast_u32(0)?;
-                let t3 = self.ep_broadcast_u32(0)?;
+                // 2026-10-12: The tokens are one packet under `METRALE_EP_C1_PACK=1`.
+                let t = self.ep_broadcast_cmd_words(&[0; 4])?;
+                let (t0, t1, t2, t3) = (t[0], t[1], t[2], t[3]);
                 self.sync_secondary()?;
                 self.decode_verify_graphed_k4(&[t0, t1, t2, t3], seq, stream)?;
                 let num_accepted = self.ep_broadcast_u32(0)?;

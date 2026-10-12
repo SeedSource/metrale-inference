@@ -25,6 +25,14 @@ impl ModelEp for TransformerModel {
         self.ep_broadcast_cmd_dispatch(cmd)
     }
 
+    fn ep_send_cmd_words(&self, words: &[u32]) -> Result<()> {
+        // 2026-10-12: Same gate as `ep_broadcast_cmd_dispatch`: live for EP and for pure TP.
+        if self.multi_rank_protocol_active() {
+            self.ep_broadcast_cmd_words(words)?;
+        }
+        Ok(())
+    }
+
     fn ep_broadcast_cmd_for_seq(&self, seq_id: u32, cmd: u32) -> Result<()> {
         // 2026-09-25: `ep_protocol_v2` is set at construction from
         // `METRALE_EP_PROTOCOL=v2`.

@@ -191,6 +191,44 @@ impl TransformerModel {
         }
     }
 
+    /// 2026-10-12: Broadcast `vals` from rank 0 as ONE packet through `ep_cmd_buf` (at most
+    /// `EP_PACK_MAX_WORDS` words). Rank 0 returns `vals`; the other ranks pass a slice of the same
+    /// length and get rank 0's values. Panics without a comm backend.
+    pub(super) fn ep_broadcast_packed(&self, vals: &[u32]) -> Result<Vec<u32>> {
+        let n = vals.len();
+        anyhow::ensure!(
+            (1..=super::ep_c1_pack::EP_PACK_MAX_WORDS).contains(&n),
+            "ep_broadcast_packed: {n} words outside 1..={}",
+            super::ep_c1_pack::EP_PACK_MAX_WORDS
+        );
+        let comm = self.comm.as_ref().expect("ep_broadcast_packed without comm");
+        let stream = self.gpu.default_stream();
+        let mut bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        if comm.rank() == 0 {
+            self.gpu.copy_h2d(&bytes, self.ep_cmd_buf)?;
+            comm.broadcast(self.ep_cmd_buf.0, 4 * n, 0)?;
+            Ok(vals.to_vec())
+        } else {
+            comm.broadcast(self.ep_cmd_buf.0, 4 * n, 0)?;
+            self.gpu.synchronize(stream)?;
+            self.gpu.copy_d2h(self.ep_cmd_buf, &mut bytes)?;
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+    }
+
+    /// 2026-10-12: A command's follow-up words: one packet under `METRALE_EP_C1_PACK=1`, else one
+    /// `ep_broadcast_u32` per word (the wire both ranks used before). Rank 0 passes the values; the
+    /// other ranks pass placeholders of the same length and get rank 0's values.
+    pub(super) fn ep_broadcast_cmd_words(&self, vals: &[u32]) -> Result<Vec<u32>> {
+        if super::ep_c1_pack::ep_c1_pack() {
+            return self.ep_broadcast_packed(vals);
+        }
+        vals.iter().map(|&v| self.ep_broadcast_u32(v)).collect()
+    }
+
     /// 2026-09-25: Broadcast one u32 from rank 0 through `ep_cmd_buf`. Rank 0
     /// returns `val`; the other ranks return the received value. Panics without
     /// a comm backend.

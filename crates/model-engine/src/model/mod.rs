@@ -17,6 +17,7 @@ pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
 pub(crate) mod impl_a2;
 mod impl_a2_ep_broadcast;
+mod ep_c1_pack;
 pub(crate) mod impl_a3;
 mod impl_a3_embed;
 mod impl_a3_lm_head;

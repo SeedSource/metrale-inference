@@ -71,18 +71,19 @@ impl TransformerModel {
                 seq.slot_idx as u32,
                 metrale_model_layers::speculative::EP_CMD_MTP_PROPOSE,
             )?;
-            self.ep_broadcast_u32(token)?;
-            self.ep_broadcast_u32(position as u32)?;
-            self.ep_broadcast_u32(num_drafts as u32)?;
             // 2026-09-25: The fourth word is the `hidden_states` row the head last saved into
             // `mtp_hidden_save` (latched by `save_hidden_for_mtp_dispatch`). The propose reads
             // its target hidden from `mtp_hidden_save`, and the worker saves the same row
             // before proposing, so both ranks reduce partials of the same input.
             // `save_hidden_for_mtp_from_stash_dispatch` does not latch this index.
-            self.ep_broadcast_u32(
+            // 2026-10-12: One packet under `METRALE_EP_C1_PACK=1`, else one broadcast per word.
+            self.ep_broadcast_cmd_words(&[
+                token,
+                position as u32,
+                num_drafts as u32,
                 self.last_mtp_hidden_idx
                     .load(std::sync::atomic::Ordering::Relaxed) as u32,
-            )?;
+            ])?;
         }
         self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask)
     }

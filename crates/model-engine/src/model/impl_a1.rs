@@ -245,8 +245,9 @@ impl TransformerModel {
                 gpu.as_ref(),
             )?;
 
-        // 2026-09-25: One u32 for the EP command broadcast.
-        let ep_cmd_buf = gpu.alloc(4)?;
+        // 2026-09-25: One u32 for the EP command broadcast. 2026-10-12: 64 bytes, so a packed
+        // command (`METRALE_EP_C1_PACK`, up to `EP_PACK_MAX_WORDS` words) stages here too.
+        let ep_cmd_buf = gpu.alloc(64)?;
 
         // 2026-09-25: Fixed-address buffer (CUDA-graph safe) for the batched
         // decode MoE per-row adapter map, 4 bytes per batch row, uploaded each

@@ -38,6 +38,15 @@ pub trait ModelEp {
         Ok(())
     }
 
+    /// 2026-10-12: Send a command's follow-up words to every worker rank: one broadcast under
+    /// `METRALE_EP_C1_PACK=1`, else one [`Self::ep_broadcast_cmd`] per word. Default: per word.
+    fn ep_send_cmd_words(&self, words: &[u32]) -> Result<()> {
+        for &w in words {
+            self.ep_broadcast_cmd(w)?;
+        }
+        Ok(())
+    }
+
     /// 2026-09-25: Send a `(seq_id, cmd)` pair to every worker rank, as the first broadcast of a
     /// command; its follow-up broadcasts use [`Self::ep_broadcast_cmd`]. When
     /// [`Self::ep_protocol_v2`] is false, `seq_id` is not sent. Default: `Ok(())`.

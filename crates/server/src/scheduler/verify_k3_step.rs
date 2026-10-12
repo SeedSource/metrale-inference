@@ -43,12 +43,11 @@ pub fn step_verify_k3(
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k3 cmd: {e:#}"));
         return;
     }
-    for &t in &tokens_k3 {
-        if let Err(e) = model.ep_broadcast_cmd(t) {
-            tracing::error!("EP broadcast verify_k3 token: {e:#}");
-            super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k3 token: {e:#}"));
-            return;
-        }
+    // 2026-10-12: One packet under `METRALE_EP_C1_PACK=1`, else one broadcast per token.
+    if let Err(e) = model.ep_send_cmd_words(&tokens_k3) {
+        tracing::error!("EP broadcast verify_k3 token: {e:#}");
+        super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k3 token: {e:#}"));
+        return;
     }
 
     let t_verify = sched.io.clock.now();

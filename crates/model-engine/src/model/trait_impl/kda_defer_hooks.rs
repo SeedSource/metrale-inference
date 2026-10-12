@@ -217,13 +217,14 @@ impl TransformerModel {
             });
             ssm_layer += 1;
         }
-        if consumer && let Some(idx) = pending {
-            if CONSUMED.fetch_add(1, Ordering::Relaxed) == 0 {
-                tracing::info!(
-                    "METRALE_GLM_KDA_DEFER_COMMIT: ENGAGED (first verify reading a deferred \
-                     commit: slot {slot}, intermediate {idx}, {ssm_layer} KDA layers, k={k})"
-                );
-            }
+        if consumer
+            && let Some(idx) = pending
+            && CONSUMED.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            tracing::info!(
+                "METRALE_GLM_KDA_DEFER_COMMIT: ENGAGED (first verify reading a deferred \
+                 commit: slot {slot}, intermediate {idx}, {ssm_layer} KDA layers, k={k})"
+            );
         }
         Ok(consumer)
     }

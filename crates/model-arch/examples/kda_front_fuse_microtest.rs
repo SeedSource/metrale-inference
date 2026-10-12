@@ -31,6 +31,16 @@
 //! scan, and the whole layer call both ways. The projection multiplies by 136 calls (34 KDA
 //! layers x 4 windows of 8192 rows at 32K).
 //!
+//! Ablation timing (only with `KDA_FF_ABLATE=1`; 2026-10-11, race-pf-kdaff): the variants of
+//! `kda_ff_prepare` in kernels/gb10/common/kda_front_fuse.cu (A0 full, A1 no solve, A2 no
+//! exp, A3 loads + stores only, A4 math only, A5/A5b register-capped, A6 no exp and no divide)
+//! at 8192 rows x 32 heads. Prints `KDAFF_ABL_RES` (registers, local bytes, occupancy),
+//! `KDAFF_ABL_EXACT` (A0 vs the unmodified kernel, A5 and A5b vs A0, bitwise on the records,
+//! core, h_state and conv_state of the full fused path), `KDAFF_ABL_WRITTEN` (every record
+//! word of every variant was overwritten) and one `KDAFF_ABL` timing line per variant. The
+//! verdict then also needs A0 == the unmodified kernel, A5 == A0, A5b == A0 and all variants
+//! written; the existing checks are unchanged. A1-A4 and A6 write intentionally wrong records.
+//!
 //! Geometry: GLM-5.3-Flash KDA (head_dim 128, conv_kernel 4, l2_eps 1e-6, gate_lower_bound
 //! -5, hidden 4096) at 32 heads, the TP=2 per-rank layer.
 //!
@@ -55,6 +65,7 @@ unsafe extern "C" {
     fn cuEventSynchronize(event: u64) -> i32;
     fn cuEventElapsedTime(ms: *mut f32, start: u64, end: u64) -> i32;
     fn cuEventDestroy_v2(event: u64) -> i32;
+    fn cuFuncGetAttribute(value: *mut i32, attrib: i32, func: u64) -> i32;
 }
 
 const D: usize = 128;
@@ -88,6 +99,27 @@ const LAYER_ROWS: [usize; 2] = [257, 8192];
 const TIME_ROWS: usize = 8192;
 const WARMUP: usize = 5;
 const TIMED: usize = 30;
+/// 2026-10-11: Ablation timing: `ABL_ROUNDS` passes over the variants (order reversed on odd
+/// passes, so slow drift hits every variant alike), `ABL_WARMUP` launches then `ABL_TIMED`
+/// samples per variant per pass; the median and minimum are over all pooled samples.
+const ABL_ROUNDS: usize = 3;
+const ABL_WARMUP: usize = 3;
+const ABL_TIMED: usize = 20;
+/// 2026-10-11: Poison for the written-everywhere check; a record word equal to it after a
+/// launch was not written (2^-16 chance for a real u16 word).
+const ABL_POISON: u8 = 0xA5;
+/// 2026-10-11: (label, entry point) of the `kda_front_fuse` module's `kda_ff_prepare` variants.
+const ABL_VARIANTS: [(&str, &str); 9] = [
+    ("A0", "kda_ff_prepare_a0"),
+    ("A1", "kda_ff_prepare_a1"),
+    ("A2", "kda_ff_prepare_a2"),
+    ("A3", "kda_ff_prepare_a3"),
+    ("A4", "kda_ff_prepare_a4"),
+    ("A5", "kda_ff_prepare_a5"),
+    ("A5b", "kda_ff_prepare_a5b"),
+    ("A6", "kda_ff_prepare_a6"),
+    ("PROD", "kda_ff_prepare"),
+];
 /// 2026-10-07: KDA layer calls of a 32K cold prefill at ROWS_FFN 8192 (34 layers x 4 windows).
 const CALLS_32K: f64 = 136.0;
 
@@ -161,18 +193,23 @@ fn ck(rc: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// 2026-10-07: Median milliseconds of `f` over `TIMED` calls, each between two CUDA events on
-/// stream 0, after `WARMUP` calls.
-fn time_ms(g: &dyn GpuBackend, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
-    for _ in 0..WARMUP {
+/// 2026-10-11: The `ms` of `timed` calls of `f`, each between two CUDA events on stream 0,
+/// after `warmup` calls, in call order.
+fn time_samples(
+    g: &dyn GpuBackend,
+    f: &mut impl FnMut() -> Result<()>,
+    warmup: usize,
+    timed: usize,
+) -> Result<Vec<f64>> {
+    for _ in 0..warmup {
         f()?;
     }
     g.synchronize(0)?;
     let (mut e0, mut e1): (u64, u64) = (0, 0);
     ck(unsafe { cuEventCreate(&mut e0, 0) }, "cuEventCreate(start)")?;
     ck(unsafe { cuEventCreate(&mut e1, 0) }, "cuEventCreate(end)")?;
-    let mut ms_all = Vec::with_capacity(TIMED);
-    for _ in 0..TIMED {
+    let mut ms_all = Vec::with_capacity(timed);
+    for _ in 0..timed {
         ck(unsafe { cuEventRecord(e0, 0) }, "cuEventRecord(start)")?;
         f()?;
         ck(unsafe { cuEventRecord(e1, 0) }, "cuEventRecord(end)")?;
@@ -188,6 +225,13 @@ fn time_ms(g: &dyn GpuBackend, mut f: impl FnMut() -> Result<()>) -> Result<f64>
         cuEventDestroy_v2(e0);
         cuEventDestroy_v2(e1);
     }
+    Ok(ms_all)
+}
+
+/// 2026-10-07: Median milliseconds of `f` over `TIMED` calls, each between two CUDA events on
+/// stream 0, after `WARMUP` calls.
+fn time_ms(g: &dyn GpuBackend, mut f: impl FnMut() -> Result<()>) -> Result<f64> {
+    let mut ms_all = time_samples(g, &mut f, WARMUP, TIMED)?;
     ms_all.sort_by(f64::total_cmp);
     Ok(ms_all[ms_all.len() / 2])
 }
@@ -298,21 +342,34 @@ struct Arm {
 
 impl Arm {
     fn new(g: &dyn GpuBackend, ins: &Inputs, sub: usize, fill: u8) -> Result<Self> {
+        Self::new_ex(g, ins, sub, fill, REC_POISON, true)
+    }
+    /// 2026-10-11: `new` with the record poison chosen and the unfused intermediates
+    /// (`qkv_proj`, `conv_out`, `gate`, `beta`) left at one byte when `front` is false.
+    fn new_ex(
+        g: &dyn GpuBackend,
+        ins: &Inputs,
+        sub: usize,
+        fill: u8,
+        poison: u8,
+        front: bool,
+    ) -> Result<Self> {
         let recs = sub.div_ceil(TC_C) * HEADS;
+        let fsub = if front { sub } else { 0 };
         Ok(Self {
             conv_state: up_f32(g, &ins.conv_state0)?,
             h_state: up_f32(g, &ins.h_state0)?,
             core: up_bytes(g, &vec![fill; ins.k * qkv() * 4])?,
             rec: [
-                up_bytes(g, &vec![REC_POISON; recs * REC_BYTES[0]])?,
-                up_bytes(g, &vec![REC_POISON; recs * REC_BYTES[1]])?,
-                up_bytes(g, &vec![REC_POISON; recs * REC_BYTES[2]])?,
-                up_bytes(g, &vec![REC_POISON; recs * REC_BYTES[3]])?,
+                up_bytes(g, &vec![poison; recs * REC_BYTES[0]])?,
+                up_bytes(g, &vec![poison; recs * REC_BYTES[1]])?,
+                up_bytes(g, &vec![poison; recs * REC_BYTES[2]])?,
+                up_bytes(g, &vec![poison; recs * REC_BYTES[3]])?,
             ],
-            qkv_proj: up_bytes(g, &vec![0; sub * cd() * 2])?,
-            conv_out: up_bytes(g, &vec![0; sub * cd() * 2])?,
-            gate: up_bytes(g, &vec![0; sub * qkv() * 4])?,
-            beta: up_bytes(g, &vec![0; sub * HEADS * 4])?,
+            qkv_proj: up_bytes(g, &vec![0; fsub * cd() * 2])?,
+            conv_out: up_bytes(g, &vec![0; fsub * cd() * 2])?,
+            gate: up_bytes(g, &vec![0; fsub * qkv() * 4])?,
+            beta: up_bytes(g, &vec![0; fsub * HEADS * 4])?,
         })
     }
     /// 2026-10-07: The records of the chunks `rows` rows fill, as raw bytes.
@@ -485,9 +542,25 @@ fn launch_fused(
     r0: usize,
     rows: usize,
 ) -> Result<()> {
+    launch_ff_prepare(g, kn.ff_prepare, di, a, k, r0, rows)?;
+    launch_ff_tail(g, kn, di, a, k, r0, rows)
+}
+
+/// 2026-10-11: The `kda_ff_prepare` launch of `launch_fused` for the entry point `prepare`
+/// (the production kernel, or an ablation variant of the same signature).
+#[allow(clippy::too_many_arguments)]
+fn launch_ff_prepare(
+    g: &dyn GpuBackend,
+    prepare: KernelHandle,
+    di: &DevIn,
+    a: &Arm,
+    k: usize,
+    r0: usize,
+    rows: usize,
+) -> Result<()> {
     let qkv = qkv();
     let (q, kk, v) = (di.part(k, 0, r0), di.part(k, 1, r0), di.part(k, 2, r0));
-    KernelLaunch::new(g, kn.ff_prepare)
+    KernelLaunch::new(g, prepare)
         .grid([rows.div_ceil(TC_C) as u32, HEADS as u32, 1])
         .block([D as u32, 1, 1])
         .arg_ptr(q)
@@ -511,6 +584,21 @@ fn launch_fused(
         .arg_f32(LOWER_BOUND)
         .arg_f32(1.0 / (D as f32).sqrt())
         .launch(0)?;
+    Ok(())
+}
+
+/// 2026-10-11: The `kda_ff_conv_state_tail` launch of `launch_fused`.
+fn launch_ff_tail(
+    g: &dyn GpuBackend,
+    kn: &Kernels,
+    di: &DevIn,
+    a: &Arm,
+    k: usize,
+    r0: usize,
+    rows: usize,
+) -> Result<()> {
+    let qkv = qkv();
+    let (q, kk, v) = (di.part(k, 0, r0), di.part(k, 1, r0), di.part(k, 2, r0));
     KernelLaunch::new(g, kn.ff_tail)
         .grid([div_ceil(cd() as u32, 256), 1, 1])
         .block([256, 1, 1])
@@ -658,6 +746,206 @@ fn kernel_timing(g: &dyn GpuBackend, kn: &Kernels) -> Result<f64> {
     a.free(g);
     di.free(g);
     Ok(save)
+}
+
+/// 2026-10-11: One fused-path run's outputs, as raw bytes: the four chunk records, the core
+/// output, the recurrent state and the conv state.
+struct AblOut {
+    rec: [Vec<u8>; 4],
+    core: Vec<u8>,
+    h: Vec<u8>,
+    conv: Vec<u8>,
+}
+
+impl AblOut {
+    /// Bytes that differ from `o` over every buffer (a length mismatch counts the excess).
+    fn differing_bytes(&self, o: &AblOut) -> usize {
+        let d = |a: &[u8], b: &[u8]| {
+            a.iter().zip(b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len())
+        };
+        (0..4).map(|i| d(&self.rec[i], &o.rec[i])).sum::<usize>()
+            + d(&self.core, &o.core)
+            + d(&self.h, &o.h)
+            + d(&self.conv, &o.conv)
+    }
+}
+
+/// 2026-10-11: The fused path (prepare entry `prepare`, `kda_ff_conv_state_tail`, `kda_tc_scan`)
+/// over all `k` rows from the inputs' starting states, in a fresh arm.
+fn abl_run(
+    g: &dyn GpuBackend,
+    kn: &Kernels,
+    prepare: KernelHandle,
+    ins: &Inputs,
+    di: &DevIn,
+    k: usize,
+) -> Result<AblOut> {
+    let a = Arm::new_ex(g, ins, k, 0xAB, REC_POISON, false)?;
+    launch_ff_prepare(g, prepare, di, &a, k, 0, k)?;
+    launch_ff_tail(g, kn, di, &a, k, 0, k)?;
+    launch_scan(g, kn, &a, 0, k)?;
+    g.synchronize(0)?;
+    let out = AblOut {
+        rec: a.records(g, k)?,
+        core: dn_bytes(g, a.core, k * qkv() * 4)?,
+        h: dn_bytes(g, a.h_state, HEADS * D * D * 4)?,
+        conv: dn_bytes(g, a.conv_state, cd() * D_CONV * 4)?,
+    };
+    a.free(g);
+    Ok(out)
+}
+
+/// 2026-10-11: `cuFuncGetAttribute`, or None when the driver refuses.
+fn func_attr(h: KernelHandle, attrib: i32) -> Option<i32> {
+    let mut v = 0i32;
+    (unsafe { cuFuncGetAttribute(&mut v, attrib, h.0) } == 0).then_some(v)
+}
+
+/// 2026-10-11: The `KDA_FF_ABLATE=1` section at 8192 rows x 32 heads. Returns the verdict:
+/// A0 equals the unmodified kernel, A5 and A5b equal A0, every variant wrote every record word,
+/// and the reference run is non-vacuous. The timings never enter it.
+fn ablation(g: &dyn GpuBackend, kn: &Kernels) -> Result<bool> {
+    let k = TIME_ROWS;
+    let mut ok = true;
+    let mut ent: Vec<(&str, KernelHandle)> = Vec::new();
+    for (label, entry) in ABL_VARIANTS {
+        match g.kernel("kda_front_fuse", entry) {
+            Ok(h) => ent.push((label, h)),
+            Err(e) => {
+                println!("FAIL KDAFF_ABL variant={label} entry={entry} not resolved: {e}");
+                ok = false;
+            }
+        }
+    }
+    if !ok {
+        return Ok(false);
+    }
+    let handle = |l: &str| ent.iter().find(|(x, _)| *x == l).map(|(_, h)| *h).unwrap();
+
+    // 2026-10-11: Registers and occupancy (driver attributes: 4 NUM_REGS, 3 LOCAL_SIZE_BYTES,
+    // 1 SHARED_SIZE_BYTES; blocks per SM from the backend's occupancy query at 128 threads).
+    for (label, h) in &ent {
+        let f = |o: Option<i32>| o.map_or("n/a".to_string(), |v| v.to_string());
+        let occ = match g.max_active_blocks_per_sm(*h, D as u32, 0) {
+            Ok(n) if n > 0 => n.to_string(),
+            _ => "n/a".to_string(),
+        };
+        println!(
+            "KDAFF_ABL_RES variant={label} regs={} local_bytes={} static_smem={} blocks_per_sm={occ}",
+            f(func_attr(*h, 4)),
+            f(func_attr(*h, 3)),
+            f(func_attr(*h, 1)),
+        );
+    }
+
+    let ins = gen_inputs(k, SEEDS[0], Gates::Mild);
+    let di = DevIn::new(g, &ins)?;
+
+    // 2026-10-11: Exactness. PROD is the unmodified kernel; A0 must equal it, A5 and A5b A0.
+    let r_prod = abl_run(g, kn, handle("PROD"), &ins, &di, k)?;
+    let core_f = floats(&r_prod.core);
+    let live = core_f.iter().all(|x| x.is_finite())
+        && core_f.iter().any(|x| *x != 0.0)
+        && r_prod
+            .rec
+            .iter()
+            .all(|b| b.iter().any(|x| *x != REC_POISON));
+    if !live {
+        println!(
+            "FAIL KDAFF_ABL reference run is vacuous (core not finite/nonzero or records unwritten)"
+        );
+        ok = false;
+    }
+    let r_a0 = abl_run(g, kn, handle("A0"), &ins, &di, k)?;
+    let n = r_a0.differing_bytes(&r_prod);
+    println!("KDAFF_ABL_EXACT A0 differing_bytes={n} (vs unmodified kda_ff_prepare)");
+    if n != 0 {
+        println!("FAIL KDAFF_ABL A0 differs from the unmodified kernel");
+        ok = false;
+    }
+    for label in ["A5", "A5b"] {
+        let r = abl_run(g, kn, handle(label), &ins, &di, k)?;
+        let n = r.differing_bytes(&r_a0);
+        println!("KDAFF_ABL_EXACT {label} differing_bytes={n} (vs A0)");
+        if n != 0 {
+            println!("FAIL KDAFF_ABL {label} is not bit-identical to A0");
+            ok = false;
+        }
+    }
+    drop((r_prod, r_a0));
+
+    // 2026-10-11: One shared arm for the written check and the timing. Before each variant
+    // the records are re-poisoned with ABL_POISON; afterwards no record buffer may hold more
+    // than 1% poison u16 words (a variant that skipped part of the stores would be timing
+    // less memory traffic).
+    let a = Arm::new_ex(g, &ins, k, 0xAB, ABL_POISON, false)?;
+    let recs = k.div_ceil(TC_C) * HEADS;
+    for (label, h) in &ent {
+        for (i, rb) in REC_BYTES.iter().enumerate() {
+            g.memset(a.rec[i], ABL_POISON, recs * rb)?;
+        }
+        launch_ff_prepare(g, *h, &di, &a, k, 0, k)?;
+        g.synchronize(0)?;
+        let mut worst = 0f64;
+        for (i, rb) in REC_BYTES.iter().enumerate() {
+            let b = dn_bytes(g, a.rec[i], recs * rb)?;
+            let w = words_u16(&b);
+            let p = w.iter().filter(|x| **x == 0xA5A5).count();
+            worst = worst.max(p as f64 / w.len().max(1) as f64);
+        }
+        let wrote = worst <= 0.01;
+        println!(
+            "KDAFF_ABL_WRITTEN variant={label} poison_word_frac_max={worst:.5} {}",
+            if wrote {
+                "ok"
+            } else {
+                "FAIL (records not fully written)"
+            }
+        );
+        ok &= wrote;
+    }
+
+    // 2026-10-11: Timing. Bytes per call: q, k, v and g_raw read once (4 x rows x qkv x 2 B)
+    // plus every chunk record written (REC_BYTES per chunk x head); beta, weights and the
+    // 3-row window re-reads (L2 hits) are not counted.
+    let bytes = (4 * k * qkv() * 2 + recs * REC_BYTES.iter().sum::<usize>()) as f64;
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); ent.len()];
+    for round in 0..ABL_ROUNDS {
+        for j in 0..ent.len() {
+            let v = if round % 2 == 0 { j } else { ent.len() - 1 - j };
+            let h = ent[v].1;
+            let s = time_samples(
+                g,
+                &mut || launch_ff_prepare(g, h, &di, &a, k, 0, k),
+                ABL_WARMUP,
+                ABL_TIMED,
+            )?;
+            samples[v].extend(s);
+        }
+    }
+    let med = |v: &Vec<f64>| {
+        let mut s = v.clone();
+        s.sort_by(f64::total_cmp);
+        s[s.len() / 2]
+    };
+    let a0_ms = med(&samples[ent.iter().position(|(l, _)| *l == "A0").unwrap()]);
+    for (j, (label, _)) in ent.iter().enumerate() {
+        let ms = med(&samples[j]);
+        let mn = samples[j].iter().cloned().fold(f64::INFINITY, f64::min);
+        println!(
+            "KDAFF_ABL variant={label} ms={ms:.4} ms_min={mn:.4} ratio_vs_A0={:.4} GBps={:.1}",
+            ms / a0_ms,
+            bytes / ms / 1e6
+        );
+    }
+    println!(
+        "KDAFF_ABL_BYTES rows={k} heads={HEADS} bytes_per_call={} n_samples_per_variant={}",
+        bytes as u64,
+        ABL_ROUNDS * ABL_TIMED
+    );
+    a.free(g);
+    di.free(g);
+    Ok(ok)
 }
 
 fn dwt(g: &dyn GpuBackend, v: &[f32]) -> Result<DenseWeight> {
@@ -857,13 +1145,35 @@ fn main() -> Result<()> {
     // 2026-10-07: Timing; reported whatever the verdict.
     let _ = kernel_timing(g, &kn)?;
 
-    let ok = all_ok && layer_ok;
+    // 2026-10-11: The ablation section, only when asked for; its verdict joins the final line.
+    let ablate = std::env::var("KDA_FF_ABLATE").as_deref() == Ok("1");
+    let abl_ok = if ablate {
+        match ablation(g, &kn) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("FAIL KDAFF_ABL error: {e:#}");
+                false
+            }
+        }
+    } else {
+        true
+    };
+
+    let ok = all_ok && layer_ok && abl_ok;
     println!(
         "{} KDA front fuse: {cases} kernel cases (records, core, h_state, conv_state bitwise) \
-         {}, layer cases ({LAYER_ROWS:?} rows: final_out, core, states bitwise) {}",
+         {}, layer cases ({LAYER_ROWS:?} rows: final_out, core, states bitwise) {}{}",
         if ok { "PASS" } else { "FAIL" },
         if all_ok { "pass" } else { "FAIL" },
-        if layer_ok { "pass" } else { "FAIL" }
+        if layer_ok { "pass" } else { "FAIL" },
+        if !ablate {
+            String::new()
+        } else if abl_ok {
+            ", ablation (A0 == unmodified, A5 and A5b == A0, all variants wrote every record) pass"
+                .to_string()
+        } else {
+            ", ablation FAIL".to_string()
+        }
     );
     if !ok {
         std::process::exit(1);

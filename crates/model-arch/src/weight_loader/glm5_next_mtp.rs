@@ -161,6 +161,10 @@ pub fn load_glm5next_mtp_module(
     let mut eh_proj = DenseWeight {
         weight: store.get(&format!("{prefix}eh_proj.weight"))?.ptr,
     };
+    // 2026-10-12: `METRALE_GLM_NUMERICS_FAKEQ` on the MTP block's DSA indexer and its router
+    // (no-op when unset).
+    crate::glm5next_numerics::apply_layer(gpu, &layer.mixer, &layer.mlp, &layer.mlp_cfg, idx)
+        .context("glm5_next MTP: METRALE_GLM_NUMERICS_FAKEQ")?;
     // 2026-10-05: `METRALE_GLM_DENSE_FP8=1`: FP8 copies of the block's dense GEMV weights and
     // `eh_proj`, read through `dense_fp8::route`; a no-op with the lever off.
     crate::glm5next_layer::dense_fp8::register_mtp(gpu, &mut layer, &mut eh_proj)

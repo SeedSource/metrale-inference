@@ -108,6 +108,7 @@ fn cfg() -> HybridConfig {
         mtp_num_drafts: 3,
         dflash_num_drafts: 7,
         dwell: Duration::from_millis(2000),
+        rate_gate: None,
     }
 }
 
@@ -165,7 +166,9 @@ fn hybrid_state_counts_sole_sequence_off_slot0() {
     run(2, sole(3, 10, 4), false, Mtp);
     assert_eq!(h.counters.sole_off_slot0_mtp, 2);
     assert!(
-        h.counters.summary().ends_with("; sole off slot 0 MTP=2"),
+        h.counters
+            .summary()
+            .ends_with("; sole off slot 0 MTP=2; rate demotions=0"),
         "{}",
         h.counters.summary()
     );
@@ -183,11 +186,11 @@ fn hybrid_state_commit_reports_changes_only() {
     assert!(!h.commit(SpecStepMode::Dflash));
     assert_eq!(
         h.counters.summary(),
-        "steps PLAIN=0 MTP=0 DFLASH=0; switches MTP->DFLASH=1; sole off slot 0 MTP=0"
+        "steps PLAIN=0 MTP=0 DFLASH=0; switches MTP->DFLASH=1; sole off slot 0 MTP=0; rate demotions=0"
     );
     assert_eq!(
         ModeCounters::default().summary(),
-        "steps PLAIN=0 MTP=0 DFLASH=0; switches none; sole off slot 0 MTP=0"
+        "steps PLAIN=0 MTP=0 DFLASH=0; switches none; sole off slot 0 MTP=0; rate demotions=0"
     );
 }
 

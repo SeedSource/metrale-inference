@@ -112,6 +112,67 @@ pub fn parse_dwell_ms(v: Option<&str>) -> u64 {
         .unwrap_or(HYBRID_DWELL_MS_DEFAULT)
 }
 
+/// 2026-10-11: `METRALE_HYBRID_RATE_GATE=1` (policy D2sR, design note (f)): on top of D2s, demote a
+/// sole sequence back to MTP when its DFlash wall rate falls below its own MTP wall rate, and bar
+/// it from DFlash for a doubling cool-down. Inert without `METRALE_HYBRID_DFLASH=1`. Rank 0 only
+/// (the mode is decided there). Read once.
+pub fn hybrid_rate_gate_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::glm_dflash::parse_switch(std::env::var("METRALE_HYBRID_RATE_GATE").ok().as_deref())
+    })
+}
+
+/// 2026-10-11: Default of [`hybrid_rate_margin_pct`].
+pub const HYBRID_RATE_MARGIN_PCT_DEFAULT: u64 = 0;
+/// 2026-10-11: Largest accepted [`hybrid_rate_margin_pct`].
+pub const HYBRID_RATE_MARGIN_PCT_MAX: u64 = 50;
+
+/// 2026-10-11: `METRALE_HYBRID_RATE_MARGIN_PCT=<0..50>` (default 0): the rate gate demotes when
+/// `r_D < r_M * (1 - pct/100)`. Unparseable or out-of-range values keep the default. Read once.
+pub fn hybrid_rate_margin_pct() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_rate_margin_pct(
+            std::env::var("METRALE_HYBRID_RATE_MARGIN_PCT")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-11: The margin parser: an integer in `0..=50`, else
+/// [`HYBRID_RATE_MARGIN_PCT_DEFAULT`].
+pub fn parse_rate_margin_pct(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|p| *p <= HYBRID_RATE_MARGIN_PCT_MAX)
+        .unwrap_or(HYBRID_RATE_MARGIN_PCT_DEFAULT)
+}
+
+/// 2026-10-11: Default of [`hybrid_rate_cooldown_ms`].
+pub const HYBRID_RATE_COOLDOWN_MS_DEFAULT: u64 = 8000;
+
+/// 2026-10-11: `METRALE_HYBRID_RATE_COOLDOWN_MS=<ms>` (default 8000): the base cool-down `C_0` of
+/// a demoted sequence; its k-th demotion bars DFlash for `C_0 * 2^k` (k capped at 6). Unparseable
+/// values keep the default. Read once.
+pub fn hybrid_rate_cooldown_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        parse_rate_cooldown_ms(
+            std::env::var("METRALE_HYBRID_RATE_COOLDOWN_MS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-11: The cool-down parser: a non-negative integer of milliseconds, else
+/// [`HYBRID_RATE_COOLDOWN_MS_DEFAULT`].
+pub fn parse_rate_cooldown_ms(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(HYBRID_RATE_COOLDOWN_MS_DEFAULT)
+}
+
 /// 2026-10-10: Bytes of one hybrid DFlash ctx accumulator (`DflashProposerState::ctx_hidden_acc`):
 /// `window` rows of `taps` target hidden rows, BF16. A hybrid serve allocates exactly one, at the
 /// full window on every rank (review F1), and reserves it before KV sizing.

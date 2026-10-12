@@ -7,7 +7,9 @@
 //! lane asks [`HybridState::decide`] for the step's [`SpecStepMode`]:
 //! - `Dflash` when exactly one sequence is active, it may take a DFlash step (grammarless, a
 //!   DFlash state and the wide SSM slot, and the DFlash lane would speculate it now) and it has
-//!   been alone for the dwell (policy D2s, `METRALE_HYBRID_DFLASH_DWELL_MS`, default 2000 ms);
+//!   been alone for the dwell (policy D2s, `METRALE_HYBRID_DFLASH_DWELL_MS`, default 2000 ms),
+//!   and, with `METRALE_HYBRID_RATE_GATE=1` (policy D2sR, `hybrid_rate`), is not in a cool-down
+//!   after a rate demotion;
 //! - else `Mtp` while `active <= METRALE_MTP_MAX_SEQS`;
 //! - else `Plain`.
 //!
@@ -23,6 +25,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::hybrid_rate::{RateGateCfg, RateTracker};
 use metrale_model_layers::speculative::hybrid::SpecStepMode;
 
 /// 2026-10-10: What serve setup resolves for a hybrid serve.
@@ -34,6 +37,8 @@ pub struct HybridConfig {
     pub dflash_num_drafts: usize,
     /// 2026-10-10: Policy D2s dwell.
     pub dwell: Duration,
+    /// 2026-10-11: Policy D2sR rate gate (`METRALE_HYBRID_RATE_GATE`); `None` = off = D2s.
+    pub rate_gate: Option<RateGateCfg>,
 }
 
 /// 2026-10-10: Identity of the sole active sequence, as far as the dwell needs it. A sequence on
@@ -46,7 +51,7 @@ pub struct SoleSeq {
 }
 
 impl SoleSeq {
-    fn same_as(&self, earlier: &SoleSeq) -> bool {
+    pub(super) fn same_as(&self, earlier: &SoleSeq) -> bool {
         self.slot == earlier.slot
             && self.prompt_len == earlier.prompt_len
             && self.generated >= earlier.generated
@@ -117,6 +122,8 @@ pub struct ModeCounters {
     /// `ssm_reserve::HYBRID_DFLASH_SLOT`, so it could not take DFlash (deviation 2: only slot 0
     /// holds a DFlash state). Prices that deviation.
     pub sole_off_slot0_mtp: u64,
+    /// 2026-10-11: Sole sequences the rate gate sent back to MTP (policy D2sR).
+    pub rate_demotions: u64,
 }
 
 impl ModeCounters {
@@ -129,7 +136,7 @@ impl ModeCounters {
     }
 
     /// 2026-10-10: One log line: `steps PLAIN=a MTP=b DFLASH=c; switches MTP->DFLASH=d ...; sole
-    /// off slot 0 MTP=e` (only the switches that happened).
+    /// off slot 0 MTP=e; rate demotions=f` (only the switches that happened).
     pub fn summary(&self) -> String {
         const MODES: [SpecStepMode; 3] =
             [SpecStepMode::Plain, SpecStepMode::Mtp, SpecStepMode::Dflash];
@@ -151,6 +158,7 @@ impl ModeCounters {
             s.push_str(" none");
         }
         s.push_str(&format!("; sole off slot 0 MTP={}", self.sole_off_slot0_mtp));
+        s.push_str(&format!("; rate demotions={}", self.rate_demotions));
         s
     }
 }
@@ -163,6 +171,8 @@ const SUMMARY_EVERY_STEPS: u64 = 4096;
 pub struct HybridState {
     pub cfg: HybridConfig,
     dwell: Dwell,
+    /// 2026-10-11: Policy D2sR (rates always observed; demotes only with `cfg.rate_gate`).
+    rate: RateTracker,
     last: Option<SpecStepMode>,
     /// 2026-10-10: The slot of the sole active sequence at the last [`Self::decide`], if exactly
     /// one was active.
@@ -174,6 +184,7 @@ impl HybridState {
     pub fn new(cfg: HybridConfig) -> Self {
         Self {
             dwell: Dwell::new(cfg.dwell),
+            rate: RateTracker::new(cfg.rate_gate),
             cfg,
             last: None,
             sole_slot: None,
@@ -194,13 +205,26 @@ impl HybridState {
     ) -> SpecStepMode {
         let sole = if active == 1 { sole } else { None };
         self.sole_slot = sole.map(|s| s.slot);
-        let dwell_met = self.dwell.observe(sole, now);
-        decide_mode(&ModeInputs {
+        // 2026-10-11: D2sR: a barred (demoted) sequence restarts the dwell until its cool-down ends.
+        let barred = self.rate.begin_step(sole, now);
+        let dwell_met = if barred {
+            self.dwell.observe(None, now)
+        } else {
+            self.dwell.observe(sole, now)
+        };
+        let mut inputs = ModeInputs {
             active,
             mtp_max_seqs,
             sole_dflash_ok,
             dwell_met,
-        })
+        };
+        let mut mode = decide_mode(&inputs);
+        if self.rate.end_step(mode, sole, now) {
+            self.counters.rate_demotions += 1;
+            inputs.dwell_met = false;
+            mode = decide_mode(&inputs);
+        }
+        mode
     }
 
     /// 2026-10-10: The mode the previous step ran under, if any.

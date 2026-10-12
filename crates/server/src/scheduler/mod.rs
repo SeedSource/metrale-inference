@@ -38,6 +38,10 @@ mod first_token_policy_tests;
 mod helpers;
 // 2026-10-10: Hybrid MTP + DFlash step-mode choice (`METRALE_HYBRID_DFLASH`).
 pub(crate) mod hybrid_mode;
+// 2026-10-11: Hybrid policy D2sR: per-sequence DFlash/MTP wall rates and the rate gate.
+pub(crate) mod hybrid_rate;
+#[cfg(test)]
+mod hybrid_rate_tests;
 pub(crate) mod io;
 mod lifecycle;
 #[cfg(test)]

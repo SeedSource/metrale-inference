@@ -92,8 +92,23 @@ pub(super) fn resolve_speculation(
                 dwell: std::time::Duration::from_millis(
                     metrale_model_layers::speculative::hybrid::hybrid_dflash_dwell_ms(),
                 ),
+                // 2026-10-11: Policy D2sR; off by default, so the serve stays D2s.
+                rate_gate: metrale_model_layers::speculative::hybrid::hybrid_rate_gate_enabled()
+                    .then(|| scheduler::hybrid_rate::RateGateCfg {
+                        margin_pct: metrale_model_layers::speculative::hybrid::hybrid_rate_margin_pct()
+                            as u32,
+                        cooldown: std::time::Duration::from_millis(
+                            metrale_model_layers::speculative::hybrid::hybrid_rate_cooldown_ms(),
+                        ),
+                    }),
             }
         });
+    if let Some(g) = hybrid.as_ref().and_then(|h| h.rate_gate) {
+        tracing::info!(target: "met::main_modules::serve_load", "HYBRID DFLASH: rate gate ON (policy D2sR): margin {}%, cool-down {} ms x 2^k",
+            g.margin_pct,
+            g.cooldown.as_millis()
+        );
+    }
     if crate::main_modules::hybrid_serve(args) && hybrid.is_none() {
         tracing::warn!(target: "met::main_modules::serve_load", "METRALE_HYBRID_DFLASH=1 but the model holds no DFlash drafter beside the MTP head: \
              serving MTP only"

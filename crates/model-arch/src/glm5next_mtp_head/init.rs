@@ -144,6 +144,7 @@ impl Glm5NextMtpHead {
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            xchg_pack_k: xchg_dev::resolve(gpu),
             hidden: config.hidden_size,
             vocab: config.vocab_size,
             max_seq_len,

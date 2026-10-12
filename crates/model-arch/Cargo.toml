@@ -433,6 +433,10 @@ name = "kda_defer_commit_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "mtp_head_xchg_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kda_chunk_tc_microtest"
 required-features = ["cuda", "gpu-examples"]
 

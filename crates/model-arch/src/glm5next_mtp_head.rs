@@ -45,6 +45,7 @@ mod batch;
 mod head_nv4;
 mod init;
 mod proposer;
+pub mod xchg_dev;
 
 pub use batch::{
     DebugStateView, MTP_BATCH_DRAFT_MAX, mtp_batch_draft, mtp_seq_kv, seq_kv_pool_bytes,
@@ -104,6 +105,9 @@ pub struct Glm5NextMtpHead {
     rms_norm_k: KernelHandle,
     gemv_k: KernelHandle,
     argmax_k: KernelHandle,
+    /// 2026-10-12: `mtp_head_xchg_pack` under `METRALE_GLM_MTP_XCHG_DEVICE=1` (`xchg_dev.rs`),
+    /// else handle 0 (the host packet).
+    xchg_pack_k: KernelHandle,
     hidden: usize,
     vocab: usize,
     max_seq_len: usize,
@@ -364,6 +368,27 @@ impl Glm5NextMtpHead {
             }
         }
         ops::argmax_bf16(gpu, self.argmax_k, st.logits, st.arg, n as u32, stream)?;
+        // 2026-10-12: `METRALE_GLM_MTP_XCHG_DEVICE=1`: the packet below, written on the device
+        // behind the argmax, so the all-reduce goes without a host round trip (`xchg_dev.rs`).
+        if let Some(comm) = ctx.comm.filter(|_| sharded && self.xchg_pack_k.0 != 0) {
+            xchg_dev::launch_pack(
+                gpu,
+                self.xchg_pack_k,
+                st.arg,
+                st.logits,
+                st.head_xchg,
+                n as u32,
+                v0 as u32,
+                self.head_rank as u32,
+                1,
+                stream,
+            )?;
+            comm.all_reduce_async(st.head_xchg.0, 16, stream)?;
+            let mut pack = [0u8; 16];
+            gpu.synchronize(stream)?;
+            gpu.copy_d2h(st.head_xchg, &mut pack)?;
+            return Ok(xchg_dev::pick_from_row(&pack));
+        }
         let mut out = [0u8; 4];
         gpu.synchronize(stream)?;
         gpu.copy_d2h(st.arg, &mut out)?;

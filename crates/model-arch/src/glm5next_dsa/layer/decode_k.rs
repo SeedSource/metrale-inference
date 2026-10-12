@@ -10,6 +10,8 @@
 //!   first launch.
 //! - 2026-10-06: With `METRALE_GLM_DSA_POOL_CACHE=1` the replay-safe path fills the geometry
 //!   with `dsa_write_geom_pk` (six slots; the workspace allocates six), never `dsa_write_geom`.
+//! - 2026-10-12: With `METRALE_GLM_DSA_CEILING_ROWS=1` and `ceiling_verify::ceiling_rows_group`
+//!   true, that geometry write and the selection run once after the loop, not per row.
 
 use anyhow::{Result, bail};
 use metrale_cache::kv_cache::PagedKvCache;
@@ -95,6 +97,7 @@ impl Glm5NextDsaLayer {
         );
         // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: the pair may run as one grouped launch
         // (`dense_nv4_group`, same bytes).
+        // 2026-10-12: or, at 3 rows, `METRALE_GLM_NV4_B3_GROUP=1` (`dense_nv4_b3_group`).
         let grouped = crate::glm5next_layer::dense_nv4_group::enabled()
             && self.try_group_q_a_kv_a(gpu, hidden, w.q_a, w.kv_a, k, stream)?;
         if !grouped {
@@ -256,17 +259,39 @@ impl Glm5NextDsaLayer {
             );
         }
         let mut batch_q_pos: Vec<i32> = Vec::with_capacity(if batch_select { k } else { 0 });
+        // 2026-10-12: `METRALE_GLM_DSA_CEILING_ROWS=1`: `group` replaces each row's geometry
+        // write and selection with one `CeilingRows` pass after the loop (`ceiling_verify.rs`).
+        let call_meta = if ctx.decode_step {
+            ctx.attn_metadata.as_ref()
+        } else {
+            rowwise_meta
+        };
+        let replay_safe = self.replay_safe(ctx.graph_capture, call_meta.is_some());
+        let group = self.ceiling_rows_for(st, call_meta, replay_safe, batch_select, src, k);
+        // 2026-10-12: `METRALE_GLM_DSA_IDX_ROWBATCH=1` and `group` (so not `batch_select`): the
+        // indexer projections of the k rows once, here, as this sequence's `PreIndexer`; the row
+        // loop then stores row `r` from it and `select_rows_ceiling` reads its queries and
+        // head weights. Otherwise `src` is untouched.
+        let idx_pre = self.idx_rowbatch_pre(gpu, group, hidden, src, k, stream)?;
+        let idx_src;
+        let src = match idx_pre {
+            Some(p) => {
+                idx_src = RowSrc {
+                    pre: Some(p),
+                    ..*src
+                };
+                &idx_src
+            }
+            None => src,
+        };
         for row in 0..k {
             let pos = seq_len + row;
             let block_size = kv_cache.config().block_size;
             // 2026-09-25: With `meta`, the row's position, KV slot, `seq_len` and block table
             // are read from device arrays and nothing is copied from the host; without it they
-            // are computed here and copied host-to-device.
-            let meta = if ctx.decode_step {
-                ctx.attn_metadata.as_ref()
-            } else {
-                rowwise_meta
-            };
+            // are computed here and copied host-to-device. 2026-10-12: The same for every row
+            // (`call_meta`, above the loop).
+            let meta = call_meta;
             let bt_stride = meta.map_or(0, |m| m.max_blocks_per_seq as usize) * 4;
             let slot_dev = match meta {
                 Some(m) => m.slot.offset(row * 8),
@@ -300,24 +325,19 @@ impl Glm5NextDsaLayer {
             use crate::glm5next_layer::profile;
             profile::end(profile::DSA_PROJ, t_proj, gpu, stream);
             let t = profile::start();
-            // 2026-09-25: Replay-safe placement (device-side position and geometry) only while
-            // capturing a graph, with metadata, and with both `dsa_indexer_store` and
-            // `dsa_write_geom` resolved; otherwise the host-offset path.
-            let replay_safe = ctx.graph_capture
-                && meta.is_some()
-                && self.select_kernels.indexer_store.0 != 0
-                && self.select_kernels.write_geom.0 != 0;
+            // 2026-09-25: `replay_safe` (above the loop, `Self::replay_safe`).
             let pos_dev = if replay_safe {
                 meta.map(|m| m.positions.offset(row * 4))
             } else {
                 None
             };
             match &src.pre {
-                None => self.indexer_forward(
+                None => self.indexer_forward_to(
                     gpu,
                     hidden.offset(row * self.cfg.hidden * 2),
                     st,
                     pos_dev,
+                    self.ceiling_rows_hw(group, row),
                     stream,
                 )?,
                 Some(pre) => self.store_pre_indexer_row(gpu, pre, row, st, pos_dev, stream)?,
@@ -395,7 +415,9 @@ impl Glm5NextDsaLayer {
                 block_size,
                 cache_stride_bytes: (block_size * self.cfg.kv_lora_rank) as u64,
             };
-            if replay_safe && st.is_pool_cache() {
+            if group {
+                // 2026-10-12: The one geometry write is the pass's (`select_rows_ceiling`).
+            } else if replay_safe && st.is_pool_cache() {
                 // 2026-10-06: `METRALE_GLM_DSA_POOL_CACHE=1`: `dsa_write_geom_pk` (`rows.rs`).
                 self.pool_write_geom_pk(gpu, st, d_sl, w.geom_dev, stream)?;
             } else if replay_safe {
@@ -421,7 +443,7 @@ impl Glm5NextDsaLayer {
                     stream,
                 )?;
                 batch_q_pos.push(pos as i32);
-            } else {
+            } else if !group {
                 let q_resid_row = src.q_resid.offset(row * self.cfg.q_lora_rank * 2);
                 let pre = src.pre.as_ref().map(|p| p.row(row, &self.cfg));
                 self.select_row_at(
@@ -450,6 +472,9 @@ impl Glm5NextDsaLayer {
         // so the rows written after it do not change its selection.
         if batch_select && !batch_q_pos.is_empty() {
             self.select_rows_batched(gpu, k, st, &batch_q_pos, None, None, stream)?;
+        }
+        if let Some(m) = call_meta.filter(|_| group) {
+            self.select_rows_ceiling(gpu, st, src, k, m, stream)?;
         }
 
         if let Some(paging) = attend_paging {

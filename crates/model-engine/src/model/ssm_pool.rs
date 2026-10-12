@@ -114,6 +114,9 @@ pub(crate) struct SsmStatePool {
     /// snapshot mode. Nothing fills it: verify refuses in replay mode.
     pub(super) replay_input_rings: Vec<DevicePtr>,
     pub(super) free_slots: Mutex<Vec<usize>>,
+    /// 2026-10-09: Deferred KDA commit state per MTP-covered slot (`kda_defer.rs`); no slot
+    /// when the intermediate pools are absent (no MTP, or replay mode).
+    pub(super) kda_defer: super::kda_defer::KdaDeferSlots,
 }
 
 /// 2026-09-25: Prefix-sum layout for per-slot H intermediates: returns
@@ -430,6 +433,8 @@ impl SsmStatePool {
             "SSM state pool: {max_slots} slots × {num_ssm_layers} layers = {total_mb} MB",
         );
 
+        // 2026-10-09: Only slots with verify intermediates can defer a commit.
+        let defer_slots = if h_intermediate_pools.is_empty() { 0 } else { mtp_slots };
         Ok(Self {
             owned_allocations,
             h_state_pools,
@@ -452,6 +457,7 @@ impl SsmStatePool {
             rollback_mode,
             replay_input_rings,
             free_slots: Mutex::new(free_slots),
+            kda_defer: super::kda_defer::KdaDeferSlots::new(defer_slots),
         })
     }
 }
@@ -480,6 +486,14 @@ impl metrale_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
         self.conv_checkpoint_pools.clear();
         self.h_prefill_stage_pool = None;
         self.replay_input_rings.clear();
+        // 2026-10-09: The deferred-commit device words, if a verify allocated them.
+        let words = std::mem::replace(&mut *self.kda_defer.dev.lock(), DevicePtr::NULL);
+        if words.0 != 0
+            && let Err(e) = gpu.free(words)
+            && first_error.is_none()
+        {
+            first_error = Some(e);
+        }
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),

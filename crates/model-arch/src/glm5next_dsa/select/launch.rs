@@ -15,8 +15,8 @@ use super::*;
 /// [`DsaSelectScratch::tokens`].
 ///
 /// Fails before any launch when `scratch` is too small for `geom`, or when a ceiling launch
-/// has no `geom_dev` or has `q_rows > 1`. The kernels are enqueued on `stream`; nothing here
-/// synchronises.
+/// has no `geom_dev` or has `q_rows > 1` (2026-10-12: `CeilingRows` allows it). The kernels
+/// are enqueued on `stream`; nothing here synchronises.
 #[allow(clippy::too_many_arguments)]
 pub fn select_tokens(
     gpu: &dyn GpuBackend,
@@ -57,14 +57,19 @@ pub(super) fn select_tokens_with(
 
     let ceiling = match launch {
         DsaSelectLaunch::Exact => None,
-        DsaSelectLaunch::Ceiling { max_pools } => {
+        DsaSelectLaunch::Ceiling { max_pools } | DsaSelectLaunch::CeilingRows { max_pools } => {
             if inputs.geom_dev.0 == 0 {
                 bail!(
                     "DSA select: a ceiling launch has no host geometry to fall back on and \
                      needs `geom_dev`; passing NULL would run the frozen scalars."
                 );
             }
-            if geom.q_rows != 1 {
+            // 2026-10-12: `CeilingRows` (one sequence's rows, one geometry) may carry more
+            // rows; its scratch must hold them at the ceiling.
+            let rows_ok = matches!(launch, DsaSelectLaunch::CeilingRows { .. });
+            if rows_ok {
+                super::ceiling_rows::check_fit(cfg, scratch, max_pools, geom.q_rows, inputs)?;
+            } else if geom.q_rows != 1 {
                 bail!(
                     "DSA select: ceiling launch is decode-only (q_rows must be 1, got {}). \
                      At q_rows > 1 the row strides vary with the context and a replayed \

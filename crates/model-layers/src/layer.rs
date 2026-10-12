@@ -15,7 +15,7 @@ use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
 mod transformer_layer;
 pub use transformer_layer::{
     GdnCarryBinding, LayerAuxState, LayerCapabilities, LayerGraphHooks, LayerSplitPrefill,
-    LayerWeightSetup, LayerWriteOnAccept, MTP_CATCHUP_MAX, TransformerLayer,
+    LayerWeightSetup, LayerWriteOnAccept, MTP_CATCHUP_MAX, SsmDeferSrc, TransformerLayer,
     VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS, VERIFY_WY_TABLE_STRIDE_BYTES,
     VERIFY_WY_TABLES_PER_LAYER,
 };
@@ -110,6 +110,10 @@ pub struct SsmLayerState {
     /// 2026-09-25: PLE per-sequence carry (token history and dilated-conv state), created
     /// on first use, only on a layer that hosts a `PleLayer`.
     pub ple: Option<crate::layers::ple::PleSeqState>,
+    /// 2026-10-09: `METRALE_GLM_KDA_DEFER_COMMIT=1`: where a K-row verify's first row reads its
+    /// input state (`SsmDeferSrc`), set by the model before each single-sequence verify; `None`
+    /// everywhere else and with the lever off, which keeps the verify reading `h_state`.
+    pub kda_defer: Option<SsmDeferSrc>,
 }
 
 impl LayerState for SsmLayerState {

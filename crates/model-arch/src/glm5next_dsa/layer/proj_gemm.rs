@@ -67,6 +67,7 @@ impl super::Glm5NextDsaLayer {
     /// rows of `hidden` into `q_a` / `kv_a` as one grouped launch (`dense_nv4_group`), the
     /// bytes [`gemm`] would write for each. `Ok(false)` launches nothing; the caller then runs
     /// both through [`gemm`]. Both read only `hidden`, and neither reads the other's output.
+    /// 2026-10-12: also the `METRALE_GLM_NV4_B3_GROUP` dsa_qa_kva group (`dense_nv4_b3_group`).
     pub(super) fn try_group_q_a_kv_a(
         &self,
         gpu: &dyn GpuBackend,

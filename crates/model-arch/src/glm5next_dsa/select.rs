@@ -340,9 +340,9 @@ pub struct DsaSelectInputs {
 /// any length.
 ///
 /// `Ceiling` requires `DsaSelectInputs::geom_dev` and `q_rows == 1` (`select_tokens` refuses
-/// otherwise). The kernels read their row strides (`out`/`valid_cand` stride `P`, `selected`
-/// stride `select_k`) from the same device geometry, which is sound only because every
-/// `r * stride` is then `0 * stride`.
+/// otherwise; `CeilingRows` is the one-sequence multi-row form). The kernels read their row
+/// strides (`out`/`valid_cand` stride `P`, `selected` stride `select_k`) from the same device
+/// geometry, which is sound only because every `r * stride` is then `0 * stride`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DsaSelectLaunch {
     /// 2026-09-25: This step's exact grid, from the host geometry.
@@ -355,6 +355,16 @@ pub enum DsaSelectLaunch {
     /// (`Glm5NextDsaKernels::grid_stride_marker`); `=0`, or a module without it, launches one
     /// block per ceiling pool.
     Ceiling { max_pools: usize },
+    /// 2026-10-12: [`Self::Ceiling`] with `q_rows >= 1` rows of ONE sequence that share one
+    /// `geom_dev`, written (`dsa_write_geom_pk`) from the LAST row's `seq_len`: every kernel
+    /// of the chain reads its row strides from that one geometry, so they agree inside the
+    /// launch. Row `r` takes only pools ending at or before `q_pos[r]`, and
+    /// `dsa_expand_selection` clamps each row's select_k to its own pool count, so each row's
+    /// tokens are those of a single-row pass at its own length (to be confirmed bitwise by
+    /// `examples/dsa_ceiling_rows_microtest.rs`). The scratch must fit `q_rows` rows at the
+    /// ceiling (`ceiling_rows::check_fit`). 2026-10-12: the one production caller is
+    /// `layer/ceiling_verify.rs`, behind `METRALE_GLM_DSA_CEILING_ROWS=1` (default off).
+    CeilingRows { max_pools: usize },
 }
 
 /// 2026-09-25: Scratch the selection kernels write through, allocated once and reused across
@@ -379,8 +389,10 @@ pub struct DsaSelectScratch {
     tokens_bytes: usize,
 }
 
+mod ceiling_rows;
 mod launch;
 mod scratch;
+pub(crate) use ceiling_rows::dsa_ceiling_rows;
 pub use launch::{PoolRows, compress_pools_only, select_tokens};
 pub mod pool_once;
 pub mod grid_stride;

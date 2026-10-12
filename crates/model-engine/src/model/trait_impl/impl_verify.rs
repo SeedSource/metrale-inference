@@ -19,6 +19,9 @@ impl ModelVerify for TransformerModel {
         stream: u64,
     ) -> Result<Vec<u32>> {
         self.gdn_carry_flush_pending()?;
+        // 2026-10-09: Never a deferred-commit consumer (`k = 0`): flushes every slot, puts this
+        // slot's device word back to -1 and clears its `SsmDeferSrc`s.
+        self.kda_defer_pre_verify(seq, 0)?;
         self.ssm_pool.require_verify_rollback_supported()?;
         let r = self.decode_verify_dispatch(tokens, seq, stream);
         self.release_verify_capture_on_err(r)
@@ -32,7 +35,12 @@ impl ModelVerify for TransformerModel {
     ) -> Result<[u32; 2]> {
         self.gdn_carry_flush_pending()?;
         self.ssm_pool.require_verify_rollback_supported()?;
+        // 2026-10-09: METRALE_GLM_KDA_DEFER_COMMIT (`kda_defer_hooks.rs`).
+        let consumer = self.kda_defer_pre_verify(seq, 2)?;
         let r = self.decode_verify_graphed_dispatch(tokens, seq, _stream);
+        if r.is_ok() {
+            self.kda_defer_post_verify(seq, consumer);
+        }
         self.release_verify_capture_on_err(r)
     }
 
@@ -44,7 +52,12 @@ impl ModelVerify for TransformerModel {
     ) -> Result<[u32; 3]> {
         self.gdn_carry_flush_pending()?;
         self.ssm_pool.require_verify_rollback_supported()?;
+        // 2026-10-09: METRALE_GLM_KDA_DEFER_COMMIT (`kda_defer_hooks.rs`).
+        let consumer = self.kda_defer_pre_verify(seq, 3)?;
         let r = self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream);
+        if r.is_ok() {
+            self.kda_defer_post_verify(seq, consumer);
+        }
         self.release_verify_capture_on_err(r)
     }
 
@@ -56,7 +69,12 @@ impl ModelVerify for TransformerModel {
     ) -> Result<[u32; 4]> {
         self.gdn_carry_flush_pending()?;
         self.ssm_pool.require_verify_rollback_supported()?;
+        // 2026-10-09: METRALE_GLM_KDA_DEFER_COMMIT (`kda_defer_hooks.rs`).
+        let consumer = self.kda_defer_pre_verify(seq, 4)?;
         let r = self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream);
+        if r.is_ok() {
+            self.kda_defer_post_verify(seq, consumer);
+        }
         self.release_verify_capture_on_err(r)
     }
 
@@ -75,6 +93,9 @@ impl ModelVerify for TransformerModel {
         opts: crate::traits::VerifyBatchedOpts,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
+        // 2026-10-09: A batched verify reads every live state: no deferred commit survives it,
+        // and its commits copy.
+        self.kda_defer_flush_disarm(self.gpu.default_stream())?;
         // 2026-10-02: Multi-rank (`verify_ep.rs`): the workers get the whole batch first, and
         // after a failure the abort verdict they wait for; a no-op on one GPU.
         let sent = self.ep_send_verify_batch(tokens, ks, &*seqs)?;
@@ -93,7 +114,12 @@ impl ModelVerify for TransformerModel {
     ) -> Result<Vec<u32>> {
         self.gdn_carry_flush_pending()?;
         self.ssm_pool.require_verify_rollback_supported()?;
+        // 2026-10-09: METRALE_GLM_KDA_DEFER_COMMIT (`kda_defer_hooks.rs`).
+        let consumer = self.kda_defer_pre_verify(seq, tokens.len())?;
         let r = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream);
+        if r.is_ok() {
+            self.kda_defer_post_verify(seq, consumer);
+        }
         self.release_verify_capture_on_err(r)
     }
 
@@ -105,7 +131,12 @@ impl ModelVerify for TransformerModel {
     ) -> Result<Vec<u32>> {
         self.gdn_carry_flush_pending()?;
         self.ssm_pool.require_verify_rollback_supported()?;
+        // 2026-10-09: METRALE_GLM_KDA_DEFER_COMMIT (`kda_defer_hooks.rs`).
+        let consumer = self.kda_defer_pre_verify(seq, tokens.len())?;
         let r = self.decode_and_verify_fused_dispatch(tokens, seq, _stream);
+        if r.is_ok() {
+            self.kda_defer_post_verify(seq, consumer);
+        }
         self.release_verify_capture_on_err(r)
     }
 

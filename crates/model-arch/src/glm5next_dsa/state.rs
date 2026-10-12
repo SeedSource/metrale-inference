@@ -376,7 +376,9 @@ impl Glm5NextDsaState {
         self.advance(k)?;
         // 2026-10-06: A replayed step selects after every row it writes (`select_row_at` on
         // the replay-safe path; the batched selector never runs under capture), so its last
-        // compress left pools `[0, len / kpool)` final on the device.
+        // compress left pools `[0, len / kpool)` final on the device. 2026-10-12: Under
+        // `METRALE_GLM_DSA_CEILING_ROWS=1` it selects once after all `k` rows
+        // (`layer/ceiling_verify.rs`); that compress also ends at `len`, so the same holds.
         self.note_selected();
         Ok(())
     }

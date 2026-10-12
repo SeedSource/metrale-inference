@@ -72,6 +72,11 @@ pub struct Glm5NextKdaKernels {
     /// walk with its snapshot copies.
     pub conv_io: KernelHandle,
     pub recurrent_io: KernelHandle,
+    /// 2026-10-09: Row 0 of a verify that reads its input state from a device-chosen intermediate
+    /// (`METRALE_GLM_KDA_DEFER_COMMIT=1`, snap_fuse/defer.rs), same file. Resolved with
+    /// `try_kernel`; either `0` keeps every commit copying.
+    pub conv_defer: KernelHandle,
+    pub recurrent_defer: KernelHandle,
     /// 2026-10-07: The fused front of the chunked-TC prefill (`METRALE_GLM_KDA_FRONT_FUSE=1`,
     /// prefill_tc_fuse.rs), kernels/gb10/common/kda_front_fuse.cu: `tc_prepare` computing its
     /// inputs from the projections (pack, conv, gate and beta sigmoid in registers) and the
@@ -173,6 +178,16 @@ impl Glm5NextKdaKernels {
                 "kda_snap_fuse",
                 "kda_recurrent_decode_bf16_smem_io",
             ),
+            conv_defer: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_snap_fuse",
+                "causal_conv1d_update_l2norm_defer",
+            ),
+            recurrent_defer: metrale_model_layers::layers::try_kernel(
+                gpu,
+                "kda_snap_fuse",
+                "kda_recurrent_decode_bf16_smem_defer",
+            ),
             ff_prepare: metrale_model_layers::layers::try_kernel(
                 gpu,
                 "kda_front_fuse",
@@ -231,6 +246,11 @@ impl Glm5NextKdaKernels {
     /// 2026-10-06: Whether both `kda_snap_fuse` kernels resolved.
     pub fn has_snap_fuse(&self) -> bool {
         self.conv_io.0 != 0 && self.recurrent_io.0 != 0
+    }
+
+    /// 2026-10-09: Whether both deferred-commit row-0 kernels resolved.
+    pub fn has_defer_commit(&self) -> bool {
+        self.conv_defer.0 != 0 && self.recurrent_defer.0 != 0
     }
 
     /// 2026-10-07: Whether both `kda_front_fuse` kernels resolved.

@@ -14,6 +14,7 @@ use crate::traits::{ModelLifecycle, SequenceState};
 impl ModelLifecycle for TransformerModel {
     fn teardown(&mut self) -> Result<()> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(self.gpu.default_stream())?;
         self.release_pools()
     }
 
@@ -38,40 +39,74 @@ impl ModelLifecycle for TransformerModel {
 
     fn alloc_sequence(&self) -> Result<SequenceState> {
         self.gdn_carry_flush_pending()?;
-        self.alloc_sequence_dispatch(usize::MAX)
+        self.kda_defer_flush(self.gpu.default_stream())?;
+        let seq = self.alloc_sequence_dispatch(usize::MAX)?;
+        // 2026-10-09: Slot reuse: no deferred commit of a previous occupant survives.
+        self.kda_defer_reset_slot(seq.slot_idx)?;
+        Ok(seq)
     }
 
     fn alloc_sequence_for(&self, budget_tokens: usize) -> Result<SequenceState> {
         self.gdn_carry_flush_pending()?;
-        self.alloc_sequence_dispatch(budget_tokens)
+        self.kda_defer_flush(self.gpu.default_stream())?;
+        let seq = self.alloc_sequence_dispatch(budget_tokens)?;
+        self.kda_defer_reset_slot(seq.slot_idx)?;
+        Ok(seq)
     }
 
     fn cache_sequence(&self, seq: &SequenceState) {
         if let Err(e) = self.gdn_carry_flush_pending() {
             tracing::error!("gdn carry flush before {}: {e:#}", "cache_sequence");
         }
+        if let Err(e) = self.kda_defer_flush(self.gpu.default_stream()) {
+            tracing::error!("KDA deferred-commit flush before cache_sequence: {e:#}");
+        }
         self.cache_sequence_dispatch(seq)
     }
 
     fn free_sequence(&self, seq: &mut SequenceState) -> Result<()> {
         self.gdn_carry_flush_pending()?;
-        self.free_sequence_dispatch(seq)
+        self.kda_defer_flush(self.gpu.default_stream())?;
+        let slot = seq.slot_idx;
+        self.free_sequence_dispatch(seq)?;
+        self.kda_defer_reset_slot(slot)
     }
 
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
         self.gdn_carry_flush_pending()?;
-        self.compact_sequence_dispatch(seq, new_slot)
+        self.kda_defer_flush(self.gpu.default_stream())?;
+        let old = seq.slot_idx;
+        self.compact_sequence_dispatch(seq, new_slot)?;
+        self.kda_defer_reset_slot(old)?;
+        self.kda_defer_reset_slot(new_slot)
     }
 
     fn migrate_to_covered_slot(&self, seq: &mut SequenceState) -> Result<Option<usize>> {
-        self.migrate_to_covered_slot_dispatch(seq)
+        // 2026-10-12: Same flush/reset as `compact_sequence`: a migration moves the
+        // slot's h state, so a deferred commit lands first (the cap path postdates the
+        // deferral; the worker flushes on the non-keeping command).
+        self.kda_defer_flush(self.gpu.default_stream())?;
+        let old = seq.slot_idx;
+        let moved = self.migrate_to_covered_slot_dispatch(seq)?;
+        if let Some(new_slot) = moved {
+            self.kda_defer_reset_slot(old)?;
+            self.kda_defer_reset_slot(new_slot)?;
+        }
+        Ok(moved)
     }
 
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
         if let Err(e) = self.gdn_carry_flush_pending() {
             tracing::error!("gdn carry flush before {}: {e:#}", "detach_slot_for_reuse");
         }
-        self.detach_slot_for_reuse_dispatch(seq)
+        if let Err(e) = self.kda_defer_flush(self.gpu.default_stream()) {
+            tracing::error!("KDA deferred-commit flush before detach_slot_for_reuse: {e:#}");
+        }
+        let slot = seq.slot_idx;
+        self.detach_slot_for_reuse_dispatch(seq);
+        if let Err(e) = self.kda_defer_reset_slot(slot) {
+            tracing::error!("KDA deferred-commit reset after detach_slot_for_reuse: {e:#}");
+        }
     }
 
     fn save_sequence_state(
@@ -80,6 +115,7 @@ impl ModelLifecycle for TransformerModel {
         writer: &mut dyn std::io::Write,
     ) -> Result<()> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(self.gpu.default_stream())?;
         self.save_sequence_state_dispatch(seq, writer)
     }
 
@@ -90,6 +126,7 @@ impl ModelLifecycle for TransformerModel {
         reader: &mut dyn std::io::Read,
     ) -> Result<()> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(self.gpu.default_stream())?;
         self.restore_sequence_state_dispatch(seq, num_blocks, reader)
     }
 

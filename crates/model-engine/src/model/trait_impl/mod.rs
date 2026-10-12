@@ -58,6 +58,7 @@ mod impl_ssm_state;
 mod impl_streams;
 mod impl_verify;
 mod impl_vision;
+pub(in crate::model) mod kda_defer_hooks;
 mod lm_head_batched;
 mod meta;
 mod meta_argmax;

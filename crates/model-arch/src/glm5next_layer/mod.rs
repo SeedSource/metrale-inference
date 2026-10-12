@@ -75,6 +75,8 @@ pub mod dense_fp8;
 pub mod dense_fp8_gw;
 pub mod dense_fp8_min_rows;
 pub mod dense_nv4_b3;
+// 2026-10-12: `METRALE_GLM_NV4_B3_GROUP` (grouped same-input 3-row NVFP4 projections).
+pub mod dense_nv4_b3_group;
 pub mod dense_nv4_bm;
 // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP` (grouped persistent tensor-core NVFP4 projections).
 pub mod dense_nv4_group;
@@ -83,6 +85,8 @@ pub mod dense_nv4_tc;
 pub mod ms_graphs;
 // 2026-10-08: `METRALE_GLM_PREFILL_DENSE_W4A4` NVFP4 W4A4 dense prefill GEMMs (CUTLASS).
 pub mod dense_w4a4;
+// 2026-10-11: Decode L2 load-prefetch on a side stream (`METRALE_GLM_DECODE_L2_LOADPF`).
+pub mod loadpf;
 // 2026-10-01: Decode L2 weight prefetch plan and launcher (`METRALE_GLM_DECODE_L2_PREFETCH`).
 pub mod prefetch;
 pub mod scratch_union;
@@ -479,7 +483,7 @@ impl LayerCapabilities for Glm5NextLayer {
 }
 
 impl LayerWeightSetup for Glm5NextLayer {}
-impl LayerWriteOnAccept for Glm5NextLayer {}
+mod defer_commit; // 2026-10-09: `impl LayerWriteOnAccept` (METRALE_GLM_KDA_DEFER_COMMIT)
 
 impl LayerGraphHooks for Glm5NextLayer {
     /// 2026-09-25: A graph replay runs only kernels, so the host-side length of the DSA indexer

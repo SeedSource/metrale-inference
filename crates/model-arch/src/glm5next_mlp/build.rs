@@ -194,6 +194,7 @@ pub fn build_moe(
         shared,
         experts,
         ptrs,
+        loadpf_shared: None,
     })
 }
 

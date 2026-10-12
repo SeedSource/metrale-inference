@@ -14,7 +14,7 @@ use metrale_gpu_runtime::gpu::DevicePtr;
 use metrale_gpu_runtime::kernel_args::KernelLaunch;
 use metrale_model_layers::layer::{AttnMetadataDev, ForwardContext, LayerState};
 
-use super::super::row_batch::batchm_rows;
+use super::super::idx_rowbatch::IndexerRowsOut;
 use super::super::row_src::{PreIndexer, RowSrc};
 use super::super::{Glm5NextDsaLayer, gemm};
 use super::{DsaXseqArena, dsa_state};
@@ -82,6 +82,7 @@ impl Glm5NextDsaLayer {
         // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: q_a and kv_a both read `hidden`, and the q
         // chain below neither reads `a.kv_a` nor writes `hidden`, so kv_a may run with q_a as
         // one grouped launch here (`dense_nv4_group`, same bytes) and is then skipped below.
+        // 2026-10-12: or, at 3 rows, `METRALE_GLM_NV4_B3_GROUP=1` (`dense_nv4_b3_group`).
         let grouped = crate::glm5next_layer::dense_nv4_group::enabled()
             && self.try_group_q_a_kv_a(gpu, hidden, a.q_a, a.kv_a, r, stream)?;
         if !grouped {
@@ -142,67 +143,24 @@ impl Glm5NextDsaLayer {
         // 2026-10-03: The indexer projections of every row, as `indexer_rows_batched` and
         // `qidx_rows_batched` run them, into the arena instead of the caches.
         let t = profile::start();
-        // 2026-10-05: `wk` and `compress_gate` go through `gemm`, the dispatch the per-sequence
-        // decode uses (`dense_fp8::route`: the row-invariant TC GEMV under
-        // `METRALE_GLM_GEMV_TC=1`), so a sequence's indexer keys do not depend on whether it
-        // decodes alone or in a cross-sequence group. `batchm_rows` on `dense_gemv_bf16_batchm`
-        // matched the per-sequence path only with TC off (race-dec-lmhbf-L34: C=2/4 texts
-        // diverged from C=1 under the ship env).
-        gemm(
-            gpu,
-            kn.gemm,
-            kn.gemv,
-            kn.gemv_batchm,
-            hidden,
-            wt.wk,
-            a.k_normed,
-            r,
-            d,
-            hid,
-            stream,
-        )?;
-        // 2026-10-03: `nllb_layernorm_bf16` normalises row `blockIdx.x` in place; every block
-        // does the same arithmetic on its own row at any `rows` (`indexer_rows_batched`).
-        KernelLaunch::new(gpu, self.select_kernels.k_norm)
-            .grid([r as u32, 1, 1])
-            .block([d.min(1024) as u32, 1, 1])
-            .shared_mem((d.min(1024) * 4) as u32)
-            .arg_ptr(a.k_normed)
-            .arg_ptr(wt.k_norm_weight)
-            .arg_ptr(wt.k_norm_bias)
-            .arg_u32(r as u32)
-            .arg_u32(d as u32)
-            .arg_f32(self.rms_eps)
-            .launch(stream)?;
-        gemm(
-            gpu,
-            kn.gemm,
-            kn.gemv,
-            kn.gemv_batchm,
-            hidden,
-            wt.compress_gate,
-            a.gate,
-            r,
-            d,
-            hid,
-            stream,
-        )?;
-        let f32k = a.gemv_batchm_f32;
-        let wp = wt.weights_proj;
-        batchm_rows(
-            gpu,
-            f32k,
-            4,
-            hidden,
-            wp,
-            a.head_weights,
-            r,
-            heads,
-            hid,
-            stream,
-        )?;
+        // 2026-10-12: The block is `indexer_project_rows` (idx_rowbatch.rs), shared with the
+        // single-sequence row batch; wk / compress_gate go through `gemm`, not `batchm_rows`
+        // (2026-10-05, race-dec-lmhbf-L34).
         let nq = heads * d;
-        batchm_rows(gpu, f32k, 4, a.q_resid, wt.wq_b, a.q_idx, r, nq, ql, stream)?;
+        self.indexer_project_rows(
+            gpu,
+            a.gemv_batchm_f32,
+            hidden,
+            a.q_resid,
+            &IndexerRowsOut {
+                k_normed: a.k_normed,
+                gate: a.gate,
+                head_weights: a.head_weights,
+                q_idx: a.q_idx,
+            },
+            r,
+            stream,
+        )?;
         profile::end(profile::DSA_INDEXER, t, gpu, stream);
 
         // 2026-10-03: Per sequence, the loop's own body over the sequence's arena rows.

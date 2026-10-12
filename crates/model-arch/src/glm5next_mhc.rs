@@ -68,6 +68,10 @@ pub struct Glm5NextMhcKernels {
     /// runs).
     pub hc_post_mix_y_bf16: KernelHandle,
     pub hc_comb_from_mix: KernelHandle,
+    /// 2026-10-11: `glm5next_hc_finish_warp`: `hc_finish` with the Sinkhorn on one warp (same
+    /// arguments and grid, hc_mult 4; `METRALE_GLM_HC_FINISH_WARP`). Optional (`try_kernel`, 0
+    /// when absent: `hc_finish` runs).
+    pub hc_finish_warp: KernelHandle,
 }
 
 /// 2026-09-25: The kernel module every GLM mHC kernel resolves from.
@@ -114,6 +118,11 @@ impl Glm5NextMhcKernels {
                 gpu,
                 GLM5NEXT_MHC_MODULE,
                 "glm5next_hc_comb_from_mix",
+            ),
+            hc_finish_warp: metrale_model_layers::layers::try_kernel(
+                gpu,
+                GLM5NEXT_MHC_MODULE,
+                "glm5next_hc_finish_warp",
             ),
         })
     }
@@ -503,6 +512,17 @@ pub fn glm_hc_pre_sliced_mix(
         (mix_kernel, mix_hc)
     };
     let (h, hc) = (hidden_size as usize, hc_mult as usize);
+    let finish_kernel = if hc_finish_warp_usable(kernels, hc_mult) {
+        static ENGAGED: std::sync::Once = std::sync::Once::new();
+        ENGAGED.call_once(|| {
+            tracing::warn!(
+                "METRALE_GLM_HC_FINISH_WARP=1: ENGAGED (glm5next_hc_finish_warp, hc_mult 4)"
+            );
+        });
+        kernels.hc_finish_warp
+    } else {
+        kernels.hc_finish
+    };
     for (t0, k) in mhc_slices(num_tokens, slice_rows) {
         let t0 = t0 as usize;
         // 2026-09-29: Row strides in bytes: FP32 highway `[hc, H]`, FP32 `mix` `[mix_hc]`, BF16
@@ -519,7 +539,7 @@ pub fn glm_hc_pre_sliced_mix(
             .arg_u32(hc_mult)
             .arg_f32(norm_eps)
             .launch(stream)?;
-        KernelLaunch::new(gpu, kernels.hc_finish)
+        KernelLaunch::new(gpu, finish_kernel)
             // 2026-09-25: Block `y == 0` computes post, comb and the Sinkhorn; blocks `1..` split
             // the collapse.
             .grid([k, 1 + collapse_blocks(hidden_size), 1])
@@ -692,6 +712,27 @@ pub fn post_mix_finish_usable(
 /// 2026-10-08: `METRALE_GLM_HC_POST_MIX_FAST` is on only for `1`.
 pub(crate) fn parse_hc_post_mix_fast(v: Option<&str>) -> bool {
     v.map(str::trim) == Some("1")
+}
+
+/// 2026-10-11: `METRALE_GLM_HC_FINISH_WARP` is on only for `1`.
+pub(crate) fn parse_hc_finish_warp(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
+
+/// 2026-10-11: `METRALE_GLM_HC_FINISH_WARP=1`: `glm_hc_pre` launches `glm5next_hc_finish_warp`
+/// (bit-identical to `glm5next_hc_finish`, hc_mult 4) in place of `hc_finish`. Off unless `1`.
+/// Read once.
+pub fn hc_finish_warp() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        parse_hc_finish_warp(std::env::var("METRALE_GLM_HC_FINISH_WARP").ok().as_deref())
+    })
+}
+
+/// 2026-10-11: Whether the warp `hc_finish` runs: lever on, `hc_mult == 4` (the entry writes
+/// nothing otherwise) and the handle resolved.
+fn hc_finish_warp_usable(kernels: &Glm5NextMhcKernels, hc_mult: u32) -> bool {
+    hc_mult == 4 && kernels.hc_finish_warp.0 != 0 && hc_finish_warp()
 }
 
 /// 2026-10-08: `METRALE_GLM_HC_POST_MIX_FAST=1` (with `METRALE_GLM_MHC_POST_MIX_FINISH=1`):
@@ -1087,6 +1128,22 @@ mod mhc_shape_tests {
         for v in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("01")] {
             assert!(!parse_hc_post_mix_fast(v), "{v:?}");
         }
+    }
+
+    /// 2026-10-11: `METRALE_GLM_HC_FINISH_WARP` is on only for `1`; the dispatch needs the
+    /// handle and hc_mult 4, and `resolve` asks for the entry the `.cu` defines.
+    #[test]
+    fn finish_warp_lever_parses_and_entry_exists() {
+        assert!(parse_hc_finish_warp(Some("1")));
+        for v in [None, Some(""), Some("0"), Some("on"), Some("01")] {
+            assert!(!parse_hc_finish_warp(v), "{v:?}");
+        }
+        let src = include_str!("glm5next_mhc.rs");
+        assert!(src.contains("\"glm5next_hc_finish_warp\""));
+        let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../kernels/gb10/common/glm5next_mhc.cu");
+        let cu = std::fs::read_to_string(cu).expect("glm5next_mhc.cu");
+        assert!(cu.contains("glm5next_hc_finish_warp("));
     }
 
     /// 2026-10-08: `Glm5NextMhcKernels::resolve` asks for the two kernels of

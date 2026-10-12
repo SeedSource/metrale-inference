@@ -586,7 +586,7 @@ names = ["argmax_*", "softmax_topp", "feed_resolve"]
 [[rule]]
 component = "elementwise"
 kind = "decode L2 weight prefetch (writes nothing)"
-names = ["glm5next_l2_prefetch"]
+names = ["glm5next_l2_prefetch", "glm5next_l2_loadpf"]
 
 [[rule]]
 component = "elementwise"

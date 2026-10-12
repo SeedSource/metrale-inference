@@ -79,6 +79,7 @@ pub fn forward_dense_sliced(
         let act = a * inter * 2;
         // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP=1`: gate and up read `xs` and write their own
         // buffers, so they may run as one grouped launch (`dense_nv4_group`, same bytes).
+        // 2026-10-12: or, at 3 rows, `METRALE_GLM_NV4_B3_GROUP=1` (`dense_nv4_b3_group`).
         if crate::glm5next_layer::dense_nv4_group::enabled() {
             use crate::glm5next_layer::dense_nv4_group::{Proj, try_group};
             let gate = Proj {

@@ -10,7 +10,7 @@
 //!   and `bt`/`sl` exactly when `METRALE_GLM_DSA_ALLOC_PER_STEP=1`.
 
 use anyhow::Result;
-use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
+use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::super::Glm5NextDsaConfig;
 use super::super::select::DsaSelectScratch;
@@ -75,6 +75,14 @@ pub struct Glm5NextDsaWorkspace {
     pub(super) head_weights_rows: DevicePtr,
     pub(super) q_pos_rows: DevicePtr,
     pub(super) q_mask_rows: DevicePtr,
+    /// 2026-10-12: `METRALE_GLM_DSA_IDX_ROWBATCH=1` row buffers (`idx_rowbatch.rs`), allocated at
+    /// load, fixed for graph replay: `[max_rows, index_head_dim]` BF16 each (`k_normed` after
+    /// `k_norm`, and `compress_gate`). NULL unless the lever is on and the batched-selector
+    /// buffers exist. The FP32 `wq_b` / `weights_proj` rows are `q_idx_rows` / `head_weights_rows`.
+    pub(super) idx_k_normed_rows: DevicePtr,
+    pub(super) idx_gate_rows: DevicePtr,
+    /// 2026-10-12: `dense_gemv_bf16_fp32out_batchm`; `KernelHandle(0)` unless the lever is on.
+    pub(super) idx_batchm_f32: KernelHandle,
     pub(super) slot: DevicePtr,
     pub(super) attn_out: DevicePtr,
     /// 2026-09-25: Block table for the paged gather, `bt_cap` i32 entries. NULL when
@@ -143,6 +151,8 @@ impl Glm5NextDsaWorkspace {
         // 2026-10-01: The row batch needs the persistent `bt`/`sl` and the batched selector.
         let row_batch = persist && batch_select && rows > 1;
         let row_batch = row_batch && crate::glm5next_layer::dsa_row_batch();
+        // 2026-10-12: `METRALE_GLM_DSA_IDX_ROWBATCH=1` row buffers (tiny: `rows * 256` B each).
+        let idx_rb = batch_select && super::idx_rowbatch::dsa_idx_rowbatch();
         Ok(Self {
             q_a: gpu.alloc(rows * (cfg.q_lora_rank * 2))?,
             q_resid: gpu.alloc(rows * (cfg.q_lora_rank * 2))?,
@@ -181,6 +191,21 @@ impl Glm5NextDsaWorkspace {
                 gpu.memset_async(p, 1, 1, 0)?;
                 gpu.synchronize(0)?;
                 p
+            },
+            idx_k_normed_rows: if idx_rb {
+                gpu.alloc(rows * cfg.index_head_dim * 2)?
+            } else {
+                DevicePtr(0)
+            },
+            idx_gate_rows: if idx_rb {
+                gpu.alloc(rows * cfg.index_head_dim * 2)?
+            } else {
+                DevicePtr(0)
+            },
+            idx_batchm_f32: if idx_rb {
+                super::idx_rowbatch::idx_batchm_f32_kernel(gpu)
+            } else {
+                KernelHandle(0)
             },
             slot: gpu.alloc(8)?,
             attn_out: gpu.alloc(rows * (cfg.local_heads * cfg.kv_lora_rank * 2))?,

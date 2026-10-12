@@ -26,7 +26,7 @@ pub use capabilities::LayerCapabilities;
 pub use graph_hooks::LayerGraphHooks;
 pub use split_prefill::LayerSplitPrefill;
 pub use weight_setup::LayerWeightSetup;
-pub use write_on_accept::{GdnCarryBinding, LayerWriteOnAccept};
+pub use write_on_accept::{GdnCarryBinding, LayerWriteOnAccept, SsmDeferSrc};
 
 /// 2026-09-25: Batched-verify WY pointer-table layout. `TransformerModel::upload_verify_wy_tables`
 /// (model-engine `verify_e2.rs`) writes it; the qwen3_ssm `GdnStates::Multi` arm and the

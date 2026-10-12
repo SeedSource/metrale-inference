@@ -651,6 +651,13 @@ fn kernels(gpu: &dyn GpuBackend) -> Option<Kernels> {
 /// 2026-10-07: `METRALE_GLM_NV4_B3_STAGED`; see `super::dense_nv4_b3`.
 pub use super::dense_nv4_b3::nv4_b3_staged;
 
+/// 2026-10-12: Whether a 3-row NVFP4 GEMV runs `w4a16_gemv_batch3_staged` today:
+/// `METRALE_GLM_NV4_B3_STAGED=1` and the image has it (what `dense_nv4_b3::pick_b3` picks), for
+/// `METRALE_GLM_NV4_B3_GROUP` (`super::dense_nv4_b3_group`).
+pub fn nv4_b3_staged_live(gpu: &dyn GpuBackend) -> bool {
+    nv4_b3_staged() && nv4_kernels(gpu).is_some_and(|k| k.b3s.is_some())
+}
+
 /// 2026-10-05: The NVFP4 kernels, resolved once; `None` (logged) when any is missing, which
 /// leaves the weights FP8-only.
 fn nv4_kernels(gpu: &dyn GpuBackend) -> Option<Nv4Kernels> {
@@ -1786,6 +1793,8 @@ pub fn finish_load(gpu: &dyn GpuBackend) -> Result<usize> {
         GW_SCALE_BYTES.load(Ordering::Relaxed),
     )?;
     finish_load_w4a4()?;
+    // 2026-10-12: `METRALE_GLM_NV4_B3_GROUP`: resolve the grouped kernel before any capture.
+    super::dense_nv4_b3_group::finish_load(gpu);
     if dense_nvfp4().any() {
         tracing::info!(
             "METRALE_GLM_DENSE_NVFP4: {} NVFP4 decode copies, {:.2} GB/rank (on top of the FP8 \

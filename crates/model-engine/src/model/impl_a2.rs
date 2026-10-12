@@ -197,6 +197,12 @@ impl TransformerModel {
             return Ok(false);
         }
 
+        // 2026-10-09: METRALE_GLM_KDA_DEFER_COMMIT: materialise a deferred commit before every
+        // command but a single-sequence verify (its wrapper decides) or a drafter proposal.
+        if !crate::model::trait_impl::kda_defer_hooks::worker_cmd_keeps_deferral(cmd) {
+            self.kda_defer_flush_disarm(self.gpu.default_stream())?;
+        }
+
         // 2026-09-25: Batched decode: the preamble seq_id is 0, and the
         // per-row slots arrive in the `seq_ids[N]` payload the batched handler
         // reads.

@@ -65,6 +65,10 @@ name = "glm5next_moe_fixcost_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_nv4_group_ceiling_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_dense_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -125,7 +129,15 @@ name = "dsa_pool_cache_parity_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dsa_ceiling_rows_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "dsa_grid_stride_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "dsa_idx_rowbatch_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
@@ -353,6 +365,10 @@ name = "glm5next_hc_slice_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm5next_l2_loadpf_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "glm5next_l2_prefetch_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -425,6 +441,10 @@ name = "kda_snap_fuse_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "kda_defer_commit_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kda_chunk_tc_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -471,6 +491,10 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "hc_post_mix_fast_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "hc_decode_fuse_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

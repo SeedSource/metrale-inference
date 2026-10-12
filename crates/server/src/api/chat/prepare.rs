@@ -124,6 +124,10 @@ pub(crate) fn prepare_chat_prompt(
         // variable undefined.
         req.preserve_thinking.or(state.behavior.preserve_thinking),
         tools_active,
+        // 2026-10-12: Only the request's own `Off` closes a template-opened think
+        // block; `--disable-thinking`, the server default directive and the model
+        // default keep the prompt unchanged.
+        matches!(req.thinking, crate::ir::ThinkingDirective::Off),
     )?;
     if state.chat.phase_timing {
         let us_template = _t_phase.elapsed().as_micros() - us_msg_entry - us_thinking;

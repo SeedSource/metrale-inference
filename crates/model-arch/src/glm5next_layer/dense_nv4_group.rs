@@ -19,6 +19,11 @@
 //! member's output): KDA `q/k/v_proj` (`glm5next_kda/mod.rs` `front_end_opts`), dense-MLP and
 //! shared-expert `gate/up_proj` (`glm5next_mlp/forward/dense.rs`), DSA `q_a_proj/kv_a_proj`
 //! (`glm5next_dsa/layer/decode_k.rs`, `xseq/group.rs`).
+//!
+//! 2026-10-12: `METRALE_GLM_NV4_B3_GROUP=1` (`dense_nv4_b3_group`) shares these call sites:
+//! [`enabled`] is true when either lever is on, and a call the tensor-core group does not take
+//! goes to [`super::dense_nv4_b3_group::try_group`] (3-row CUDA-core staged tier), which also
+//! returns `Ok(false)` without launching when it does not apply.
 
 use std::sync::{Once, OnceLock};
 
@@ -30,9 +35,15 @@ use metrale_model_layers::weight_map::QuantizedWeight;
 use super::{dense_fp8, dense_nv4_tc};
 
 /// `METRALE_GLM_NV4_TC_GROUP=1`, read once.
-pub fn enabled() -> bool {
+fn tc_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("METRALE_GLM_NV4_TC_GROUP").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// 2026-10-12: Whether a call site should offer its group to [`try_group`]:
+/// `METRALE_GLM_NV4_TC_GROUP=1` or `METRALE_GLM_NV4_B3_GROUP=1`.
+pub fn enabled() -> bool {
+    tc_enabled() || super::dense_nv4_b3_group::enabled()
 }
 
 /// One projection of a group: the BF16 weight pointer the caller would pass to its `gemm`
@@ -49,6 +60,8 @@ pub struct Proj {
 /// take the tensor-core NVFP4 path on its own, or the grouped entry missing). `gemv` is the
 /// GEMV handle the caller's `gemm` wrapper passes to `dense_fp8::route`. No allocation or
 /// sync, so it is capture-safe.
+/// 2026-10-12: A call the tensor-core group does not take is offered to
+/// `METRALE_GLM_NV4_B3_GROUP` ([`super::dense_nv4_b3_group::try_group`]).
 pub fn try_group(
     gpu: &dyn GpuBackend,
     gemv: KernelHandle,
@@ -58,7 +71,23 @@ pub fn try_group(
     k: usize,
     stream: u64,
 ) -> Result<bool> {
-    if !enabled()
+    if try_tc_group(gpu, gemv, a, members, m, k, stream)? {
+        return Ok(true);
+    }
+    super::dense_nv4_b3_group::try_group(gpu, gemv, a, members, m, k, stream)
+}
+
+/// The `METRALE_GLM_NV4_TC_GROUP` arm of [`try_group`] (its body before 2026-10-12).
+fn try_tc_group(
+    gpu: &dyn GpuBackend,
+    gemv: KernelHandle,
+    a: DevicePtr,
+    members: &[Proj],
+    m: usize,
+    k: usize,
+    stream: u64,
+) -> Result<bool> {
+    if !tc_enabled()
         || members.len() < 2
         || members.len() > gemv_tc::TC_GROUP_MAX
         || !dense_nv4_tc::takes(m)

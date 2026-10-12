@@ -402,6 +402,9 @@ pub fn forward_moe_sliced(
     profile::end(profile::MOE_ROUTER, t, gpu, stream);
     // 2026-10-10: `METRALE_GLM_MOE_UNION_LOG`: observe-only, off by default.
     union_log::maybe_log(gpu, cfg, ws.ids, rows, &groups, stream);
+    // 2026-10-11: `METRALE_GLM_DECODE_L2_LOADPF_SHARED` (off): shared gate/up into L2 on a side
+    // stream while the routed experts run; joined before the shared GEMVs below.
+    crate::glm5next_layer::loadpf::fork(w.loadpf_shared.as_ref(), gpu, rows, stream)?;
 
     // 2026-09-25: Zero every routed output first: an expert this rank does not own writes
     // nothing, and its slots must add zero to the sum.
@@ -438,6 +441,7 @@ pub fn forward_moe_sliced(
         moe_experts::row_batched_experts(&site, &groups)?;
     }
 
+    crate::glm5next_layer::loadpf::join(w.loadpf_shared.as_ref(), gpu, stream)?;
     let t = profile::start();
     forward_dense_sliced(
         gpu,

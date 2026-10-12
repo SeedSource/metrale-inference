@@ -1321,3 +1321,274 @@ extern "C" __global__ void glm5next_hc_expand(
         for (unsigned int i = 0; i < hc_mult; ++i) s[i * H + d] = v;
     }
 }
+
+
+// 2026-10-11: Decode-site mHC fusion experiments E1-E3 (race-prefill gate 0; SeedHQ/seed-skills#80).
+// New entry points only: no production kernel above is touched and no launcher dispatches these.
+// Checked bit for bit against the production kernels by model-arch
+// examples/hc_decode_fuse_microtest.rs (hc hidden 4096, hc_mult 4, mix_hc 24).
+
+// 2026-10-11: glm_hc_finish_warp: post and comb of glm5next_hc_finish for one token on ONE WARP.
+// hc_mult == 4 only. Lane L (0..15; lanes 16..31 repeat lanes 0..15 so every shuffle can use the
+// full mask and nothing diverges) holds comb[i][j], i = L >> 2, j = L & 3. Order, against
+// glm5next_hc_finish (block y == 0), expression for expression:
+// - post: 2.f * (1.f / (1.f + expf(-po))), po = mix[hc + i] * scale[1] + base[hc + i].
+// - logit: mix[2hc + L] * scale[2] + base[2hc + L].
+// - softmax per row i: mx = -1e30f then fmaxf over j = 0..3 ascending; e = expf(c - mx); sum = 0.f
+//   then += e_j for j ascending; comb = e / sum + hc_eps (true IEEE divide, as there).
+// - normalisation: a row sum starts at hc_eps and adds comb[i][0..3] in j ascending, then every
+//   element is divided by it; a column sum starts at hc_eps and adds comb[0..3][j] in i
+//   ascending, then divides. The first step is the column step, then `iters - 1` rounds of row
+//   then column, the loop bounds of the original.
+// The four operands of a sum arrive by __shfl_sync from the lanes that hold them and are added
+// in the original's sequence, so each lane forms the same rounded sums the original's one
+// thread per row (or column) did; a division is never turned into a multiply.
+__device__ __forceinline__ void glm_hc_finish_warp(
+    const float* __restrict__ s_mix,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int sinkhorn_iters,
+    const float hc_eps
+) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int L = lane & 15u;
+    const unsigned int j = L & 3u;
+    const unsigned int rb = lane & ~3u;              // first lane of this lane's row
+    const unsigned int cb = (lane & 16u) + j;        // lane of row 0, this lane's column
+    const unsigned int hc = 4;
+
+    if (lane < hc) {
+        float po = __ldcg(s_mix + hc + lane) * hc_scale[1] + hc_base[hc + lane];
+        post_out[lane] = 2.f * (1.f / (1.f + expf(-po)));
+    }
+    float v = __ldcg(s_mix + 2 * hc + L) * hc_scale[2] + hc_base[2 * hc + L];
+
+    float mx = -1e30f;
+    mx = fmaxf(mx, __shfl_sync(0xffffffffu, v, rb + 0));
+    mx = fmaxf(mx, __shfl_sync(0xffffffffu, v, rb + 1));
+    mx = fmaxf(mx, __shfl_sync(0xffffffffu, v, rb + 2));
+    mx = fmaxf(mx, __shfl_sync(0xffffffffu, v, rb + 3));
+    const float e = expf(v - mx);
+    float sum = 0.f;
+    sum += __shfl_sync(0xffffffffu, e, rb + 0);
+    sum += __shfl_sync(0xffffffffu, e, rb + 1);
+    sum += __shfl_sync(0xffffffffu, e, rb + 2);
+    sum += __shfl_sync(0xffffffffu, e, rb + 3);
+    v = e / sum + hc_eps;
+
+    {
+        float c = hc_eps;
+        c += __shfl_sync(0xffffffffu, v, cb + 0);
+        c += __shfl_sync(0xffffffffu, v, cb + 4);
+        c += __shfl_sync(0xffffffffu, v, cb + 8);
+        c += __shfl_sync(0xffffffffu, v, cb + 12);
+        v /= c;
+    }
+    for (unsigned int it = 0; it + 1 < sinkhorn_iters; ++it) {
+        float r = hc_eps;
+        r += __shfl_sync(0xffffffffu, v, rb + 0);
+        r += __shfl_sync(0xffffffffu, v, rb + 1);
+        r += __shfl_sync(0xffffffffu, v, rb + 2);
+        r += __shfl_sync(0xffffffffu, v, rb + 3);
+        v /= r;
+        float c = hc_eps;
+        c += __shfl_sync(0xffffffffu, v, cb + 0);
+        c += __shfl_sync(0xffffffffu, v, cb + 4);
+        c += __shfl_sync(0xffffffffu, v, cb + 8);
+        c += __shfl_sync(0xffffffffu, v, cb + 12);
+        v /= c;
+    }
+    if (lane < 16) comb_out[lane] = v;
+}
+
+// 2026-10-11: E1 glm5next_hc_finish_warp: glm5next_hc_finish with block y == 0's post / comb /
+// Sinkhorn done by warp 0 (glm_hc_finish_warp above) instead of 4 lanes of the block with two
+// barriers per iteration. Same arguments, grid (T, NB), block 256, same collapse code and the
+// same `pre` expression in every block. hc_mult == 4 only (any other value returns without
+// writing). Warps 1..7 of block y == 0 wait at the barrier before the collapse, as before.
+extern "C" __global__ void glm5next_hc_finish_warp(
+    const float* __restrict__ streams,
+    const float* __restrict__ mix,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float hc_eps
+) {
+    if (hc_mult != 4) return;
+    const unsigned int t = blockIdx.x;
+    const unsigned int by = blockIdx.y;
+    const unsigned int nb = gridDim.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc = 4;
+    const unsigned int mix_hc = 24;
+
+    const float* x = streams + (size_t)t * hc * H;
+    const float* s_mix = mix + (size_t)t * mix_hc;
+    __shared__ float s_pre[GLM_HC_MAX_MULT];
+
+    if (tid < hc) {
+        float pr = s_mix[tid] * hc_scale[0] + hc_base[tid];
+        s_pre[tid] = 1.f / (1.f + expf(-pr)) + hc_eps;
+    }
+    if (by == 0 && tid < 32) {
+        glm_hc_finish_warp(s_mix, hc_scale, hc_base, post_out + (size_t)t * hc,
+                           comb_out + (size_t)t * hc * hc, sinkhorn_iters, hc_eps);
+    }
+    __syncthreads();
+
+    if (nb == 1 || by > 0) {
+        const unsigned int slot = (nb == 1) ? 0 : by - 1;
+        const unsigned int nslot = (nb == 1) ? 1 : nb - 1;
+        for (unsigned int d = slot * GLM_HC_BLOCK + tid; d < H; d += nslot * GLM_HC_BLOCK) {
+            float acc = 0.f;
+            for (unsigned int i = 0; i < hc; ++i) acc += s_pre[i] * (float)x[i * H + d];
+            y_out[(size_t)t * H + d] = __float2bfloat16(acc);
+        }
+    }
+}
+
+// 2026-10-11: E2 glm5next_hc_mix_bf16_1pass: glm5next_hc_mix_bf16 with the RMS loop and the dot
+// loop merged into one pass over the highway row. Same arguments, grid (T, mix_hc), block 256,
+// one block per mix row. Every output bit equals glm5next_hc_mix_bf16's:
+// - Ownership: thread tid handles k = tid + 256 j, j ascending, as there.
+// - Chains: ss += v * v from 0.f and acc += bf16(fn[m, k]) * v from 0.f are two independent
+//   register chains in the same ascending-j order; merging the loops changes neither (no FMA:
+//   common/ builds with --fmad=false).
+// - Trees: red_ss and red_dot each reduce as glm_hc_block_reduce does, s = 128 .. 1,
+//   a[tid] += a[tid + s] for tid < s, one barrier per level shared by both arrays.
+// - Epilogue: out = r * rsqrtf(ssum / (float)hc_dim + norm_eps), tid 0 writes, as there.
+extern "C" __global__ void glm5next_hc_mix_bf16_1pass(
+    const float* __restrict__ streams,
+    const __nv_bfloat16* __restrict__ hc_fn,
+    float* __restrict__ mix_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const float norm_eps
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int m = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int hc_dim = hc_mult * hidden_size;
+    const unsigned int mix_hc = (2 + hc_mult) * hc_mult;
+
+    const float* x = streams + (size_t)t * hc_dim;
+    const __nv_bfloat16* fn_row = hc_fn + (size_t)m * hc_dim;
+    __shared__ float red_ss[GLM_HC_BLOCK];
+    __shared__ float red_dot[GLM_HC_BLOCK];
+
+    float ss = 0.f;
+    float acc = 0.f;
+    for (unsigned int k = tid; k < hc_dim; k += GLM_HC_BLOCK) {
+        const float v = (float)x[k];
+        ss += v * v;
+        acc += __bfloat162float(fn_row[k]) * v;
+    }
+    red_ss[tid] = ss;
+    red_dot[tid] = acc;
+    __syncthreads();
+    for (unsigned int s = GLM_HC_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red_ss[tid] += red_ss[tid + s];
+            red_dot[tid] += red_dot[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float rsqrt = rsqrtf(red_ss[0] / (float)hc_dim + norm_eps);
+        mix_out[(size_t)t * mix_hc + m] = red_dot[0] * rsqrt;
+    }
+}
+
+// 2026-10-11: E3 glm5next_hc_mix_finish_1pass: E2 and E1 in ONE launch. Grid (T, mix_hc), block
+// 256. Each block computes one mix row as glm5next_hc_mix_bf16_1pass and writes it to mix_out;
+// then thread 0 fences and bumps counters[t]; the block that makes it mix_hc is the last one for
+// token t, resets counters[t] to 0 (so the buffer is reusable, graph replay included) and runs
+// the finish for t: s_pre, glm_hc_finish_warp on warp 0 and the collapse y over the whole row by
+// this one block (d = tid + 256 q, the original's nb == 1 loop, so y bits equal hc_finish's at
+// any NB). `counters` is [T] unsigned, zero before the first launch. hc_mult == 4 only. The mix
+// values are read back with __ldcg (L2), after the fence on both sides.
+extern "C" __global__ void glm5next_hc_mix_finish_1pass(
+    const float* __restrict__ streams,
+    const __nv_bfloat16* __restrict__ hc_fn,
+    float* mix_out,
+    unsigned int* counters,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    if (hc_mult != 4) return;
+    const unsigned int t = blockIdx.x;
+    const unsigned int m = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc = 4;
+    const unsigned int hc_dim = hc * H;
+    const unsigned int mix_hc = 24;
+
+    const float* x = streams + (size_t)t * hc_dim;
+    const __nv_bfloat16* fn_row = hc_fn + (size_t)m * hc_dim;
+    __shared__ float red_ss[GLM_HC_BLOCK];
+    __shared__ float red_dot[GLM_HC_BLOCK];
+    __shared__ float s_pre[GLM_HC_MAX_MULT];
+    __shared__ unsigned int s_last;
+
+    float ss = 0.f;
+    float acc = 0.f;
+    for (unsigned int k = tid; k < hc_dim; k += GLM_HC_BLOCK) {
+        const float v = (float)x[k];
+        ss += v * v;
+        acc += __bfloat162float(fn_row[k]) * v;
+    }
+    red_ss[tid] = ss;
+    red_dot[tid] = acc;
+    __syncthreads();
+    for (unsigned int s = GLM_HC_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red_ss[tid] += red_ss[tid + s];
+            red_dot[tid] += red_dot[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float rsqrt = rsqrtf(red_ss[0] / (float)hc_dim + norm_eps);
+        __stcg(mix_out + (size_t)t * mix_hc + m, red_dot[0] * rsqrt);
+        __threadfence();
+        const unsigned int old = atomicAdd(counters + t, 1u);
+        s_last = (old == mix_hc - 1) ? 1u : 0u;
+        if (s_last) counters[t] = 0u;
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+
+    const float* s_mix = mix_out + (size_t)t * mix_hc;
+    if (tid < hc) {
+        float pr = __ldcg(s_mix + tid) * hc_scale[0] + hc_base[tid];
+        s_pre[tid] = 1.f / (1.f + expf(-pr)) + hc_eps;
+    }
+    if (tid < 32) {
+        glm_hc_finish_warp(s_mix, hc_scale, hc_base, post_out + (size_t)t * hc,
+                           comb_out + (size_t)t * hc * hc, sinkhorn_iters, hc_eps);
+    }
+    __syncthreads();
+    for (unsigned int d = tid; d < H; d += GLM_HC_BLOCK) {
+        float a = 0.f;
+        for (unsigned int i = 0; i < hc; ++i) a += s_pre[i] * (float)x[i * H + d];
+        y_out[(size_t)t * H + d] = __float2bfloat16(a);
+    }
+}

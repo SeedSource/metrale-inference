@@ -43,6 +43,7 @@ impl ModelDraft for TransformerModel {
         num_drafts: usize,
     ) -> Result<crate::engine::GenerateResult> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(self.gpu.default_stream())?;
         self.generate_speculative_dispatch(prompt_tokens, params, num_drafts)
     }
 
@@ -61,6 +62,7 @@ impl ModelDraft for TransformerModel {
 
     fn decode_draft(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
         self.gdn_carry_flush_pending()?;
+        self.kda_defer_flush(stream)?;
         self.decode_draft_dispatch(token, seq, stream)
     }
 

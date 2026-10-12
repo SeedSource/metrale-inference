@@ -13,8 +13,8 @@
 //! - (b) Tolerance against an FP64 host reference on the DEQUANTIZED weights (E2M1 x E4M3 scale x
 //!   tensor scale read back from the copy), M = 1,2,3,4,5,7,8,9,16, both new kernels: cosine >=
 //!   0.99999, max_rel (max |new - ref| / max |ref| over the output) <= 1e-4, nonfinite 0.
-//! - (c) Speed: cold pool (BF16: 4 rotated weight copies = 50 MB; NVFP4: 8 = 28 MB, both above the
-//!   24 MB L2), a CUDA graph of 16 launches replayed 25 times, median per launch, at M = 1, 2, 3,
+//! - (c) Speed: cold pool (BF16: 12 rotated weight copies = 151 MB; NVFP4: 36 = 126 MB, both above the
+//!   24 MB L2), a CUDA graph of 36 launches (one pass over every NVFP4 copy) replayed 25 times, median per launch, at M = 1, 2, 3,
 //!   4, 5, 7, 8, 9, 16 for: `old` = the BF16 FP32-out GEMV (`dense_gemv_bf16_fp32out`, M >= 2
 //!   `dense_gemv_bf16_fp32out_batchm`), `core` = CUDA-core NVFP4, `tc` = tensor-core NVFP4.
 //!   `new` is the faster of core and tc. GB/s = weight (+ scale) bytes / time; > 255 prints
@@ -38,9 +38,9 @@ use metrale_model_layers::weight_map::{DenseWeight, QuantizedWeight};
 const N: usize = 4096;
 const K: usize = 1536;
 const MS: [usize; 9] = [1, 2, 3, 4, 5, 7, 8, 9, 16];
-const BF16_COPIES: usize = 4;
-const NV4_COPIES: usize = 8;
-const LAUNCHES: usize = 16;
+const BF16_COPIES: usize = 12; // 2026-10-12 phcmt2 re-measure: 151 MB, >= 4x L2 (race-lead)
+const NV4_COPIES: usize = 36; // 126 MB, >= 4x L2: the 8-copy 28 MB pool read 255-258 GB/s (VOID) on tc
+const LAUNCHES: usize = 36; // one pass over every NV4 copy per replay (36 % 12 == 0 for BF16)
 const REPLAYS: usize = 25;
 
 struct Lcg(u64);

@@ -43,10 +43,10 @@ use super::{Glm5NextDsaLayer, gemm};
 pub const NV4_MAX_M: usize = 16;
 /// 2026-10-12 PROVISIONAL: chunks of 1..=this many rows keep the BF16 FP32-out GEMV. 0 = none.
 pub const BF16_MAX_M: usize = 0;
-/// 2026-10-12 PROVISIONAL: chunks of `BF16_MAX_M + 1..=this` rows take the CUDA-core NVFP4
+/// 2026-10-12 phcmt2 (race-lead: as written): chunks of `BF16_MAX_M + 1..=this` rows take the CUDA-core NVFP4
 /// kernel (bit-identical per row to the production NVFP4 tiers); larger chunks take the
 /// tensor-core kernel (needs `K % 128 == 0`, else CUDA-core).
-pub const CORE_MAX_M: usize = 3;
+pub const CORE_MAX_M: usize = 9;
 
 /// Which kernel a chunk of rows takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

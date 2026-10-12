@@ -362,8 +362,8 @@ pub enum DsaSelectLaunch {
     /// `dsa_expand_selection` clamps each row's select_k to its own pool count, so each row's
     /// tokens are those of a single-row pass at its own length (to be confirmed bitwise by
     /// `examples/dsa_ceiling_rows_microtest.rs`). The scratch must fit `q_rows` rows at the
-    /// ceiling (`ceiling_rows::check_fit`). 2026-10-12: no production caller; only the
-    /// microtest constructs it.
+    /// ceiling (`ceiling_rows::check_fit`). 2026-10-12: the one production caller is
+    /// `layer/ceiling_verify.rs`, behind `METRALE_GLM_DSA_CEILING_ROWS=1` (default off).
     CeilingRows { max_pools: usize },
 }
 
@@ -392,6 +392,7 @@ pub struct DsaSelectScratch {
 mod ceiling_rows;
 mod launch;
 mod scratch;
+pub(crate) use ceiling_rows::dsa_ceiling_rows;
 pub use launch::{PoolRows, compress_pools_only, select_tokens};
 pub mod pool_once;
 pub mod grid_stride;

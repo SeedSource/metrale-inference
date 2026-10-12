@@ -48,6 +48,7 @@ use super::state::Glm5NextDsaState;
 use super::{Glm5NextDsaConfig, Glm5NextDsaKernels};
 use metrale_model_layers::layer::{ForwardContext, LayerState, TransformerLayer};
 
+mod ceiling_verify;
 mod ctx_rows;
 mod decode_k;
 mod proj_gemm;
@@ -180,6 +181,22 @@ impl Glm5NextDsaLayer {
         pos_dev: Option<DevicePtr>,
         stream: u64,
     ) -> Result<()> {
+        let hw = self.workspace.head_weights;
+        self.indexer_forward_to(gpu, hidden, state, pos_dev, hw, stream)
+    }
+
+    /// 2026-10-12: [`Self::indexer_forward`] with the head weights written to `head_weights`
+    /// (`index_heads` FP32) instead of the workspace's single-row slot: the same launches, only
+    /// that output address differs (`ceiling_verify.rs` passes row `r` of `head_weights_rows`).
+    pub(super) fn indexer_forward_to(
+        &self,
+        gpu: &dyn GpuBackend,
+        hidden: DevicePtr,
+        state: &mut Glm5NextDsaState,
+        pos_dev: Option<DevicePtr>,
+        head_weights: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
         // 2026-09-25: Checked before any write: everything below writes row `state.len()`,
         // which is past the end of the buffers when the cache is full.
         state.ensure_room(1)?;
@@ -249,7 +266,7 @@ impl Glm5NextDsaLayer {
             KernelHandle(0),
             hidden,
             self.weights.weights_proj,
-            self.workspace.head_weights,
+            head_weights,
             1,
             self.cfg.index_heads,
             self.cfg.hidden,

@@ -40,6 +40,7 @@ fn the_layer_takes_the_vanilla_rmsnorm_not_the_plus_one_variant() {
     for (file, text) in [
         ("layer.rs", src),
         ("layer/decode_k.rs", include_str!("decode_k.rs")),
+        ("layer/ceiling_verify.rs", include_str!("ceiling_verify.rs")),
         ("layer/rows.rs", include_str!("rows.rs")),
         ("layer/workspace.rs", include_str!("workspace.rs")),
         ("layer/proj_gemm.rs", include_str!("proj_gemm.rs")),

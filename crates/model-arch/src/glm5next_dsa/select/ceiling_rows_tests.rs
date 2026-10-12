@@ -3,7 +3,7 @@
 //! 2026-10-12: Host tests of `DsaSelectLaunch::CeilingRows` on the mock backend: the
 //! single-row `Ceiling` refusal of `q_rows > 1` is unchanged, `CeilingRows` needs a
 //! `geom_dev` and a scratch that fits its rows at the ceiling, it launches the ceiling chain
-//! with the row axis widened, and nothing in production constructs it.
+//! with the row axis widened, and production constructs it only behind its lever.
 //!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants: none beyond the types.
@@ -143,19 +143,23 @@ fn ceiling_rows_is_the_ceiling_chain_with_the_row_axis_widened() {
     }
 }
 
-/// 2026-10-12: No production file constructs `CeilingRows`: it is reachable only from the
-/// microtest until a lever-gated caller is reviewed in.
+/// 2026-10-12: `CeilingRows` is constructed in production only behind its lever: outside
+/// the select module (declaration, launcher, fit check, these tests) the one file that
+/// writes `CeilingRows {` is `layer/ceiling_verify.rs`, once, and that file's only gate reads
+/// `dsa_ceiling_rows()` (`METRALE_GLM_DSA_CEILING_ROWS`) as its first term.
 #[test]
-fn no_production_caller_constructs_ceiling_rows() {
+fn ceiling_rows_is_constructed_only_behind_its_lever() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let allowed = [
+    let select_module = [
         "glm5next_dsa/select.rs",
         "glm5next_dsa/select/launch.rs",
         "glm5next_dsa/select/ceiling_rows.rs",
         "glm5next_dsa/select/ceiling_rows_tests.rs",
     ];
+    let caller = "glm5next_dsa/layer/ceiling_verify.rs";
     let mut pending = vec![root.clone()];
     let mut scanned = 0;
+    let mut callers = Vec::new();
     while let Some(dir) = pending.pop() {
         for entry in std::fs::read_dir(&dir).expect("readable src dir") {
             let path = entry.expect("readable entry").path();
@@ -165,11 +169,19 @@ fn no_production_caller_constructs_ceiling_rows() {
                 scanned += 1;
                 let rel = path.strip_prefix(&root).unwrap().to_string_lossy();
                 let src = std::fs::read_to_string(&path).unwrap();
-                if src.contains("CeilingRows") {
-                    assert!(allowed.contains(&rel.as_ref()), "{rel} uses CeilingRows");
+                if src.contains("CeilingRows {") && !select_module.contains(&rel.as_ref()) {
+                    callers.push(rel.into_owned());
                 }
             }
         }
     }
     assert!(scanned > 100, "scanned only {scanned} files");
+    assert_eq!(callers, [caller], "CeilingRows constructed outside its gated caller");
+    let src = include_str!("../layer/ceiling_verify.rs");
+    assert_eq!(src.matches("DsaSelectLaunch::CeilingRows {").count(), 1);
+    assert!(src.contains("lever: dsa_ceiling_rows(),"));
+    assert!(src.contains("    f.lever\n        && f.k >= 2\n"));
+    assert!(include_str!("ceiling_rows.rs").contains(
+        "std::env::var(\"METRALE_GLM_DSA_CEILING_ROWS\")"
+    ));
 }

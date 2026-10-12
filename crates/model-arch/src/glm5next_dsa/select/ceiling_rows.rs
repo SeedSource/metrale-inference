@@ -15,9 +15,16 @@
 //! The scores region holds `q_rows` rows of the live pool count, which under a ceiling launch
 //! is known only on the device, so the scratch must fit `q_rows` rows at the ceiling.
 //!
+//! 2026-10-12: Also the lever [`dsa_ceiling_rows`] (`METRALE_GLM_DSA_CEILING_ROWS`), which
+//! lets the replay-safe verify (`layer/ceiling_verify.rs`) run one such pass per sequence
+//! instead of one single-row ceiling pass per verify row.
+//!
 //! Owner: model-arch (GLM-5.3 DSA).
 //! Invariants:
-//! - 2026-10-12: No production caller constructs `CeilingRows` (source guard below).
+//! - 2026-10-12: The only production construction of `CeilingRows` is in
+//!   `layer/ceiling_verify.rs`, behind [`dsa_ceiling_rows`] (source guard in the tests).
+
+use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 
@@ -38,6 +45,31 @@ pub(super) fn check_fit(
     }
     let at_ceiling = DsaSelectGeometry::plan(cfg, max_pools * cfg.index_kpool, q_rows)?;
     scratch.fits_with(cfg, &at_ceiling, inputs.pool_cache.is_some())
+}
+
+/// 2026-10-12: `METRALE_GLM_DSA_CEILING_ROWS=1` (default off), read once: a graph-captured
+/// verify of `k >= 2` rows of one sequence with the pool cache on selects all `k` rows in one
+/// `CeilingRows` pass (one `dsa_write_geom_pk` from the last row's `seq_len`) instead of `k`
+/// single-row ceiling passes. Byte-identical by construction; GPU gate
+/// `examples/dsa_ceiling_rows_microtest.rs`. A value other than unset, empty, `0` or `1` is
+/// off, with one warning.
+pub(crate) fn dsa_ceiling_rows() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        let raw = std::env::var("METRALE_GLM_DSA_CEILING_ROWS").ok();
+        let on = raw.as_deref().map(str::trim) == Some("1");
+        let odd = |r: &&str| !r.is_empty() && r.trim() != "0" && r.trim() != "1";
+        if let Some(r) = raw.as_deref().filter(odd) {
+            tracing::warn!("METRALE_GLM_DSA_CEILING_ROWS={r} is not 0 or 1 - treated as off");
+        }
+        if on {
+            tracing::warn!(
+                "METRALE_GLM_DSA_CEILING_ROWS=1 - a graph-captured DSA verify of one sequence's \
+                 rows selects them in one CeilingRows pass (byte-identical by construction)"
+            );
+        }
+        on
+    })
 }
 
 #[cfg(test)]

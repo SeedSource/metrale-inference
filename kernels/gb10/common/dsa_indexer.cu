@@ -392,8 +392,10 @@ extern "C" __global__ void dsa_index_scores(
         S = (unsigned int)geom[DSA_GEOM_S];
         P = (unsigned int)geom[DSA_GEOM_NPOOLS];
         // 2026-09-25: `P` is also the row stride of out / valid_cand, so it may vary with geom
-        // only because the device-geometry path is decode-only (Q == 1, every r * P is 0).
-        // The launcher refuses a ceiling launch with Q > 1.
+        // only because every row of a device-geometry launch shares this one geom: a single-row
+        // ceiling launch (Q == 1, every r * P is 0), or 2026-10-12 a `CeilingRows` launch over
+        // one sequence's Q verify rows with geom written from the last row's seq_len. The
+        // launcher refuses any other ceiling launch with Q > 1.
         live = P;
     }
     for (unsigned int p = blockIdx.x; p < live; p += gridDim.x) {

@@ -82,7 +82,17 @@ impl ModelLifecycle for TransformerModel {
     }
 
     fn migrate_to_covered_slot(&self, seq: &mut SequenceState) -> Result<Option<usize>> {
-        self.migrate_to_covered_slot_dispatch(seq)
+        // 2026-10-12: Same flush/reset as `compact_sequence`: a migration moves the
+        // slot's h state, so a deferred commit lands first (the cap path postdates the
+        // deferral; the worker flushes on the non-keeping command).
+        self.kda_defer_flush(self.gpu.default_stream())?;
+        let old = seq.slot_idx;
+        let moved = self.migrate_to_covered_slot_dispatch(seq)?;
+        if let Some(new_slot) = moved {
+            self.kda_defer_reset_slot(old)?;
+            self.kda_defer_reset_slot(new_slot)?;
+        }
+        Ok(moved)
     }
 
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {

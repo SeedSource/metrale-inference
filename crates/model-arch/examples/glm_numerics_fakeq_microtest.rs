@@ -255,9 +255,17 @@ fn fp8_and_nvfp4(g: &dyn GpuBackend, rng: &mut Lcg, t: &mut Tally) -> Result<()>
             t.check(bad == 0, || {
                 format!("(b) nvfp4 {tag}: {bad} of {} elements differ", n * k)
             });
+            // 2026-10-12: x1.0001 was invisible: E2M1 x E4M3 products carry <= 6 significant
+            // bits, exact in BF16, so a 1e-4 nudge rounded back (N0 FAIL M). 1% crosses BF16
+            // rounding (half-ulp 0.2%); a flipped code in a nonzero nibble is the second control.
             let wrong =
-                host_ref::nvfp4_dequant_bits(&packed, &scales, q.weight_scale_2 * 1.0001, n, k);
-            let det = mismatches(&got, &wrong);
+                host_ref::nvfp4_dequant_bits(&packed, &scales, q.weight_scale_2 * 1.01, n, k);
+            let mut flipped = packed.clone();
+            if let Some(b) = flipped.iter_mut().find(|b| (**b & 0x7) != 0) {
+                *b ^= 0x1;
+            }
+            let wrong2 = host_ref::nvfp4_dequant_bits(&flipped, &scales, q.weight_scale_2, n, k);
+            let det = mismatches(&got, &wrong).min(mismatches(&got, &wrong2));
             t.check(det > 0, || {
                 format!("(d) nvfp4 {tag}: the deliberately wrong reference was NOT detected")
             });

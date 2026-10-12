@@ -16,6 +16,7 @@ mod gdn_carry;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
 pub(crate) mod impl_a2;
+mod ep_dummy_words;
 mod impl_a2_ep_broadcast;
 pub(crate) mod impl_a3;
 mod impl_a3_embed;

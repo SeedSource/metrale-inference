@@ -125,6 +125,21 @@ impl TransformerModel {
             self.ep_broadcast_u32(seq_id)?;
         }
         self.ep_broadcast_u32(cmd)?;
+        self.ep_send_dummy_words()?;
+        Ok(())
+    }
+
+    /// 2026-10-12: `METRALE_EP_DUMMY_WORDS` slope test (`super::ep_dummy_words`): N extra 4-byte broadcasts
+    /// after a command, on rank 0 and on the worker alike. A no-op when N = 0.
+    fn ep_send_dummy_words(&self) -> Result<()> {
+        let n = super::ep_dummy_words::ep_dummy_words();
+        if n == 0 {
+            return Ok(());
+        }
+        for _ in 0..n {
+            self.ep_broadcast_u32(0)?;
+        }
+        super::ep_dummy_words::note_command();
         Ok(())
     }
 
@@ -184,11 +199,13 @@ impl TransformerModel {
         let mut buf = [0u8; 4];
         self.gpu.copy_d2h(self.ep_cmd_buf, &mut buf)?;
         let first = u32::from_le_bytes(buf);
-        if v2 {
-            Ok((first, self.ep_broadcast_u32(0)?))
+        let pair = if v2 {
+            (first, self.ep_broadcast_u32(0)?)
         } else {
-            Ok((0, first))
-        }
+            (0, first)
+        };
+        self.ep_send_dummy_words()?;
+        Ok(pair)
     }
 
     /// 2026-09-25: Broadcast one u32 from rank 0 through `ep_cmd_buf`. Rank 0

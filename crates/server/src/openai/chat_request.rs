@@ -98,6 +98,11 @@ pub struct ChatCompletionRequest {
     /// default) = no minimum.
     #[serde(default)]
     pub min_tokens: usize,
+    /// 2026-10-12: vLLM `ignore_eos`: generate to `max_tokens`. Read only by the
+    /// stream-side content guards under `METRALE_GUARD_HONOR_FORCED_LEN`; EOS handling
+    /// is unchanged.
+    #[serde(default)]
+    pub ignore_eos: bool,
     pub seed: Option<u64>,
     /// 2026-09-26: `true` alone returns the sampled token's logprob with no
     /// alternatives; `top_logprobs` sets the count when present.

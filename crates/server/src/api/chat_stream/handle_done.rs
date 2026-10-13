@@ -184,6 +184,16 @@ pub(super) fn handle_done(
         ),
     };
 
+    if state.guard_suppressed > 0 {
+        tracing::info!(
+            target: "met::api::chat_stream::handle_done",
+            id = %ctx.id,
+            "guard stop suppressed {} times ({})",
+            state.guard_suppressed,
+            if ctx.ignore_eos { "ignore_eos" } else { "min_tokens" },
+        );
+    }
+
     let fr = resolve_wire_finish_reason(
         &finish_reason,
         state.tool_loop_capped,

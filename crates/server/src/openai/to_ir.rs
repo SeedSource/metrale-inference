@@ -109,6 +109,7 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             },
             max_tokens: req.max_tokens,
             min_tokens: req.min_tokens,
+            ignore_eos: req.ignore_eos,
             stop: req.stop,
             stream: req.stream,
             n: req.n,

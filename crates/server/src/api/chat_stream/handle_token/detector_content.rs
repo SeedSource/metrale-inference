@@ -14,7 +14,43 @@ use crate::ir::StreamDelta;
 
 use super::super::ctx::StreamCtx;
 use super::super::state::StreamState;
-use super::{DeltaVec, simhash_loop_enabled, watchdogs_disabled};
+use super::{
+    DeltaVec, forced_len_suppresses, guard_honor_forced_len, simhash_loop_enabled,
+    watchdogs_disabled,
+};
+
+/// 2026-10-12: A content guard fired (`semantic` names which). Under
+/// `METRALE_GUARD_HONOR_FORCED_LEN` (`lever_on`) a request that forces its length
+/// (`ignore_eos`, or fewer than `min_tokens` tokens so far) only counts the fire and
+/// returns `false`. Otherwise name the guard, cancel the request and return `true`.
+pub(super) fn apply_guard_trip(
+    state: &mut StreamState,
+    lever_on: bool,
+    ignore_eos: bool,
+    min_tokens: usize,
+    semantic: bool,
+) -> bool {
+    if forced_len_suppresses(lever_on, ignore_eos, min_tokens, state.tokens_seen) {
+        state.guard_suppressed = state.guard_suppressed.saturating_add(1);
+        return false;
+    }
+    if semantic {
+        tracing::warn!(target: "met::api::chat_stream::handle_token", ring_len = state.simhash_guard.len(),
+            "SimHash semantic-loop watchdog fired (paraphrased sentence repeat)"
+        );
+    }
+    state.loop_watchdog_triggered = true;
+    state.stop_string_triggered = true;
+    state.guard_stop = Some(if semantic {
+        "simhash_semantic_loop"
+    } else {
+        "token_loop_watchdog"
+    });
+    state
+        .cancel_flag
+        .store(true, std::sync::atomic::Ordering::Release);
+    true
+}
 
 /// 2026-09-26: Run the SimHash and token loop watchdogs over an already-sanitized
 /// content chunk (both callers sanitize first). On a trip: name the guard, cancel, and
@@ -56,23 +92,15 @@ pub(super) fn process_detector_content(
             state.loop_watchdog_triggered,
         );
 
-    if semantic_trip || token_trip {
-        if semantic_trip {
-            tracing::warn!(target: "met::api::chat_stream::handle_token", ring_len = state.simhash_guard.len(),
-                "SimHash semantic-loop watchdog fired (paraphrased sentence repeat)"
-            );
-        }
-        state.loop_watchdog_triggered = true;
-        state.stop_string_triggered = true;
-        state.guard_stop = Some(if semantic_trip {
-            "simhash_semantic_loop"
-        } else {
-            "token_loop_watchdog"
-        });
-        state
-            .cancel_flag
-            .store(true, std::sync::atomic::Ordering::Release);
-
+    if (semantic_trip || token_trip)
+        && apply_guard_trip(
+            state,
+            guard_honor_forced_len(),
+            ctx.ignore_eos,
+            ctx.min_tokens,
+            semantic_trip,
+        )
+    {
         // 2026-09-26: A trip emits nothing further for this chunk.
         return Some(DeltaVec::new());
     }
@@ -106,3 +134,7 @@ pub(super) fn detector_content_arm(
     );
     process_detector_content(state, ctx, &sanitized)
 }
+
+#[cfg(test)]
+#[path = "guard_forced_len_tests.rs"]
+mod guard_forced_len_tests;

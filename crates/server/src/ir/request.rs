@@ -23,6 +23,8 @@ pub struct ChatRequest {
     pub sampling: SamplingParams,
     pub max_tokens: usize,
     pub min_tokens: usize,
+    /// 2026-10-12: The client asked to generate to `max_tokens` (vLLM `ignore_eos`).
+    pub ignore_eos: bool,
     pub stop: Vec<String>,
     pub stream: bool,
     /// 2026-09-26: Number of choices. Only OpenAI chat can ask for more than

@@ -13,6 +13,8 @@
 //!   (`host_ref::nvfp4_dequant_bits`) of the bytes `quantize_nvfp4_copy` produces for the same
 //!   input (packed E2M1, E4M3 block scales, tensor scale), bit for bit. The returned error
 //!   statistics equal the host's over the same sampled rows.
+//! - (e) INT2 (2026-10-14): `fake_quant_inplace(.., Fmt::Int2)` (host-side) equals
+//!   `host_ref::int2_fakeq_bits` bit for bit.
 //! - (c) State round: the kernel's output equals `half::{bf16,f16}` round to nearest even and back
 //!   to f32 bit for bit; the statistics slot holds the exact absmax (of the finite pre-rounding
 //!   values), the exact count of finite values that round to infinity and of non-finite values,
@@ -277,6 +279,31 @@ fn fp8_and_nvfp4(g: &dyn GpuBackend, rng: &mut Lcg, t: &mut Tally) -> Result<()>
             for p in [w, w2, q.weight, q.weight_scale] {
                 g.free(p)?;
             }
+
+            // (e) INT2 (2026-10-14, host-side positive control): bitwise vs the host reference;
+            // a scale-nudged reference must be detected; error must dwarf the fp8 error.
+            let w = up_bits(g, &src)?;
+            let st = fake_quant_inplace(g, w, n, k, Fmt::Int2)?;
+            let got = dn_bits(g, w, n * k)?;
+            let want = host_ref::int2_fakeq_bits(&src, n, k);
+            let bad = mismatches(&got, &want);
+            t.check(bad == 0, || {
+                format!("(e) int2 {tag}: {bad} of {} elements differ", n * k)
+            });
+            let wrong: Vec<u16> = want
+                .iter()
+                .map(|&b| half::bf16::from_f32(half::bf16::from_bits(b).to_f32() * 1.01).to_bits())
+                .collect();
+            let det = mismatches(&got, &wrong);
+            t.check(det > 0, || {
+                format!("(d) int2 {tag}: the deliberately wrong reference was NOT detected")
+            });
+            let hs = err_stats(&pick(&src), &pick(&want));
+            t.check(
+                st.max_abs.to_bits() == hs.max_abs.to_bits() && st.elems == hs.elems,
+                || format!("(e) int2 {tag}: error stats {st:?} != host {hs:?}"),
+            );
+            g.free(w)?;
         }
     }
     Ok(())
@@ -488,7 +515,7 @@ fn run() -> Result<String> {
         );
     }
     Ok(format!(
-        "PASS: glm_numerics_fakeq {} checks: fp8 and nvfp4 fake-quant bitwise vs host reference \
+        "PASS: glm_numerics_fakeq {} checks: fp8, nvfp4 and int2 fake-quant bitwise vs host reference \
          ({} shapes x random/edge), state round bf16/fp16 bitwise with exact absmax/overflow/nonfinite \
          stats, known-bad references detected",
         t.checks,

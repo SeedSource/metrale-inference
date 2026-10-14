@@ -86,6 +86,13 @@ pub fn sample_with_params_seeded(
             .unwrap_or(0);
     }
 
+    // 2026-10-14: Top-p alone (no top-k cap, no min-p): the official GLM-5.3 default.
+    // The nucleus is found on a sorted prefix that grows until it holds the cutoff,
+    // instead of sorting the whole vocabulary for every sampled token.
+    if (top_k == 0 || top_k >= logits.len()) && min_p <= 0.0 && top_p < 1.0 {
+        return sample_top_p_prefix(logits, top_p, seed);
+    }
+
     // 2026-09-25: Top-k, min-p and top-p need descending order. With a top-k
     // cap, quickselect isolates the k largest in O(n) and only those k are
     // sorted. With none of the three, nothing is sorted: the distribution of
@@ -157,6 +164,12 @@ pub fn sample_with_params_seeded(
         probs.truncate(cutoff);
     }
 
+    multinomial_draw(&probs, seed)
+}
+
+/// 2026-10-14: The multinomial draw over `probs` (unnormalised weights, in order):
+/// `Some(seed)` draws from `StdRng::seed_from_u64(seed)`, `None` from `rand::random`.
+fn multinomial_draw(probs: &[(u32, f32)], seed: Option<u64>) -> u32 {
     let sum: f32 = probs.iter().map(|p| p.1).sum();
     let random_val: f32 = if let Some(s) = seed {
         use rand::Rng;
@@ -168,13 +181,70 @@ pub fn sample_with_params_seeded(
     };
     let threshold = random_val * sum;
     let mut cumsum = 0.0f32;
-    for &(idx, prob) in &probs {
+    for &(idx, prob) in probs {
         cumsum += prob;
         if cumsum >= threshold {
             return idx;
         }
     }
     probs.last().map_or(0, |p| p.0)
+}
+
+/// 2026-10-14: Top-p with no top-k cap and no min-p, over temperature-scaled
+/// `logits` (finite, non-empty). Same nucleus and draw as the sorted path: the
+/// weights are `exp(l - max)`, the order is descending logit, the cutoff is the
+/// first position where the cumulative share reaches `top_p`, and the draw runs
+/// over that prefix in that order. Only the prefix is sorted: the k largest are
+/// selected and sorted, and k grows 4x until the prefix holds the cutoff. The
+/// entropy is recorded over every candidate, as on the sorted path. The total
+/// weight is summed in vocabulary order rather than sorted order, so a cutoff
+/// can differ from the sorted path's only at float rounding.
+fn sample_top_p_prefix(mut logits: Vec<(u32, f32)>, top_p: f32, seed: Option<u64>) -> u32 {
+    let max_val = logits
+        .iter()
+        .map(|&(_, v)| v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|&(_, l)| (l - max_val).exp()).sum();
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        let h: f32 = logits
+            .iter()
+            .map(|&(_, l)| {
+                let p = (l - max_val).exp() * inv;
+                if p > 1e-10 { -p * p.ln() } else { 0.0 }
+            })
+            .sum();
+        record_entropy(h);
+    }
+    let cmp_desc =
+        |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    let n = logits.len();
+    let mut k = n.min(256);
+    let cutoff = loop {
+        if k < n {
+            logits.select_nth_unstable_by(k - 1, cmp_desc);
+        }
+        logits[..k].sort_unstable_by(cmp_desc);
+        let mut cumsum = 0.0f32;
+        let mut found = None;
+        for (i, &(_, l)) in logits[..k].iter().enumerate() {
+            cumsum += (l - max_val).exp() / sum;
+            if cumsum >= top_p {
+                found = Some(i + 1);
+                break;
+            }
+        }
+        match found {
+            Some(c) => break c,
+            None if k == n => break n,
+            None => k = (k * 4).min(n),
+        }
+    };
+    let probs: Vec<(u32, f32)> = logits[..cutoff]
+        .iter()
+        .map(|&(idx, l)| (idx, (l - max_val).exp()))
+        .collect();
+    multinomial_draw(&probs, seed)
 }
 
 /// 2026-09-25: Returns what `max_by(partial_cmp.unwrap_or(Equal))` returns:
@@ -280,3 +350,7 @@ mod greedy_tests {
         assert_eq!(greedy_pick_last_wins(&v), 200_000);
     }
 }
+
+#[cfg(test)]
+#[path = "sample_impl_tests.rs"]
+mod sample_impl_tests;

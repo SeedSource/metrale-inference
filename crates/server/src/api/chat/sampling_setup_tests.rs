@@ -287,4 +287,146 @@ mod tests {
             );
         }
     }
+
+    use super::super::{CoreDefaults, CoreSampling, resolve_core_sampling};
+
+    /// 2026-10-14: GLM-5.3's four `[sampling.*]` presets as MODEL.toml declares them
+    /// (`crates/kernels/tests/glm53_sampling_presets.rs` checks the file).
+    fn glm53_preset() -> metrale_kernels::SamplingCategory {
+        metrale_kernels::SamplingCategory {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repetition_penalty: 1.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            lz_penalty: 0.0,
+            min_p: Some(0.0),
+            top_n_sigma: Some(0.0),
+        }
+    }
+
+    /// 2026-10-14: The server defaults a GLM-5.3 serve starts with at 526615e1:
+    /// generation_config temperature 1.0 / top_p 0.95, the old parse default top_k 20,
+    /// `--default-top-n-sigma 1.0`, `--default-min-p 0.08`.
+    const SERVER: CoreDefaults = CoreDefaults {
+        temperature: 1.0,
+        top_k: 20,
+        top_p: 0.95,
+        top_n_sigma: 1.0,
+        min_p: 0.08,
+    };
+
+    fn glm(req: &crate::ir::SamplingParams) -> CoreSampling {
+        resolve_core_sampling(req, &glm53_preset(), true, SERVER, false, 0.0, 0.0)
+    }
+
+    /// 2026-10-14: What vLLM v0.30.0 samples with for this request on the official
+    /// checkpoint: the request value, then generation_config (temperature 1.0,
+    /// top_p 0.95), then the built-ins (protocol.py:638-644: top_k 0, min_p 0.0,
+    /// repetition_penalty 1.0; presence/frequency 0.0, protocol.py:218 and 229).
+    /// vLLM has no top-n-sigma (0.0 = off here).
+    fn vllm(req: &crate::ir::SamplingParams) -> CoreSampling {
+        CoreSampling {
+            temperature: req.temperature.unwrap_or(1.0),
+            top_k: req.top_k.unwrap_or(0),
+            top_p: req.top_p.unwrap_or(0.95),
+            top_n_sigma: req.top_n_sigma.unwrap_or(0.0),
+            min_p: req.min_p.unwrap_or(0.0),
+            repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
+            presence_penalty: req.presence_penalty.unwrap_or(0.0),
+            frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        }
+    }
+
+    /// 2026-10-14: A request with no sampling fields, or with only temperature and
+    /// top_p (the contract's T>0 requests), samples with vLLM's values.
+    #[test]
+    fn glm53_omitted_fields_take_the_official_values() {
+        let cases = [
+            crate::ir::SamplingParams::default(),
+            crate::ir::SamplingParams {
+                temperature: Some(1.0),
+                top_p: Some(0.95),
+                ..Default::default()
+            },
+            crate::ir::SamplingParams {
+                temperature: Some(0.6),
+                top_p: Some(0.9),
+                ..Default::default()
+            },
+        ];
+        for req in cases {
+            assert_eq!(glm(&req), vllm(&req), "{req:?}");
+        }
+        let d = glm(&crate::ir::SamplingParams::default());
+        assert_eq!((d.top_k, d.min_p, d.top_n_sigma), (0, 0.0, 0.0));
+    }
+
+    /// 2026-10-14: A request value still wins over the preset, for every field.
+    #[test]
+    fn glm53_request_values_win() {
+        let req = crate::ir::SamplingParams {
+            temperature: Some(0.7),
+            top_k: Some(40),
+            top_p: Some(0.8),
+            top_n_sigma: Some(1.5),
+            min_p: Some(0.05),
+            repetition_penalty: Some(1.1),
+            presence_penalty: Some(0.5),
+            frequency_penalty: Some(-0.5),
+        };
+        let got = glm(&req);
+        assert_eq!(got, vllm(&req));
+        assert_eq!(
+            (got.temperature, got.top_k, got.top_p, got.top_n_sigma, got.min_p),
+            (0.7, 40, 0.8, 1.5, 0.05)
+        );
+    }
+
+    /// 2026-10-14: Temperature 0 is kept (greedy); `METRALE_FORCE_TEMP_ZERO` still
+    /// clears every filter.
+    #[test]
+    fn glm53_greedy_requests_stay_greedy() {
+        let req = crate::ir::SamplingParams {
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(glm(&req).temperature, 0.0);
+        let forced = resolve_core_sampling(
+            &crate::ir::SamplingParams::default(),
+            &glm53_preset(),
+            true,
+            SERVER,
+            true,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            (forced.temperature, forced.top_k, forced.top_p, forced.min_p, forced.top_n_sigma),
+            (0.0, 0, 1.0, 0.0, 0.0)
+        );
+    }
+
+    /// 2026-10-14: A model without `use_sampling_presets_for_core` keeps the server
+    /// defaults (the pre-change resolution).
+    #[test]
+    fn models_without_core_presets_keep_the_server_defaults() {
+        let got = resolve_core_sampling(
+            &crate::ir::SamplingParams::default(),
+            &glm53_preset(),
+            false,
+            SERVER,
+            false,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            (got.temperature, got.top_k, got.top_p, got.top_n_sigma, got.min_p),
+            (1.0, 20, 0.95, 1.0, 0.08)
+        );
+    }
 }

@@ -91,6 +91,45 @@ min_reasoning_floor_tokens = 0
 # the last (spark-bench c30gate TEBGAP-TRACE.md C).
 hf_tool_json = true
 render_tools_on_tool_choice_none = true
+# 2026-10-14: Request-omitted sampling = the official serve's: the [sampling.*] presets below
+# feed temperature, top_k, top_p, min_p and top-n-sigma (api/chat/sampling_setup.rs), not the
+# server-wide --default-min-p 0.08 / --default-top-n-sigma 1.0 and the parse default top_k 20.
+use_sampling_presets_for_core = true
+
+# 2026-10-14: The official values, the same for every category. nvidia/GLM-5.3-Flash-NVFP4
+# @09b04e5e generation_config.json sets temperature 1.0 and top_p 0.95 only; vLLM v0.30.0
+# (ced6857a) fills the rest from its built-ins (entrypoints/openai/chat_completion/protocol.py
+# 638-644 and 672-698: top_k 0 = all tokens, min_p 0.0, repetition_penalty 1.0; presence and
+# frequency 0.0, lines 218 and 229) and has no top-n-sigma. top_k = 0 and the 0.0 keys below
+# turn those filters off; the penalties keep their neutral parse defaults. A request value wins.
+
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 0
+min_p = 0.0
+top_n_sigma = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 0.95
+top_k = 0
+min_p = 0.0
+top_n_sigma = 0.0
 
 # 2026-09-25: The target matcher: ptx_for_config (crates/kernels/src/resolve.rs) matches a
 # checkpoint to this target by [[model_types]], and serve refuses a model_type that no

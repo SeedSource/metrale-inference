@@ -76,6 +76,142 @@ fn tool_grammar_escape_applies(disable_tool_grammar: bool, tool_choice_required:
     disable_tool_grammar && !tool_choice_required
 }
 
+/// 2026-10-14: The server-level values a request-omitted field falls back to when
+/// MODEL.toml does not set `use_sampling_presets_for_core` (`AppState::default_*`).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CoreDefaults {
+    pub(super) temperature: f32,
+    pub(super) top_k: u32,
+    pub(super) top_p: f32,
+    pub(super) top_n_sigma: f32,
+    pub(super) min_p: f32,
+}
+
+/// 2026-10-14: The core sampler values of one chat request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct CoreSampling {
+    pub(super) temperature: f32,
+    pub(super) top_k: u32,
+    pub(super) top_p: f32,
+    pub(super) top_n_sigma: f32,
+    pub(super) min_p: f32,
+    pub(super) repetition_penalty: f32,
+    pub(super) presence_penalty: f32,
+    pub(super) frequency_penalty: f32,
+}
+
+/// 2026-10-14: `build_sampling`'s core values, without I/O: the request's value,
+/// then the preset or the server default, then MODEL.toml's `min_p_floor` and
+/// `temperature_max` (0.0 = off). `force_temp_zero` is `METRALE_FORCE_TEMP_ZERO`.
+pub(super) fn resolve_core_sampling(
+    req: &crate::ir::SamplingParams,
+    preset: &metrale_kernels::SamplingCategory,
+    core_preset: bool,
+    d: CoreDefaults,
+    force_temp_zero: bool,
+    min_p_floor: f32,
+    temperature_max: f32,
+) -> CoreSampling {
+    // 2026-09-26: A request value wins. Otherwise temperature, top_k and
+    // top_p come from the preset when MODEL.toml sets
+    // `use_sampling_presets_for_core`, and from the server defaults when it
+    // does not.
+    let temperature = if force_temp_zero {
+        0.0
+    } else {
+        req.temperature.unwrap_or(if core_preset {
+            preset.temperature
+        } else {
+            d.temperature
+        })
+    };
+    let top_k = if force_temp_zero {
+        0
+    } else {
+        req.top_k.unwrap_or(if core_preset {
+            preset.top_k
+        } else {
+            d.top_k
+        })
+    };
+    let top_p = if force_temp_zero {
+        1.0
+    } else {
+        req.top_p.unwrap_or(if core_preset {
+            preset.top_p
+        } else {
+            d.top_p
+        })
+    };
+    // 2026-09-26: top_n_sigma and min_p: the request, then (with
+    // `use_sampling_presets_for_core`) the preset when it sets one, then the
+    // server default.
+    let top_n_sigma = if force_temp_zero {
+        0.0
+    } else {
+        req
+            .top_n_sigma
+            .or(if core_preset {
+                preset.top_n_sigma
+            } else {
+                None
+            })
+            .unwrap_or(d.top_n_sigma)
+    };
+    let min_p = if force_temp_zero {
+        0.0
+    } else {
+        req
+            .min_p
+            .or(if core_preset { preset.min_p } else { None })
+            .unwrap_or(d.min_p)
+    };
+    let repetition_penalty = if force_temp_zero {
+        1.0
+    } else {
+        req
+            .repetition_penalty
+            .unwrap_or(preset.repetition_penalty)
+    };
+    let presence_penalty = if force_temp_zero {
+        0.0
+    } else {
+        req
+            .presence_penalty
+            .unwrap_or(preset.presence_penalty)
+    };
+    let frequency_penalty = if force_temp_zero {
+        0.0
+    } else {
+        req
+            .frequency_penalty
+            .unwrap_or(preset.frequency_penalty)
+    };
+    // 2026-09-26: MODEL.toml `[behavior]` `min_p_floor` and `temperature_max`
+    // apply after the values above, so they bind whatever the client sends.
+    // 0.0 turns each off; neither applies under `METRALE_FORCE_TEMP_ZERO`.
+    let min_p = if !force_temp_zero && min_p_floor > 0.0 {
+        min_p.max(min_p_floor)
+    } else {
+        min_p
+    };
+    let temperature = if !force_temp_zero && temperature_max > 0.0 {
+        temperature.min(temperature_max)
+    } else {
+        temperature
+    };
+    CoreSampling {
+        temperature,
+        top_k,
+        top_p,
+        top_n_sigma,
+        min_p,
+        repetition_penalty,
+        presence_penalty,
+        frequency_penalty,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 pub(super) fn build_sampling(
@@ -101,95 +237,31 @@ pub(super) fn build_sampling(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    // 2026-09-26: A request value wins. Otherwise temperature, top_k and
-    // top_p come from the preset when MODEL.toml sets
-    // `use_sampling_presets_for_core`, and from the server defaults when it
-    // does not.
     let core_preset = state.behavior.use_sampling_presets_for_core;
-    let temperature = if force_temp_zero {
-        0.0
-    } else {
-        req.sampling.temperature.unwrap_or(if core_preset {
-            preset.temperature
-        } else {
-            state.default_temperature
-        })
-    };
-    let top_k = if force_temp_zero {
-        0
-    } else {
-        req.sampling.top_k.unwrap_or(if core_preset {
-            preset.top_k
-        } else {
-            state.default_top_k
-        })
-    };
-    let top_p = if force_temp_zero {
-        1.0
-    } else {
-        req.sampling.top_p.unwrap_or(if core_preset {
-            preset.top_p
-        } else {
-            state.default_top_p
-        })
-    };
-    // 2026-09-26: top_n_sigma and min_p: the request, then (with
-    // `use_sampling_presets_for_core`) the preset when it sets one, then the
-    // server default.
-    let top_n_sigma = if force_temp_zero {
-        0.0
-    } else {
-        req.sampling
-            .top_n_sigma
-            .or(if core_preset {
-                preset.top_n_sigma
-            } else {
-                None
-            })
-            .unwrap_or(state.default_top_n_sigma)
-    };
-    let min_p = if force_temp_zero {
-        0.0
-    } else {
-        req.sampling
-            .min_p
-            .or(if core_preset { preset.min_p } else { None })
-            .unwrap_or(state.default_min_p)
-    };
-    let repetition_penalty = if force_temp_zero {
-        1.0
-    } else {
-        req.sampling
-            .repetition_penalty
-            .unwrap_or(preset.repetition_penalty)
-    };
-    let presence_penalty = if force_temp_zero {
-        0.0
-    } else {
-        req.sampling
-            .presence_penalty
-            .unwrap_or(preset.presence_penalty)
-    };
-    let frequency_penalty = if force_temp_zero {
-        0.0
-    } else {
-        req.sampling
-            .frequency_penalty
-            .unwrap_or(preset.frequency_penalty)
-    };
-    // 2026-09-26: MODEL.toml `[behavior]` `min_p_floor` and `temperature_max`
-    // apply after the values above, so they bind whatever the client sends.
-    // 0.0 turns each off; neither applies under `METRALE_FORCE_TEMP_ZERO`.
-    let min_p = if !force_temp_zero && state.behavior.min_p_floor > 0.0 {
-        min_p.max(state.behavior.min_p_floor)
-    } else {
-        min_p
-    };
-    let temperature = if !force_temp_zero && state.behavior.temperature_max > 0.0 {
-        temperature.min(state.behavior.temperature_max)
-    } else {
-        temperature
-    };
+    let CoreSampling {
+        temperature,
+        top_k,
+        top_p,
+        top_n_sigma,
+        min_p,
+        repetition_penalty,
+        presence_penalty,
+        frequency_penalty,
+    } = resolve_core_sampling(
+        &req.sampling,
+        preset,
+        core_preset,
+        CoreDefaults {
+            temperature: state.default_temperature,
+            top_k: state.default_top_k,
+            top_p: state.default_top_p,
+            top_n_sigma: state.default_top_n_sigma,
+            min_p: state.default_min_p,
+        },
+        force_temp_zero,
+        state.behavior.min_p_floor,
+        state.behavior.temperature_max,
+    );
     // 2026-09-26: Logs the resolved values of the first request in the
     // process.
     {

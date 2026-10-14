@@ -191,6 +191,7 @@ pub(super) fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_thinking_in_tools: pb.thinking_in_tools,
                 behavior_max_thinking_budget: pb.max_thinking_budget,
                 behavior_effort_capped_at_ceiling: pb.effort_capped_at_ceiling,
+                behavior_effort_prompt_only: pb.effort_prompt_only,
                 behavior_thinking_default: pb.thinking_default,
                 behavior_fp8_kv_calibration_tokens: pb.fp8_kv_calibration_tokens,
                 behavior_default_kv_dtype: pb.default_kv_dtype,

@@ -32,9 +32,17 @@ pub struct ServeSchedulingArgs {
     /// An explicit client token budget (`thinking.budget_tokens`,
     /// `thinking_token_budget`) still wins; the budget is capped at 90% of
     /// max_tokens unless MODEL.toml sets `cap_thinking_at_max_tokens = false`.
+    /// For a model with `effort_prompt_only` (GLM-5.3, no budget by default),
+    /// giving this flag brings the budget ladder back.
     /// Refused together with `--disable-thinking`.
     #[arg(long)]
     pub max_thinking_budget: Option<u32>,
+
+    /// 2026-10-14: Reply limit (tokens) of a request that sends no
+    /// `max_tokens` / `max_completion_tokens` / `max_output_tokens`. Admission
+    /// reserves prompt + min(this, max_seq_len) for such a request.
+    #[arg(long, default_value_t = 4096)]
+    pub default_max_tokens: usize,
 
     /// Override MODEL.toml's `[behavior].max_inter_tool_prose` (tokens):
     /// the cap on free-prose tokens between successive tool calls on a

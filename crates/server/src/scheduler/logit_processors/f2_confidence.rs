@@ -11,6 +11,10 @@
 //! `seq.force_end_thinking`; `forced_think_end` decides when `</think>` is
 //! injected.
 //!
+//! 2026-10-14: It also needs a thinking budget. Thinking with none
+//! (`[behavior].effort_prompt_only`, GLM-5.3) ends only when the model closes
+//! it, as on the official model, so the stage does not run there.
+//!
 //! Owner: scheduler.
 //! Invariants:
 //! - This stage never writes `logits`.
@@ -32,6 +36,7 @@ impl LogitsProcessor for F2ConfidenceEarlyStop {
             && a.inside_thinking
             && !a.force_end_thinking
             && a.thinking_tokens >= 400
+            && a.thinking_budget.is_some()
             && ctx.watchdog.confidence_early_stop
         {
             let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -67,5 +72,47 @@ impl LogitsProcessor for F2ConfidenceEarlyStop {
 
     fn is_argmax_invariant(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-10-14: A run of confident thinking tokens arms the forced `</think>`
+    /// only when the sequence has a thinking budget.
+    #[test]
+    fn confidence_stop_needs_a_thinking_budget() {
+        let scratch = crate::scheduler::sched_ctx::DecodeScratch::default();
+        let io = crate::scheduler::io::SchedIo::for_test();
+        let ctx = LogitsContext {
+            scratch: &scratch,
+            tel: &*io.tel,
+            clock: &*io.clock,
+            watchdog: crate::scheduler::helpers::WatchdogParams::default(),
+            boundary_mask: None,
+            mid_word_mask: None,
+            sampling: super::super::SamplingLevers::default(),
+            think_end_token: Some(1),
+            think_start_token: Some(2),
+            tool_call_start_token: Some(3),
+            tool_call_end_token: Some(4),
+            code_fence_token: None,
+            verify_pos: 0,
+        };
+        assert!(ctx.watchdog.confidence_early_stop);
+        for (budget, want_armed) in [(Some(1_000_000), true), (None, false)] {
+            let (mut a, _rx) = crate::scheduler::test_support::test_seq(Vec::new(), 1000, None, 0);
+            a.inside_thinking = true;
+            a.enable_thinking = true;
+            a.thinking_tokens = 400;
+            a.thinking_budget = budget;
+            for _ in 0..=ctx.watchdog.confidence_run_length {
+                let mut logits = vec![-100.0f32; 8];
+                logits[5] = 10.0;
+                F2ConfidenceEarlyStop.apply(&mut logits, &mut a, &ctx);
+            }
+            assert_eq!(a.force_end_thinking, want_armed, "budget {budget:?}");
+        }
     }
 }

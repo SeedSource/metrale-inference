@@ -100,6 +100,7 @@ pub(super) struct Target {
     pub(super) behavior_thinking_in_tools: bool,
     pub(super) behavior_max_thinking_budget: u32,
     pub(super) behavior_effort_capped_at_ceiling: bool,
+    pub(super) behavior_effort_prompt_only: bool,
     pub(super) behavior_thinking_default: bool,
     pub(super) behavior_fp8_kv_calibration_tokens: usize,
     pub(super) behavior_default_kv_dtype: String,

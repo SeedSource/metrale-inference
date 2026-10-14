@@ -290,6 +290,8 @@ pub(crate) fn load_model(
     )?;
 
     let adaptive_sampling = args.adaptive_sampling;
+    // 2026-10-14: The reply limit of a request that names none.
+    crate::openai::set_default_max_tokens(args.default_max_tokens);
     let session_manager = session_manager::SessionSsmManager::new(600);
     // 2026-09-26: The thinking budget a sequence gets when the model opens
     // `<think>` on its own (`emit_step/token.rs`): `--max-thinking-budget`,

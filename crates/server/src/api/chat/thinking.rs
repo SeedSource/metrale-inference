@@ -8,9 +8,14 @@
 //!   3. MODEL.toml `[behavior].thinking_default`, which a tool turn overrides to off
 //!      when `thinking_in_tools` is false.
 //!
+//! 2026-10-14: With MODEL.toml `[behavior].effort_prompt_only` (GLM-5.3), thinking that is
+//! on has no budget unless the client names one: effort reaches the model only through the
+//! chat template's prompt line, as on the official model.
+//!
 //! Owner: server chat API.
 //! Invariants:
 //! - A disabled result carries no budget: `enable_thinking == false` implies `None`.
+//! - `enable_thinking == true` with `None` means no budget: only `effort_prompt_only` gives it.
 
 use std::sync::Arc;
 
@@ -31,6 +36,7 @@ pub(super) fn resolve_thinking(
             thinking_in_tools: state.behavior.thinking_in_tools,
             max_thinking_budget: state.behavior.max_thinking_budget,
             effort_capped_at_ceiling: state.behavior.effort_capped_at_ceiling,
+            effort_prompt_only: state.behavior.effort_prompt_only,
             cap_at_max_tokens: state.behavior.cap_thinking_at_max_tokens,
         },
         max_tokens,
@@ -66,6 +72,10 @@ struct Policy {
     /// ladder at E, so high and xhigh give E. An explicit client token budget is not
     /// affected.
     effort_capped_at_ceiling: bool,
+    /// 2026-10-14: MODEL.toml `[behavior].effort_prompt_only` (after the
+    /// `--max-thinking-budget` / `METRALE_EFFORT_THINKING_BUDGET` override): thinking
+    /// without a client budget gets none, at every effort level.
+    effort_prompt_only: bool,
     /// 2026-09-26: MODEL.toml `[behavior].cap_thinking_at_max_tokens`. When false, the
     /// budget (the client's, or `max_thinking_budget`) is not clamped to 90% of
     /// `max_tokens`.
@@ -86,6 +96,9 @@ fn resolve(
         ThinkingDirective::Unspecified => (policy.model_default, None),
         ThinkingDirective::Off => (false, None),
         ThinkingDirective::On { budget } => (true, budget),
+        // 2026-10-14: The official GLM-5.3 template turns effort into the prompt line
+        // "Reasoning Effort: Low|High|Max" and nothing else; no budget here.
+        ThinkingDirective::OnEffort(_) if policy.effort_prompt_only => (true, None),
         // 2026-09-26: An effort level scales with `max_thinking_budget`, which MODEL.toml
         // or `--max-thinking-budget` sets.
         ThinkingDirective::OnEffort(level) => (
@@ -105,7 +118,12 @@ fn resolve(
     } else {
         et
     };
-    let budget = if et {
+    let budget = if et && tb.is_none() && policy.effort_prompt_only {
+        // 2026-10-14: No budget: no forced `</think>`, no confidence early stop and no
+        // 90% `max_tokens` clamp; thinking ends when the model closes it or at
+        // `max_tokens`.
+        None
+    } else if et {
         let b = tb.unwrap_or(policy.max_thinking_budget);
         if !policy.cap_at_max_tokens {
             Some(b)
@@ -161,6 +179,7 @@ mod tests {
             thinking_in_tools: true,
             max_thinking_budget: 2048,
             effort_capped_at_ceiling: false,
+            effort_prompt_only: false,
             cap_at_max_tokens: true,
         }
     }
@@ -291,6 +310,7 @@ mod tests {
         let p = Policy {
             max_thinking_budget: 128,
             effort_capped_at_ceiling: true,
+            effort_prompt_only: false,
             cap_at_max_tokens: false,
             ..policy()
         };
@@ -314,6 +334,7 @@ mod tests {
         let p = Policy {
             max_thinking_budget: 128,
             effort_capped_at_ceiling: true,
+            effort_prompt_only: false,
             cap_at_max_tokens: false,
             ..policy()
         };
@@ -422,5 +443,86 @@ mod tests {
         assert!(et);
         assert_eq!(tb, Some(230));
         assert!(tb.unwrap() < 256);
+    }
+
+    fn prompt_only() -> Policy {
+        // 2026-10-14: GLM-5.3: E = 256 (the default), the 90% clamp on, effort a prompt
+        // line only.
+        Policy {
+            max_thinking_budget: 256,
+            effort_prompt_only: true,
+            ..policy()
+        }
+    }
+
+    #[test]
+    fn prompt_only_gives_every_effort_level_no_budget() {
+        use crate::ir::EffortLevel;
+        for level in [
+            EffortLevel::Minimal,
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::XHigh,
+        ] {
+            for tools in [false, true] {
+                let r = resolve(ThinkingDirective::OnEffort(level), prompt_only(), 65536, tools);
+                assert_eq!(r, (true, None), "{level:?} tools={tools}");
+            }
+            // 2026-10-14: not the 90% clamp either: a small max_tokens still gives None.
+            let r = resolve(ThinkingDirective::OnEffort(level), prompt_only(), 100, false);
+            assert_eq!(r, (true, None), "{level:?} max_tokens 100");
+        }
+    }
+
+    #[test]
+    fn prompt_only_thinking_on_without_a_budget_has_none() {
+        let r = resolve(ThinkingDirective::On { budget: None }, prompt_only(), 65536, false);
+        assert_eq!(r, (true, None));
+        let r = resolve(
+            ThinkingDirective::Unspecified,
+            Policy {
+                model_default: true,
+                ..prompt_only()
+            },
+            65536,
+            false,
+        );
+        assert_eq!(r, (true, None));
+    }
+
+    #[test]
+    fn prompt_only_keeps_an_explicit_client_budget_and_off() {
+        let r = resolve(ThinkingDirective::On { budget: Some(700) }, prompt_only(), 65536, false);
+        assert_eq!(r, (true, Some(700)));
+        // 2026-10-14: the client's budget keeps the 90% clamp it always had.
+        let r = resolve(ThinkingDirective::On { budget: Some(700) }, prompt_only(), 100, false);
+        assert_eq!(r, (true, Some(90)));
+        assert_eq!(resolve(ThinkingDirective::Off, prompt_only(), 65536, false), (false, None));
+        let off = Policy {
+            disable_thinking: true,
+            ..prompt_only()
+        };
+        let r = resolve(ThinkingDirective::OnEffort(crate::ir::EffortLevel::XHigh), off, 65536, false);
+        assert_eq!(r, (false, None));
+    }
+
+    #[test]
+    fn without_prompt_only_the_ladder_is_unchanged() {
+        // 2026-10-14: the lever-on / other-model path: 128 / 256 / 512 / 1024 at E = 256.
+        use crate::ir::EffortLevel;
+        let ladder = Policy {
+            effort_prompt_only: false,
+            ..prompt_only()
+        };
+        for (level, want) in [
+            (EffortLevel::Low, 128),
+            (EffortLevel::Medium, 256),
+            (EffortLevel::High, 512),
+            (EffortLevel::XHigh, 1024),
+        ] {
+            let r = resolve(ThinkingDirective::OnEffort(level), ladder, 65536, false);
+            assert_eq!(r, (true, Some(want)), "{level:?}");
+        }
     }
 }

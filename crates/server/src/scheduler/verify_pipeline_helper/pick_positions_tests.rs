@@ -824,6 +824,9 @@ fn spec_think_partial_accept_does_not_leak_pipeline_accumulators() {
         let mut a = thinking_grammarless_seq();
         a.thinking_tokens = 400;
         a.consecutive_confident = 57;
+        // 2026-10-14: F2 runs only with a thinking budget (`effort_prompt_only`
+        // thinking has none); one far above this window keeps it on.
+        a.thinking_budget = Some(100_000);
         a
     };
     let rows = vec![row(&[(HELLO, 10.0)]); 4];

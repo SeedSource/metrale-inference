@@ -127,7 +127,9 @@ pub(super) fn render_template(
         enable_thinking,
         thinking_budget,
         close_open_think,
-        state.behavior.max_thinking_budget,
+        // 2026-10-14: `effort_prompt_only` (GLM-5.3): template-forced thinking gets no
+        // budget, as the official template's default (effort Max) has none.
+        (!state.behavior.effort_prompt_only).then_some(state.behavior.max_thinking_budget),
     );
 
     Ok(TemplateOut {
@@ -148,6 +150,9 @@ struct ThinkTokens {
 /// means the template forced thinking on; thinking is then enabled with the model's
 /// `max_thinking_budget`.
 ///
+/// 2026-10-14: `forced_budget` is that budget: `None` under `effort_prompt_only` (no
+/// budget, as on the official model, whose template always opens `<think>`).
+///
 /// 2026-10-12: `close_open_think` (the request itself asked for thinking off) appends
 /// the think-end token to such a tail instead, so the prompt ends `<think></think>` and
 /// thinking stays off. This is the convention of the official zai-org GLM-4.5
@@ -160,7 +165,7 @@ fn resolve_think_tail(
     enable_thinking: bool,
     thinking_budget: Option<u32>,
     close_open_think: bool,
-    max_thinking_budget: u32,
+    forced_budget: Option<u32>,
 ) -> (bool, Option<u32>) {
     let Some(think_start) = think.start else {
         return (enable_thinking, thinking_budget);
@@ -182,9 +187,9 @@ fn resolve_think_tail(
     }
     tracing::info!(
         "Template-forced thinking detected (unclosed \\<think\\> in prompt tail) — \
-         overriding enable_thinking=true with budget={max_thinking_budget}",
+         overriding enable_thinking=true with budget={forced_budget:?}",
     );
-    (true, Some(max_thinking_budget))
+    (true, forced_budget)
 }
 
 /// 2026-09-26: Build the Jinja-facing JSON message array from [`MsgEntry`] values,
@@ -435,177 +440,5 @@ mod json_message_tests {
 }
 
 #[cfg(test)]
-mod think_tail_tests {
-    use super::{ThinkTokens, resolve_think_tail};
-
-    const START: u32 = 10;
-    const END: u32 = 11;
-    const MAX_BUDGET: u32 = 256;
-    const THINK: ThinkTokens = ThinkTokens {
-        start: Some(START),
-        end: Some(END),
-    };
-
-    /// 2026-10-12: The GLM-5.3 generation prompt: `<|assistant|>` (7) then an open
-    /// `<think>`.
-    fn glm_open_tail() -> Vec<u32> {
-        vec![1, 2, 3, 7, START]
-    }
-
-    #[test]
-    fn request_off_closes_the_open_think() {
-        let mut toks = glm_open_tail();
-        let out = resolve_think_tail(&mut toks, THINK, false, None, true, MAX_BUDGET);
-        assert_eq!(toks, vec![1, 2, 3, 7, START, END]);
-        assert_eq!(out, (false, None), "thinking stays off, no budget");
-    }
-
-    #[test]
-    fn without_request_off_the_template_still_forces_thinking() {
-        // 2026-10-12: The car's behaviour (absent directive, `--disable-thinking`,
-        // a server or model default) is unchanged: prompt untouched, thinking forced on.
-        let mut toks = glm_open_tail();
-        let out = resolve_think_tail(&mut toks, THINK, false, None, false, MAX_BUDGET);
-        assert_eq!(toks, glm_open_tail());
-        assert_eq!(out, (true, Some(MAX_BUDGET)));
-    }
-
-    #[test]
-    fn thinking_on_is_unchanged() {
-        for close in [false, true] {
-            let mut toks = glm_open_tail();
-            let out = resolve_think_tail(&mut toks, THINK, true, Some(128), close, MAX_BUDGET);
-            assert_eq!(toks, glm_open_tail());
-            assert_eq!(out, (true, Some(128)));
-        }
-    }
-
-    #[test]
-    fn a_template_that_already_closed_think_gets_nothing_appended() {
-        // 2026-10-12: Qwen-style templates render `<think></think>` themselves when
-        // thinking is off.
-        let closed = vec![1, 7, START, 5, END, 5];
-        let mut toks = closed.clone();
-        let out = resolve_think_tail(&mut toks, THINK, false, None, true, MAX_BUDGET);
-        assert_eq!(toks, closed);
-        assert_eq!(out, (false, None));
-    }
-
-    #[test]
-    fn no_think_tokens_or_no_end_token_leave_the_prompt_alone() {
-        let mut toks = glm_open_tail();
-        let none = ThinkTokens {
-            start: None,
-            end: None,
-        };
-        assert_eq!(
-            resolve_think_tail(&mut toks, none, false, None, true, MAX_BUDGET),
-            (false, None)
-        );
-        assert_eq!(toks, glm_open_tail());
-        // 2026-10-12: No `</think>` id: nothing to close with, the old override applies.
-        let start_only = ThinkTokens {
-            start: Some(START),
-            end: None,
-        };
-        assert_eq!(
-            resolve_think_tail(&mut toks, start_only, false, None, true, MAX_BUDGET),
-            (true, Some(MAX_BUDGET))
-        );
-        assert_eq!(toks, glm_open_tail());
-    }
-
-    #[test]
-    fn request_off_answer_is_content_from_its_first_token() {
-        // 2026-10-12: The resolved `enable_thinking` drives the reasoning split. After
-        // the close it is false, so the GLM (`qwen` format) parser gives no reasoning and
-        // keeps the answer's first words; the old forced-on result put a tagless answer
-        // in reasoning and left content empty.
-        let parser = crate::reasoning_parser::ReasoningFormat::Qwen.into_parser();
-        let answer = "Hello there. The answer is 4.";
-        let mut toks = glm_open_tail();
-        let (et, _) = resolve_think_tail(&mut toks, THINK, false, None, true, MAX_BUDGET);
-        assert_eq!(
-            parser.extract_thinking(answer, et),
-            (None, answer.to_string())
-        );
-        let mut toks = glm_open_tail();
-        let (et_old, _) = resolve_think_tail(&mut toks, THINK, false, None, false, MAX_BUDGET);
-        assert_eq!(
-            parser.extract_thinking(answer, et_old),
-            (Some(answer.to_string()), String::new())
-        );
-    }
-
-    /// 2026-10-12: The real GLM-5.3 tokenizer and official zai-org chat template, from
-    /// `METRALE_TEST_GLM53_DIR` (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`;
-    /// without the config the loader falls back to ChatML); skipped when
-    /// unset. The template renders the same tokens for `enable_thinking` absent, true and
-    /// false (it has no such branch); the request-off prompt is that render plus exactly
-    /// the `</think>` token, decoding to `...<|assistant|><think></think>`.
-    #[test]
-    fn glm53_official_template_off_is_render_plus_think_end() {
-        let Ok(dir) = std::env::var("METRALE_TEST_GLM53_DIR") else {
-            eprintln!("METRALE_TEST_GLM53_DIR unset; skipping");
-            return;
-        };
-        let tok = crate::tokenizer::ChatTokenizer::from_model_dir(
-            std::path::Path::new(&dir),
-            0,
-            true,
-            "glm5_next",
-            None,
-            false,
-        )
-        .expect("GLM-5.3 tokenizer");
-        let start = tok.encode("<think>").expect("encode")[0];
-        let end = tok.think_end_token_id().expect("</think> is one token");
-        let think = ThinkTokens {
-            start: Some(start),
-            end: Some(end),
-        };
-        let messages = [
-            serde_json::json!({"role": "system", "content": "You are a helpful assistant."}),
-            serde_json::json!({"role": "user", "content": "Say hello."}),
-        ];
-        let render = |thinking: bool, effort: Option<&str>| {
-            tok.apply_chat_template_openai_with_effort(
-                &messages, None, thinking, false, effort, None,
-            )
-            .expect("render")
-        };
-        let base = render(true, None);
-        assert_eq!(
-            render(false, None),
-            base,
-            "enable_thinking=false renders the same"
-        );
-        assert_eq!(
-            render(false, Some("none")),
-            base,
-            "effort none renders the same"
-        );
-        assert_eq!(
-            *base.last().unwrap(),
-            start,
-            "official render ends in an open <think>"
-        );
-
-        let mut off = render(false, None);
-        let out = resolve_think_tail(&mut off, think, false, None, true, MAX_BUDGET);
-        assert_eq!(out, (false, None));
-        assert_eq!(off[..base.len()], base[..]);
-        assert_eq!(off[base.len()..], [end]);
-        let tail = tok
-            .decode_with_special(&off[off.len() - 3..])
-            .expect("decode");
-        assert!(
-            tail.ends_with("<|assistant|><think></think>"),
-            "tail {tail:?}"
-        );
-        assert_eq!(
-            tok.decode_with_special(&off).unwrap(),
-            format!("{}</think>", tok.decode_with_special(&base).unwrap())
-        );
-    }
-}
+#[path = "template_think_tail_tests.rs"]
+mod think_tail_tests;

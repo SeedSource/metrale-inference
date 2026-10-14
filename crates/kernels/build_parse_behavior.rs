@@ -24,6 +24,8 @@ pub(crate) struct ParsedBehavior {
     pub max_thinking_budget: u32,
     /// 2026-09-25: See `behavior_defaults.rs`: clamp effort levels at the ceiling.
     pub effort_capped_at_ceiling: bool,
+    /// 2026-10-14: See `behavior_defaults.rs`: effort as a prompt line only, no budget.
+    pub effort_prompt_only: bool,
     pub thinking_default: bool,
     pub fp8_kv_calibration_tokens: usize,
     pub default_kv_dtype: String,
@@ -75,6 +77,7 @@ impl Default for ParsedBehavior {
             thinking_in_tools: true,
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
+            effort_prompt_only: DEFAULT_EFFORT_PROMPT_ONLY,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: String::new(),
@@ -134,6 +137,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("effort_capped_at_ceiling"))
         .and_then(|v| v.as_bool())
         .unwrap_or(DEFAULT_EFFORT_CAPPED_AT_CEILING);
+    let effort_prompt_only = b
+        .and_then(|v| v.get("effort_prompt_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_EFFORT_PROMPT_ONLY);
     let thinking_default = b
         .and_then(|v| v.get("thinking_default"))
         .and_then(|v| v.as_bool())
@@ -264,6 +271,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
         effort_capped_at_ceiling,
+        effort_prompt_only,
         thinking_default,
         fp8_kv_calibration_tokens,
         default_kv_dtype,

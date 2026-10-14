@@ -399,8 +399,22 @@ impl ChatCompletionRequest {
     }
 }
 
+/// 2026-10-14: `--default-max-tokens`, set once at serve start
+/// ([`set_default_max_tokens`]); unset, 4096.
+static DEFAULT_MAX_TOKENS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// 2026-10-14: The reply limit of a request that names none (chat, completions and
+/// responses). The official GLM-5.3 serve runs such a request to the end of the
+/// context; Metrale reserves prompt + `min(max_tokens, msl)` at admission, so the
+/// default stays a fixed serve setting.
 pub(super) fn default_max_tokens() -> usize {
-    4096
+    DEFAULT_MAX_TOKENS.get().copied().unwrap_or(4096)
+}
+
+/// 2026-10-14: Set the default reply limit from `--default-max-tokens`. The first
+/// call wins (one serve per process).
+pub fn set_default_max_tokens(n: usize) {
+    let _ = DEFAULT_MAX_TOKENS.set(n);
 }
 pub(super) fn default_n() -> usize {
     1

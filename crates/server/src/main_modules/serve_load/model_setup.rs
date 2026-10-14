@@ -298,6 +298,14 @@ pub(super) fn resolve_behavior(
     if let Some(cli_budget) = args.max_thinking_budget {
         b.max_thinking_budget = cli_budget;
     }
+    // 2026-10-14: `effort_prompt_only` (MODEL.toml) gives thinking no budget at any
+    // effort. `--max-thinking-budget` or `METRALE_EFFORT_THINKING_BUDGET=1` brings the
+    // budget ladder back (`api/chat/thinking.rs`).
+    b.effort_prompt_only = effort_prompt_only(
+        b.effort_prompt_only,
+        args.max_thinking_budget.is_some(),
+        std::env::var("METRALE_EFFORT_THINKING_BUDGET").ok().as_deref(),
+    );
     if let Some(grammar_on) =
         crate::cli::flag_values::Tristate::validated(&args.tool_grammar).pinned()
     {
@@ -310,6 +318,31 @@ pub(super) fn resolve_behavior(
         b.preserve_thinking = Some(p);
     }
     b
+}
+
+/// 2026-10-14: Whether effort reaches the model only through the template (no thinking
+/// budget): MODEL.toml's `effort_prompt_only`, off when `--max-thinking-budget` is given or
+/// `METRALE_EFFORT_THINKING_BUDGET` is `1` (default off).
+fn effort_prompt_only(model: bool, cli_budget: bool, lever: Option<&str>) -> bool {
+    model && !cli_budget && lever.map(str::trim) != Some("1")
+}
+
+#[cfg(test)]
+mod effort_prompt_only_tests {
+    use super::effort_prompt_only;
+
+    #[test]
+    fn lever_and_cli_budget_bring_the_ladder_back() {
+        assert!(effort_prompt_only(true, false, None));
+        assert!(effort_prompt_only(true, false, Some("0")));
+        assert!(effort_prompt_only(true, false, Some("")));
+        assert!(!effort_prompt_only(true, false, Some("1")));
+        assert!(!effort_prompt_only(true, false, Some(" 1 ")));
+        assert!(!effort_prompt_only(true, true, None));
+        // 2026-10-14: a model without the key keeps its ladder whatever the lever says.
+        assert!(!effort_prompt_only(false, false, None));
+        assert!(!effort_prompt_only(false, false, Some("0")));
+    }
 }
 
 pub(super) fn load_tokenizer(

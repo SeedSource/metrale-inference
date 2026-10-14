@@ -33,3 +33,16 @@ pub const DEFAULT_MAX_THINKING_BUDGET: u32 = 256;
 /// The clamp applies only to the effort ladder; an explicit client token
 /// budget is not clamped.
 pub const DEFAULT_EFFORT_CAPPED_AT_CEILING: bool = false;
+
+/// 2026-10-14: Default `[behavior].effort_prompt_only`: whether `reasoning_effort`
+/// reaches the model only through the chat template, with no thinking token budget.
+///
+/// `false` keeps the budget ladder above. `true` gives every effort level, and a
+/// thinking-on request that names no budget (including template-forced thinking), no
+/// budget: no forced `</think>`, no `F2ConfidenceEarlyStop`, and no 90% `max_tokens`
+/// clamp, so thinking ends when the model closes it or at `max_tokens`. That is the
+/// official GLM-5.3 semantics: its `chat_template.jinja` (nvidia/GLM-5.3-Flash-NVFP4
+/// @09b04e5e, lines 2-3) renders effort as the prompt line "Reasoning Effort:
+/// Low|High|Max" and vLLM serves it with no budget. An explicit client token budget
+/// still applies. `kernels/gb10/glm-5.3-flash` sets it.
+pub const DEFAULT_EFFORT_PROMPT_ONLY: bool = false;

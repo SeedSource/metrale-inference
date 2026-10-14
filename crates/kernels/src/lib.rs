@@ -35,7 +35,7 @@ pub use resolve::{ResolveCandidate, TargetResolveError, ptx_for_config, ptx_for_
 // and `ModelBehavior::default()` read one constant.
 mod behavior_defaults;
 pub use behavior_defaults::{
-    DEFAULT_EFFORT_CAPPED_AT_CEILING, DEFAULT_MAX_INTER_TOOL_PROSE, DEFAULT_MAX_THINKING_BUDGET,
+    DEFAULT_EFFORT_CAPPED_AT_CEILING, DEFAULT_EFFORT_PROMPT_ONLY, DEFAULT_MAX_INTER_TOOL_PROSE, DEFAULT_MAX_THINKING_BUDGET,
 };
 
 // 2026-09-25: The compiled target's serving defaults, baked from
@@ -188,6 +188,10 @@ pub struct ModelBehavior {
     /// xhigh resolve to `max_thinking_budget` instead of 2E and 4E. Default
     /// [`DEFAULT_EFFORT_CAPPED_AT_CEILING`].
     pub effort_capped_at_ceiling: bool,
+    /// 2026-10-14: Effort reaches the model only through the chat template; no
+    /// thinking budget unless the client names one. Default
+    /// [`DEFAULT_EFFORT_PROMPT_ONLY`].
+    pub effort_prompt_only: bool,
     /// 2026-09-25: Thinking state for a request that carries no thinking
     /// directive. Any explicit directive overrides it, and
     /// `--disable-thinking` turns thinking off for every request. Default
@@ -327,6 +331,7 @@ impl Default for ModelBehavior {
             thinking_in_tools: true,
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
+            effort_prompt_only: DEFAULT_EFFORT_PROMPT_ONLY,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: "",

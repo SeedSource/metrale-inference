@@ -57,6 +57,15 @@ routed_scaling_factor = 2.5
 hc_mult = 4
 hc_sinkhorn_iters = 20
 
+# 2026-10-14: Effort is a prompt line only, as on the official model. Its chat_template.jinja
+# (nvidia/GLM-5.3-Flash-NVFP4 @09b04e5e, lines 2-3) renders "Reasoning Effort: Low|High|Max"
+# (any other value, and none, is Max) and vLLM serves it with no thinking budget. So no
+# effort level, and no request without one, gets a budget, a forced </think> or the
+# confidence early stop; an explicit client budget still applies. METRALE_EFFORT_THINKING_BUDGET=1
+# or --max-thinking-budget brings the old ladder back (64/128/256/512/1024 at E = 256).
+[behavior]
+effort_prompt_only = true
+
 # 2026-09-25: The target matcher: ptx_for_config (crates/kernels/src/resolve.rs) matches a
 # checkpoint to this target by [[model_types]], and serve refuses a model_type that no
 # target declares (serve_load.rs). The dimension keys in [model] do not take part.

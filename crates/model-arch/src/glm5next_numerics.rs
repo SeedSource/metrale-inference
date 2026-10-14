@@ -100,6 +100,8 @@ impl Family {
 pub enum Fmt {
     Fp8,
     Nvfp4,
+    /// 2026-10-14: deliberately coarse 2-bit symmetric positive control (host-side).
+    Int2,
 }
 
 impl Fmt {
@@ -107,12 +109,14 @@ impl Fmt {
         match self {
             Fmt::Fp8 => "fp8",
             Fmt::Nvfp4 => "nvfp4",
+            Fmt::Int2 => "int2",
         }
     }
     fn parse(s: &str) -> Option<Fmt> {
         match s {
             "fp8" => Some(Fmt::Fp8),
             "nvfp4" => Some(Fmt::Nvfp4),
+            "int2" => Some(Fmt::Int2),
             _ => None,
         }
     }
@@ -146,7 +150,7 @@ pub fn parse_fakeq(raw: Option<&str>) -> Result<FakeqSpec> {
         let Some((fam, fmt)) = item.split_once(':') else {
             bail!(
                 "METRALE_GLM_NUMERICS_FAKEQ: item {item:?} is not <family>:<fmt> (families: {}; \
-                 formats: fp8, nvfp4)",
+                 formats: fp8, nvfp4, int2)",
                 family_list()
             );
         };
@@ -158,7 +162,9 @@ pub fn parse_fakeq(raw: Option<&str>) -> Result<FakeqSpec> {
             );
         };
         let Some(m) = Fmt::parse(fmt) else {
-            bail!("METRALE_GLM_NUMERICS_FAKEQ: unknown format {fmt:?} for {fam} (fp8, nvfp4)");
+            bail!(
+                "METRALE_GLM_NUMERICS_FAKEQ: unknown format {fmt:?} for {fam} (fp8, nvfp4, int2)"
+            );
         };
         if out.iter().any(|(g, _)| *g == f) {
             bail!("METRALE_GLM_NUMERICS_FAKEQ: family {fam} listed twice");
@@ -327,6 +333,31 @@ pub fn fake_quant_inplace(
             gpu.free(q.weight)?;
             gpu.free(q.weight_scale)?;
             r?;
+        }
+        Fmt::Int2 => {
+            // Host-side, in row chunks (<= 64 MiB of BF16 each): int2 is a positive control, so
+            // no device kernel (and no image change) is needed. Same arithmetic as
+            // `host_ref::int2_fakeq_bits`.
+            let rows_per = ((32usize << 20) / k).max(1);
+            let mut buf = Vec::new();
+            let mut r0 = 0;
+            while r0 < n {
+                let m = rows_per.min(n - r0);
+                buf.resize(m * k * 2, 0u8);
+                let at = w.offset(r0 * k * 2);
+                gpu.copy_d2h(at, &mut buf)?;
+                let src: Vec<u16> = buf
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let out = host_ref::int2_fakeq_bits(&src, m, k);
+                for (c, v) in buf.chunks_exact_mut(2).zip(out) {
+                    c.copy_from_slice(&v.to_le_bytes());
+                }
+                gpu.copy_h2d(&buf, at)?;
+                r0 += m;
+            }
+            gpu.synchronize(s)?;
         }
     }
     let new = read_rows(gpu, w, k, &rows)?;
@@ -663,6 +694,33 @@ pub mod host_ref {
         out
     }
 
+    /// 2026-10-14: the `int2` positive-control fake-quant on a BF16 `[n, k]` matrix (bit patterns):
+    /// per group of 16 consecutive values along K, scale = max|x| / 1.5 (f32; a zero group stays
+    /// zero), code = clamp(floor(x / scale + 2), 0, 3) (round to nearest, ties toward +), value =
+    /// (code - 1.5) * scale in f32, RNE to BF16. Values are {-1.5, -0.5, 0.5, 1.5} * scale.
+    pub fn int2_fakeq_bits(src: &[u16], n: usize, k: usize) -> Vec<u16> {
+        assert!(k % 16 == 0 && src.len() == n * k);
+        let mut out = Vec::with_capacity(src.len());
+        for grp in src.chunks_exact(16) {
+            let mx = grp
+                .iter()
+                .map(|&b| bf16::from_bits(b).to_f32().abs())
+                .filter(|a| !a.is_nan())
+                .fold(0.0f32, f32::max);
+            let scale = mx / 1.5;
+            for &b in grp {
+                let v = bf16::from_bits(b).to_f32();
+                if scale == 0.0 || !scale.is_finite() || v.is_nan() {
+                    out.push(if scale == 0.0 { 0 } else { b });
+                    continue;
+                }
+                let code = (v / scale + 2.0).floor().clamp(0.0, 3.0);
+                out.push(bf16::from_f32((code - 1.5) * scale).to_bits());
+            }
+        }
+        out
+    }
+
     /// `dequant_nvfp4_to_bf16` on `packed` `[n, k/2]`, `scales` `[n, k/16]`, tensor scale `g`:
     /// `E2M1(nibble) * (E4M3(scale) * g)` in f32, RNE to BF16 (bit patterns).
     pub fn nvfp4_dequant_bits(
@@ -808,6 +866,71 @@ mod tests {
             let want = bf16::from_f32(E2M1_LUT[c] * 0.5).to_bits();
             assert_eq!(b, want, "col {c}");
         }
+    }
+
+    #[test]
+    fn parse_accepts_int2() {
+        let s = parse_fakeq(Some("router:int2")).unwrap();
+        assert_eq!(s.0, vec![(Family::Router, Fmt::Int2)]);
+        assert_eq!(Fmt::Int2.name(), "int2");
+        assert!(parse_fakeq(Some("router:int3")).is_err());
+        assert!(parse_fakeq(Some("router:int2,router:fp8")).is_err());
+    }
+
+    fn bf(v: f32) -> u16 {
+        bf16::from_f32(v).to_bits()
+    }
+
+    #[test]
+    fn int2_reference_known_vector() {
+        // max|x| = 3.0 -> scale 2.0, levels {-3,-1,1,3}. Boundaries at -2, 0, 2 (x/scale -1,0,1).
+        let mut g = vec![0.0f32; 16];
+        g[..8].copy_from_slice(&[3.0, -3.0, 0.9, -0.9, 1.1, -1.1, 2.1, -2.1]);
+        g[8] = 0.0; // ties toward +: 0 -> +1
+        g[9] = 1.9;
+        g[10] = -1.9;
+        let src: Vec<u16> = g.iter().map(|&v| bf(v)).collect();
+        let out = int2_fakeq_bits(&src, 1, 16);
+        let want = [3.0, -3.0, 1.0, -1.0, 1.0, -1.0, 3.0, -3.0, 1.0, 1.0, -1.0];
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(bf16::from_bits(out[i]).to_f32(), *w, "idx {i}");
+        }
+        // A zero group stays zero; groups are independent (second group has its own scale).
+        let mut two = vec![0u16; 32];
+        two[16] = bf(0.3);
+        let o = int2_fakeq_bits(&two, 1, 32);
+        assert!(o[..16].iter().all(|&b| b == 0));
+        assert_eq!(
+            bf16::from_bits(o[16]).to_f32(),
+            bf16::from_f32(1.5 * (0.3f32 / 1.5)).to_f32()
+        );
+        // Every output is one of 4 levels per group.
+        let lv: std::collections::BTreeSet<u32> = out
+            .iter()
+            .map(|&b| bf16::from_bits(b).to_f32().to_bits())
+            .collect();
+        assert!(lv.len() <= 4, "{lv:?}");
+    }
+
+    #[test]
+    fn int2_error_much_larger_than_nvfp4_scale_on_random_data() {
+        // Gaussian-ish data via an LCG; compare with a 4-bit-like grid (fp8 reference as the
+        // fine format) and the analytic 2-bit floor.
+        let (n, k) = (8, 256);
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut u = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let src: Vec<u16> = (0..n * k)
+            .map(|_| bf((((u() + u() + u() + u()) - 2.0) * 1.7) as f32))
+            .collect();
+        let e2 = err_stats(&src, &int2_fakeq_bits(&src, n, k)).rel_rms();
+        let e8 = err_stats(&src, &fp8_fakeq_bits(&src, n, k)).rel_rms();
+        assert!(e2 > 0.2, "int2 rel_rms {e2}");
+        assert!(e2 > 10.0 * e8, "int2 {e2} vs fp8 {e8}");
     }
 
     #[test]

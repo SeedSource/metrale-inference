@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! 2026-09-26: Loop-watchdog cases that need a long stream: a repeat separated by
-//! kilobytes of unique text, and a repeat whose last copy has more text on its line.
+//! kilobytes of unique text (no longer a loop since the 2026-10-14 periodic-tail rule),
+//! and a repeating 2-line block whose last copy has more text on its line.
 //! `stream_guards`' inline tests cover an already-triggered call, empty text, four
 //! identical lines and the buffer trim.
 //!
@@ -51,27 +52,22 @@ fn phrase_with_unique_interstitials(n: usize) -> String {
 const TOKEN_SIZES: std::ops::RangeInclusive<usize> = 1..=16;
 
 #[test]
-fn a_repeat_separated_by_kilobytes_of_unique_prose_still_fires() {
-    // 2026-09-26: Four copies of the phrase span about 5.6 KB, which the buffer still
-    // holds: it is trimmed only above 10,240 bytes. The filler is unique to each copy,
-    // so only the phrase can fire the watchdog.
+fn a_repeat_separated_by_kilobytes_of_unique_prose_does_not_fire() {
+    // 2026-10-14 (#82 guard fix; was `..._still_fires`): a line that comes back between
+    // kilobytes of new text is structure, not a loop. Only a periodic tail fires now.
     let feed = phrase_with_unique_interstitials(5);
-    assert!(
-        feed.len() > 3_000,
-        "the interstitials must exceed the old 3 KB window to be a regression test; got {}",
-        feed.len()
-    );
+    assert!(feed.len() > 3_000);
     for chunk in TOKEN_SIZES {
         assert!(
-            fires(&feed, chunk),
-            "5 repeats across large unique interstitials must fire at chunk size {chunk}"
+            !fires(&feed, chunk),
+            "5 repeats across large unique interstitials must not fire at chunk size {chunk}"
         );
     }
 }
 
 #[test]
 fn three_repeats_do_not_fire() {
-    // 2026-09-26: The watchdog fires at 4 occurrences (`check_loop_watchdog`).
+    // 2026-10-14: Not periodic (new filler between copies), so never fires.
     let feed = phrase_with_unique_interstitials(3);
     for chunk in TOKEN_SIZES {
         assert!(
@@ -84,9 +80,9 @@ fn three_repeats_do_not_fire() {
 
 #[test]
 fn a_repeat_whose_last_instance_starts_mid_line_still_fires() {
-    // 2026-09-26: The fourth copy has more text after it on the same line, so the
-    // finished line does not match the first three; the watchdog has to fire while
-    // that line is still arriving.
+    // 2026-10-14: The phrase and the line after it form a 2-line block repeated back to
+    // back; the third copy of the block completes the periodic tail (period 2, 3
+    // repeats), before the fourth phrase copy with its extra text arrives.
     let mut feed = String::new();
     for _ in 0..3 {
         feed.push_str(PHRASE);
@@ -117,8 +113,8 @@ fn ordinary_varied_prose_never_fires() {
 
 #[test]
 fn a_repeating_short_line_does_not_fire() {
-    // 2026-09-26: Lines of 15 bytes or fewer (trimmed) are never the needle, so repeated
-    // short code lines such as `}` do not fire.
+    // 2026-10-14: A block needs 16 alphanumeric chars, so repeated short code lines
+    // such as `}` do not fire.
     let feed = "}\n".repeat(50);
     assert!(!fires(&feed, 8), "short repeated lines must be ignored");
 }

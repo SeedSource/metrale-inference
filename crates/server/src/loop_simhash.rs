@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 2026-09-26: Sentence-level loop guard for the chat stream: a sentence trips
-//! it when its set of word-bigram hashes has a Jaccard similarity at or above
-//! the threshold with one of the last `cap` sentences stored. Despite the
-//! type's name, no SimHash is computed.
+//! 2026-09-26: Sentence-level loop guard for the chat stream. A sentence is a
+//! repeat when its set of word-bigram hashes has a Jaccard similarity at or
+//! above the threshold with one of the last `cap` sentences stored. Since
+//! 2026-10-14 (#82 guard fix) the guard trips only on a sustained run: `run`
+//! (default 3, `METRALE_SIMHASH_RUN`) checked sentences in a row that are each
+//! a repeat that adds no word bigram absent from the ring. One matching
+//! sentence (a code line beside a similar one, a templated heading) no longer
+//! ends the stream, nor does a list whose items share a template but each name
+//! something new: a loop's vocabulary closes, a list's keeps growing. Despite
+//! the type's name, no SimHash is computed.
 //!
 //! Owner: server chat stream.
 //! Invariants: the ring holds at most `cap` sets, and `cap` is at least 1.
@@ -23,6 +29,28 @@ const DEFAULT_JACCARD_THRESHOLD_PCT: u32 = 55;
 const WORD_SHINGLE_LEN: usize = 2;
 const MIN_NORMALIZED_LEN: usize = 24;
 const MIN_WORDS: usize = 3;
+/// 2026-10-14: Consecutive repeat sentences that trip the guard, when
+/// `METRALE_SIMHASH_RUN` is unset or not an integer >= 1.
+const DEFAULT_RUN: usize = 3;
+/// 2026-10-14: A sentence with fewer word bigrams than this is compared at
+/// `SHORT_THRESHOLD_PCT` (when that is above the guard's threshold): a 3-bigram
+/// set reaches 55% by sharing 2 bigrams.
+const SHORT_BIGRAMS: usize = 6;
+const SHORT_THRESHOLD_PCT: u32 = 75;
+
+/// 2026-10-14: Read once per process: `METRALE_SIMHASH_RUN`, the consecutive
+/// repeat sentences that trip the guard (default `DEFAULT_RUN`; an unset,
+/// unparsable or zero value keeps the default).
+fn default_run() -> usize {
+    static RUN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RUN.get_or_init(|| {
+        std::env::var("METRALE_SIMHASH_RUN")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(DEFAULT_RUN)
+    })
+}
 
 /// 2026-09-26: The word-bigram sets of the last `cap` sentences stored.
 #[derive(Debug)]
@@ -30,6 +58,10 @@ pub struct SimHashLoopGuard {
     ring: VecDeque<BTreeSet<u64>>,
     cap: usize,
     threshold_pct: u32,
+    /// 2026-10-14: Repeat sentences in a row needed to trip.
+    run: usize,
+    /// 2026-10-14: Repeat sentences in a row so far.
+    streak: usize,
 }
 
 impl Default for SimHashLoopGuard {
@@ -46,20 +78,31 @@ impl SimHashLoopGuard {
     }
 
     /// 2026-09-26: A ring of `cap` sets (at least 1) and a Jaccard threshold
-    /// in whole percent (55 means 0.55).
+    /// in whole percent (55 means 0.55); the run length is the process default.
     pub fn with_params(cap: usize, threshold_pct: u32) -> Self {
+        Self::with_run(cap, threshold_pct, default_run())
+    }
+
+    /// 2026-10-14: As `with_params`, tripping after `run` (at least 1)
+    /// consecutive repeat sentences.
+    pub fn with_run(cap: usize, threshold_pct: u32, run: usize) -> Self {
         Self {
             ring: VecDeque::with_capacity(cap.max(1)),
             cap: cap.max(1),
             threshold_pct,
+            run: run.max(1),
+            streak: 0,
         }
     }
 
-    /// 2026-09-26: True when the sentence's bigram set reaches the threshold
-    /// (`jaccard_pct`) against any set in the ring. The set then enters the
-    /// ring, evicting the oldest one past `cap`. A sentence shorter than
-    /// `MIN_NORMALIZED_LEN` bytes once normalized, or with fewer than
-    /// `MIN_WORDS` words, returns false and is not stored.
+    /// 2026-10-14: True when this sentence completes a run of `run` checked
+    /// sentences in a row that each reach the threshold (`jaccard_pct`; at
+    /// least `SHORT_THRESHOLD_PCT` for a set under `SHORT_BIGRAMS` bigrams)
+    /// against some set in the ring and whose bigrams all appear somewhere in
+    /// the ring. Any other checked sentence ends the run. The set then enters the ring, evicting the oldest one past `cap`. A
+    /// sentence shorter than `MIN_NORMALIZED_LEN` bytes once normalized, or
+    /// with fewer than `MIN_WORDS` words, returns false, is not stored and
+    /// leaves the run as it was.
     pub fn check(&mut self, sentence: &str) -> bool {
         let normalized = normalize(sentence);
         if normalized.len() < MIN_NORMALIZED_LEN {
@@ -69,19 +112,30 @@ impl SimHashLoopGuard {
         if shingles.is_empty() {
             return false;
         }
+        let threshold = if shingles.len() < SHORT_BIGRAMS {
+            self.threshold_pct.max(SHORT_THRESHOLD_PCT)
+        } else {
+            self.threshold_pct
+        };
         let dup = self
             .ring
             .iter()
-            .any(|prev| jaccard_pct(&shingles, prev) >= self.threshold_pct);
+            .any(|prev| jaccard_pct(&shingles, prev) >= threshold);
+        let closed = dup
+            && shingles
+                .iter()
+                .all(|h| self.ring.iter().any(|prev| prev.contains(h)));
+        self.streak = if closed { self.streak + 1 } else { 0 };
         if self.ring.len() >= self.cap {
             self.ring.pop_front();
         }
         self.ring.push_back(shingles);
-        dup
+        self.streak >= self.run
     }
 
     pub fn reset(&mut self) {
         self.ring.clear();
+        self.streak = 0;
     }
 
     pub fn len(&self) -> usize {
@@ -207,16 +261,74 @@ mod tests {
 
     #[test]
     fn paraphrase_with_case_change_triggers_on_third_repeat() {
-        let mut g = SimHashLoopGuard::new();
         let s1 = "I'll create a proper Rust Axum server with the /echo endpoint.";
         let s2 = "I'll create a proper Rust axum server with an /echo endpoint and tests.";
         let s3 = "I'll create a proper Rust axum server with the /echo endpoint.";
+        // 2026-10-14 (#82 guard fix): the guard trips on the third repeat in a row
+        // (`DEFAULT_RUN`) whose words are all already in the ring. s2 is a repeat but
+        // brings new bigrams (`with an`, `and tests`), so it does not count; s3, s4 and
+        // s5 do, and s5 trips. Before the fix s2 tripped.
+        let s4 = "I'll create a proper Rust Axum server with an /echo endpoint.";
+        let s5 = "I'll create a proper Rust axum server with the /echo endpoint and tests.";
+        let mut g = SimHashLoopGuard::with_run(DEFAULT_RING_CAP, DEFAULT_JACCARD_THRESHOLD_PCT, 3);
         assert!(!g.check(s1), "first sentence is novel");
         assert!(
-            g.check(s2),
-            "second sentence (case+wording paraphrase) duplicates first"
+            !g.check(s2),
+            "second sentence (case+wording paraphrase) is a repeat with new words"
         );
-        assert!(g.check(s3), "third sentence duplicates first/second");
+        assert!(!g.check(s3), "third sentence: closed repeat, run 1");
+        assert!(!g.check(s4), "fourth sentence: closed repeat, run 2");
+        assert!(g.check(s5), "fifth sentence: closed repeat, run 3, trips");
+    }
+
+    #[test]
+    fn a_templated_list_that_names_something_new_each_item_does_not_trip() {
+        let mut g = SimHashLoopGuard::with_run(DEFAULT_RING_CAP, DEFAULT_JACCARD_THRESHOLD_PCT, 3);
+        for svc in [
+            "nginx",
+            "postgres",
+            "redis",
+            "kafka",
+            "grafana",
+            "prometheus",
+            "jenkins",
+            "rabbitmq",
+            "elasticsearch",
+            "memcached",
+            "haproxy",
+            "vault",
+        ] {
+            let item =
+                format!("- Restart the {svc} service and verify that it comes back up cleanly.");
+            assert!(!g.check(&item), "{item}");
+        }
+    }
+
+    #[test]
+    fn a_novel_sentence_ends_the_run() {
+        let mut g = SimHashLoopGuard::with_run(DEFAULT_RING_CAP, DEFAULT_JACCARD_THRESHOLD_PCT, 3);
+        let s = "I will create the Rust axum server with proper tests.";
+        assert!(!g.check(s));
+        assert!(!g.check(s));
+        assert!(!g.check(s));
+        assert!(!g.check("Next we wire the router into main and bind the listener."));
+        assert!(!g.check(s), "run restarts at 1 after a novel sentence");
+        assert!(!g.check(s));
+        assert!(g.check(s));
+    }
+
+    #[test]
+    fn short_sentences_need_the_short_threshold() {
+        // 2026-10-14: 4-bigram sets sharing 3 bigrams are 60% similar: a repeat at
+        // 55%, not at the 75% a set under `SHORT_BIGRAMS` bigrams needs.
+        let mut g = SimHashLoopGuard::with_run(DEFAULT_RING_CAP, DEFAULT_JACCARD_THRESHOLD_PCT, 1);
+        assert!(!g.check("elif scale_setting matches the Standard:"));
+        assert!(!g.check("elif scale_setting matches the Premium:"));
+        assert!(!g.check("elif scale_setting matches the Economy:"));
+        assert!(
+            g.check("elif scale_setting matches the Economy:"),
+            "an exact repeat still counts"
+        );
     }
 
     #[test]
@@ -290,11 +402,13 @@ mod tests {
 
     #[test]
     fn f47_cc_session_23x_phrase_loop_trips() {
-        let mut g = SimHashLoopGuard::new();
+        let mut g = SimHashLoopGuard::with_run(DEFAULT_RING_CAP, DEFAULT_JACCARD_THRESHOLD_PCT, 3);
         let s =
             "I see the issue. Let me try a different approach - let me use the cargo bin directly:";
         assert!(!g.check(s), "first emit must be novel");
-        assert!(g.check(s), "exact repeat must trip");
+        assert!(!g.check(s), "first repeat is run 1");
+        assert!(!g.check(s), "second repeat is run 2");
+        assert!(g.check(s), "third repeat in a row must trip");
     }
 
     #[test]
@@ -316,11 +430,16 @@ mod tests {
     }
 
     #[test]
-    fn identical_sentences_trip_immediately() {
-        let mut g = SimHashLoopGuard::new();
+    fn identical_sentences_trip_on_the_third_repeat() {
+        let mut g = SimHashLoopGuard::with_run(DEFAULT_RING_CAP, DEFAULT_JACCARD_THRESHOLD_PCT, 3);
         let s = "I will create the Rust axum server with proper tests.";
         assert!(!g.check(s), "first emit is novel");
-        assert!(g.check(s), "exact repeat must trip");
+        assert!(
+            !g.check(s),
+            "one exact repeat no longer trips (#82 guard fix)"
+        );
+        assert!(!g.check(s));
+        assert!(g.check(s), "third exact repeat in a row trips");
     }
 
     #[test]

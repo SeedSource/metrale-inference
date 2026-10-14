@@ -64,9 +64,10 @@ pub(super) fn process_detector_content(
     let sanitized = sanitized_or_raw;
 
     // 2026-09-26: SimHash semantic-loop guard (`loop_simhash`), checked at each sentence
-    // boundary or every 1024 pending bytes. One chunk at bigram Jaccard >= 0.55 against
-    // any of the last 16 trips it and ends the stream, which repetitive structured
-    // output can reach; `METRALE_SIMHASH_LOOP=0` turns it off.
+    // boundary or every 1024 pending bytes. Since 2026-10-14 (#82 guard fix) it ends the
+    // stream only after 3 checked chunks in a row (`METRALE_SIMHASH_RUN`) each reach
+    // bigram Jaccard >= 0.55 against one of the last 16 with no new bigram; one match used to, and cut
+    // ordinary code and markdown answers. `METRALE_SIMHASH_LOOP=0` turns it off.
     let semantic_trip = if simhash_loop_enabled() && !state.loop_watchdog_triggered {
         state.simhash_pending.push_str(sanitized);
         let mut dup = false;

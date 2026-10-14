@@ -94,6 +94,13 @@ pub(super) struct RunOptions {
     pub telemetry: &'static metrale_telemetry::Telemetry,
     /// 2026-09-25: Fault injection for the pipelined lane (the negative controls).
     pub pipeline_faults: crate::scheduler::PipelineFaults,
+    /// 2026-10-14: `METRALE_BISECT_NO_MIX`: no fused mixed step, so a tick runs its prefill chunk
+    /// and then a separate decode step, as a multi-rank serve does (`decode_slice` tests).
+    pub no_mix: bool,
+    /// 2026-10-14: `METRALE_PREFILL_CHUNK_WHILE_DECODING` (resolved value).
+    pub prefill_chunk_while_decoding: Option<usize>,
+    /// 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK` (resolved value).
+    pub decode_steps_per_prefill_chunk: Option<usize>,
 }
 
 /// 2026-09-25: Never configured: every feed into it takes the `Off` branch.
@@ -121,6 +128,9 @@ impl Default for RunOptions {
             lora_rotation: None,
             telemetry: &TELEMETRY_OFF,
             pipeline_faults: crate::scheduler::PipelineFaults::NONE,
+            no_mix: false,
+            prefill_chunk_while_decoding: None,
+            decode_steps_per_prefill_chunk: None,
         }
     }
 }
@@ -339,6 +349,9 @@ fn run_scenario_inner(sc: &Scenario, build: DeviceBuilder) -> Vec<String> {
     };
     let mut levers = SchedLevers::defaults();
     levers.mtp_gate_force = opts.mtp_gate_force;
+    levers.bisect_no_mix = opts.no_mix;
+    levers.prefill_chunk_while_decoding = opts.prefill_chunk_while_decoding;
+    levers.decode_steps_per_prefill_chunk = opts.decode_steps_per_prefill_chunk;
     let levers = Arc::new(levers);
     levers.set_loop_watchdog(opts.loop_watchdog);
     let masks = VocabMasks {

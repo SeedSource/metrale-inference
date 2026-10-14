@@ -17,6 +17,7 @@
 //! deadlines have already passed when the scheduler checks them, and
 //! cancel flags are flipped by the model at a scripted point.
 
+mod decode_slice_tests;
 mod model;
 mod model_feed;
 mod model_forward;

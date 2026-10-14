@@ -79,6 +79,11 @@ pub struct SchedulerCore {
     /// `plan_tick`); with `METRALE_PREFILL_CHUNK_WHILE_DECODING` on it decides the next tick's
     /// admissions and whether this tick's ContinuePrefills runs (`prefill_chunk_cap`).
     started_prefill: bool,
+    /// 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK`: decode-only ticks still owed after
+    /// the last prefill chunk (`decode_slice::next_left`), and whether this tick is one of them
+    /// (set in `plan_tick`, read by ContinuePrefills).
+    slice_left: usize,
+    slice_hold: bool,
     /// 2026-09-25: The pipelined decode lane's steps still in flight.
     pipeline: pipeline::Pipeline,
 }
@@ -305,6 +310,8 @@ impl SchedulerCore {
             snapshot_steps: 0,
             did_mixed_step: false,
             started_prefill: false,
+            slice_left: 0,
+            slice_hold: false,
             pipeline: pipeline::Pipeline::new(pipeline_faults),
         }
     }

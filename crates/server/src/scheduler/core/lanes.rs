@@ -84,11 +84,14 @@ impl SchedulerCore {
         let t_loop = sched.io.clock.now();
         // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING`: no second prefill chunk in a tick
         // whose StartPrefills ran one while a sequence decodes (`prefill_chunk_cap`).
-        let skip = crate::scheduler::prefill_chunk_cap::skip_continue(
-            sched.levers.prefill_chunk_while_decoding.is_some(),
-            crate::scheduler::prefill_chunk_cap::decoders(active),
-            self.started_prefill,
-        );
+        // 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK`: none on a held tick (`decode_slice`).
+        let skip = self.slice_hold
+            || crate::scheduler::prefill_chunk_cap::skip_continue(
+                sched.levers.prefill_chunk_while_decoding.is_some(),
+                crate::scheduler::prefill_chunk_cap::decoders(active),
+                self.started_prefill,
+            );
+        let before = (prefilling.len(), prefilling.first().map(|p| p.chunk_offset));
         *did_mixed_step = !skip
             && continue_in_progress_prefills(
             sched.io.dev.model(),
@@ -112,6 +115,17 @@ impl SchedulerCore {
             sched,
         );
         sched.io.tel.mark(mtp_timing::Phase::LoopPrefill, t_loop);
+        // 2026-10-14: The decode-only ticks owed after this one: a chunk ran if StartPrefills
+        // started a request or the head prefill moved (advanced or finished).
+        let prefill_ran = self.started_prefill
+            || before != (prefilling.len(), prefilling.first().map(|p| p.chunk_offset));
+        self.slice_left = crate::scheduler::decode_slice::next_left(
+            sched.levers.decode_steps_per_prefill_chunk,
+            crate::scheduler::prefill_chunk_cap::decoders(active),
+            self.slice_left,
+            self.slice_hold,
+            prefill_ran,
+        );
 
         if active.is_empty() {
             // 2026-09-25: `SkipRest` below also skips the end-of-tick resume, so give

@@ -16,6 +16,7 @@ mod decode_launch;
 mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
+mod decode_slice;
 mod decode_step;
 #[cfg(test)]
 mod emit_eos_thinking_tests;

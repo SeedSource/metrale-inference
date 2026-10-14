@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK` (`decode_slice`) through the real
+//! scheduler loop: one sequence decodes while a second, long prompt prefills in chunks, with the
+//! fused mixed step off (`no_mix`, the multi-rank shape) and the chunk-while-decoding cap on (the
+//! race car's setting). Off: one decode step per prefill chunk. `k`: `k` decode steps per chunk.
+//! Either way every client receives the same bytes, and a lone request runs the same model calls.
+//!
+//! Owner: scheduler.
+//! Invariants: none beyond the types.
+
+use super::model::ModelCfg;
+use super::runner::{EOS, ReqSpec, RunOptions, Scenario, run_scenario};
+
+fn reply(n: usize, base: u32) -> Vec<u32> {
+    let mut v: Vec<u32> = (0..n as u32).map(|i| base + i).collect();
+    v.push(EOS);
+    v
+}
+
+fn scenario(k: Option<usize>, with_decoder: bool) -> Scenario {
+    let mut reqs = Vec::new();
+    if with_decoder {
+        // 2026-10-14: the decoder: a short prompt and a long reply, so it decodes throughout.
+        reqs.push(ReqSpec::new(1, 4, reply(60, 100)));
+    }
+    // 2026-10-14: the long prompt: 64 tokens in 8-token chunks, arriving once seq 1 decodes.
+    let mut long = ReqSpec::new(2, 64, reply(3, 500));
+    long.arrive_at_tick = with_decoder.then_some(3);
+    reqs.push(long);
+    Scenario {
+        name: "decode_slice",
+        cfg: ModelCfg::default(),
+        opts: RunOptions {
+            max_prefill_tokens: 8,
+            no_mix: true,
+            prefill_chunk_while_decoding: Some(256),
+            decode_steps_per_prefill_chunk: k,
+            ..RunOptions::default()
+        },
+        reqs,
+    }
+}
+
+/// Per tick: (ran a prefill chunk of seq 2, ran a decode step).
+fn ticks(lines: &[String]) -> Vec<(bool, bool)> {
+    let mut out: Vec<(bool, bool)> = Vec::new();
+    for l in lines {
+        if l.starts_with("-- tick ") {
+            out.push((false, false));
+        } else if let Some(t) = out.last_mut() {
+            if l.starts_with("prefill_chunk(") && l.contains(" s2@") {
+                t.0 = true;
+            }
+            if l.starts_with("decode_batch(") || l.starts_with("decode(") {
+                t.1 = true;
+            }
+        }
+    }
+    out
+}
+
+/// The decode-only ticks between consecutive seq-2 chunks, while seq 1 is still decoding.
+fn gaps(t: &[(bool, bool)]) -> Vec<usize> {
+    let chunk_ticks: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.0).map(|(i, _)| i).collect();
+    chunk_ticks
+        .windows(2)
+        .map(|w| (w[0] + 1..w[1]).filter(|&i| t[i].1 && !t[i].0).count())
+        .collect()
+}
+
+fn outputs(lines: &[String]) -> Vec<String> {
+    lines.iter().filter(|l| l.starts_with("out s")).cloned().collect()
+}
+
+#[test]
+fn off_runs_one_decode_step_per_prefill_chunk() {
+    let lines = run_scenario(&scenario(None, true));
+    let t = ticks(&lines);
+    let g = gaps(&t);
+    assert!(g.len() >= 6, "seq 2 ran {} chunk ticks: {lines:#?}", g.len() + 1);
+    assert!(g.iter().all(|&n| n == 0), "off: chunks back to back, got gaps {g:?}");
+    assert!(t.iter().filter(|x| x.0).all(|x| x.1), "off: every chunk tick also decodes");
+}
+
+#[test]
+fn k_runs_k_decode_steps_per_prefill_chunk() {
+    for k in [2usize, 3, 5] {
+        let lines = run_scenario(&scenario(Some(k), true));
+        let t = ticks(&lines);
+        let g = gaps(&t);
+        assert!(g.len() >= 6, "k={k}: seq 2 ran {} chunk ticks", g.len() + 1);
+        assert!(g.iter().all(|&n| n == k - 1), "k={k}: want {} decode-only ticks per gap, got {g:?}", k - 1);
+        assert!(t.iter().filter(|x| x.0).all(|x| x.1), "k={k}: every chunk tick also decodes");
+    }
+}
+
+#[test]
+fn client_bytes_do_not_depend_on_the_lever() {
+    let off = outputs(&run_scenario(&scenario(None, true)));
+    assert_eq!(off.len(), 2, "{off:?}");
+    for k in [2usize, 3, 5] {
+        assert_eq!(outputs(&run_scenario(&scenario(Some(k), true))), off, "k={k}");
+    }
+}
+
+#[test]
+fn a_lone_request_runs_the_same_model_calls() {
+    // 2026-10-14: no decoder while seq 2 prefills, and no prefill while it decodes: the lever
+    // never holds a tick, so the whole trace is identical (the C=1 byte-identity case).
+    let off = run_scenario(&scenario(None, false));
+    for k in [2usize, 5] {
+        assert_eq!(run_scenario(&scenario(Some(k), false)), off, "k={k}");
+    }
+}

@@ -57,13 +57,24 @@ impl SchedulerCore {
         // tick started one (`prefill_chunk_cap::admit_now`); the rest return to the front of
         // the pending queue in arrival order.
         let mut new_reqs = new_reqs;
-        let admit = crate::scheduler::prefill_chunk_cap::admit_now(
-            sched.levers.prefill_chunk_while_decoding.is_some(),
+        // 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK`: a held tick (decode only, owed
+        // after the last prefill chunk) admits nothing (`decode_slice`).
+        self.slice_hold = crate::scheduler::decode_slice::hold(
+            sched.levers.decode_steps_per_prefill_chunk,
             crate::scheduler::prefill_chunk_cap::decoders(active),
-            new_reqs.len(),
-            !prefilling.is_empty(),
-            self.started_prefill,
+            self.slice_left,
         );
+        let admit = if self.slice_hold {
+            0
+        } else {
+            crate::scheduler::prefill_chunk_cap::admit_now(
+                sched.levers.prefill_chunk_while_decoding.is_some(),
+                crate::scheduler::prefill_chunk_cap::decoders(active),
+                new_reqs.len(),
+                !prefilling.is_empty(),
+                self.started_prefill,
+            )
+        };
         if admit < new_reqs.len() {
             for (i, req) in new_reqs.drain(admit..).enumerate() {
                 pending.requests.insert(i, req);

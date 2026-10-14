@@ -136,17 +136,42 @@ pub(crate) fn kv_decode_agree() -> bool {
 }
 
 /// 2026-10-14 (race-memory, A183): `METRALE_KV_DECODE_FAIL_ABOVE_BLOCKS` (test-only fault
-/// injection, 0 = off): an agreed KV growth whose last block index is at least N refuses on this
-/// rank. Read once, per process (per rank); deliberately NOT rank-agreed, so a test can set it on
-/// one rank only.
-pub(in crate::model) fn kv_decode_fail_above_blocks() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
+/// injection; unset, 0 or unparsable = off): `N` makes an agreed KV growth whose last block index
+/// is at least N refuse on every rank, `N@R` on rank R only (the 2-rank GPU check's one-rank
+/// refusal; the serve scripts give both ranks the same env). Read once, per process; deliberately
+/// NOT rank-agreed.
+pub(in crate::model) fn kv_decode_fail_above_blocks() -> (usize, Option<usize>) {
+    static N: OnceLock<(usize, Option<usize>)> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("METRALE_KV_DECODE_FAIL_ABOVE_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+            .map(|v| parse_fail_above(&v))
+            .unwrap_or((0, None))
     })
+}
+
+/// 2026-10-14 (race-memory, A183): `"N"` -> `(N, None)`, `"N@R"` -> `(N, Some(R))`; anything
+/// unparsable -> `(0, None)` (off).
+pub(in crate::model) fn parse_fail_above(v: &str) -> (usize, Option<usize>) {
+    let (n, r) = match v.trim().split_once('@') {
+        Some((n, r)) => match r.trim().parse() {
+            Ok(r) => (n, Some(r)),
+            Err(_) => return (0, None),
+        },
+        None => (v.trim(), None),
+    };
+    match n.trim().parse() {
+        Ok(n) => (n, r),
+        Err(_) => (0, None),
+    }
+}
+
+/// 2026-10-14 (race-memory, A183): The fault-injection threshold for `rank` (0 = off).
+pub(in crate::model) fn fail_above_for_rank(lever: (usize, Option<usize>), rank: usize) -> usize {
+    match lever {
+        (n, None) => n,
+        (n, Some(r)) if r == rank => n,
+        _ => 0,
+    }
 }
 
 /// 2026-10-14 (race-memory, A183): One sequence's rank-agreed KV growth through block
@@ -201,7 +226,10 @@ impl TransformerModel {
         agree_kv_blocks_with(
             seq,
             last_block,
-            kv_decode_fail_above_blocks(),
+            fail_above_for_rank(
+                kv_decode_fail_above_blocks(),
+                self.comm.as_ref().map_or(0, |c| c.rank()),
+            ),
             |s| {
                 ensure_blocks_through_decode(
                     s,

@@ -503,6 +503,20 @@ mod kv {
         assert_eq!(out[0].1, out[1].1);
     }
 
+    /// 2026-10-14: The fault-injection lever's value syntax and its per-rank threshold.
+    #[test]
+    fn fail_above_lever_parses_n_and_n_at_rank() {
+        use super::super::decode_lazy_agree::{fail_above_for_rank, parse_fail_above};
+        assert_eq!(parse_fail_above("40"), (40, None));
+        assert_eq!(parse_fail_above(" 40@1 "), (40, Some(1)));
+        assert_eq!(parse_fail_above("0"), (0, None));
+        assert_eq!(parse_fail_above("x"), (0, None));
+        assert_eq!(parse_fail_above("40@x"), (0, None), "a bad rank turns it off");
+        assert_eq!(fail_above_for_rank((40, None), 0), 40);
+        assert_eq!(fail_above_for_rank((40, Some(1)), 0), 0);
+        assert_eq!(fail_above_for_rank((40, Some(1)), 1), 40);
+    }
+
     /// 2026-10-14: The startup cap: blocks at or above the agreed count leave the free list and
     /// are never handed out; capping above the pool retires nothing; a cap below an in-use block
     /// fails.

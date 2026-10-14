@@ -120,6 +120,9 @@ impl ModelVerify for TransformerModel {
         if r.is_ok() {
             self.kda_defer_post_verify(seq, consumer);
         }
+        // 2026-10-14: Hybrid DFLASH step: ring the verify rows for the MTP catch-up while
+        // `hidden_states` still holds them (`hybrid_mtp_catchup.rs`). Both ranks run this verify.
+        let r = r.and_then(|v| self.hybrid_mtp_ring_stage(seq, tokens.len()).map(|()| v));
         self.release_verify_capture_on_err(r)
     }
 

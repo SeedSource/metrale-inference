@@ -168,7 +168,7 @@ fn hybrid_state_counts_sole_sequence_off_slot0() {
     assert!(
         h.counters
             .summary()
-            .ends_with("; sole off slot 0 MTP=2; rate demotions=0"),
+            .contains("; sole off slot 0 MTP=2; rate demotions=0; MTP accept"),
         "{}",
         h.counters.summary()
     );
@@ -186,11 +186,73 @@ fn hybrid_state_commit_reports_changes_only() {
     assert!(!h.commit(SpecStepMode::Dflash));
     assert_eq!(
         h.counters.summary(),
-        "steps PLAIN=0 MTP=0 DFLASH=0; switches MTP->DFLASH=1; sole off slot 0 MTP=0; rate demotions=0"
+        "steps PLAIN=0 MTP=0 DFLASH=0; switches MTP->DFLASH=1; sole off slot 0 MTP=0; rate \
+         demotions=0; MTP accept post-switch=0/0 (-, 0 steps) other=0/0 (-, 0 steps)"
     );
     assert_eq!(
         ModeCounters::default().summary(),
-        "steps PLAIN=0 MTP=0 DFLASH=0; switches none; sole off slot 0 MTP=0; rate demotions=0"
+        "steps PLAIN=0 MTP=0 DFLASH=0; switches none; sole off slot 0 MTP=0; rate demotions=0; \
+         MTP accept post-switch=0/0 (-, 0 steps) other=0/0 (-, 0 steps)"
+    );
+}
+
+/// 2026-10-14: #82 hybrid B2(i): the first `POST_SWITCH_MTP_STEPS` MTP verify steps of the
+/// sequence that left DFlash count as post-switch, every other MTP verify step as other, and a
+/// step with no pending drafts (a bootstrap) counts as neither.
+#[test]
+fn post_switch_mtp_acceptance_is_counted_apart() {
+    use SpecStepMode::*;
+    let t0 = Instant::now();
+    let ms = |m: u64| t0 + Duration::from_millis(m);
+    let mut h = HybridState::new(cfg());
+    let run = |h: &mut HybridState, t: u64, active: usize, s: Option<SoleSeq>| {
+        let m = h.decide(active, 8, s, true, ms(t));
+        h.commit(m);
+        m
+    };
+    assert_eq!(run(&mut h, 0, 1, sole(0, 10, 1)), Mtp);
+    h.note_mtp_verify(0, 3, 2);
+    assert_eq!(run(&mut h, 2000, 1, sole(0, 10, 30)), Dflash);
+    assert_eq!(run(&mut h, 2100, 2, None), Mtp);
+    h.note_mtp_verify(0, 0, 0);
+    h.note_mtp_verify(1, 3, 1);
+    for _ in 0..POST_SWITCH_MTP_STEPS {
+        h.note_mtp_verify(0, 3, 3);
+    }
+    h.note_mtp_verify(0, 3, 0);
+    let c = &h.counters;
+    assert_eq!(
+        c.post_switch_mtp,
+        AcceptTally {
+            accepted: 3 * u64::from(POST_SWITCH_MTP_STEPS),
+            proposed: 3 * u64::from(POST_SWITCH_MTP_STEPS),
+            steps: u64::from(POST_SWITCH_MTP_STEPS),
+        }
+    );
+    assert_eq!(
+        c.other_mtp,
+        AcceptTally {
+            accepted: 3,
+            proposed: 9,
+            steps: 3
+        }
+    );
+    let line = c.summary();
+    assert!(
+        line.ends_with(
+            "; MTP accept post-switch=96/96 (100.0%, 32 steps) other=3/9 (33.3%, 3 steps)"
+        ),
+        "{line}"
+    );
+    // 2026-10-14: A second stretch of the same slot restarts its post-switch window.
+    assert_eq!(run(&mut h, 2200, 1, sole(0, 10, 200)), Mtp);
+    assert_eq!(run(&mut h, 4300, 1, sole(0, 10, 260)), Dflash);
+    assert_eq!(run(&mut h, 4400, 2, None), Mtp);
+    h.note_mtp_verify(0, 4, 9);
+    assert_eq!(h.counters.post_switch_mtp.steps, 33);
+    assert_eq!(
+        h.counters.post_switch_mtp.accepted, 100,
+        "accepted is capped at proposed"
     );
 }
 

@@ -118,6 +118,10 @@ impl TransformerModel {
         // capture (the eager consume at end of prefill already did on a hybrid serve).
         if !hybrid_dflash {
             self.ensure_drafter_context(proposer, seq, &ctx, stream);
+            // 2026-10-14: The slot's first MTP propose after a hybrid DFlash stretch: catch the
+            // drafter up (`METRALE_HYBRID_MTP_CATCHUP`) and log `HYBRID MTP resume`. The worker
+            // runs this propose too (`EP_CMD_MTP_PROPOSE`), with the same `position`.
+            self.hybrid_mtp_resume(proposer, seq, position, stream);
         }
         let prop_state = if hybrid_dflash {
             seq.dflash_state.as_mut()

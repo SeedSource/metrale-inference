@@ -247,6 +247,8 @@ impl SchedulerCore {
                     {
                         let lens_before: Vec<usize> =
                             active.iter().map(|a| a.seq.seq_len).collect();
+                        // 2026-10-14: Hybrid MTP-mode acceptance, post-switch vs other (`hybrid_lane`).
+                        let hy_snap = super::hybrid_lane::mtp_snapshot(hybrid.as_ref(), active);
                         step_mtp(
                             sched.io.dev.model(),
                             active,
@@ -255,6 +257,7 @@ impl SchedulerCore {
                             &verify_ctx,
                             dflash_verify_raw_argmax,
                         );
+                        super::hybrid_lane::note_mtp_step(hybrid.as_mut(), active, &hy_snap);
                         for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
                             a.mtp_acct
                                 .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
@@ -306,6 +309,9 @@ impl SchedulerCore {
                                 let lens_before: Vec<usize> =
                                     active.iter().map(|a| a.seq.seq_len).collect();
                                 let t0 = sched.io.clock.now();
+                                // 2026-10-14: Hybrid MTP-mode acceptance, post-switch vs other (`hybrid_lane`).
+                                let hy_snap =
+                                    super::hybrid_lane::mtp_snapshot(hybrid.as_ref(), active);
                                 step_mtp(
                                     sched.io.dev.model(),
                                     active,
@@ -313,6 +319,11 @@ impl SchedulerCore {
                                     num_drafts,
                                     &verify_ctx,
                                     dflash_verify_raw_argmax,
+                                );
+                                super::hybrid_lane::note_mtp_step(
+                                    hybrid.as_mut(),
+                                    active,
+                                    &hy_snap,
                                 );
                                 let emitted: usize = active
                                     .iter()
@@ -350,6 +361,8 @@ impl SchedulerCore {
                     // 2026-09-25: Gate disarmed (`--mtp-gate force` or
                     // `METRALE_MTP_GATE_FORCE`): always MTP.
                     let lens_before: Vec<usize> = active.iter().map(|a| a.seq.seq_len).collect();
+                    // 2026-10-14: Hybrid MTP-mode acceptance, post-switch vs other (`hybrid_lane`).
+                    let hy_snap = super::hybrid_lane::mtp_snapshot(hybrid.as_ref(), active);
                     step_mtp(
                         sched.io.dev.model(),
                         active,
@@ -358,6 +371,7 @@ impl SchedulerCore {
                         &verify_ctx,
                         dflash_verify_raw_argmax,
                     );
+                    super::hybrid_lane::note_mtp_step(hybrid.as_mut(), active, &hy_snap);
                     for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
                         a.mtp_acct
                             .record_verify_emitted(a.seq.seq_len.saturating_sub(b));

@@ -154,7 +154,9 @@ fn prose_trace_demotes_with_doubling_cooldown() {
         "third probe at {enter3}"
     );
     assert!(
-        s.h.counters.summary().ends_with("rate demotions=2"),
+        s.h.counters
+            .summary()
+            .contains("rate demotions=2; MTP accept"),
         "{}",
         s.h.counters.summary()
     );

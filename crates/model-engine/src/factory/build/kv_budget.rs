@@ -162,7 +162,14 @@ pub(super) fn dflash_reserve_bytes(
                 } else {
                     0
                 };
-            drafter_kv + fused_kv + capture + fp8_mirrors + (300 << 20)
+            // 2026-10-14: Hybrid MTP catch-up ring and zero rows (`METRALE_HYBRID_MTP_CATCHUP`),
+            // allocated at the drafter install (`set_hybrid_dflash_proposer`), after this sizing.
+            let mtp_catchup = metrale_model_layers::speculative::hybrid::hybrid_mtp_catchup_bytes(
+                hybrid && metrale_model_layers::speculative::hybrid::hybrid_mtp_catchup_enabled(),
+                metrale_model_layers::speculative::hybrid::hybrid_mtp_catchup_rows(),
+                config.hidden_size,
+            );
+            drafter_kv + fused_kv + capture + fp8_mirrors + mtp_catchup + (300 << 20)
         })
         .unwrap_or(0);
     if dflash_reserve > 0 {

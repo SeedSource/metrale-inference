@@ -183,6 +183,11 @@ impl TransformerModel {
         self.dflash_proposer = Some(drafter);
         self.spec_mode
             .store(SpecStepMode::Mtp as u8, Ordering::Relaxed);
+        // 2026-10-14: `METRALE_HYBRID_MTP_CATCHUP=1`: the catch-up ring (`hybrid_mtp_catchup.rs`),
+        // on every rank (each installs its drafter here).
+        if hy::hybrid_mtp_catchup_enabled() {
+            self.hybrid_mtp_ring_alloc()?;
+        }
         Ok(())
     }
 

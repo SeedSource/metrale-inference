@@ -137,6 +137,10 @@ impl TransformerModel {
         for seq in seqs.iter_mut() {
             self.ensure_drafter_context(proposer, seq, &ctx, stream);
         }
+        // 2026-10-14: Hybrid MTP catch-up (`hybrid_mtp_catchup.rs`).
+        for (seq, &p) in seqs.iter_mut().zip(positions) {
+            self.hybrid_mtp_resume(proposer, seq, p, stream);
+        }
         let h = self.config.hidden_size;
         let hiddens: Vec<metrale_gpu_runtime::gpu::DevicePtr> = stash_idx
             .iter()

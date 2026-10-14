@@ -46,6 +46,8 @@ mod feed;
 mod gdn_woa;
 mod graph_borrow;
 // 2026-10-10: Hybrid MTP + DFlash proposer routing (`METRALE_HYBRID_DFLASH`).
+// 2026-10-14: Hybrid MTP catch-up at the DFlash -> MTP switch (`METRALE_HYBRID_MTP_CATCHUP`).
+mod hybrid_mtp_catchup;
 mod hybrid_spec;
 mod impl_adapters;
 mod impl_device_feed;

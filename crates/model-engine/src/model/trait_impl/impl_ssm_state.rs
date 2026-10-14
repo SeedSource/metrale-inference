@@ -96,6 +96,10 @@ impl ModelSsmState for TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
+        // 2026-10-14: Hybrid DFLASH step: the accepted rows of the ringed verify become covered
+        // (`hybrid_mtp_catchup.rs`). Rank 0 (`step_verify_dflash`) and the worker
+        // (`EP_CMD_VERIFY_KGAMMA`) both commit here, with the same arguments.
+        self.hybrid_mtp_ring_commit(seq, num_accepted, k);
         self.commit_accepted_prefix_dispatch(seq, num_accepted, k)
     }
 }

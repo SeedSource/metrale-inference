@@ -231,6 +231,21 @@ pub struct TransformerModel {
     /// the ring. A write that does not extend the range restarts it at that
     /// position; `count` never exceeds `MTP_CATCHUP_RING_ROWS`.
     pub(super) mtp_catchup_meta: parking_lot::Mutex<(usize, usize)>,
+    /// 2026-10-14: Hybrid MTP catch-up (`METRALE_HYBRID_MTP_CATCHUP=1`, #82 hybrid B2(i)): ring
+    /// of `hybrid_mtp_ring_rows` BF16 target hidden rows, label `l` at row `l %
+    /// hybrid_mtp_ring_rows`, written by every hybrid DFlash verify on every rank
+    /// (`trait_impl/hybrid_mtp_catchup.rs`). NULL unless a hybrid serve with the lever installed
+    /// its DFlash drafter (`set_hybrid_dflash_proposer`).
+    pub(super) hybrid_mtp_ring: DevicePtr,
+    /// 2026-10-14: Rows of `hybrid_mtp_ring`; 0 while it is NULL.
+    pub(super) hybrid_mtp_ring_rows: usize,
+    /// 2026-10-14: `hybrid_ring::ZERO_ROWS` zeroed BF16 hidden rows, the hidden the catch-up's
+    /// gap fill feeds. NULL with `hybrid_mtp_ring`.
+    pub(super) hybrid_mtp_zero_rows: DevicePtr,
+    /// 2026-10-14: The ring's meta (`hybrid_ring::RingMeta`). Its `resume` flag is kept on every
+    /// hybrid serve, lever or not, for the `HYBRID MTP resume` diagnostic.
+    pub(super) hybrid_mtp_ring_meta:
+        parking_lot::Mutex<metrale_model_layers::speculative::hybrid_ring::RingMeta>,
     /// 2026-09-25: Whole-prompt final-layer hidden capture, `[rows,
     /// hidden_size]` BF16 with `rows = mtp_prefill_capacity`. Written per
     /// prefill chunk and read by the drafter prefill and the drafter carry

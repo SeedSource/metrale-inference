@@ -124,6 +124,46 @@ pub struct ModeCounters {
     pub sole_off_slot0_mtp: u64,
     /// 2026-10-11: Sole sequences the rate gate sent back to MTP (policy D2sR).
     pub rate_demotions: u64,
+    /// 2026-10-14: MTP drafts accepted / proposed over the first [`POST_SWITCH_MTP_STEPS`] MTP
+    /// verify steps of each sequence that left DFlash (#82 hybrid B2(i)), and the step count.
+    pub post_switch_mtp: AcceptTally,
+    /// 2026-10-14: The same over every other MTP verify step, for the comparison.
+    pub other_mtp: AcceptTally,
+}
+
+/// 2026-10-14: MTP verify steps after a DFlash -> MTP switch counted as post-switch, per sequence.
+pub const POST_SWITCH_MTP_STEPS: u32 = 32;
+
+/// 2026-10-14: Accepted and proposed MTP drafts over `steps` verify steps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcceptTally {
+    pub accepted: u64,
+    pub proposed: u64,
+    pub steps: u64,
+}
+
+impl AcceptTally {
+    fn add(&mut self, proposed: usize, accepted: usize) {
+        self.proposed += proposed as u64;
+        self.accepted += accepted.min(proposed) as u64;
+        self.steps += 1;
+    }
+
+    /// 2026-10-14: `accepted/proposed (pct%, steps)`; `pct` is `-` with nothing proposed.
+    fn show(&self) -> String {
+        let pct = if self.proposed == 0 {
+            "-".to_string()
+        } else {
+            format!(
+                "{:.1}%",
+                100.0 * self.accepted as f64 / self.proposed as f64
+            )
+        };
+        format!(
+            "{}/{} ({pct}, {} steps)",
+            self.accepted, self.proposed, self.steps
+        )
+    }
 }
 
 impl ModeCounters {
@@ -159,6 +199,12 @@ impl ModeCounters {
         }
         s.push_str(&format!("; sole off slot 0 MTP={}", self.sole_off_slot0_mtp));
         s.push_str(&format!("; rate demotions={}", self.rate_demotions));
+        // 2026-10-14: Appended last, so earlier fields keep their place for the log parsers.
+        s.push_str(&format!(
+            "; MTP accept post-switch={} other={}",
+            self.post_switch_mtp.show(),
+            self.other_mtp.show()
+        ));
         s
     }
 }
@@ -177,6 +223,10 @@ pub struct HybridState {
     /// 2026-10-10: The slot of the sole active sequence at the last [`Self::decide`], if exactly
     /// one was active.
     sole_slot: Option<usize>,
+    /// 2026-10-14: The slot of the sole sequence at the last `Dflash` decision.
+    dflash_slot: Option<usize>,
+    /// 2026-10-14: Slots that left DFlash, each with its post-switch MTP verify steps left.
+    resumed: Vec<(usize, u32)>,
     pub counters: ModeCounters,
 }
 
@@ -188,6 +238,8 @@ impl HybridState {
             cfg,
             last: None,
             sole_slot: None,
+            dflash_slot: None,
+            resumed: Vec::new(),
             counters: ModeCounters::default(),
         }
     }
@@ -224,6 +276,9 @@ impl HybridState {
             inputs.dwell_met = false;
             mode = decide_mode(&inputs);
         }
+        if mode == SpecStepMode::Dflash {
+            self.dflash_slot = self.sole_slot;
+        }
         mode
     }
 
@@ -239,6 +294,14 @@ impl HybridState {
         match prev {
             Some(p) if p != mode => {
                 self.counters.count_switch(p, mode);
+                // 2026-10-14: The sequence that left DFlash: its next MTP verify steps count as
+                // post-switch.
+                if p == SpecStepMode::Dflash
+                    && let Some(slot) = self.dflash_slot
+                {
+                    self.resumed.retain(|&(s, _)| s != slot);
+                    self.resumed.push((slot, POST_SWITCH_MTP_STEPS));
+                }
                 if p == SpecStepMode::Dflash || mode == SpecStepMode::Dflash {
                     tracing::info!(
                         "HYBRID DFLASH: switch {} -> {} ({})",
@@ -267,6 +330,24 @@ impl HybridState {
         let total: u64 = self.counters.steps.iter().sum();
         if total.is_multiple_of(SUMMARY_EVERY_STEPS) {
             tracing::info!("HYBRID DFLASH counters: {}", self.counters.summary());
+        }
+    }
+
+    /// 2026-10-14: One MTP verify of the sequence on `slot`: `proposed` drafts were pending at the
+    /// step's start, `accepted` of them were accepted. Counted post-switch while the slot has
+    /// post-switch steps left, else as other. A step with no drafts (a bootstrap) is not counted.
+    pub fn note_mtp_verify(&mut self, slot: usize, proposed: usize, accepted: usize) {
+        if proposed == 0 {
+            return;
+        }
+        if let Some(i) = self.resumed.iter().position(|&(s, _)| s == slot) {
+            self.counters.post_switch_mtp.add(proposed, accepted);
+            self.resumed[i].1 -= 1;
+            if self.resumed[i].1 == 0 {
+                self.resumed.swap_remove(i);
+            }
+        } else {
+            self.counters.other_mtp.add(proposed, accepted);
         }
     }
 

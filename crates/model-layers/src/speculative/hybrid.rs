@@ -191,3 +191,49 @@ pub fn hybrid_drafter_window(max_seq_len: usize, ctx_cap: usize) -> usize {
         max_seq_len.min(ctx_cap)
     }
 }
+
+/// 2026-10-14: `METRALE_HYBRID_MTP_CATCHUP=1` (#82 hybrid B2(i); inert without
+/// `METRALE_HYBRID_DFLASH=1`): every hybrid DFlash verify also copies its committed target hidden
+/// rows into a ring (`hybrid_ring`), on every rank, and the first MTP propose of the sequence
+/// after its DFlash stretch feeds them to the MTP drafter, so the drafter resumes with the
+/// stretch's context at the right positions. Both ranks must set it. Read once.
+pub fn hybrid_mtp_catchup_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::glm_dflash::parse_switch(std::env::var("METRALE_HYBRID_MTP_CATCHUP").ok().as_deref())
+    })
+}
+
+/// 2026-10-14: `METRALE_HYBRID_MTP_CATCHUP_ROWS=<rows>` (default
+/// [`super::hybrid_ring::DEFAULT_RING_ROWS`]): the ring's row count, the longest DFlash stretch
+/// whose every row reaches the MTP drafter. Read once.
+pub fn hybrid_mtp_catchup_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        parse_catchup_rows(
+            std::env::var("METRALE_HYBRID_MTP_CATCHUP_ROWS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// 2026-10-14: The ring row parser: an integer in
+/// `MIN_RING_ROWS..=MAX_RING_ROWS` (`hybrid_ring`), else the default.
+pub fn parse_catchup_rows(v: Option<&str>) -> usize {
+    use super::hybrid_ring::{DEFAULT_RING_ROWS, MAX_RING_ROWS, MIN_RING_ROWS};
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|r| (MIN_RING_ROWS..=MAX_RING_ROWS).contains(r))
+        .unwrap_or(DEFAULT_RING_ROWS)
+}
+
+/// 2026-10-14: Device bytes of the hybrid MTP catch-up buffers a hybrid serve allocates after KV
+/// sizing when the lever is on: the ring (`rows` BF16 hidden rows) and the zero rows the gap
+/// fill reads (`hybrid_ring::ZERO_ROWS`). `0` with the lever off.
+pub fn hybrid_mtp_catchup_bytes(lever_on: bool, rows: usize, hidden: usize) -> usize {
+    if lever_on {
+        (rows + super::hybrid_ring::ZERO_ROWS) * hidden * 2
+    } else {
+        0
+    }
+}

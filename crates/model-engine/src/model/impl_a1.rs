@@ -421,6 +421,10 @@ impl TransformerModel {
             verify_catchup_stash,
             mtp_catchup_ring,
             mtp_catchup_meta: parking_lot::Mutex::new((0, 0)),
+            hybrid_mtp_ring: DevicePtr::NULL,
+            hybrid_mtp_ring_rows: 0,
+            hybrid_mtp_zero_rows: DevicePtr::NULL,
+            hybrid_mtp_ring_meta: parking_lot::Mutex::new(Default::default()),
             mtp_prefill_hidden,
             // 2026-09-25: The rows actually allocated (both caps applied), which
             // the capture guard in `drafter_prefill.rs` checks against.

@@ -190,6 +190,23 @@ impl DraftProposer for Glm5NextMtpHead {
         self.rows_impl(tokens, hiddens, row_base, state, ctx, stream)
     }
 
+    /// 2026-10-14: The rollback `after_verify` and `propose` already do (counters only; rows past
+    /// `rows` become unreachable and are overwritten before the indexer can select them).
+    fn rewind_drafter_to(&self, state: &mut dyn ProposerState, rows: usize) -> Result<bool> {
+        let Some(st) = state
+            .as_any_mut()
+            .downcast_mut::<Glm5NextMtpProposerState>()
+        else {
+            return Ok(false);
+        };
+        if rows > st.seq_len || st.released {
+            return Ok(false);
+        }
+        st.dsa.rewind_to(rows)?;
+        st.seq_len = rows;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn propose(
         &self,

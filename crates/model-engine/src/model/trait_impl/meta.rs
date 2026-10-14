@@ -230,6 +230,9 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
         self.gpu.synchronize(stream)?;
+        // 2026-10-14: The hybrid MTP catch-up ring forgets the slot's previous occupant (both
+        // ranks allocate every slot, `EP` alloc command).
+        self.hybrid_mtp_ring_reset_slot(slot);
         let has_mtp = self.proposer.is_some() || self.self_speculative;
 
         // 2026-09-25: A fresh sequence resets the whole-prompt capture length, so the capture

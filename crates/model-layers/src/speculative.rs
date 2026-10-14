@@ -10,6 +10,7 @@
 pub mod glm_dflash;
 pub mod glm_dflash_batch;
 pub mod hybrid;
+pub mod hybrid_ring;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;
@@ -175,6 +176,14 @@ pub trait DraftProposer: Send + Sync {
         _stream: u64,
     ) -> Result<usize> {
         Ok(0)
+    }
+
+    /// 2026-10-14: Drop the drafter's rows from `rows` on (keys `rows..`), so the next
+    /// [`Self::catchup_drafter`] at `row_base == rows` rewrites them. Returns whether it did;
+    /// `false` (the default) when unsupported or when the drafter holds fewer than `rows` rows,
+    /// leaving the state unchanged. Used by the hybrid MTP catch-up (`hybrid_ring`).
+    fn rewind_drafter_to(&self, _state: &mut dyn ProposerState, _rows: usize) -> Result<bool> {
+        Ok(false)
     }
 
     /// 2026-09-25: Propose up to `num_drafts` tokens autoregressively.

@@ -231,6 +231,10 @@ impl TransformerModel {
         for seq in seqs.iter_mut() {
             self.ensure_drafter_context(proposer, seq, &ctx, stream);
         }
+        // 2026-10-14: Hybrid MTP catch-up, in batch order, as the worker does below.
+        for (seq, &p) in seqs.iter_mut().zip(positions) {
+            self.hybrid_mtp_resume(proposer, seq, p, stream);
+        }
         let h = self.config.hidden_size;
         let hiddens: Vec<metrale_gpu_runtime::gpu::DevicePtr> = stash_idx
             .iter()
@@ -317,6 +321,10 @@ impl TransformerModel {
         let ctx = self.mtp_serial_propose_ctx(proposer);
         for seq in refs.iter_mut() {
             self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        }
+        // 2026-10-14: Hybrid MTP catch-up, in rank 0's batch order.
+        for (seq, &p) in refs.iter_mut().zip(&meta.positions) {
+            self.hybrid_mtp_resume(proposer, seq, p, stream);
         }
         let h = self.config.hidden_size;
         let hiddens: Vec<metrale_gpu_runtime::gpu::DevicePtr> = meta

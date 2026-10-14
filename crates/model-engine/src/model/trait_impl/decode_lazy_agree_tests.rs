@@ -347,3 +347,181 @@ fn eager_states_vote_once_then_never() {
     assert_eq!(out[0], (usize::MAX, 1));
     assert_eq!(out[1], (usize::MAX, 1));
 }
+
+// ---------------------------------------------------------------------------------------------
+// 2026-10-14 (race-memory, A183): rank-agreed KV block growth (`agree_kv_blocks_with`) on real
+// paged KV pools (`PagedKvCache` on the mock GPU, no prefix cache) of different sizes per rank,
+// grown by the real `ensure_blocks_through_decode`.
+
+mod kv {
+    use metrale_cache::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+    use metrale_gpu_runtime::gpu::mock::MockGpuBackend;
+    use metrale_telemetry::prefix_cache::NoPrefixCaching;
+
+    use super::super::super::block_mgmt::ensure_blocks_through_decode;
+    use super::super::decode_lazy_agree::agree_kv_blocks_with;
+    use super::{BS, Peer, kv_exhausted, run_two};
+    use crate::traits::SequenceState;
+    use anyhow::Result;
+
+    fn pool(gpu: &MockGpuBackend, blocks: usize) -> PagedKvCache {
+        let cfg = KvCacheConfig {
+            block_size: BS,
+            num_kv_heads: 1,
+            head_dim: 64,
+            num_layers: 1,
+            dtype: KvCacheDtype::Fp8,
+            layer_dtypes: vec![],
+            layer_dims: vec![],
+            cache_blocks_per_seq: None,
+            v_aliases_k: false,
+        };
+        PagedKvCache::new(cfg, blocks, gpu).unwrap()
+    }
+
+    /// 2026-10-14: One decode step of `seq` at `seq_len` (last block `seq_len / BS`) with the
+    /// vote (`p = Some`) or without it (the 526615e1 behaviour: grow locally, no gather).
+    fn step(
+        seq: &mut SequenceState,
+        seq_len: usize,
+        kv: &mut PagedKvCache,
+        gpu: &MockGpuBackend,
+        fail_above: usize,
+        p: Option<&Peer>,
+    ) -> Result<()> {
+        let last = seq_len / BS;
+        let mut grow = |s: &mut SequenceState| {
+            ensure_blocks_through_decode(s, last, kv, &NoPrefixCaching, gpu, 0, false)
+        };
+        match p {
+            Some(p) => agree_kv_blocks_with(seq, last, fail_above, grow, |v| p.gather(v)),
+            None => grow(seq),
+        }
+    }
+
+    /// 2026-10-14: Decode one sequence until the first refusal on a pool of `blocks` blocks;
+    /// returns (the seq_len of the first refusal or None, whether it was "KV cache exhausted",
+    /// blocks held).
+    fn decode_until_refused(
+        blocks: usize,
+        fail_above: usize,
+        p: Option<&Peer>,
+    ) -> (Option<usize>, bool, usize) {
+        let gpu = MockGpuBackend::new();
+        let mut kv = pool(&gpu, blocks);
+        let mut seq = SequenceState::host_only(0);
+        for seq_len in 0..(12 * BS) {
+            let r = step(&mut seq, seq_len, &mut kv, &gpu, fail_above, p);
+            if r.is_err() {
+                return (Some(seq_len), kv_exhausted(&r), seq.block_table.len());
+            }
+        }
+        (None, false, seq.block_table.len())
+    }
+
+    /// 2026-10-14: The A183 bug, reproduced on the 526615e1 path: pools of 6 and 5 blocks
+    /// (hyb27c had 81,826 / 81,825), no vote. Rank 1 refuses the step that needs block 5 while
+    /// rank 0 runs on: in a serve rank 0 then enters the step's collective alone.
+    #[test]
+    fn without_the_vote_one_block_of_pool_skew_diverges() {
+        let r0 = decode_until_refused(6, 0, None);
+        let r1 = decode_until_refused(5, 0, None);
+        assert_eq!(r1, (Some(5 * BS), true, 5), "rank 1 refuses block 5");
+        assert_eq!(
+            r0.0,
+            Some(6 * BS),
+            "rank 0 refuses one block later: the ranks diverge"
+        );
+    }
+
+    /// 2026-10-14: With the vote both ranks refuse the same step, both report "KV cache
+    /// exhausted" (the scheduler's preemption trigger), and both made the same number of
+    /// gathers: one per block of growth (the steps inside a block make none).
+    #[test]
+    fn with_the_vote_one_rank_refusal_is_agreed_on_both_ranks() {
+        let out = run_two(|p| decode_until_refused(if p.rank == 0 { 6 } else { 5 }, 0, Some(p)));
+        let [((at0, ex0, held0), g0), ((at1, ex1, held1), g1)] = out;
+        assert_eq!(
+            (at0, at1),
+            (Some(5 * BS), Some(5 * BS)),
+            "same refused step on both ranks"
+        );
+        assert!(ex0 && ex1, "both refusals say KV cache exhausted");
+        assert_eq!(g0, g1, "same gather count on both ranks");
+        assert_eq!(g0, 6, "one gather per block: blocks 0..=5");
+        assert_eq!(
+            (held0, held1),
+            (6, 5),
+            "rank 0 keeps its block 5; it is reused on the retry"
+        );
+    }
+
+    /// 2026-10-14: After the refusal, room appears on the short rank (the scheduler's victim
+    /// release, here a freed block): the same step is voted again and agreed, rank 0 does not
+    /// allocate a second block 5, and the agreed extent moves past block 5.
+    #[test]
+    fn the_retry_after_room_appears_is_agreed_without_double_allocation() {
+        let out = run_two(|p| {
+            let gpu = MockGpuBackend::new();
+            let mut kv = pool(&gpu, if p.rank == 0 { 7 } else { 6 });
+            let victim = kv.alloc_block().unwrap(); // a second sequence's block
+            let mut seq = SequenceState::host_only(0);
+            let mut first_refused = None;
+            for seq_len in 0..=(5 * BS) {
+                if step(&mut seq, seq_len, &mut kv, &gpu, 0, Some(p)).is_err() {
+                    first_refused = Some(seq_len);
+                    break;
+                }
+            }
+            kv.free_block(victim);
+            let retry = step(&mut seq, 5 * BS, &mut kv, &gpu, 0, Some(p));
+            (
+                first_refused,
+                retry.is_ok(),
+                seq.block_table.len(),
+                seq.kv_blocks_agreed,
+            )
+        });
+        for ((first, retry_ok, held, agreed), _) in &out {
+            assert_eq!(*first, Some(5 * BS));
+            assert!(*retry_ok, "retry agreed");
+            assert_eq!(*held, 6, "blocks 0..=5, no double allocation");
+            assert_eq!(*agreed, 6);
+        }
+        assert_eq!(out[0].1, out[1].1, "same gather count");
+    }
+
+    /// 2026-10-14: The test fault-injection lever on ONE rank (the 2-rank GPU check's recipe):
+    /// rank 1 refuses at block 3 although both pools are large; the refusal is agreed.
+    #[test]
+    fn fault_injection_on_one_rank_is_an_agreed_refusal() {
+        let out = run_two(|p| decode_until_refused(64, if p.rank == 1 { 3 } else { 0 }, Some(p)));
+        for ((at, exhausted, _), _) in &out {
+            assert_eq!(*at, Some(3 * BS));
+            assert!(*exhausted);
+        }
+        assert_eq!(out[0].1, out[1].1);
+    }
+
+    /// 2026-10-14: The startup cap: blocks at or above the agreed count leave the free list and
+    /// are never handed out; capping above the pool retires nothing; a cap below an in-use block
+    /// fails.
+    #[test]
+    fn cap_usable_blocks_retires_the_tail_only() {
+        let gpu = MockGpuBackend::new();
+        let mut kv = pool(&gpu, 6);
+        let dummy = kv.alloc_block().unwrap();
+        assert_eq!(dummy, 0, "the free list hands out block 0 first");
+        assert_eq!(kv.cap_usable_blocks(9).unwrap(), 0);
+        assert_eq!(kv.cap_usable_blocks(5).unwrap(), 1);
+        assert_eq!((kv.num_blocks(), kv.num_free_blocks()), (5, 4));
+        let got: Vec<u32> = (0..4).map(|_| kv.alloc_block().unwrap()).collect();
+        assert!(got.iter().all(|&b| b < 5), "{got:?}");
+        assert!(kv.alloc_block().is_err(), "exhausted at the agreed count");
+        let mut kv2 = pool(&gpu, 6);
+        for _ in 0..4 {
+            kv2.alloc_block().unwrap();
+        }
+        assert!(kv2.cap_usable_blocks(2).is_err(), "block 2 is in use");
+    }
+}

@@ -122,6 +122,8 @@ impl TransformerModel {
                 new_block_table.push(block_idx);
             }
             seq.block_table = new_block_table;
+            // 2026-10-14 (race-memory, A183): a rebuilt table votes afresh.
+            seq.kv_blocks_agreed = 0;
         }
 
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {

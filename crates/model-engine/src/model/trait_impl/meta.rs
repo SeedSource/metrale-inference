@@ -348,6 +348,7 @@ impl TransformerModel {
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: vec![0; num_attn_layers],
             lazy_rows_agreed: 0,
+            kv_blocks_agreed: 0,
         })
     }
 

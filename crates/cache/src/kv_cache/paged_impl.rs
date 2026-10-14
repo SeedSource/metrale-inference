@@ -411,6 +411,26 @@ impl PagedKvCache {
         self.num_blocks
     }
 
+    /// 2026-10-14 (race-memory, A183): Cap the usable pool at `n` blocks, the minimum over the
+    /// ranks (`rank_agree::agree_min_u64`), so every rank exhausts at the same block count. Each
+    /// rank sizes its pool from its own free memory, so two ranks can differ by a block (hyb27c
+    /// 10-11: 81,825 / 81,826). Blocks `n..` stay allocated on the device but leave the free
+    /// list and are never handed out. Returns how many blocks were retired; `n >=
+    /// num_blocks()` retires none. Fails when a block at or above `n` is in use (call it
+    /// before serving).
+    pub fn cap_usable_blocks(&mut self, n: usize) -> Result<usize> {
+        if n >= self.num_blocks {
+            return Ok(0);
+        }
+        if let Some(b) = (n..self.num_blocks).find(|&b| self.block_ref_counts[b] != 0) {
+            bail!("cannot cap the KV pool at {n} blocks: block {b} is in use");
+        }
+        let before = self.free_blocks.len();
+        self.free_blocks.retain(|&b| (b as usize) < n);
+        self.num_blocks = n;
+        Ok(before - self.free_blocks.len())
+    }
+
     pub fn dtype(&self) -> KvCacheDtype {
         self.config.dtype
     }

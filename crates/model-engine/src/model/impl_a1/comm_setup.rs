@@ -116,6 +116,13 @@ pub(super) fn assert_rank_levers_agree(
                 "METRALE_DSA_INDEXER_LAZY",
                 u64::from(metrale_model_arch::glm5next_dsa::lazy::dsa_indexer_lazy()),
             ),
+            // 2026-10-14 (race-memory, A183): The rank-agreed KV pool cap and decode KV vote add
+            // a startup agreement and per-block-boundary gathers; a rank without them would skip
+            // collectives the other issues.
+            (
+                "METRALE_KV_DECODE_AGREE",
+                u64::from(super::super::trait_impl::kv_decode_agree()),
+            ),
             (
                 "DSA indexer pool MiB (METRALE_DSA_INDEXER_POOL_GB)",
                 if metrale_model_arch::glm5next_dsa::lazy::dsa_indexer_lazy() {

@@ -167,6 +167,12 @@ pub struct SequenceState {
     /// any rank. Equal on every rank: it changes only at a vote, from the gathered values.
     /// `0` at allocation and after `free_sequence`.
     pub lazy_rows_agreed: usize,
+    /// 2026-10-14 (race-memory, A183): Logical KV blocks `[0, kv_blocks_agreed)` that every rank
+    /// holds for this sequence, by a rank-agreed vote (`trait_impl/decode_lazy_agree.rs`,
+    /// `METRALE_KV_DECODE_AGREE=1`). A decode or verify step whose last block reaches it votes
+    /// before its first collective. Equal on every rank: it changes only at a vote. `0` at
+    /// allocation, after `free_sequence` and after a state restore rebuilds the block table.
+    pub kv_blocks_agreed: usize,
     /// 2026-09-25: `Some(k)` makes prefill score every prompt position with its top-`k`
     /// alternatives (`/v1/completions` with `echo` and `logprobs`). Set by the scheduler before
     /// prefill. Such a request bypasses the prefix cache, so every position has a hidden row.
@@ -233,6 +239,7 @@ impl SequenceState {
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: Vec::new(),
             lazy_rows_agreed: 0,
+            kv_blocks_agreed: 0,
             collect_prompt_logprobs: None,
             prompt_logprobs: Vec::new(),
             adapter_slot: -1,

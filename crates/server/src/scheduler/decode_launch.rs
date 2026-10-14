@@ -32,6 +32,7 @@ pub(super) const PREEMPT_IMMUNITY_TOKENS: usize = 64;
 /// Policy: fewest generated tokens, ties broken by the lower slot.
 ///
 /// Exclusions:
+///   * finished sequences (2026-10-14);
 ///   * grammar-active sequences;
 ///   * without spill, sequences whose tokens contain vision pads (their KV
 ///     came from image embeddings a token re-prefill cannot reproduce);
@@ -42,8 +43,13 @@ pub(super) fn choose_decode_victim(
     active: &[ActiveSeq],
     can_spill: bool,
 ) -> Option<usize> {
+    // 2026-10-14 (race-memory, A184): a sequence that already finished this step is never a
+    // victim (`preempt_after_spec_refusal` runs before finished rows are retired); requeuing
+    // it would resume a reply that has ended.
     let eligible = |a: &ActiveSeq| {
-        a.grammar_state.is_none() && (can_spill || !model.tokens_contain_vision_pad(&a.seq.tokens))
+        !a.finished
+            && a.grammar_state.is_none()
+            && (can_spill || !model.tokens_contain_vision_pad(&a.seq.tokens))
     };
     let pick = |immune_ok: bool| {
         active

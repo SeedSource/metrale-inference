@@ -252,7 +252,17 @@ impl RecordingModel {
         seqs: &mut [&mut SequenceState],
         st: u64,
         woa: bool,
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>> {
+        let call = self.next_verify_batched_call();
+        if self.cfg.verify_kv_exhaust_at.contains(&call) {
+            let ids: Vec<String> = seqs.iter().map(|s| sid(s)).collect();
+            let t = fmt_ids(tokens);
+            rec!(
+                self,
+                "decode_verify_batched(tokens={t}, ks={ks:?}, seqs={ids:?}, stream={st}, woa={woa}) -> ERR KV cache exhausted"
+            );
+            anyhow::bail!("KV cache exhausted (scripted at decode_verify_batched #{call})");
+        }
         let mut out = Vec::with_capacity(tokens.len());
         let mut off = 0usize;
         let mut ids = Vec::new();
@@ -270,7 +280,7 @@ impl RecordingModel {
             self,
             "decode_verify_batched(tokens={t}, ks={ks:?}, seqs={ids:?}, stream={st}, woa={woa}) -> {o}"
         );
-        out
+        Ok(out)
     }
     pub(super) fn fx_propose_batched(
         &self,

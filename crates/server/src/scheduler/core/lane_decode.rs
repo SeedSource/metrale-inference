@@ -165,6 +165,9 @@ impl SchedulerCore {
                     })
                 )
             {
+                // 2026-10-14 (race-memory, A184): a batched MTP step's retryable KV refusal,
+                // handled after the step's accounting below.
+                let mut spec_refusal: Option<String> = None;
                 // 2026-09-25: The MTP gate chooses each step (plain decode or MTP verify)
                 // by measured delivered throughput (`metrale_speculative::mtp_gate`).
                 if let Some(gate) = mtp_gate.as_mut() {
@@ -200,7 +203,7 @@ impl SchedulerCore {
                     {
                         let lens_before: Vec<usize> =
                             active.iter().map(|a| a.seq.seq_len).collect();
-                        step_mtp(
+                        spec_refusal = step_mtp(
                             sched.io.dev.model(),
                             active,
                             sched,
@@ -259,7 +262,7 @@ impl SchedulerCore {
                                 let lens_before: Vec<usize> =
                                     active.iter().map(|a| a.seq.seq_len).collect();
                                 let t0 = sched.io.clock.now();
-                                step_mtp(
+                                spec_refusal = step_mtp(
                                     sched.io.dev.model(),
                                     active,
                                     sched,
@@ -303,7 +306,7 @@ impl SchedulerCore {
                     // 2026-09-25: Gate disarmed (`--mtp-gate force` or
                     // `METRALE_MTP_GATE_FORCE`): always MTP.
                     let lens_before: Vec<usize> = active.iter().map(|a| a.seq.seq_len).collect();
-                    step_mtp(
+                    spec_refusal = step_mtp(
                         sched.io.dev.model(),
                         active,
                         sched,
@@ -315,6 +318,13 @@ impl SchedulerCore {
                         a.mtp_acct
                             .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
                     }
+                }
+                // 2026-10-14 (race-memory, A184): preempt a victim so the refused rows retry
+                // (or fail the lone one with an error frame), as a plain decode step does.
+                if let Some(msg) = spec_refusal {
+                    crate::scheduler::preempt::preempt_after_spec_refusal(
+                        sched, active, &msg, swapped, preempted,
+                    );
                 }
             } else {
                 // 2026-09-25: Plain decode. With MTP on, drop any pending drafts first.

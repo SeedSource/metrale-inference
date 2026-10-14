@@ -259,3 +259,189 @@ fn resume_loop_errors_out_a_sequence_that_can_never_fit() {
     assert!(preempted.is_empty() && active.is_empty());
     assert!(rx.try_recv().expect("error delivered").is_err());
 }
+
+// 2026-10-14 (race-memory, A184): batched MTP steps refused for KV. kvagcheck2 (n3n4) saw
+// one refusal in a C=4 batched verify end all four replies with finish "stop" and no error.
+
+/// 2026-10-14: The message `lazy_agree::agreed_outcome` gives a rank that admitted when
+/// another rank refused.
+const VOTED: &str = "KV cache exhausted: decode/verify step of slot 2 through KV block 256: \
+                     rank(s) [1] refused this step's KV/lazy-map admission, so every rank \
+                     refuses it (rank-agreed)";
+
+#[test]
+fn spec_refusal_is_retryable_only_with_the_rank_vote_on_multi_rank() {
+    use super::preempt::spec_kv_refusal_retryable;
+    let one = PreemptStubModel::default();
+    let ep = PreemptStubModel {
+        ep: true,
+        ..Default::default()
+    };
+    assert!(spec_kv_refusal_retryable(
+        &one,
+        "KV cache exhausted: no free blocks"
+    ));
+    assert!(!spec_kv_refusal_retryable(
+        &one,
+        "CUDA error 700: illegal memory access"
+    ));
+    // 2026-10-14: without the vote a worker may have run the step (A183).
+    assert!(!spec_kv_refusal_retryable(
+        &ep,
+        "KV cache exhausted: no free blocks"
+    ));
+    assert!(spec_kv_refusal_retryable(&ep, VOTED));
+}
+
+/// 2026-10-14: Two unfinished rows at slots 0 and 1, 3 drafts each (verify width 4).
+fn two_drafted() -> (
+    Vec<super::types::ActiveSeq>,
+    super::test_support::RespRx,
+    super::test_support::RespRx,
+) {
+    let (mut a0, rx0) = active_seq(0, 3);
+    let (mut a1, rx1) = active_seq(1, 4);
+    a0.pending_drafts = vec![7, 8, 9];
+    a1.pending_drafts = vec![7, 8, 9];
+    (vec![a0, a1], rx0, rx1)
+}
+
+/// 2026-10-14: Run `step_verify_k4_batched` over both rows of `two_drafted` on `model`.
+fn verify_batched(
+    model: std::sync::Arc<PreemptStubModel>,
+    active: &mut [super::types::ActiveSeq],
+) -> Option<String> {
+    let sched = SchedCtx::for_test_with(model.clone());
+    let c = super::think_end_token0_tests::ctx(&sched, &active[0]);
+    let mut batch: Vec<&mut super::types::ActiveSeq> = active.iter_mut().collect();
+    super::verify_k4_batch_step::step_verify_k4_batched(&*model, &mut batch, &sched, &[4, 4], 3, &c)
+}
+
+#[test]
+fn batched_verify_kv_refusal_is_returned_and_finishes_nothing() {
+    for model in [
+        PreemptStubModel::failing(1),
+        PreemptStubModel {
+            ep: true,
+            kv_error: Some(VOTED),
+            ..PreemptStubModel::failing(1)
+        },
+    ] {
+        let (mut active, mut rx0, mut rx1) = two_drafted();
+        let refusal = verify_batched(std::sync::Arc::new(model), &mut active);
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|m| m.contains("KV cache exhausted")),
+            "{refusal:?}"
+        );
+        for a in &active {
+            assert!(!a.finished && a.error.is_none(), "a refused row stays live");
+        }
+        for rx in [&mut rx0, &mut rx1] {
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+    }
+}
+
+#[test]
+fn batched_verify_failure_that_cannot_retry_fails_rows_with_an_error_not_a_stop() {
+    for model in [
+        // 2026-10-14: a device error, and a KV refusal on a multi-rank serve without the vote.
+        PreemptStubModel {
+            hard_error: Some("CUDA error 700: illegal memory access"),
+            ..Default::default()
+        },
+        PreemptStubModel {
+            ep: true,
+            ..PreemptStubModel::failing(1)
+        },
+    ] {
+        let (mut active, _rx0, _rx1) = two_drafted();
+        let refusal = verify_batched(std::sync::Arc::new(model), &mut active);
+        assert!(refusal.is_none());
+        for a in &active {
+            assert!(a.finished, "the row ends");
+            assert!(
+                a.error.is_some(),
+                "with an error, never a bare finish read as stop"
+            );
+        }
+    }
+}
+
+#[test]
+fn spec_refusal_preempts_the_least_progress_live_row_never_a_finished_one() {
+    let model = std::sync::Arc::new(PreemptStubModel::default());
+    // 2026-10-14: slot 0 finished this step with the fewest tokens; it must not be chosen.
+    let (mut done, _rxd) = active_seq(0, 1);
+    done.finished = true;
+    let (mut a1, mut rx1) = active_seq(1, 3);
+    let (mut a2, _rx2) = active_seq(2, 6);
+    a1.pending_drafts = vec![7, 8, 9];
+    a2.pending_drafts = vec![7, 8, 9];
+    let mut active = vec![done, a1, a2];
+    let (mut swapped, mut preempted) = (Vec::new(), Vec::new());
+    super::preempt::preempt_after_spec_refusal(
+        &SchedCtx::for_test_with(model.clone()),
+        &mut active,
+        VOTED,
+        &mut swapped,
+        &mut preempted,
+    );
+    assert_eq!(preempted.len(), 1);
+    assert_eq!(
+        preempted[0].a.seq.slot_idx, 1,
+        "least progress among the live rows"
+    );
+    assert_eq!(*model.freed_slots.lock().unwrap(), vec![1]);
+    assert!(swapped.is_empty());
+    let slots: Vec<usize> = active.iter().map(|a| a.seq.slot_idx).collect();
+    assert_eq!(slots, vec![0, 2]);
+    assert!(
+        active[0].finished && active[0].error.is_none(),
+        "the finished row is untouched"
+    );
+    assert!(!active[1].finished && active[1].error.is_none());
+    assert!(
+        active[1].pending_drafts.is_empty(),
+        "survivors re-bootstrap their drafts"
+    );
+    assert!(matches!(
+        rx1.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn spec_refusal_with_one_live_row_fails_it_with_an_error() {
+    let model = std::sync::Arc::new(PreemptStubModel::default());
+    let (mut done, _rxd) = active_seq(0, 1);
+    done.finished = true;
+    let (a1, _rx1) = active_seq(1, 3);
+    let mut active = vec![done, a1];
+    let (mut swapped, mut preempted) = (Vec::new(), Vec::new());
+    super::preempt::preempt_after_spec_refusal(
+        &SchedCtx::for_test_with(model),
+        &mut active,
+        VOTED,
+        &mut swapped,
+        &mut preempted,
+    );
+    assert!(preempted.is_empty() && swapped.is_empty());
+    assert_eq!(active.len(), 2);
+    assert!(
+        active[0].error.is_none(),
+        "the finished row keeps its own ending"
+    );
+    assert!(active[1].finished);
+    assert!(
+        active[1]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("KV cache exhausted"))
+    );
+}

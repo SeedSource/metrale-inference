@@ -62,6 +62,9 @@ pub(super) struct ModelCfg {
     /// 2026-09-25: Indexes of `decode_batch` / `decode_batch_fed` calls (0-based, counted
     /// per model) that fail with "KV cache exhausted" instead of running.
     pub kv_exhaust_at: Vec<usize>,
+    /// 2026-10-14 (race-memory, A184): Indexes of `decode_verify_batched` calls (0-based,
+    /// counted per model) that fail with "KV cache exhausted" instead of running.
+    pub verify_kv_exhaust_at: Vec<usize>,
     /// 2026-09-25: Blocks the prefix cache can give back on `reclaim_prefix_blocks`.
     pub reclaimable: usize,
     /// 2026-09-25: Blocks pinned outside any live sequence (a warm prefix cache): they
@@ -96,6 +99,7 @@ impl Default for ModelCfg {
             can_batch_verify: true,
             slot_draft_capacity: 8,
             kv_exhaust_at: Vec::new(),
+            verify_kv_exhaust_at: Vec::new(),
             reclaimable: 0,
             held_blocks: 0,
             device_token_feed: true,
@@ -115,6 +119,8 @@ pub(super) struct State {
     /// 2026-09-25: Next token per row of the most recent forward.
     pub rows: Vec<u32>,
     pub decode_batch_calls: usize,
+    /// 2026-10-14: `decode_verify_batched` calls so far (`verify_kv_exhaust_at`).
+    pub verify_batched_calls: usize,
     pub ticks: usize,
     /// 2026-09-25: What the last feed argmax wrote, per row.
     pub feed_cells: Vec<u32>,
@@ -416,6 +422,14 @@ impl RecordingModel {
         let mut st = self.state.lock().unwrap();
         let c = st.decode_batch_calls;
         st.decode_batch_calls += 1;
+        c
+    }
+
+    /// 2026-10-14 (race-memory, A184): the index of this `decode_verify_batched` call.
+    pub fn next_verify_batched_call(&self) -> usize {
+        let mut st = self.state.lock().unwrap();
+        let c = st.verify_batched_calls;
+        st.verify_batched_calls += 1;
         c
     }
 

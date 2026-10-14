@@ -71,6 +71,13 @@ pub(super) fn can_batch_bootstrap(
 /// `effective_drafts_under_grammar` clamp. One difference: when saving the
 /// hidden state fails, the per-sequence loop's `continue` also skips
 /// `start_checkpoint_async`; here the checkpoint still runs.
+///
+/// 2026-10-14 (race-memory, A184): Returns the error when the `decode_batch` was
+/// refused for KV and the refusal is safe to retry
+/// (`preempt::spec_kv_refusal_retryable`); no sequence advanced or finished then, and
+/// the caller passes it to `preempt::preempt_after_spec_refusal`. Every other failure
+/// fails its sequences with an error frame, not a bare `finished`.
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub(super) fn step_mtp_bootstrap_batched(
     model: &dyn Model,
     active: &mut [ActiveSeq],
@@ -78,7 +85,7 @@ pub(super) fn step_mtp_bootstrap_batched(
     idxs: &[usize],
     ladder_nd: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
-) {
+) -> Option<String> {
     // 2026-09-25: Disjoint &mut for the (ascending) indices, sorted by SSM slot,
     // the order `decode_step.rs` also sorts `active` into before `decode_batch`.
     // `active` itself is not reordered. Row j <-> refs[j].
@@ -103,11 +110,20 @@ pub(super) fn step_mtp_bootstrap_batched(
         match model.decode_batch(&tokens, &mut seq_refs, 0) {
             Ok(l) => l,
             Err(e) => {
-                tracing::error!("batched bootstrap decode_batch (n={n}): {e:#}");
-                for a in refs.iter_mut() {
-                    a.finished = true;
+                let msg = format!("batched bootstrap decode_batch (n={n}): {e:#}");
+                // 2026-10-14 (race-memory, A184): a retryable KV refusal is raised at block
+                // admission, before any forward (the plain decode step retries the same
+                // error, `decode_launch.rs`), so the twice-decode hazard above does not
+                // apply: the caller preempts a victim and the rest retry.
+                if crate::scheduler::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
                 }
-                return;
+                tracing::error!("{msg}");
+                for a in refs.iter_mut() {
+                    super::lifecycle::fail_sequence(a, msg.clone());
+                }
+                return None;
             }
         }
     };
@@ -240,7 +256,10 @@ pub(super) fn step_mtp_bootstrap_batched(
                     Ok(t) => t,
                     Err(e) => {
                         tracing::error!("batched bootstrap sample error: {e:#}");
-                        a.finished = true;
+                        super::lifecycle::fail_sequence(
+                            a,
+                            format!("batched bootstrap sample error: {e:#}"),
+                        );
                         continue;
                     }
                 }
@@ -403,4 +422,5 @@ pub(super) fn step_mtp_bootstrap_batched(
              replaces {n} M=1 decodes + {n} drafter forwards per draft position"
         );
     }
+    None
 }

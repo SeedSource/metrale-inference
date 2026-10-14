@@ -331,3 +331,34 @@ fn c_a_fatal_device_error_fails_every_row_in_the_batch_and_only_them() {
         "T30 T90 T91 Done(stop, n=4, think=0, cached=0, acc=0, guard=None)"
     );
 }
+
+#[test]
+fn c_kv_refusal_in_a_batched_dflash_verify_preempts_one_victim_and_no_reply_is_cut() {
+    // 2026-10-14 (race-memory, A184): the DFlash batched verify used to put its drafts back
+    // on a KV refusal and return, so a lasting refusal repeated every step with no
+    // preemption (a stalled batch). Now it preempts one victim, as the MTP verify does.
+    let reference = run_scenario(&scenarios::dflash("dflash_batched3", 3));
+    let mut sc = scenarios::dflash("dflash_batched3_kv_refusal", 3);
+    sc.cfg.verify_kv_exhaust_at = vec![1];
+    let lines = run_scenario(&sc);
+    assert_eq!(
+        positions(&lines, "-> ERR KV cache exhausted").len(),
+        1,
+        "the scripted refusal ran once"
+    );
+    assert_eq!(
+        positions(&lines, "fx apply ReleaseSeq{cache=true, preempt_requeue}").len(),
+        1,
+        "exactly one victim is requeued"
+    );
+    for id in 1..=3 {
+        let (want, got) = (output(&reference, id), output(&lines, id));
+        assert!(!got.contains("Error"), "s{id}: {got}");
+        assert!(got.contains("Done(stop"), "s{id}: {got}");
+        assert_eq!(
+            reply_tokens(&got),
+            reply_tokens(&want),
+            "s{id} reply was cut or changed"
+        );
+    }
+}

@@ -185,7 +185,7 @@ pub(super) fn spec_kv_refusal_retryable(model: &dyn Model, msg: &str) -> bool {
     msg.contains("KV cache exhausted") && (!model.is_ep() || msg.contains("rank-agreed"))
 }
 
-/// 2026-10-14 (race-memory, A184): Free room after a batched MTP step was refused for KV
+/// 2026-10-14 (race-memory, A184): Free room after a batched MTP or DFlash step was refused for KV
 /// (`step_mtp` returned `msg`), as a plain decode step does in `launch_with_preemption`:
 /// preempt one victim (`choose_decode_victim`; spilled, or requeued for re-prefill) and
 /// let the others retry on the next step. Every live sequence drops its drafts and the

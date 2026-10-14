@@ -86,6 +86,9 @@ pub(in crate::model) mod propose_batch_ep;
 mod verify_fused;
 mod worker_commit;
 
+// 2026-10-14 (race-memory, A183): the startup KV pool agreement in `TransformerModel::new` reads it.
+pub(in crate::model) use decode_lazy_agree::kv_decode_agree;
+
 impl Model for TransformerModel {}
 
 impl TransformerModel {

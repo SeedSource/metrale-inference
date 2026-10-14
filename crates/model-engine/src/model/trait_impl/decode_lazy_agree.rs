@@ -39,10 +39,29 @@
 //!   equal on every rank; it never exceeds what any rank has backed.
 //! - Lever off, or no multi-rank protocol: `agree_decode_lazy_maps` returns at once, no
 //!   collective, no map.
+//!
+//! 2026-10-14 (race-memory, A183): the paged KV blocks themselves had the same hole. Decode and
+//! verify grow a sequence's blocks per rank (`ensure_blocks_through_decode`) with no vote, each
+//! rank sizes its pool from its own free memory (hyb27c 10-11: 81,825 / 81,826 blocks) and only
+//! rank 0 inserts into its prefix cache, so one rank could hit "KV cache exhausted" while the
+//! other ran on: rank 1 refusing alone left rank 0 in the step's first collective (hang); rank 0
+//! refusing alone timed its next broadcast out (exit 75). With `METRALE_KV_DECODE_AGREE=1`
+//! every rank caps its usable pool at the minimum block count over the ranks at startup
+//! (`TransformerModel::new`), and `agree_decode_kv_blocks` runs right after
+//! `agree_decode_lazy_maps` in the same seven step functions: a sequence votes only when the
+//! step's last block reaches `kv_blocks_agreed` (once per block of growth, plus the first step
+//! after allocation), grows its blocks, and gathers one 0/1 vote; a refusal anywhere is a
+//! rank-agreed "KV cache exhausted" on every rank, answered by the scheduler as above.
+//! `kv_blocks_agreed` changes only at a vote, so every rank makes the same number of gathers.
 
-use anyhow::Result;
+use std::sync::OnceLock;
 
-use super::super::block_mgmt::{lazy_map_end, map_lazy_states_through};
+use anyhow::{Result, anyhow};
+use metrale_cache::kv_cache::PagedKvCache;
+
+use super::super::block_mgmt::{
+    ensure_blocks_through_decode, lazy_map_end, map_lazy_states_through,
+};
 use super::super::types::TransformerModel;
 use super::prefill_b::lazy_agree::agreed_outcome;
 use crate::traits::SequenceState;
@@ -110,7 +129,94 @@ pub(in crate::model) fn agree_lazy_rows_with(
     Ok(())
 }
 
+/// 2026-10-14 (race-memory, A183): `METRALE_KV_DECODE_AGREE=1` (module docs). Read once.
+pub(crate) fn kv_decode_agree() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("METRALE_KV_DECODE_AGREE").as_deref(), Ok("1")))
+}
+
+/// 2026-10-14 (race-memory, A183): `METRALE_KV_DECODE_FAIL_ABOVE_BLOCKS` (test-only fault
+/// injection, 0 = off): an agreed KV growth whose last block index is at least N refuses on this
+/// rank. Read once, per process (per rank); deliberately NOT rank-agreed, so a test can set it on
+/// one rank only.
+pub(in crate::model) fn kv_decode_fail_above_blocks() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("METRALE_KV_DECODE_FAIL_ABOVE_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// 2026-10-14 (race-memory, A183): One sequence's rank-agreed KV growth through block
+/// `last_block`, with the growth and the gather supplied (the model's
+/// `ensure_blocks_through_decode` and `ep_gather_u32`; a two-rank harness in tests). No growth
+/// and no gather when `last_block < kv_blocks_agreed`. `fail_above` > 0 refuses locally at
+/// `last_block >= fail_above` (the test fault-injection lever).
+pub(in crate::model) fn agree_kv_blocks_with(
+    seq: &mut SequenceState,
+    last_block: usize,
+    fail_above: usize,
+    grow: impl FnOnce(&mut SequenceState) -> Result<()>,
+    gather: impl FnOnce(u32) -> Result<Vec<u32>>,
+) -> Result<()> {
+    if last_block < seq.kv_blocks_agreed {
+        return Ok(());
+    }
+    let local = if fail_above > 0 && last_block >= fail_above {
+        Err(anyhow!(
+            "KV cache exhausted: test fault-injection lever \
+             METRALE_KV_DECODE_FAIL_ABOVE_BLOCKS={fail_above} (block {last_block})"
+        ))
+    } else {
+        grow(seq)
+    };
+    let votes = gather(u32::from(local.is_ok()))?;
+    let what = format!(
+        "decode/verify step of slot {} through KV block {last_block}",
+        seq.slot_idx
+    );
+    agreed_outcome(local, &votes, &what)?;
+    seq.kv_blocks_agreed = last_block + 1;
+    Ok(())
+}
+
 impl TransformerModel {
+    /// 2026-10-14 (race-memory, A183): Rank-agreed KV block growth of `seq` through `last_block`
+    /// for a decode or verify step (module docs). Every rank must call it at the same point of
+    /// the same step, for the same sequences in the same order, before the step's first
+    /// collective and outside any capture; the step's own `ensure_blocks_through_decode` that
+    /// follows then finds the blocks in place. Lever off or single rank: returns at once.
+    pub(in crate::model) fn agree_decode_kv_blocks(
+        &self,
+        seq: &mut SequenceState,
+        last_block: usize,
+        kv_cache: &mut PagedKvCache,
+        stream: u64,
+    ) -> Result<()> {
+        if !kv_decode_agree() || !self.multi_rank_protocol_active() {
+            return Ok(());
+        }
+        agree_kv_blocks_with(
+            seq,
+            last_block,
+            kv_decode_fail_above_blocks(),
+            |s| {
+                ensure_blocks_through_decode(
+                    s,
+                    last_block,
+                    kv_cache,
+                    self.prefix_cache.as_ref(),
+                    self.gpu.as_ref(),
+                    stream,
+                    self.levers.kv_poison,
+                )
+            },
+            |v| self.ep_gather_u32(v),
+        )
+    }
+
     /// 2026-10-05: Rank-agreed lazy-map admission of `seq` for a decode or verify step whose
     /// last KV block is `last_block` (module docs). Every rank must call it at the same point of
     /// the same step, for the same sequences in the same order, before the step's first

@@ -82,6 +82,36 @@ pub(crate) fn assert_ranks_agree(
     Ok(())
 }
 
+/// 2026-10-14 (race-memory, A183): The minimum of `mine` over every rank: each rank in turn
+/// broadcasts its value. A single-rank run returns `mine` without communicating. A collective:
+/// every rank calls it at the same point (the one caller is `TransformerModel::new`, for the KV
+/// pool block count).
+pub(crate) fn agree_min_u64(
+    gpu: &dyn GpuBackend,
+    comm: &dyn CommBackend,
+    mine: u64,
+) -> Result<u64> {
+    if comm.world_size() < 2 {
+        return Ok(mine);
+    }
+    let buf = gpu.alloc(8)?;
+    let gathered = (|| -> Result<u64> {
+        let mut min = mine;
+        for root in 0..comm.world_size() {
+            let mut host = mine.to_le_bytes();
+            gpu.copy_h2d(&host, buf)?;
+            comm.broadcast(buf.0, 8, root)?;
+            gpu.copy_d2h(buf, &mut host)?;
+            min = min.min(u64::from_le_bytes(host));
+        }
+        Ok(min)
+    })();
+    if let Err(e) = gpu.free(buf) {
+        tracing::warn!("rank-agreement scratch free failed (non-fatal): {e}");
+    }
+    gathered
+}
+
 #[cfg(test)]
 mod tests {
     //! 2026-09-25: The collective needs 2 ranks, so these tests cover only the comparison, on

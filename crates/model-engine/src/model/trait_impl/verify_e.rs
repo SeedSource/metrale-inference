@@ -184,6 +184,13 @@ impl TransformerModel {
         // and any capture or replay (`decode_lazy_agree.rs`).
         for (i, seq) in seqs.iter_mut().enumerate() {
             self.agree_decode_lazy_maps(seq, (seq.seq_len + ks[i]).saturating_sub(1) / bs, bs)?;
+            // 2026-10-14 (race-memory, A183): rank-agreed KV block growth (`METRALE_KV_DECODE_AGREE`).
+            self.agree_decode_kv_blocks(
+                seq,
+                (seq.seq_len + ks[i]).saturating_sub(1) / bs,
+                &mut kv_cache,
+                stream,
+            )?;
         }
         for (i, seq) in seqs.iter_mut().enumerate() {
             let last_pos = seq.seq_len + ks[i] - 1;

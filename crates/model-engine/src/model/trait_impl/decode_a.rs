@@ -159,6 +159,8 @@ impl TransformerModel {
         // 2026-10-05: Rank-agreed lazy-map admission (A168), before the step's first collective
         // and any capture or replay (`decode_lazy_agree.rs`).
         self.agree_decode_lazy_maps(seq, blocks_needed - 1, bs)?;
+        // 2026-10-14 (race-memory, A183): rank-agreed KV block growth (`METRALE_KV_DECODE_AGREE`).
+        self.agree_decode_kv_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         ensure_blocks_through_decode(
             seq,
             blocks_needed - 1,

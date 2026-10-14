@@ -270,6 +270,24 @@ impl TransformerModel {
             comm_setup::assert_rank_levers_agree(gpu.as_ref(), comm)?;
         }
 
+        // 2026-10-14 (race-memory, A183): `METRALE_KV_DECODE_AGREE=1` (rank-agreed above): cap
+        // every rank's usable KV pool at the minimum block count over the ranks, so no rank can
+        // grow a sequence the others cannot (`trait_impl/decode_lazy_agree.rs`). Only the dummy
+        // block (index 0) is allocated so far.
+        if let Some(ref comm) = comm
+            && super::trait_impl::kv_decode_agree()
+        {
+            let own = kv_cache.num_blocks();
+            let agreed =
+                crate::rank_agree::agree_min_u64(gpu.as_ref(), comm.as_ref(), own as u64)? as usize;
+            let retired = kv_cache.cap_usable_blocks(agreed)?;
+            tracing::info!(
+                "KV pool rank-agreed (METRALE_KV_DECODE_AGREE): {agreed} blocks = {} tokens on \
+                 every rank (this rank built {own}; retired {retired})",
+                agreed * kv_cache.block_size()
+            );
+        }
+
         // 2026-09-25: At world size 2, register the reduce targets
         // (`moe_output`, `norm_output`, and `logits` for the vocab-parallel
         // lm_head) with the comm backend and give it the `bf16_add_inplace`

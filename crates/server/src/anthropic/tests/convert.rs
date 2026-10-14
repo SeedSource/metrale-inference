@@ -52,6 +52,20 @@ fn stop_reason_covers_every_finish_reason_wire_string() {
     }
 }
 
+#[test]
+fn repetition_guard_cut_stays_max_tokens_for_anthropic() {
+    // 2026-10-14: "stop" on the OpenAI wire, but Anthropic has no stop_reason field
+    // beside it, so the cut is reported as cut short, as before (#82 guard fix).
+    use super::super::helpers::anthropic_stop_reason;
+    use crate::ir::FinishReason;
+    assert_eq!(
+        anthropic_stop_reason(&FinishReason::Repetition),
+        "max_tokens"
+    );
+    assert_eq!(anthropic_stop_reason(&FinishReason::Stop), "end_turn");
+    assert_eq!(anthropic_stop_reason(&FinishReason::Length), "max_tokens");
+}
+
 fn choice(kind: &str, name: Option<&str>) -> AnthropicToolChoice {
     AnthropicToolChoice {
         choice_type: kind.to_string(),

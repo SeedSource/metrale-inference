@@ -18,7 +18,8 @@ pub use request::{
     parse_wire_effort,
 };
 pub use response::{
-    ChatResponse, Choice, ChoiceLogprobs, FINISH_REASON_TIMEOUT, FinishReason, TokenLogprob, Usage,
+    ChatResponse, Choice, ChoiceLogprobs, FINISH_REASON_REPETITION, FINISH_REASON_TIMEOUT,
+    FinishReason, TokenLogprob, Usage,
 };
 pub use stream::{DeltaStream, StreamDelta};
 

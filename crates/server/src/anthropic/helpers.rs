@@ -76,3 +76,14 @@ pub(super) fn convert_stop_reason(finish_reason: &str) -> &'static str {
         _ => "end_turn",
     }
 }
+
+/// 2026-10-14: [`convert_stop_reason`] for an IR finish reason. A repetition guard cut is
+/// `"stop"` on the OpenAI wire (with its own `stop_reason`), but Anthropic has no such
+/// field, and `end_turn` would report the cut turn complete: it stays `max_tokens`, as the
+/// guard cut was reported before (#82 guard fix).
+pub(super) fn anthropic_stop_reason(reason: &crate::ir::FinishReason) -> &'static str {
+    match reason {
+        crate::ir::FinishReason::Repetition => "max_tokens",
+        other => convert_stop_reason(other.as_wire()),
+    }
+}

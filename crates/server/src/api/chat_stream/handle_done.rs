@@ -268,9 +268,13 @@ pub(super) fn handle_done(
 ///    scheduler can still say `"length"` when the budget ran out before it saw the
 ///    cancel.
 /// 5. a stream-side guard (`guard_stop`, such as the token loop watchdog or the
-///    SimHash trip) → `"length"`. These guards cancel without naming a guard to the
-///    scheduler, which then reports `"stop"`.
+///    SimHash trip) → `"repetition"` (`ir::FinishReason::Repetition`: wire `"stop"` with
+///    `stop_reason` `"repetition_detected"`). These guards cancel without naming a guard
+///    to the scheduler, which then reports `"stop"`.
 /// 6. otherwise the scheduler's reason.
+///
+/// 2026-10-14: Rung 5 was `"length"`, which made a guard cut read as the token budget
+/// running out (#82 guard fix; race-memory OPEN 14(a): 7 of 24 normal answers cut).
 fn resolve_wire_finish_reason<'a>(
     scheduler_reason: &'a str,
     tool_loop_capped: bool,
@@ -287,9 +291,9 @@ fn resolve_wire_finish_reason<'a>(
     } else if stop_string_matched {
         "stop"
     } else if stream_guard_stop.is_some() {
-        // 2026-09-26: A guard cut is a truncation. It ranks below tool calls and a stop
-        // match, so a guard that trips on the same step reports what actually happened.
-        "length"
+        // 2026-09-26: It ranks below tool calls and a stop match, so a guard that trips
+        // on the same step reports what actually happened.
+        crate::ir::FINISH_REASON_REPETITION
     } else {
         scheduler_reason
     }
@@ -319,14 +323,16 @@ mod wire_finish_reason_tests {
     }
 
     #[test]
-    fn stream_side_guard_cut_reports_length() {
-        // 2026-09-26: The scheduler reports "stop" for a stream-side guard cut; the wire
-        // reason is "length".
+    fn stream_side_guard_cut_reports_repetition() {
+        // 2026-10-14: The scheduler reports "stop" for a stream-side guard cut; the reason
+        // is "repetition" (wire "stop" + stop_reason "repetition_detected"), not "length".
         for guard in ["simhash_semantic_loop", "token_loop_watchdog"] {
+            let r = resolve_wire_finish_reason("stop", false, false, false, Some(guard));
+            assert_eq!(r, "repetition", "guard={guard}");
+            let f = crate::ir::FinishReason::from(r);
             assert_eq!(
-                resolve_wire_finish_reason("stop", false, false, false, Some(guard)),
-                "length",
-                "guard={guard}"
+                (f.as_wire(), f.stop_reason()),
+                ("stop", Some("repetition_detected"))
             );
         }
     }

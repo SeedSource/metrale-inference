@@ -41,6 +41,7 @@ impl From<crate::ir::ChatResponse> for MessagesResponse {
                 crate::ir::FinishReason::ToolCalls => "tool_use",
                 crate::ir::FinishReason::Length => "max_tokens",
                 crate::ir::FinishReason::ContentFilter => "refusal",
+                crate::ir::FinishReason::Repetition => "max_tokens",
                 crate::ir::FinishReason::Other(_) => "end_turn",
             };
             stop_sequence = c.matched_stop;

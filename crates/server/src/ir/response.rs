@@ -118,6 +118,11 @@ impl Usage {
 /// `"length"`.
 pub const FINISH_REASON_TIMEOUT: &str = "timeout";
 
+/// 2026-10-14: The internal reason a stream-side repetition guard cut carries
+/// (`resolve_wire_finish_reason`); it becomes [`FinishReason::Repetition`], whose wire
+/// reason is `"stop"`.
+pub const FINISH_REASON_REPETITION: &str = "repetition";
+
 /// 2026-09-26: Why generation stopped. `Other` keeps any other engine
 /// reason string unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +131,12 @@ pub enum FinishReason {
     Length,
     ToolCalls,
     ContentFilter,
+    /// 2026-10-14: A stream-side repetition guard (the SimHash loop detector or the line
+    /// watchdog) ended the response. On the OpenAI wire it is `"stop"` with `stop_reason`
+    /// `"repetition_detected"` (vLLM's stop_reason string for its repetition stop), so a
+    /// guard cut stays inside the OpenAI enum and is not confused with the token budget
+    /// (`"length"`), which it was reported as until this change (#82 guard fix).
+    Repetition,
     Other(String),
 }
 
@@ -136,6 +147,7 @@ impl From<&str> for FinishReason {
             "length" => FinishReason::Length,
             "tool_calls" => FinishReason::ToolCalls,
             "content_filter" => FinishReason::ContentFilter,
+            FINISH_REASON_REPETITION => FinishReason::Repetition,
             other => FinishReason::Other(other.to_string()),
         }
     }
@@ -148,7 +160,17 @@ impl FinishReason {
             FinishReason::Length => "length",
             FinishReason::ToolCalls => "tool_calls",
             FinishReason::ContentFilter => "content_filter",
+            FinishReason::Repetition => "stop",
             FinishReason::Other(s) => s,
+        }
+    }
+
+    /// 2026-10-14: The OpenAI choice's `stop_reason` beside `finish_reason`: set only for a
+    /// repetition guard cut (`"repetition_detected"`, as vLLM sends it).
+    pub fn stop_reason(&self) -> Option<&'static str> {
+        match self {
+            FinishReason::Repetition => Some("repetition_detected"),
+            _ => None,
         }
     }
 }

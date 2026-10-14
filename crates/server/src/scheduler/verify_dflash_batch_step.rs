@@ -17,6 +17,15 @@ use super::*;
 ///
 /// `drafts_per_seq` is γ: every sequence must carry exactly that many pending
 /// drafts (`mtp_step.rs` groups only sequences with the same draft count).
+///
+/// 2026-10-14 (race-memory, A184): Returns the error when the forward was refused for
+/// KV and the refusal is safe to retry (`preempt::spec_kv_refusal_retryable`), as
+/// `step_verify_k4_batched` does. No sequence is finished then; the caller must pass it
+/// to `preempt::preempt_after_spec_refusal`. Before this, the refusal put the drafts back
+/// and returned, so the same refusal repeated every step and the batch stalled. Every
+/// other failure fails its sequences with the error (an error frame), never a bare
+/// `finished`, which the client would read as a normal "stop".
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub fn step_verify_dflash_batched(
     model: &dyn Model,
     batch: &mut [&mut ActiveSeq],
@@ -24,7 +33,7 @@ pub fn step_verify_dflash_batched(
     drafts_per_seq: usize,
     num_drafts: usize,
     _verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
-) {
+) -> Option<String> {
     let n = batch.len();
     let k = drafts_per_seq + 1;
     debug_assert!(n >= 2 && drafts_per_seq >= 1);
@@ -33,10 +42,8 @@ pub fn step_verify_dflash_batched(
     // async checkpoint copies are complete before this verify.
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary (dflash batched): {e:#}");
-        for a in batch.iter_mut() {
-            a.finished = true;
-        }
-        return;
+        fail_dflash_batch(batch, &format!("sync_secondary (dflash batched): {e:#}"));
+        return None;
     }
 
     // 2026-09-25: flat seq-major token rows, plus the per-sequence drafts they encode.
@@ -64,14 +71,19 @@ pub fn step_verify_dflash_batched(
         match model.decode_verify_batched(&tokens, &ks, &mut seq_refs, 0, opts) {
             Ok(v) => v,
             Err(e) => {
-                // 2026-09-25: per the `decode_verify_batched` contract no
-                // sequence state advanced on Err; put the drafts back so
-                // the next tick verifies them again.
-                tracing::error!("decode_verify_batched (dflash): {e:#}");
-                for (a, d) in batch.iter_mut().zip(drafts_all.into_iter()) {
-                    a.pending_drafts = d;
+                let msg = format!("decode_verify_batched (dflash, n={n} k={k}): {e:#}");
+                // 2026-10-14 (race-memory, A184): per the `decode_verify_batched`
+                // contract no sequence state advanced on Err. A retryable KV refusal
+                // finishes nothing: the caller preempts a victim and drops every
+                // draft, so the rest bootstrap again on the next step. Any other
+                // error would repeat on every step, so it fails the batch.
+                if crate::scheduler::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
                 }
-                return;
+                tracing::error!("{msg}");
+                fail_dflash_batch(batch, &msg);
+                return None;
             }
         }
     };
@@ -88,10 +100,15 @@ pub fn step_verify_dflash_batched(
             results.len(),
             n * k
         );
-        for a in batch.iter_mut() {
-            a.finished = true;
-        }
-        return;
+        fail_dflash_batch(
+            batch,
+            &format!(
+                "decode_verify_batched (dflash): short result {} < {}",
+                results.len(),
+                n * k
+            ),
+        );
+        return None;
     }
 
     // 2026-09-25: First pass, per sequence: verdict, rewind, ctx commit and
@@ -192,16 +209,17 @@ pub fn step_verify_dflash_batched(
             // recurrent state untrusted, so every sequence finishes, as
             // a commit error does for one sequence.
             tracing::error!("gdn_fold_accepted (dflash batched): {e:#}");
-            for a in batch.iter_mut() {
-                a.finished = true;
-            }
-            return;
+            fail_dflash_batch(batch, &format!("gdn_fold_accepted (dflash batched): {e:#}"));
+            return None;
         }
         for (i, a) in batch.iter_mut().enumerate() {
             let num_accepted = accepted_per_seq[i];
             if let Err(e) = model.commit_accepted_prefix(&mut a.seq, num_accepted + 1, k) {
                 tracing::error!("commit_accepted_prefix (dflash batched): {e:#}");
-                a.finished = true;
+                super::lifecycle::fail_sequence(
+                    a,
+                    format!("commit_accepted_prefix (dflash batched): {e:#}"),
+                );
             }
         }
     }
@@ -333,4 +351,13 @@ pub fn step_verify_dflash_batched(
             .as_secs_f64()
             * 1000.0,
     );
+    None
+}
+
+/// 2026-10-14 (race-memory, A184): Fail every sequence of the batch with `msg`, so each
+/// client gets an error frame (`lifecycle::fail_sequence`), not a cut reply ending "stop".
+fn fail_dflash_batch(batch: &mut [&mut ActiveSeq], msg: &str) {
+    for a in batch.iter_mut() {
+        super::lifecycle::fail_sequence(a, msg.to_string());
+    }
 }

@@ -43,7 +43,7 @@ pub fn step_verify_dflash(
 ) {
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
-        a.finished = true;
+        super::lifecycle::fail_sequence(a, format!("sync_secondary (dflash): {e:#}"));
         return;
     }
 
@@ -62,7 +62,7 @@ pub fn step_verify_dflash(
             .and_then(|_| model.ep_broadcast_tokens(&tokens).map(|_| ()));
         if let Err(e) = sent {
             tracing::error!("EP broadcast verify_kgamma: {e:#}");
-            a.finished = true;
+            super::lifecycle::fail_sequence(a, format!("EP broadcast verify_kgamma: {e:#}"));
             return;
         }
     }
@@ -74,8 +74,10 @@ pub fn step_verify_dflash(
     let verified_argmax = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
         Err(e) => {
+            // 2026-10-14 (race-memory, A184): an error frame, as the K4/K3/K2 serial
+            // steps send; a bare `finished` reached the client as a normal "stop".
             tracing::error!("decode_verify_dflash: {e:#}");
-            a.finished = true;
+            super::lifecycle::fail_sequence(a, format!("decode_verify_dflash: {e:#}"));
             return;
         }
     };
@@ -134,7 +136,7 @@ pub fn step_verify_dflash(
     // verify, so it goes out before any emit below can finish the sequence.
     if ep && let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
         tracing::error!("EP broadcast verify_kgamma result: {e:#}");
-        a.finished = true;
+        super::lifecycle::fail_sequence(a, format!("EP broadcast verify_kgamma result: {e:#}"));
         return;
     }
     if let Ok(mut st) = DFLASH_ACCEPT.lock() {
@@ -239,7 +241,7 @@ pub fn step_verify_dflash(
     let total_accepted = num_accepted + 1;
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash): {e:#}");
-        a.finished = true;
+        super::lifecycle::fail_sequence(a, format!("commit_accepted_prefix (dflash): {e:#}"));
         return;
     }
 

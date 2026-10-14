@@ -317,6 +317,19 @@ fn verify_batched(
     super::verify_k4_batch_step::step_verify_k4_batched(&*model, &mut batch, &sched, &[4, 4], 3, &c)
 }
 
+/// 2026-10-14: Run `step_verify_dflash_batched` (γ=3) over both rows of `two_drafted`.
+fn verify_batched_dflash(
+    model: std::sync::Arc<PreemptStubModel>,
+    active: &mut [super::types::ActiveSeq],
+) -> Option<String> {
+    let sched = SchedCtx::for_test_with(model.clone());
+    let c = super::think_end_token0_tests::ctx(&sched, &active[0]);
+    let mut batch: Vec<&mut super::types::ActiveSeq> = active.iter_mut().collect();
+    super::verify_dflash_batch_step::step_verify_dflash_batched(
+        &*model, &mut batch, &sched, 3, 3, &c,
+    )
+}
+
 #[test]
 fn batched_verify_kv_refusal_is_returned_and_finishes_nothing() {
     for model in [
@@ -443,5 +456,77 @@ fn spec_refusal_with_one_live_row_fails_it_with_an_error() {
             .error
             .as_deref()
             .is_some_and(|e| e.contains("KV cache exhausted"))
+    );
+}
+
+#[test]
+fn dflash_batched_verify_kv_refusal_is_returned_and_finishes_nothing() {
+    // 2026-10-14 (race-memory, A184): before, the refusal put the drafts back and returned
+    // nothing, so it repeated every step and the batch stalled with no preemption.
+    for model in [
+        PreemptStubModel::failing(1),
+        PreemptStubModel {
+            ep: true,
+            kv_error: Some(VOTED),
+            ..PreemptStubModel::failing(1)
+        },
+    ] {
+        let (mut active, _rx0, _rx1) = two_drafted();
+        let refusal = verify_batched_dflash(std::sync::Arc::new(model), &mut active);
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|m| m.contains("KV cache exhausted")),
+            "{refusal:?}"
+        );
+        for a in &active {
+            assert!(!a.finished && a.error.is_none(), "a refused row stays live");
+        }
+    }
+}
+
+#[test]
+fn dflash_batched_verify_failure_that_cannot_retry_fails_rows_with_an_error() {
+    // 2026-10-14: before, any verify error also put the drafts back, so a device error
+    // repeated forever.
+    for model in [
+        PreemptStubModel {
+            hard_error: Some("CUDA error 700: illegal memory access"),
+            ..Default::default()
+        },
+        PreemptStubModel {
+            ep: true,
+            ..PreemptStubModel::failing(1)
+        },
+    ] {
+        let (mut active, _rx0, _rx1) = two_drafted();
+        let refusal = verify_batched_dflash(std::sync::Arc::new(model), &mut active);
+        assert!(refusal.is_none());
+        for a in &active {
+            assert!(
+                a.finished && a.error.is_some(),
+                "an error, never a bare finish"
+            );
+        }
+    }
+}
+
+#[test]
+fn dflash_serial_verify_failure_ends_the_row_with_an_error_not_a_stop() {
+    // 2026-10-14 (race-memory, A184): a bare `finished` reached the client as HTTP 200
+    // finish "stop", as the K4/K3/K2 serial steps no longer do.
+    let model = std::sync::Arc::new(PreemptStubModel::failing(1));
+    let (mut active, _rx0, _rx1) = two_drafted();
+    let sched = SchedCtx::for_test_with(model.clone());
+    let c = super::think_end_token0_tests::ctx(&sched, &active[0]);
+    let a = &mut active[0];
+    super::verify_dflash_step::step_verify_dflash(&*model, a, &sched, &[7, 8, 9], 3, &c, true);
+    assert!(a.finished, "the row ends");
+    assert!(
+        a.error
+            .as_deref()
+            .is_some_and(|m| m.contains("KV cache exhausted")),
+        "{:?}",
+        a.error
     );
 }

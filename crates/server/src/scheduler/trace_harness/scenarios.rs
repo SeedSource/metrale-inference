@@ -132,7 +132,7 @@ pub(super) fn batched_verify() -> Scenario {
     }
 }
 
-fn dflash(name: &'static str, n: u64) -> Scenario {
+pub(super) fn dflash(name: &'static str, n: u64) -> Scenario {
     let reqs: Vec<ReqSpec> = (1..=n)
         .map(|i| {
             let mut r = ReqSpec::new(i, 5, gen_eos(16, 10 * i as u32));

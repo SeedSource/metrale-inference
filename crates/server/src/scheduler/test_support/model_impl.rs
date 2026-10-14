@@ -244,6 +244,31 @@ impl ModelVerify for PreemptStubModel {
         }
         anyhow::bail!("decode_verify_batched: success unused in preempt tests")
     }
+    /// 2026-10-14 (race-memory, A184): the serial DFlash verify, scripted as
+    /// `decode_verify_batched` (same call count); succeeding is unused.
+    fn decode_verify_dflash(
+        &self,
+        _t: &[u32],
+        _s: &mut SequenceState,
+        _st: u64,
+    ) -> Result<Vec<u32>> {
+        self.decode_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(msg) = self.hard_error {
+            anyhow::bail!("{msg}");
+        }
+        if self
+            .fail_decodes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!(
+                "{}",
+                self.kv_error
+                    .unwrap_or("KV cache exhausted: no free blocks")
+            );
+        }
+        anyhow::bail!("decode_verify_dflash: success unused in preempt tests")
+    }
 }
 
 impl ModelDraft for PreemptStubModel {

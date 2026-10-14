@@ -210,9 +210,10 @@ pub fn step_mtp(
                     }
                     tagged.sort_by_key(|t| t.0);
                     let mut refs: Vec<&mut ActiveSeq> = tagged.into_iter().map(|t| t.1).collect();
-                    step_verify_dflash_batched(
+                    let r = step_verify_dflash_batched(
                         model, &mut refs, sched, gamma, num_drafts, verify_ctx,
                     );
+                    refusal = refusal.or(r);
                 } else {
                     // 2026-09-25: A trailing single cannot batch; it takes
                     // the serial loop below.

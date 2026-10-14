@@ -376,6 +376,7 @@ impl BlockDiffusionDraftHead {
             fused_kv_weight: Some(fused_kv_weight),
             fc_fp8: None,
             fused_kv_fp8: None,
+            fp8_mirror_bytes: 0,
             selector_hidden_proj_fp8: None,
             nv4: super::nv4::HeadNv4::default(),
             kv_cache: Mutex::new(kv_cache),

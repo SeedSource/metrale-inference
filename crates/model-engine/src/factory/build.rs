@@ -341,8 +341,20 @@ pub fn build_model(
     } else {
         (max_seq_len, max_batch_size)
     };
-    let dflash_reserve: usize =
-        kv_budget::dflash_reserve_bytes(&dflash_args, &config, dflash_seq_len, hybrid_drafter, gib);
+    // 2026-10-14: The drafter's mirror term is this rank's shard (same `(rank, world)` as
+    // `TransformerModel::dflash_tp_rank`, which the install uses).
+    let dflash_rank_world = comm
+        .as_ref()
+        .filter(|_| config.ep_world_size > 1 || config.tp_world_size > 1)
+        .map(|c| (c.rank(), c.world_size()));
+    let dflash_reserve: usize = kv_budget::dflash_reserve_bytes(
+        &dflash_args,
+        &config,
+        dflash_seq_len,
+        hybrid_drafter,
+        dflash_rank_world,
+        gib,
+    );
     // 2026-10-14: The BF16 drafter layer weights the install frees after this sizing (#82
     // hybrid M1) are credited to the budget term only; the free-memory clamp keeps them,
     // because they are still allocated when the pool is.

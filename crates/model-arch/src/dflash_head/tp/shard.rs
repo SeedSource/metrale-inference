@@ -107,6 +107,18 @@ impl TpGeometry {
         Ok(())
     }
 
+    /// 2026-10-14: The whole drafter as one rank holds it (no TP): every slice is the full
+    /// dimension. [`weight_parts_with`] over it gives the unsharded weights.
+    pub fn full_layout(&self) -> RankLayout {
+        RankLayout {
+            q_heads: (0, self.q_heads),
+            kv_heads: (0, self.kv_heads),
+            inter: (0, self.inter),
+            vocab: (0, self.vocab),
+            fc_out: (0, self.hidden),
+        }
+    }
+
     /// 2026-10-09: `rank`'s slices. Errors on a geometry [`Self::check`] rejects.
     pub fn layout(&self, rank: usize) -> Result<RankLayout> {
         self.check()?;
@@ -147,7 +159,13 @@ pub struct WeightPart {
 /// `shard_weights.rs` applies them. q/k/v/gate/up/lm_head/fc are row slices (contiguous,
 /// so a pointer offset); o/down are column slices (a pitched copy).
 pub fn weight_parts(g: &TpGeometry, rank: usize) -> Result<Vec<WeightPart>> {
-    let l = g.layout(rank)?;
+    Ok(weight_parts_with(g, &g.layout(rank)?))
+}
+
+/// 2026-10-14: [`weight_parts`] for an explicit layout: one rank's slices, or
+/// [`TpGeometry::full_layout`] for the unsharded drafter. The FP8 mirror prediction
+/// (`from_weights/fp8_weights.rs`) reads both through this one rule.
+pub fn weight_parts_with(g: &TpGeometry, l: &RankLayout) -> Vec<WeightPart> {
     let hd = g.head_dim;
     let q_dim = g.q_heads * hd;
     let kv_dim = g.kv_heads * hd;
@@ -169,7 +187,7 @@ pub fn weight_parts(g: &TpGeometry, rank: usize) -> Result<Vec<WeightPart>> {
     };
     let q = (l.q_heads.0 * hd, l.q_heads.1 * hd);
     let kv = (l.kv_heads.0 * hd, l.kv_heads.1 * hd);
-    Ok(vec![
+    vec![
         rows("q_proj", q_dim, g.hidden, q),
         rows("k_proj", kv_dim, g.hidden, kv),
         rows("v_proj", kv_dim, g.hidden, kv),
@@ -179,7 +197,7 @@ pub fn weight_parts(g: &TpGeometry, rank: usize) -> Result<Vec<WeightPart>> {
         cols("down_proj", g.hidden, g.inter, l.inter),
         rows("lm_head", g.vocab, g.hidden, l.vocab),
         rows("fc", g.hidden, g.fc_in, l.fc_out),
-    ])
+    ]
 }
 
 /// 2026-10-09: The candidate order of the merge: higher value first, then lower token id.

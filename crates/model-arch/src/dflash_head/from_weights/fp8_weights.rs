@@ -96,6 +96,7 @@ fn quantize_drafter_fp8(
     let h = head.hidden_size;
     let inter = head.intermediate_size;
     let quant_k = head.kernels.quantize_bf16_to_fp8;
+    let mut mirror_bytes = 0usize;
     // 2026-10-09: METRALE_DFLASH_DRAFT_TP2: o/down are row-parallel, so each rank keeps
     // a column slice of the full quantization (`tp/shard_weights.rs`).
     let o_cols = head.tp.as_ref().map(|t| t.plan.o_cols());
@@ -112,6 +113,23 @@ fn quantize_drafter_fp8(
             Some(shapes) => crate::dflash_head::nv4::quantize_layer(gpu, layer, shapes)?,
             None => [false; 7],
         };
+        // 2026-10-14: What each mirror below allocates, by the rule the KV reserve predicts with.
+        let mb = fp8_mirror_alloc_bytes;
+        let (o_n, o_k) = o_cols.map_or((h, q_dim_local), |(_, (_, cols))| (h, cols));
+        let (d_n, d_k) = down_cols.map_or((h, inter), |(_, (_, cols))| (h, cols));
+        for (built, bytes) in [
+            (!nv4[0], mb(q_dim_local, h)),
+            (!nv4[1], mb(kv_dim_local, h)),
+            (!nv4[2], mb(kv_dim_local, h)),
+            (!nv4[3], mb(o_n, o_k)),
+            (!nv4[4], mb(inter, h)),
+            (!nv4[5], mb(inter, h)),
+            (!nv4[6], mb(d_n, d_k)),
+        ] {
+            if built {
+                mirror_bytes += bytes;
+            }
+        }
         if !nv4[0] {
             layer.q_proj_fp8 = Some(
                 layer
@@ -238,7 +256,9 @@ fn quantize_drafter_fp8(
             head.hidden_size,
             stream,
         )?);
+        mirror_bytes += fp8_mirror_alloc_bytes(head.vocab_size, head.hidden_size);
     }
+    head.fp8_mirror_bytes = mirror_bytes;
     head.quant = DflashQuantization::Fp8Weights;
     tracing::info!(
         target: "metrale_model_arch::dflash_head::from_weights",
@@ -269,7 +289,63 @@ const AUX_CONV_SUFFIXES: [&str; 2] = [
 ];
 const AUX_SELECTOR_SUFFIX: &str = "candidate_selector.hidden_projection.weight";
 
+/// 2026-10-14: Bytes one per-row FP8 mirror of a `[n, k]` weight allocates:
+/// `Fp8DenseWeight` is `n * k` E4M3 bytes plus `n` f32 row scales (`quantize_to_fp8`; the
+/// column slice of `quantize_cols` allocates the same for its `[n, len]`).
+pub(crate) fn fp8_mirror_alloc_bytes(n: usize, k: usize) -> usize {
+    n * k + n * std::mem::size_of::<f32>()
+}
+
 impl BlockDiffusionDraftHead {
+    /// 2026-10-14: The bytes `quantize_drafter_fp8` allocates on one rank for the seven layer
+    /// GEMM mirrors and the lm_head mirror, predicted from the drafter config before the head
+    /// exists: each weight's part from `tp::shard::weight_parts_with` (the rule the install's
+    /// slices come from; `full_layout` without TP), priced by [`fp8_mirror_alloc_bytes`].
+    /// `0` when `fp8_requested` is false (`METRALE_DFLASH_DRAFTER_FP8=0`). `draft_tp2` is
+    /// `METRALE_DFLASH_DRAFT_TP2`; `rank_world` the serve's `(rank, world)`.
+    /// Counts the lm_head mirror always: a checkpoint-native FP8 lm_head is shared, so that
+    /// case over-reserves it. `fc` / fused K/V / conv / selector mirrors
+    /// (`METRALE_DFLASH_AUX_FP8`) and NVFP4 copies are not counted. If the geometry cannot be
+    /// split the full (unsharded) size is returned, the safe side.
+    pub fn predicted_fp8_mirror_bytes(
+        c: &crate::weight_loader::DflashConfig,
+        draft_tp2: bool,
+        rank_world: Option<(usize, usize)>,
+        fp8_requested: bool,
+    ) -> usize {
+        use crate::dflash_head::tp::shard::{Split, TpGeometry, weight_parts_with};
+        if !fp8_requested {
+            return 0;
+        }
+        let g = TpGeometry {
+            world: 2,
+            q_heads: c.num_attention_heads,
+            kv_heads: c.num_key_value_heads,
+            head_dim: c.head_dim,
+            hidden: c.hidden_size,
+            inter: c.intermediate_size,
+            vocab: c.vocab_size,
+            fc_in: 0,
+        };
+        let layout = draft_tp2
+            .then(|| crate::dflash_head::tp::TpPlan::two_rank(rank_world))
+            .flatten()
+            .and_then(|(rank, _)| g.layout(rank).ok())
+            .unwrap_or_else(|| g.full_layout());
+        let bytes = |p: &crate::dflash_head::tp::shard::WeightPart| match p.split {
+            Split::Rows => fp8_mirror_alloc_bytes(p.len, p.k),
+            Split::Cols => fp8_mirror_alloc_bytes(p.n, p.len),
+        };
+        weight_parts_with(&g, &layout)
+            .iter()
+            .map(|p| match p.name {
+                "fc" => 0,
+                "lm_head" => bytes(p),
+                _ => c.num_hidden_layers * bytes(p),
+            })
+            .sum()
+    }
+
     /// 2026-10-14: The bytes [`Self::release_bf16_layer_weights`] frees under its layer rule,
     /// predicted from the drafter store before the head exists: the BF16 store copies of the
     /// seven layer GEMM weights, when the FP8 drafter is requested (`fp8_requested`,
@@ -444,5 +520,67 @@ mod release_credit_tests {
             "METRALE_DFLASH_DRAFTER_FP8=0 keeps BF16"
         );
         assert_eq!(p(&store, true, false), 0, "the non-paged body reads BF16");
+    }
+}
+
+#[cfg(test)]
+mod mirror_prediction_tests {
+    use super::fp8_mirror_alloc_bytes as mb;
+    use crate::dflash_head::BlockDiffusionDraftHead;
+    use crate::weight_loader::dflash_loader::parse_dflash_config;
+
+    /// 2026-10-14: The GLM-5.3 DFlash2 drafter's shapes (serve log 2026-10-14: 5 layers,
+    /// hidden 4096, inter 12288 = 2 x 6144, GQA 32/8 = 2 x 16/4, head_dim 128, vocab 154880).
+    fn glm() -> crate::weight_loader::DflashConfig {
+        parse_dflash_config(
+            r#"{"hidden_size": 4096, "num_hidden_layers": 5, "intermediate_size": 12288,
+                "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+                "vocab_size": 154880}"#,
+        )
+        .unwrap()
+    }
+
+    /// 2026-10-14: TP1 counts every shape whole; a TP2 rank counts its shard (column-parallel
+    /// rows halved, row-parallel columns halved, lm_head vocab halved) with the full rows'
+    /// scales for o/down (#82 hybrid M1b).
+    #[test]
+    fn tp2_rank_predicts_its_shard_and_tp1_the_whole() {
+        let c = glm();
+        let p = BlockDiffusionDraftHead::predicted_fp8_mirror_bytes;
+        let tp1 = p(&c, false, None, true);
+        let layer1 = mb(4096, 4096)
+            + 2 * mb(1024, 4096)
+            + mb(4096, 4096)
+            + 2 * mb(12288, 4096)
+            + mb(4096, 12288);
+        assert_eq!(tp1, 5 * layer1 + mb(154_880, 4096));
+        for rank in 0..2 {
+            let tp2 = p(&c, true, Some((rank, 2)), true);
+            let layer2 = mb(2048, 4096)
+                + 2 * mb(512, 4096)
+                + mb(4096, 2048)
+                + 2 * mb(6144, 4096)
+                + mb(4096, 6144);
+            assert_eq!(tp2, 5 * layer2 + mb(77_440, 4096), "rank {rank}");
+            // Halved up to the unsharded scales of o/down (4 bytes x 4096 rows x 2 x 5).
+            assert!(tp2 * 2 >= tp1 && tp2 * 2 <= tp1 + 5 * 2 * 4096 * 4);
+        }
+        // 2026-10-14: about 763 MiB per rank for the GLM drafter, against 603 MiB for the
+        // five q/k/v/gate/up mirrors and the lm_head the ledger lists (o/down are the rest).
+        assert_eq!(p(&c, true, Some((0, 2)), true), 800_320_000);
+    }
+
+    /// 2026-10-14: Without the TP lever, or off a two-rank serve, the whole drafter is
+    /// predicted; METRALE_DFLASH_DRAFTER_FP8=0 predicts nothing.
+    #[test]
+    fn lever_off_world_one_and_fp8_off() {
+        let c = glm();
+        let p = BlockDiffusionDraftHead::predicted_fp8_mirror_bytes;
+        let whole = p(&c, false, None, true);
+        assert_eq!(p(&c, false, Some((0, 2)), true), whole, "lever off");
+        assert_eq!(p(&c, true, Some((0, 1)), true), whole, "one rank");
+        assert_eq!(p(&c, true, None, true), whole, "no communicator");
+        assert_eq!(p(&c, true, Some((1, 2)), false), 0);
+        assert_eq!(p(&c, false, None, false), 0);
     }
 }

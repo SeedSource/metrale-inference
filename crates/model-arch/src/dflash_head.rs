@@ -188,6 +188,10 @@ pub struct BlockDiffusionDraftHead {
     pub fc_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
     pub fused_kv_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
     pub selector_hidden_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    /// 2026-10-14: Bytes of the FP8 layer and lm_head mirrors this rank allocated at the
+    /// install (`quantize_drafter_fp8`), counted by the same `fp8_mirror_alloc_bytes` rule as
+    /// the KV reserve's prediction; 0 on the BF16 path (#82 hybrid M1b).
+    pub fp8_mirror_bytes: usize,
     /// 2026-10-12: NVFP4 copies of the lm_head (`METRALE_DFLASH_NV4_HEAD`) and of `fc`, the
     /// fused ctx K/V and the selector's hidden projection (`METRALE_DFLASH_NV4_AUX`), `nv4.rs`;
     /// all `None` unless a lever built them.

@@ -77,6 +77,12 @@ pub struct TpPlan {
 }
 
 impl TpPlan {
+    /// 2026-10-14: The `(rank, world)` the drafter splits over: a two-rank serve only. One
+    /// rule for [`Self::decide`] and the KV reserve's mirror prediction (#82 hybrid M1b).
+    pub fn two_rank(rank_world: Option<(usize, usize)>) -> Option<(usize, usize)> {
+        rank_world.filter(|&(_, w)| w == 2)
+    }
+
     /// 2026-10-09: `Some` when the lever is on and this is a two-rank serve. Errors (fail
     /// fast) when the lever is on and the drafter cannot be split as built: no paged cache,
     /// an NVFP4 lm_head, a DSpark Markov head, or a geometry `TpGeometry::check` rejects.
@@ -91,7 +97,7 @@ impl TpPlan {
         if !lever {
             return Ok(None);
         }
-        let Some((rank, world)) = rank_world.filter(|&(_, w)| w == 2) else {
+        let Some((rank, world)) = Self::two_rank(rank_world) else {
             tracing::warn!(
                 "METRALE_DFLASH_DRAFT_TP2=1 needs a two-rank serve (got {rank_world:?}); \
                  the drafter runs on rank 0 alone"

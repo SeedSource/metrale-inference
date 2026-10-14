@@ -135,6 +135,14 @@ pub(super) fn install_dflash_drafter(
                 dflash_credit,
                 released.map_or(0, |(_, bytes)| bytes),
             )?;
+            // 2026-10-14: The mirrors this rank allocated against the reserve (#82 hybrid M1b).
+            super::kv_budget::check_dflash_mirror_reserve(
+                super::kv_budget::dflash_fp8_mirror_reserve_bytes(
+                    &args.drafter_config,
+                    model.dflash_tp_rank(),
+                ),
+                head.fp8_mirror_bytes,
+            )?;
             if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
                 // 2026-10-10: Hybrid serve: the drafter goes beside the MTP head, which stays in
                 // `proposer` with every buffer it was sized with (`hybrid_spec.rs`).

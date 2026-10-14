@@ -134,6 +134,7 @@ pub(super) fn dflash_reserve_bytes(
     config: &ModelConfig,
     max_seq_len: usize,
     hybrid: bool,
+    rank_world: Option<(usize, usize)>,
     gib: impl Fn(usize) -> f64,
 ) -> usize {
     let dflash_reserve: usize = dflash_args
@@ -154,14 +155,9 @@ pub(super) fn dflash_reserve_bytes(
             } else {
                 max_seq_len * config.hidden_size * 2
             };
-            // 2026-09-25: The same test as the allocation in
-            // dflash_head/from_weights.rs: on unless the variable is `0`.
-            let fp8_mirrors =
-                if std::env::var("METRALE_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("0") {
-                    a.drafter_store.total_bytes() / 2
-                } else {
-                    0
-                };
+            // 2026-10-14: The FP8 mirrors this rank allocates (was half the store: a TP2 rank
+            // holds only its shard; #82 hybrid M1b).
+            let fp8_mirrors = dflash_fp8_mirror_reserve_bytes(c, rank_world);
             // 2026-10-14: Hybrid MTP catch-up ring and zero rows (`METRALE_HYBRID_MTP_CATCHUP`),
             // allocated at the drafter install (`set_hybrid_dflash_proposer`), after this sizing.
             let mtp_catchup = metrale_model_layers::speculative::hybrid::hybrid_mtp_catchup_bytes(
@@ -178,6 +174,41 @@ pub(super) fn dflash_reserve_bytes(
         );
     }
     dflash_reserve
+}
+
+/// 2026-10-14: The post-sizing FP8 mirror bytes this rank's install allocates
+/// (`BlockDiffusionDraftHead::predicted_fp8_mirror_bytes`, one shard rule with the
+/// allocation); `0` under `METRALE_DFLASH_DRAFTER_FP8=0`. The reserve and the install's
+/// check both call this, so they read one number.
+pub(super) fn dflash_fp8_mirror_reserve_bytes(
+    drafter_config: &metrale_model_arch::weight_loader::DflashConfig,
+    rank_world: Option<(usize, usize)>,
+) -> usize {
+    metrale_model_arch::dflash_head::BlockDiffusionDraftHead::predicted_fp8_mirror_bytes(
+        drafter_config,
+        metrale_model_arch::dflash_head::levers::DFlashLevers::from_env().draft_tp2,
+        rank_world,
+        std::env::var("METRALE_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("0"),
+    )
+}
+
+/// 2026-10-14: The install's check on [`dflash_fp8_mirror_reserve_bytes`]: logs the post-sizing
+/// mirrors against the reserve and returns `Err` when the head allocated more than reserved
+/// plus 64 MiB (rounding), since the KV pool then runs over its budget by the difference.
+pub(super) fn check_dflash_mirror_reserve(reserved: usize, actual: usize) -> anyhow::Result<()> {
+    tracing::info!(target: "metrale_model_engine::factory::build", "KV budget: DFlash post-sizing mirrors {:.3} GB vs reserved {:.3} GB",
+        actual as f64 / (1u64 << 30) as f64,
+        reserved as f64 / (1u64 << 30) as f64,
+    );
+    if actual > reserved + (64 << 20) {
+        anyhow::bail!(
+            "DFlash mirror reserve: the KV sizing reserved {reserved} bytes for the FP8 drafter \
+             mirrors, but the install allocated {actual}: the KV pool is over its \
+             --gpu-memory-utilization budget by the difference. The reserve's shard rule and \
+             the allocation disagree (METRALE_DFLASH_DRAFT_TP2 / lm_head / NVFP4 copies)."
+        );
+    }
+    Ok(())
 }
 
 /// 2026-10-14: Bytes of BF16 drafter layer weights that are resident at KV sizing and freed by
@@ -289,7 +320,22 @@ pub(super) fn glm_mtp_reserve(
 
 #[cfg(test)]
 mod dflash_credit_tests {
-    use super::check_dflash_bf16_credit;
+    use super::{check_dflash_bf16_credit, check_dflash_mirror_reserve};
+
+    /// 2026-10-14: The mirror check passes up to 64 MiB over the reserve and fails beyond;
+    /// under-using the reserve passes (#82 hybrid M1b).
+    #[test]
+    fn the_mirror_check_has_a_64_mib_slack_edge() {
+        let gb = 1usize << 30;
+        assert!(check_dflash_mirror_reserve(0, 0).is_ok());
+        assert!(check_dflash_mirror_reserve(gb, gb / 2).is_ok());
+        assert!(check_dflash_mirror_reserve(gb, gb + (64 << 20)).is_ok());
+        assert!(check_dflash_mirror_reserve(gb, gb + (64 << 20) + 1).is_err());
+        assert!(
+            check_dflash_mirror_reserve(0, 65 << 20).is_err(),
+            "mirrors built where none were reserved (FP8=0 reserve, FP8 install)"
+        );
+    }
 
     /// 2026-10-14: The install refuses a serve whose release freed less than the KV credit,
     /// beyond 64 MiB of rounding; freeing as much or more passes (#82 hybrid M1).

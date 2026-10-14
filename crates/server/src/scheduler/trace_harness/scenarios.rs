@@ -115,7 +115,7 @@ fn verify_k(name: &'static str, num_drafts: usize) -> Scenario {
     }
 }
 
-fn batched_verify() -> Scenario {
+pub(super) fn batched_verify() -> Scenario {
     let mut reqs: Vec<ReqSpec> = (1..=3)
         .map(|i| ReqSpec::new(i, 4 + i as usize, gen_eos(12, 10 * i as u32)))
         .collect();

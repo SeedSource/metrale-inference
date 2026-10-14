@@ -255,6 +255,11 @@ pub(super) struct PreemptStubModel {
     /// row length, `copy_logits_to_host` reads them as BF16 at the pointer's
     /// offset, and the argmax calls return each row's argmax.
     pub(super) logit_rows: Vec<Vec<f32>>,
+    /// 2026-10-14 (race-memory, A184): `is_ep` (default `false`, single rank).
+    pub(super) ep: bool,
+    /// 2026-10-14: The message of a scripted KV failure (`fail_decodes`); `None` (default)
+    /// is "KV cache exhausted: no free blocks".
+    pub(super) kv_error: Option<&'static str>,
 }
 
 impl PreemptStubModel {

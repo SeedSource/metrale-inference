@@ -28,6 +28,14 @@ use super::*;
 /// `propose_nd` is the ladder's draft count, not the pruned one: the drafter
 /// refills every sequence to full depth, and the next step's D-Cut prunes
 /// again.
+///
+/// 2026-10-14 (race-memory, A184): Returns the error when the forward was refused
+/// for KV and the refusal is safe to retry (`preempt::spec_kv_refusal_retryable`).
+/// No sequence is finished then; the caller must pass it to
+/// `preempt::preempt_after_spec_refusal`, which frees room by preempting a victim.
+/// Every other failure fails the batch's sequences with the error (an error frame),
+/// never a bare `finished`, which the client would read as a normal "stop".
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub(super) fn step_verify_k4_batched(
     model: &dyn Model,
     batch: &mut [&mut ActiveSeq],
@@ -35,7 +43,7 @@ pub(super) fn step_verify_k4_batched(
     ks: &[usize],
     propose_nd: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
-) {
+) -> Option<String> {
     let n = batch.len();
     debug_assert_eq!(ks.len(), n);
     // 2026-09-25: `off[i]` is sequence i's first row in the flat seq-major
@@ -61,10 +69,8 @@ pub(super) fn step_verify_k4_batched(
     // forward. On failure every sequence in the batch is finished.
     if let Err(e) = model.sync_secondary() {
         tracing::error!("batched-verify sync_secondary: {e:#}");
-        for a in batch.iter_mut() {
-            a.finished = true;
-        }
-        return;
+        fail_batch(batch, &format!("batched-verify sync_secondary: {e:#}"));
+        return None;
     }
 
     // 2026-09-25: each sequence contributes the rows
@@ -102,11 +108,17 @@ pub(super) fn step_verify_k4_batched(
         match model.decode_verify_batched(&tokens, ks, &mut seq_refs, 0, opts) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("decode_verify_batched (n={n} ks={ks:?}): {e:#}");
-                for a in batch.iter_mut() {
-                    a.finished = true;
+                let msg = format!("decode_verify_batched (n={n} ks={ks:?}): {e:#}");
+                // 2026-10-14 (race-memory, A184): a retryable KV refusal advanced no
+                // sequence, so nothing is finished here: the caller preempts a victim and
+                // the rest retry. The drafts taken above are dropped with the refusal.
+                if crate::scheduler::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
                 }
-                return;
+                tracing::error!("{msg}");
+                fail_batch(batch, &msg);
+                return None;
             }
         }
     };
@@ -186,10 +198,11 @@ pub(super) fn step_verify_k4_batched(
         let words: Vec<u32> = verdicts.iter().map(|&(_, na, _)| na as u32).collect();
         if let Err(e) = model.ep_broadcast_tokens(&words) {
             tracing::error!("EP broadcast batched-verify verdict (n={n}): {e:#}");
-            for a in batch.iter_mut() {
-                a.finished = true;
-            }
-            return;
+            fail_batch(
+                batch,
+                &format!("EP broadcast batched-verify verdict (n={n}): {e:#}"),
+            );
+            return None;
         }
     }
     let t_stash = sched.io.clock.now();
@@ -244,13 +257,11 @@ pub(super) fn step_verify_k4_batched(
         let k_max = ks.iter().copied().max().unwrap_or(2);
         if let Err(e) = model.gdn_fold_accepted(&slots, &rows, k_max) {
             tracing::error!("gdn_fold_accepted (mtp batched): {e:#}");
-            for a in batch.iter_mut() {
-                a.finished = true;
-            }
+            fail_batch(batch, &format!("gdn_fold_accepted (mtp batched): {e:#}"));
             // 2026-10-02: the workers wait for this gather after real verdict words, on
             // every path (`verify_ep.rs`); every sequence is failed here.
             retire_failed_on_workers(model, batch, u32::MAX);
-            return;
+            return None;
         }
     }
     // 2026-09-25: per-sequence verdict through `k4_apply_verdict`, with the
@@ -291,7 +302,7 @@ pub(super) fn step_verify_k4_batched(
         .collect();
     if pending.is_empty() {
         // 2026-09-25: `_step_timer` records the step on drop.
-        return;
+        return None;
     }
     // 2026-09-25: exact drafter KV: append the accepted drafts' drafter rows
     // for all pending sequences in one batched call before any propose.
@@ -427,6 +438,15 @@ pub(super) fn step_verify_k4_batched(
         .tel
         .mark(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
     // 2026-09-25: `_step_timer` records the step on drop.
+    None
+}
+
+/// 2026-10-14 (race-memory, A184): Fail every sequence of the batch with `msg`, so each
+/// client gets an error frame (`lifecycle::fail_sequence`), not a cut reply ending "stop".
+fn fail_batch(batch: &mut [&mut ActiveSeq], msg: &str) {
+    for a in batch.iter_mut() {
+        super::lifecycle::fail_sequence(a, msg.to_string());
+    }
 }
 
 /// 2026-10-02: Multi-rank batched verify: join the workers' commit-failure gather
@@ -442,14 +462,27 @@ fn retire_failed_on_workers(model: &dyn Model, batch: &mut [&mut ActiveSeq], loc
             for (i, a) in batch.iter_mut().enumerate().take(32) {
                 if (mask >> i) & 1 == 1 {
                     tracing::error!("batched verify: worker commit failed, retiring seq {i}");
-                    a.finished = true;
+                    // 2026-10-14 (race-memory, A184): an error frame, not a bare finish. A
+                    // sequence that already ended (its own stop, or an earlier error) keeps
+                    // its outcome.
+                    if a.error.is_none() && !a.finished {
+                        super::lifecycle::fail_sequence(
+                            a,
+                            "batched verify: worker commit failed".to_string(),
+                        );
+                    }
                 }
             }
         }
         Err(e) => {
             tracing::error!("EP batched-verify failure gather: {e:#}");
             for a in batch.iter_mut() {
-                a.finished = true;
+                if a.error.is_none() && !a.finished {
+                    super::lifecycle::fail_sequence(
+                        a,
+                        format!("EP batched-verify failure gather: {e:#}"),
+                    );
+                }
             }
         }
     }

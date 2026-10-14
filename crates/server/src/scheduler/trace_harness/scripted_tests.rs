@@ -258,6 +258,45 @@ fn c_kv_exhaustion_preempts_one_victim_and_the_rest_continue() {
     }
 }
 
+/// 2026-10-14 (race-memory, A184): the reply tokens of `out` without the closing
+/// `Done(...)` stats (acceptance counts differ when drafts are dropped).
+fn reply_tokens(out: &str) -> &str {
+    out.split(" Done(").next().unwrap_or(out)
+}
+
+#[test]
+fn c_kv_refusal_in_a_batched_mtp_verify_preempts_one_victim_and_no_reply_is_cut() {
+    // 2026-10-14 (race-memory, A184): kvagcheck2 (n3n4) saw one KV refusal in a C=4
+    // batched MTP verify end all four replies early with finish "stop". Here the second
+    // batched verify of three MTP streams is refused: one victim is requeued, and every
+    // reply still carries the same tokens as the fault-free run and ends without an error.
+    let reference = run_scenario(&scenarios::batched_verify());
+    let mut sc = scenarios::batched_verify();
+    sc.name = "batched_verify_kv_refusal";
+    sc.cfg.verify_kv_exhaust_at = vec![1];
+    let lines = run_scenario(&sc);
+    assert_eq!(
+        positions(&lines, "-> ERR KV cache exhausted").len(),
+        1,
+        "the scripted refusal ran once"
+    );
+    assert_eq!(
+        positions(&lines, "fx apply ReleaseSeq{cache=true, preempt_requeue}").len(),
+        1,
+        "exactly one victim is requeued"
+    );
+    for id in 1..=3 {
+        let (want, got) = (output(&reference, id), output(&lines, id));
+        assert!(!got.contains("Error"), "s{id}: {got}");
+        assert!(got.contains("Done(stop"), "s{id}: {got}");
+        assert_eq!(
+            reply_tokens(&got),
+            reply_tokens(&want),
+            "s{id} reply was cut or changed"
+        );
+    }
+}
+
 #[test]
 fn c_a_fatal_device_error_fails_every_row_in_the_batch_and_only_them() {
     // 2026-09-25: request 3 arrives at tick 1, while requests 1 and 2

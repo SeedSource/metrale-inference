@@ -309,7 +309,7 @@ impl ModelVerify for RecordingModel {
         stream: u64,
         opts: VerifyBatchedOpts,
     ) -> Result<Vec<u32>> {
-        Ok(self.fx_verify_batched(tokens, ks, seqs, stream, opts.write_on_accept))
+        self.fx_verify_batched(tokens, ks, seqs, stream, opts.write_on_accept)
     }
     recorded! {
         fn can_batch_verify(&self, ks: &[usize]) -> bool = self.cfg.can_batch_verify => "can_batch_verify({ks:?}) -> {}", self.cfg.can_batch_verify;

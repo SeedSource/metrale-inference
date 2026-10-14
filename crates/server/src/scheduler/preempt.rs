@@ -175,6 +175,78 @@ pub(super) fn preempt_requeue(io: &SchedIo, mut a: ActiveSeq) -> PreemptedSeq {
     PreemptedSeq { a, tokens }
 }
 
+/// 2026-10-14 (race-memory, A184): Whether a batched speculative step's error (`msg`, the
+/// full `{e:#}` chain) is a KV refusal that is safe to retry after a preemption. It must
+/// name "KV cache exhausted" (block admission, before any forward), and on a multi-rank
+/// serve it must come from the rank vote (`lazy_agree.rs`, "rank-agreed"), so no rank ran
+/// the step. A refusal without the vote may leave the ranks apart (A183): it fails the
+/// step's sequences instead.
+pub(super) fn spec_kv_refusal_retryable(model: &dyn Model, msg: &str) -> bool {
+    msg.contains("KV cache exhausted") && (!model.is_ep() || msg.contains("rank-agreed"))
+}
+
+/// 2026-10-14 (race-memory, A184): Free room after a batched MTP step was refused for KV
+/// (`step_mtp` returned `msg`), as a plain decode step does in `launch_with_preemption`:
+/// preempt one victim (`choose_decode_victim`; spilled, or requeued for re-prefill) and
+/// let the others retry on the next step. Every live sequence drops its drafts and the
+/// secondary stream is ordered first, as on an MTP-gate switch to plain decode, so the
+/// next step bootstraps them. With no eligible victim (one live sequence left, or only
+/// grammar rows) every live sequence is failed with `msg`: the client gets an error
+/// frame, never a cut reply ending "stop" (kvagcheck2, 2026-10-14).
+pub(super) fn preempt_after_spec_refusal(
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    active: &mut Vec<ActiveSeq>,
+    msg: &str,
+    swapped: &mut Vec<SwappedSeq>,
+    preempted: &mut Vec<PreemptedSeq>,
+) {
+    let io = &sched.io;
+    let model = io.dev.model();
+    for a in active.iter_mut() {
+        a.pending_drafts.clear();
+        a.pending_draft_conf.clear();
+    }
+    if let Err(e) = io.dev.apply(Effect::SyncSecondary) {
+        tracing::error!("spec KV refusal sync_secondary: {e}");
+    }
+    let spill = io.spill.as_deref();
+    let live = active.iter().filter(|a| !a.finished).count();
+    let victim = if live > 1 {
+        super::decode_launch::choose_decode_victim(model, active, spill.is_some())
+    } else {
+        None
+    };
+    let Some(vi) = victim else {
+        tracing::error!("{msg}: no victim to preempt; failing {live} live sequence(s)");
+        for a in active.iter_mut().filter(|a| !a.finished) {
+            super::lifecycle::fail_sequence(a, msg.to_string());
+        }
+        return;
+    };
+    // 2026-10-14: `remove`, not `swap_remove`, as in `launch_with_preemption`.
+    let v = active.remove(vi);
+    tracing::warn!(
+        "KV cache exhausted in a batched MTP step: preempting slot={} ({} blocks, {} tokens \
+         generated) for later RESUME so the other {} sequence(s) can continue",
+        v.seq.slot_idx,
+        v.seq.block_table.len(),
+        v.output_tokens.len(),
+        live - 1,
+    );
+    match spill {
+        Some(sp) => match spill_out_sequence(io, v, sp) {
+            Ok(s) => swapped.push(s),
+            Err((v, spill_err)) => {
+                tracing::warn!(
+                    "spec-preempt spill failed ({spill_err:#}); requeuing victim for re-prefill instead"
+                );
+                preempted.push(preempt_requeue(io, v));
+            }
+        },
+        None => preempted.push(preempt_requeue(io, v)),
+    }
+}
+
 /// 2026-09-25: Resume a requeued victim: allocate a new sequence and
 /// prefill the saved token history into it. The prefill's logits are
 /// discarded and `a.last_token` stays the next decode input, so no token

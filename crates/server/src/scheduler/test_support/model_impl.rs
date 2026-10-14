@@ -116,7 +116,11 @@ impl ModelForward for PreemptStubModel {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            anyhow::bail!("KV cache exhausted: no free blocks");
+            anyhow::bail!(
+                "{}",
+                self.kv_error
+                    .unwrap_or("KV cache exhausted: no free blocks")
+            );
         }
         Ok(DevicePtr::NULL)
     }
@@ -213,6 +217,33 @@ impl ModelVerify for PreemptStubModel {
     ) -> Result<[u32; 4]> {
         anyhow::bail!("unused in preempt tests")
     }
+    /// 2026-10-14 (race-memory, A184): scripted like `decode_batch` (`hard_error`, then
+    /// `fail_decodes` KV failures), sharing its call count; succeeding is unused.
+    fn decode_verify_batched(
+        &self,
+        _t: &[u32],
+        _ks: &[usize],
+        _s: &mut [&mut SequenceState],
+        _st: u64,
+        _o: metrale_model_engine::traits::VerifyBatchedOpts,
+    ) -> Result<Vec<u32>> {
+        self.decode_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(msg) = self.hard_error {
+            anyhow::bail!("{msg}");
+        }
+        if self
+            .fail_decodes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!(
+                "{}",
+                self.kv_error
+                    .unwrap_or("KV cache exhausted: no free blocks")
+            );
+        }
+        anyhow::bail!("decode_verify_batched: success unused in preempt tests")
+    }
 }
 
 impl ModelDraft for PreemptStubModel {
@@ -269,7 +300,11 @@ impl ModelVision for PreemptStubModel {
     }
 }
 
-impl ModelEp for PreemptStubModel {}
+impl ModelEp for PreemptStubModel {
+    fn is_ep(&self) -> bool {
+        self.ep
+    }
+}
 
 impl ModelStreams for PreemptStubModel {}
 

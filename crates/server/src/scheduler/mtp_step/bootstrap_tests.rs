@@ -90,7 +90,10 @@ fn boot(kind: Boot, a: ActiveSeq, want: u32, next: u32, lever: bool) -> (ActiveS
     let c = ctx(&sched, &active[0]);
     match kind {
         Boot::Serial => bootstrap_seq(&*model, &mut active[0], &sched, 3, 3, &c, false),
-        Boot::Batched => step_mtp_bootstrap_batched(&*model, &mut active, &sched, &[0, 1], 3, &c),
+        Boot::Batched => {
+            let refusal = step_mtp_bootstrap_batched(&*model, &mut active, &sched, &[0, 1], 3, &c);
+            assert!(refusal.is_none(), "no KV refusal in this test: {refusal:?}");
+        }
     }
     if let Boot::Batched = kind {
         let plain = active.pop().expect("plain row");

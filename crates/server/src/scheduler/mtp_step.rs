@@ -21,6 +21,12 @@ mod serial_bootstrap;
 /// `verify_ctx` is the `logit_processors` context handed to every bootstrap
 /// and verify call, so verified tokens go through the logits processors
 /// (`verify_pipeline_helper`).
+///
+/// 2026-10-14 (race-memory, A184): Returns the first retryable KV refusal of a batched
+/// bootstrap or batched verify (`preempt::spec_kv_refusal_retryable`). The refused
+/// sequences are left live; the caller must pass the error to
+/// `preempt::preempt_after_spec_refusal` once its per-step accounting is done.
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub fn step_mtp(
     model: &dyn Model,
     active: &mut [ActiveSeq],
@@ -28,7 +34,7 @@ pub fn step_mtp(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-) {
+) -> Option<String> {
     // 2026-09-25: Start of the `Phase::StepOuter` span, recorded at both
     // exits of this function.
     let t_step_outer = sched.io.clock.now();
@@ -44,6 +50,8 @@ pub fn step_mtp(
         num_drafts
     };
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
+    // 2026-10-14 (race-memory, A184): the first retryable KV refusal of this step.
+    let mut refusal: Option<String> = None;
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {
         if !a.pending_drafts.is_empty() {
@@ -91,7 +99,14 @@ pub fn step_mtp(
     // allows it, which `METRALE_NO_MTP_BATCH_BOOTSTRAP` prevents. Otherwise
     // the per-sequence loop below runs.
     if can_batch_bootstrap(model, sched, bootstrap_idxs.len(), dflash_verify_raw_argmax) {
-        step_mtp_bootstrap_batched(model, active, sched, &bootstrap_idxs, ladder_nd, verify_ctx);
+        refusal = step_mtp_bootstrap_batched(
+            model,
+            active,
+            sched,
+            &bootstrap_idxs,
+            ladder_nd,
+            verify_ctx,
+        );
         bootstrap_idxs.clear();
     }
     for &idx in &bootstrap_idxs {
@@ -247,7 +262,7 @@ pub fn step_mtp(
             .io
             .tel
             .mark(crate::scheduler::mtp_timing::Phase::StepOuter, t_step_outer);
-        return;
+        return refusal;
     }
     if verify_idxs.len() >= 2
         && sched.levers.mtp_max_seqs > 1
@@ -337,7 +352,9 @@ pub fn step_mtp(
                         .expect("verify_batch_permutation is a permutation")
                 })
                 .collect();
-            step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+            let r =
+                step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+            refusal = refusal.or(r);
         } else {
             // 2026-09-25: A lone sequence, or a chunk `can_batch_verify`
             // refuses: per-sequence loop.
@@ -405,6 +422,7 @@ pub fn step_mtp(
         .io
         .tel
         .mark(crate::scheduler::mtp_timing::Phase::StepOuter, t_step_outer);
+    refusal
 }
 
 /// 2026-09-25: Sort the DFlash batched-verify group by ssm slot (see the

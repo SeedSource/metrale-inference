@@ -173,6 +173,47 @@ pub(super) fn dflash_reserve_bytes(
     dflash_reserve
 }
 
+/// 2026-10-14: Bytes of BF16 drafter layer weights that are resident at KV sizing and freed by
+/// the install once the head runs on their FP8 mirrors
+/// (`BlockDiffusionDraftHead::predicted_bf16_layer_release_bytes`); `0` without DFlash.
+/// The budget term credits them back to `used_so_far` (#82 hybrid M1: 1.93 GB, about 368K KV
+/// tokens, went back to the host instead of the pool). The free-memory clamp does not, because
+/// the bytes are still allocated when the pool is. `install_dflash_drafter` refuses the
+/// serve when the release frees less.
+pub(super) fn dflash_bf16_credit_bytes(
+    dflash_args: &Option<DflashBuildArgs<'_>>,
+    gib: impl Fn(usize) -> f64,
+) -> usize {
+    let credit = dflash_args.as_ref().map_or(0, |a| {
+        metrale_model_arch::dflash_head::BlockDiffusionDraftHead::predicted_bf16_layer_release_bytes(
+            a.drafter_store,
+            std::env::var("METRALE_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("0"),
+            metrale_model_arch::dflash_head::levers::DFlashLevers::from_env().option_b,
+        )
+    });
+    if credit > 0 {
+        tracing::info!(target: "metrale_model_engine::factory::build", "KV budget: crediting {:.2} GB of BF16 DFlash drafter layer weights freed after sizing (FP8 mirrors)",
+            gib(credit),
+        );
+    }
+    credit
+}
+
+/// 2026-10-14: The install's check on [`dflash_bf16_credit_bytes`]: `Err` when the release freed
+/// less than the KV sizing credited, since the pool then runs over the `--gpu-memory-utilization`
+/// budget by the difference. 64 MiB of slack covers rounding only.
+pub(super) fn check_dflash_bf16_credit(credited: usize, freed: usize) -> anyhow::Result<()> {
+    if freed + (64 << 20) < credited {
+        anyhow::bail!(
+            "DFlash KV credit: the KV sizing credited {credited} bytes of BF16 drafter layer weights, \
+             but the install freed {freed}: the KV pool is over its --gpu-memory-utilization budget \
+             by the difference. The head did not reach the FP8 path its prediction assumed (FP8 \
+             GEMM kernels missing, or a layer without all seven mirrors)."
+        );
+    }
+    Ok(())
+}
+
 /// 2026-09-26: Bytes reserved for the MTP head's paged KV pool, which
 /// allocates after KV sizing; `0` when no MTP head is built.
 pub(super) fn mtp_pool_reserve_bytes(
@@ -237,4 +278,28 @@ pub(super) fn glm_mtp_reserve(
         stage_rows.min(max_seq_len),
     );
     bytes
+}
+
+#[cfg(test)]
+mod dflash_credit_tests {
+    use super::check_dflash_bf16_credit;
+
+    /// 2026-10-14: The install refuses a serve whose release freed less than the KV credit,
+    /// beyond 64 MiB of rounding; freeing as much or more passes (#82 hybrid M1).
+    #[test]
+    fn a_short_release_fails_the_install() {
+        let gb = 1usize << 30;
+        assert!(check_dflash_bf16_credit(0, 0).is_ok());
+        assert!(check_dflash_bf16_credit(2 * gb, 2 * gb).is_ok());
+        assert!(
+            check_dflash_bf16_credit(2 * gb, 3 * gb).is_ok(),
+            "AUX_FP8 frees more"
+        );
+        assert!(check_dflash_bf16_credit(2 * gb, 2 * gb - (32 << 20)).is_ok());
+        assert!(
+            check_dflash_bf16_credit(2 * gb, 0).is_err(),
+            "BF16 fallback freed nothing"
+        );
+        assert!(check_dflash_bf16_credit(2 * gb, 2 * gb - (65 << 20)).is_err());
+    }
 }

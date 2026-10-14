@@ -270,6 +270,27 @@ const AUX_CONV_SUFFIXES: [&str; 2] = [
 const AUX_SELECTOR_SUFFIX: &str = "candidate_selector.hidden_projection.weight";
 
 impl BlockDiffusionDraftHead {
+    /// 2026-10-14: The bytes [`Self::release_bf16_layer_weights`] frees under its layer rule,
+    /// predicted from the drafter store before the head exists: the BF16 store copies of the
+    /// seven layer GEMM weights, when the FP8 drafter is requested (`fp8_requested`,
+    /// `METRALE_DFLASH_DRAFTER_FP8` not `0`) and the paged body is on (`option_b`).
+    /// The KV sizing credits these bytes, which are freed only after it (#82 hybrid M1),
+    /// and the install checks that the release freed at least this much. The conv and
+    /// selector frees under `METRALE_DFLASH_AUX_FP8` are not counted.
+    pub fn predicted_bf16_layer_release_bytes(
+        store: &metrale_model_weights::weights::WeightStore,
+        fp8_requested: bool,
+        option_b: bool,
+    ) -> usize {
+        if !(fp8_requested && option_b) {
+            return 0;
+        }
+        store.freeable_bytes_matching(|n, t| {
+            BF16_LAYER_SUFFIXES.iter().any(|s| n.ends_with(s))
+                && t.dtype == metrale_model_weights::weights::WeightDtype::BF16
+        })
+    }
+
     /// 2026-10-10: Frees the BF16 copies of the layers' seven dense GEMM weights once the
     /// head runs on their FP8 mirrors (#82 hybrid memory, P2). Returns the freed (tensors,
     /// bytes), or `None` when it keeps them.
@@ -367,5 +388,61 @@ impl BlockDiffusionDraftHead {
             *w = null;
         }
         store.free_matching(gpu, |n| doomed.contains(n)).map(Some)
+    }
+}
+
+#[cfg(test)]
+mod release_credit_tests {
+    use crate::dflash_head::BlockDiffusionDraftHead;
+    use metrale_gpu_runtime::gpu::GpuBackend;
+    use metrale_gpu_runtime::gpu::mock::MockGpuBackend;
+    use metrale_model_weights::weights::{WeightDtype, WeightStore, WeightTensor};
+
+    /// 2026-10-14: The KV credit counts the BF16 copies of the seven layer GEMM weights only,
+    /// and nothing when the FP8 drafter or the paged body is off (#82 hybrid M1).
+    #[test]
+    fn credit_counts_the_bf16_layer_gemms_the_release_frees() {
+        let gpu = MockGpuBackend::new();
+        let mut map = std::collections::HashMap::new();
+        let mut want = 0;
+        for l in 0..2 {
+            for s in super::BF16_LAYER_SUFFIXES {
+                map.insert(
+                    format!("layers.{l}{s}"),
+                    WeightTensor {
+                        ptr: gpu.alloc(256).expect("alloc"),
+                        shape: vec![8, 16],
+                        dtype: WeightDtype::BF16,
+                    },
+                );
+                want += 8 * 16 * 2;
+            }
+        }
+        for (name, dtype) in [
+            ("fc.weight", WeightDtype::BF16),
+            (
+                "layers.0.attention_conv.kernel_projection.weight",
+                WeightDtype::BF16,
+            ),
+            ("layers.9.self_attn.q_proj.weight", WeightDtype::FP8E4M3),
+        ] {
+            map.insert(
+                name.to_string(),
+                WeightTensor {
+                    ptr: gpu.alloc(256).expect("alloc"),
+                    shape: vec![8, 16],
+                    dtype,
+                },
+            );
+        }
+        let store = WeightStore::from_map(map);
+        let p = BlockDiffusionDraftHead::predicted_bf16_layer_release_bytes;
+        assert_eq!(p(&store, true, true), want);
+        assert_eq!(
+            p(&store, false, true),
+            0,
+            "METRALE_DFLASH_DRAFTER_FP8=0 keeps BF16"
+        );
+        assert_eq!(p(&store, true, false), 0, "the non-paged body reads BF16");
     }
 }

@@ -84,6 +84,8 @@ pub(super) fn install_glm_mtp_proposer(
 
 /// 2026-09-26: Installs the DFlash drafter when `dflash_args` is given and its
 /// store has DFlash weights.
+/// 2026-10-14: `dflash_credit` = the BF16 bytes the KV sizing credited
+/// (`kv_budget::dflash_bf16_credit_bytes`); the install fails when it frees less.
 pub(super) fn install_dflash_drafter(
     model: &mut TransformerModel,
     dflash_args: Option<DflashBuildArgs<'_>>,
@@ -94,6 +96,7 @@ pub(super) fn install_dflash_drafter(
     target_hidden_for_dflash: usize,
     max_seq_len: usize,
     max_batch_size: usize,
+    dflash_credit: usize,
 ) -> Result<()> {
     if let Some(args) = dflash_args {
         let weights = load_dflash_weights(
@@ -119,15 +122,19 @@ pub(super) fn install_dflash_drafter(
             )?;
             // 2026-10-10: The BF16 copies of the layer GEMM weights are dead once the head
             // runs on FP8 mirrors (#82 P2); every rank frees its own.
-            if let Some((n, bytes)) =
-                head.release_bf16_layer_weights(args.drafter_store, model.gpu_backend())?
-            {
+            let released =
+                head.release_bf16_layer_weights(args.drafter_store, model.gpu_backend())?;
+            if let Some((n, bytes)) = released {
                 tracing::info!(target: "metrale_model_engine::factory::build",
                     "DFlash drafter: freed {n} BF16 layer weight tensor(s), {:.2} GB; the head \
                      runs on their FP8 mirrors",
                     bytes as f64 / 1e9
                 );
             }
+            super::kv_budget::check_dflash_bf16_credit(
+                dflash_credit,
+                released.map_or(0, |(_, bytes)| bytes),
+            )?;
             if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
                 // 2026-10-10: Hybrid serve: the drafter goes beside the MTP head, which stays in
                 // `proposer` with every buffer it was sized with (`hybrid_spec.rs`).
@@ -151,6 +158,7 @@ pub(super) fn install_dflash_drafter(
                  drafter did not install on this rank, and a hybrid serve needs it on every rank"
             );
         } else {
+            super::kv_budget::check_dflash_bf16_credit(dflash_credit, 0)?;
             tracing::warn!(target: "metrale_model_engine::factory::build", "DFlash drafter store had no fc.weight — proposer not installed; \
                  falling back to whatever proposer (if any) the target's MTP path built"
             );

@@ -343,6 +343,11 @@ pub fn build_model(
     };
     let dflash_reserve: usize =
         kv_budget::dflash_reserve_bytes(&dflash_args, &config, dflash_seq_len, hybrid_drafter, gib);
+    // 2026-10-14: The BF16 drafter layer weights the install frees after this sizing (#82
+    // hybrid M1) are credited to the budget term only; the free-memory clamp keeps them,
+    // because they are still allocated when the pool is.
+    let dflash_credit = kv_budget::dflash_bf16_credit_bytes(&dflash_args, gib);
+    let used_so_far = used_so_far.saturating_sub(dflash_credit);
     let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
     let kv_budget = total_budget
         .saturating_sub(used_so_far)
@@ -496,6 +501,7 @@ pub fn build_model(
         target_hidden_for_dflash,
         dflash_seq_len,
         dflash_batch,
+        dflash_credit,
     )?;
 
     // 2026-09-25: Step 8: the n-gram embedding, and the LoRA adapters loaded

@@ -64,7 +64,11 @@ impl SchedulerCore {
             crate::scheduler::prefill_chunk_cap::decoders(active),
             self.slice_left,
         );
-        let admit = if self.slice_hold {
+        // 2026-10-15 (race-prefill, A192): a resume re-prefill in flight
+        // (`METRALE_RESUME_ONE_CHUNK_PER_TICK`) holds a sequence the batch-slot count does not
+        // see, and runs only under KV pressure: start nothing until it finishes.
+        let resume_in_flight = preempted.iter().any(|p| p.resume.is_some());
+        let admit = if self.slice_hold || resume_in_flight {
             0
         } else {
             crate::scheduler::prefill_chunk_cap::admit_now(

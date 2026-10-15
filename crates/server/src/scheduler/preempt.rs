@@ -172,7 +172,11 @@ pub(super) fn preempt_requeue(io: &SchedIo, mut a: ActiveSeq) -> PreemptedSeq {
     a.pending_drafts.clear();
     a.pending_draft_conf.clear();
     a.spec_adapt = Default::default();
-    PreemptedSeq { a, tokens }
+    PreemptedSeq {
+        a,
+        tokens,
+        resume: None,
+    }
 }
 
 /// 2026-10-14 (race-memory, A184): Whether a batched speculative step's error (`msg`, the
@@ -263,7 +267,30 @@ pub(super) fn resume_preempted_seq(
     p: PreemptedSeq,
     max_prefill_tokens: usize,
 ) -> Result<ActiveSeq> {
-    let PreemptedSeq { mut a, tokens } = p;
+    let PreemptedSeq { mut a, tokens, .. } = p;
+    let mut seq = resume_alloc(model, io, &mut a)?;
+    let total = tokens.len();
+    let mut offset = 0;
+    while offset < total {
+        match resume_chunk(model, &tokens, &mut seq, offset, max_prefill_tokens) {
+            Ok(next) => offset = next,
+            Err(e) => {
+                a.seq = seq;
+                send_error(
+                    io,
+                    &mut a,
+                    &format!("preempt-resume re-prefill failed: {e:#}"),
+                );
+                return Err(e);
+            }
+        }
+    }
+    Ok(resume_finish(model, a, seq))
+}
+
+/// 2026-10-15 (race-prefill, A192): The start of a resume: a new sequence with the victim's
+/// session and adapter. On failure the client has been sent an error frame.
+fn resume_alloc(model: &dyn Model, io: &SchedIo, a: &mut ActiveSeq) -> Result<SequenceState> {
     let mut seq = match model.alloc_sequence() {
         Ok(s) => s,
         Err(e) => {
@@ -282,41 +309,45 @@ pub(super) fn resume_preempted_seq(
     // (`core/tick.rs`), so the slot still holds the same adapter.
     seq.adapter_id = a.seq.adapter_id;
     seq.acquired_adapter_slot = model.acquire_adapter_slot(a.seq.adapter_slot);
+    Ok(seq)
+}
 
-    // 2026-09-25: The same EP prefill preamble as `prefill_b_step`, so an
-    // EP worker runs the re-prefill too.
-    let prefill_result = (|| -> Result<()> {
-        let total = tokens.len();
-        let mut offset = 0;
-        while offset < total {
-            let chunk_len = resume_chunk_len(model, &tokens, offset, max_prefill_tokens);
-            let is_last = offset + chunk_len >= total;
-            model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-            model.ep_broadcast_cmd(chunk_len as u32)?;
-            model.ep_broadcast_cmd(offset as u32)?;
-            model.ep_broadcast_cmd(total as u32)?;
-            model.ep_broadcast_tokens(&tokens)?;
-            // 2026-09-25: The worker makes the matching call in its
-            // `0xFFFFFFF0` handler, so it must run here too.
-            model.ep_sync_vision_embeds(&tokens)?;
-            model.prefill_chunk(&tokens, &mut seq, offset, chunk_len, is_last, 0)?;
-            // 2026-10-14: The worker normalizes after every chunk; so does `run_standard`.
-            if let Err(e) = model.normalize_ssm_states(&seq, 0) {
-                tracing::warn!("preempt-resume SSM state normalization failed: {e:#}");
-            }
-            offset += chunk_len;
-        }
-        Ok(())
-    })();
-    if let Err(e) = prefill_result {
-        a.seq = seq;
-        send_error(
-            io,
-            &mut a,
-            &format!("preempt-resume re-prefill failed: {e:#}"),
-        );
-        return Err(e);
+/// 2026-10-15 (race-prefill, A192): One planned re-prefill chunk at `offset`, with the same EP
+/// preamble as `prefill_a_step` / `run_standard` (race-memory, kvagcheck8, below). Returns the
+/// next chunk's start.
+/// 2026-10-14 (race-memory, kvagcheck8): the re-prefill runs as planned `prefill_chunk` calls,
+/// each announced with its own `0xFFFFFFF0` broadcast. The worker's `0xFFFFFFF0` handler calls
+/// `prefill_chunk`, whose prefix lookup joins an `ep_min_u32` agreement; a rank-0 `prefill`
+/// never joins it, and both ranks of the 2-node car hung on the first resume.
+fn resume_chunk(
+    model: &dyn Model,
+    tokens: &[u32],
+    seq: &mut SequenceState,
+    offset: usize,
+    max_prefill_tokens: usize,
+) -> Result<usize> {
+    let total = tokens.len();
+    let chunk_len = resume_chunk_len(model, tokens, offset, max_prefill_tokens);
+    let is_last = offset + chunk_len >= total;
+    model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
+    model.ep_broadcast_cmd(chunk_len as u32)?;
+    model.ep_broadcast_cmd(offset as u32)?;
+    model.ep_broadcast_cmd(total as u32)?;
+    model.ep_broadcast_tokens(tokens)?;
+    // 2026-09-25: The worker makes the matching call in its
+    // `0xFFFFFFF0` handler, so it must run here too.
+    model.ep_sync_vision_embeds(tokens)?;
+    model.prefill_chunk(tokens, seq, offset, chunk_len, is_last, 0)?;
+    // 2026-10-14: The worker normalizes after every chunk; so does `run_standard`.
+    if let Err(e) = model.normalize_ssm_states(seq, 0) {
+        tracing::warn!("preempt-resume SSM state normalization failed: {e:#}");
     }
+    Ok(offset + chunk_len)
+}
+
+/// 2026-10-15 (race-prefill, A192): The end of a resume: the re-prefilled sequence goes back
+/// into `a`, whose stream continues where it paused.
+fn resume_finish(model: &dyn Model, mut a: ActiveSeq, seq: SequenceState) -> ActiveSeq {
     // 2026-09-25: `seq.prompt_len` stays as prefill set it: the whole
     // history. `cache_sequence` treats the first `prompt_len` tokens as
     // already inserted by prefill and does not count them again.
@@ -325,7 +356,7 @@ pub(super) fn resume_preempted_seq(
     // sequence; start an empty ring, as `resume_swapped_seq` does.
     a.ssm_rollback_ring = SsmDecodeRing::new(model.decode_rollback_ring_slots());
     a.preempt_immune_until_tokens = a.output_tokens.len() + PREEMPT_IMMUNITY_TOKENS;
-    Ok(a)
+    a
 }
 
 /// 2026-10-14 (race-memory, kvagcheck8): The next re-prefill chunk at `offset`, planned as
@@ -363,6 +394,13 @@ fn resume_chunk_len(
 /// slots and KV blocks allow. A victim needs its history's blocks plus one
 /// block of growth, and prefix-cache blocks are reclaimed to make room. A
 /// victim that could never fit the pool is sent an error and dropped.
+/// 2026-10-15 (race-prefill, A192): With `one_chunk_per_tick`
+/// (`METRALE_RESUME_ONE_CHUNK_PER_TICK`), a resume runs one planned chunk per call while
+/// another sequence decodes, so the decoders step between chunks instead of freezing for the
+/// whole re-prefill (a 324K resume ~160 s). The chunks, their order and their EP words are the
+/// synchronous resume's. One resume is in flight at a time; with nobody decoding it runs to the
+/// end in one call, as before.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resume_preempted_seqs(
     model: &dyn Model,
     io: &SchedIo,
@@ -371,7 +409,12 @@ pub(super) fn resume_preempted_seqs(
     max_batch_size: usize,
     block_size: usize,
     max_prefill_tokens: usize,
+    one_chunk_per_tick: bool,
 ) {
+    if let Some(i) = preempted.iter().position(|p| p.resume.is_some()) {
+        advance_resume(model, io, active, preempted, i, block_size, max_prefill_tokens);
+        return;
+    }
     while !preempted.is_empty() && active.len() < max_batch_size {
         let Some((idx, needed)) = preempted
             .iter()
@@ -398,15 +441,19 @@ pub(super) fn resume_preempted_seqs(
             );
             continue;
         }
-        let mut free = model.num_free_blocks();
-        while free < want {
-            let got = model.reclaim_prefix_blocks(want - free);
-            if got == 0 {
-                break;
-            }
-            free = model.num_free_blocks();
+        if !reclaim_until_free(model, want) {
+            return;
         }
-        if free < want {
+        if one_chunk_per_tick {
+            let mut p = preempted.remove(idx);
+            let Ok(seq) = resume_alloc(model, io, &mut p.a) else {
+                tracing::error!("Preempt-resume failed: sequence alloc");
+                continue;
+            };
+            p.resume = Some(ResumeProgress { seq, offset: 0 });
+            preempted.push(p);
+            let i = preempted.len() - 1;
+            advance_resume(model, io, active, preempted, i, block_size, max_prefill_tokens);
             return;
         }
         let p = preempted.remove(idx);
@@ -421,6 +468,96 @@ pub(super) fn resume_preempted_seqs(
                 active.push(a);
             }
             Err(e) => tracing::error!("Preempt-resume failed: {e:#}"),
+        }
+    }
+}
+
+/// 2026-09-25: Reclaim prefix-cache blocks until `want` are free; false when they cannot be.
+fn reclaim_until_free(model: &dyn Model, want: usize) -> bool {
+    let mut free = model.num_free_blocks();
+    while free < want {
+        let got = model.reclaim_prefix_blocks(want - free);
+        if got == 0 {
+            break;
+        }
+        free = model.num_free_blocks();
+    }
+    free >= want
+}
+
+/// 2026-10-15 (race-prefill, A192): Run the in-flight resume `preempted[i]` on: one chunk, or
+/// to the end while nobody decodes. Before every chunk the blocks the rest of the resume still
+/// needs (its history plus one block of growth, less what it holds) must be free, reclaiming
+/// prefix blocks as the start does; otherwise it waits for the next tick, so the decode steps
+/// between chunks can never leave a chunk short of blocks part-way (the decoders free blocks
+/// by finishing or by the rank-agreed preemption). A cancelled row is released between chunks.
+fn advance_resume(
+    model: &dyn Model,
+    io: &SchedIo,
+    active: &mut Vec<ActiveSeq>,
+    preempted: &mut Vec<PreemptedSeq>,
+    i: usize,
+    block_size: usize,
+    max_prefill_tokens: usize,
+) {
+    loop {
+        let p = &mut preempted[i];
+        let cancelled = p
+            .a
+            .cancel_flag
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
+        if cancelled {
+            let mut p = preempted.remove(i);
+            if let Some(mut r) = p.resume.take() {
+                let _ = io.dev.apply(Effect::ReleaseSeq {
+                    seq: &mut r.seq,
+                    cache: false,
+                    what: "resume_cancelled",
+                });
+            }
+            tracing::info!("Preempt-resume: request cancelled part-way; released");
+            return;
+        }
+        let total = p.tokens.len();
+        let Some(r) = p.resume.as_mut() else {
+            return;
+        };
+        let want = total / block_size.max(1) + 2;
+        let need = want.saturating_sub(r.seq.block_table.len());
+        if !reclaim_until_free(model, need) {
+            return;
+        }
+        match resume_chunk(model, &p.tokens, &mut r.seq, r.offset, max_prefill_tokens) {
+            Ok(next) => r.offset = next,
+            Err(e) => {
+                let mut p = preempted.remove(i);
+                if let Some(r) = p.resume.take() {
+                    p.a.seq = r.seq;
+                }
+                send_error(
+                    io,
+                    &mut p.a,
+                    &format!("preempt-resume re-prefill failed: {e:#}"),
+                );
+                tracing::error!("Preempt-resume failed: {e:#}");
+                return;
+            }
+        }
+        if r.offset >= total {
+            let mut p = preempted.remove(i);
+            let r = p.resume.take().expect("in flight");
+            let a = resume_finish(model, p.a, r.seq);
+            tracing::info!(
+                "Preempt-resume: re-prefilled {total} tokens one chunk per tick \
+                 ({} generated so far), decode continues",
+                a.output_tokens.len(),
+            );
+            active.push(a);
+            return;
+        }
+        if !active.is_empty() {
+            return;
         }
     }
 }

@@ -139,6 +139,7 @@ impl SchedulerCore {
                     max_batch_size,
                     block_size,
                     max_prefill_tokens,
+                    sched.levers.resume_one_chunk_per_tick,
                 );
             }
             if active.is_empty() {

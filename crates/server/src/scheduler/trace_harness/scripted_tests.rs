@@ -258,6 +258,70 @@ fn c_kv_exhaustion_preempts_one_victim_and_the_rest_continue() {
     }
 }
 
+/// 2026-10-15 (race-prefill, A192): the KV-exhaustion run with 4-token prefill chunks, the
+/// resume lever on or off.
+fn preempt_run(one_chunk_per_tick: bool) -> Vec<String> {
+    let mut sc = three_streams();
+    sc.opts.max_prefill_tokens = 4;
+    sc.opts.resume_one_chunk_per_tick = one_chunk_per_tick;
+    scripted(&sc, |d| {
+        d.script(1, [70, 71, 72, EOS]);
+        d.script(2, [80, 81, EOS]);
+        d.script(3, [90, 91, 92, EOS]);
+        d.fail_next(Fault::KvExhausted);
+    })
+}
+
+/// 2026-10-15: the resume's chunks: every `prefill_chunk` after the requeue.
+fn resume_chunks(lines: &[String]) -> Vec<usize> {
+    let requeue = positions(lines, "fx apply ReleaseSeq{cache=true, preempt_requeue}")[0];
+    positions(lines, "prefill_chunk(")
+        .into_iter()
+        .filter(|&i| i > requeue)
+        .collect()
+}
+
+// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_ONE_CHUNK_PER_TICK` through the real
+// scheduler loop. Off, the victim's whole re-prefill runs inside one tick (no decode between
+// its chunks: every other row waits). On, the other rows decode between its chunks, and every
+// reply is the same.
+#[test]
+fn c_chunked_resume_lets_the_other_rows_decode_between_its_chunks_with_the_same_replies() {
+    let off = preempt_run(false);
+    let on = preempt_run(true);
+    for lines in [&off, &on] {
+        assert_eq!(
+            positions(lines, "fx apply ReleaseSeq{cache=true, preempt_requeue}").len(),
+            1,
+            "exactly one victim is requeued"
+        );
+    }
+    let decodes_between = |lines: &[String]| {
+        let c = resume_chunks(lines);
+        assert!(c.len() >= 2, "a multi-chunk resume: {c:?}");
+        positions(lines, "fx launch Decode{n=")
+            .into_iter()
+            .filter(|&i| i > c[0] && i < c[c.len() - 1])
+            .count()
+    };
+    assert_eq!(decodes_between(&off), 0, "off: the resume runs inside one tick");
+    assert!(decodes_between(&on) >= 1, "on: the other rows decode between chunks");
+    // 2026-10-15: the same chunk plan in both runs.
+    let plan = |lines: &[String]| -> Vec<String> {
+        resume_chunks(lines)
+            .into_iter()
+            .map(|i| lines[i].split(", stream=").next().unwrap_or("").to_string())
+            .collect()
+    };
+    assert_eq!(plan(&off), plan(&on));
+    for id in 1..=3 {
+        let (a, b) = (output(&off, id), output(&on, id));
+        assert!(!b.contains("Error"), "{b}");
+        assert!(b.contains("Done(stop"), "{b}");
+        assert_eq!(reply_tokens(&a), reply_tokens(&b), "s{id} reply");
+    }
+}
+
 /// 2026-10-14 (race-memory, A184): the reply tokens of `out` without the closing
 /// `Done(...)` stats (acceptance counts differ when drafts are dropped).
 fn reply_tokens(out: &str) -> &str {

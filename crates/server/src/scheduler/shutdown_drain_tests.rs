@@ -41,6 +41,7 @@ fn shutdown_tells_every_parked_request_which_state_it_died_in() {
     let preempted = PreemptedSeq {
         a: parked,
         tokens: vec![7],
+        resume: None,
     };
 
     abort_in_flight_on_shutdown(

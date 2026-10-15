@@ -217,6 +217,7 @@ fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
         8,
         16,
         0,
+        false,
     );
     assert_eq!(active.len(), 1);
     assert!(preempted.is_empty());
@@ -237,6 +238,7 @@ fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
         8,
         16,
         0,
+        false,
     );
     assert!(active2.is_empty());
     assert_eq!(preempted2.len(), 1);
@@ -268,6 +270,7 @@ fn resume_loop_errors_out_a_sequence_that_can_never_fit() {
         8,
         16,
         0,
+        false,
     );
     assert!(preempted.is_empty() && active.is_empty());
     assert!(rx.try_recv().expect("error delivered").is_err());
@@ -313,6 +316,171 @@ fn resume_on_two_ranks_announces_each_planned_chunk_and_runs_prefill_chunk() {
     assert!(model.prefilled.lock().unwrap().is_empty());
     assert_eq!(resumed.seq.tokens, (0..40).collect::<Vec<u32>>());
     assert_eq!(resumed.seq.prompt_len, 40);
+}
+
+// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_ONE_CHUNK_PER_TICK`. A synchronous resume
+// re-prefills the whole history inside one tick, so every decoding row froze for it (a 324K
+// resume ~160 s). With the lever, each call runs one planned chunk while a row decodes.
+
+/// 2026-10-15: A two-rank stub with room for the resume: 100 free blocks of 16 tokens.
+fn chunked_model() -> std::sync::Arc<PreemptStubModel> {
+    std::sync::Arc::new(PreemptStubModel {
+        ep: true,
+        chunks_ok: true,
+        block_size: Some(16),
+        total_blocks: 100,
+        free_blocks: AtomicUsize::new(100),
+        ..Default::default()
+    })
+}
+
+/// 2026-10-15: A requeued victim with a 40-token history, its requeue words cleared.
+fn victim_40(model: &std::sync::Arc<PreemptStubModel>) -> super::types::PreemptedSeq {
+    let (a, _rx) = active_seq(2, 4);
+    let mut s = a;
+    s.seq.tokens = (0..40).collect();
+    let p = preempt_requeue(&SchedIo::for_test_with(model.clone()), s);
+    model.ep_words.lock().unwrap().clear();
+    model.chunks.lock().unwrap().clear();
+    p
+}
+
+fn resume_calls(
+    model: &std::sync::Arc<PreemptStubModel>,
+    active: &mut Vec<super::types::ActiveSeq>,
+    preempted: &mut Vec<super::types::PreemptedSeq>,
+    one_chunk_per_tick: bool,
+) {
+    resume_preempted_seqs(
+        &**model,
+        &SchedIo::for_test_with(model.clone()),
+        active,
+        preempted,
+        8,
+        16,
+        16,
+        one_chunk_per_tick,
+    );
+}
+
+#[test]
+fn chunked_resume_runs_one_chunk_per_tick_while_a_row_decodes_and_matches_the_sync_resume() {
+    // 2026-10-15: the synchronous resume of the same history, as the reference.
+    let sync_model = chunked_model();
+    let p = victim_40(&sync_model);
+    let reference = resume_preempted_seq(
+        &*sync_model,
+        &SchedIo::for_test_with(sync_model.clone()),
+        p,
+        16,
+    )
+    .expect("sync resume");
+    let sync_chunks = sync_model.chunks.lock().unwrap().clone();
+    let sync_words = sync_model.ep_words.lock().unwrap().clone();
+    assert_eq!(sync_chunks, vec![(0, 16, false), (16, 16, false), (32, 8, true)]);
+
+    let model = chunked_model();
+    let mut preempted = vec![victim_40(&model)];
+    let (decoder, _drx) = active_seq(5, 3);
+    let mut active = vec![decoder];
+    // 2026-10-15: one chunk per call while slot 5 decodes; the row stays preempted in between.
+    for (n, offset) in [(1, 16), (2, 32)] {
+        resume_calls(&model, &mut active, &mut preempted, true);
+        assert_eq!(model.chunks.lock().unwrap().len(), n, "one chunk per tick");
+        assert_eq!(active.len(), 1, "not decoding until the last chunk");
+        assert_eq!(preempted.len(), 1);
+        assert_eq!(preempted[0].resume.as_ref().map(|r| r.offset), Some(offset));
+    }
+    resume_calls(&model, &mut active, &mut preempted, true);
+    assert!(preempted.is_empty());
+    assert_eq!(active.len(), 2);
+    // 2026-10-15: the same chunks and the same EP words, in the same order, as the sync resume.
+    assert_eq!(*model.chunks.lock().unwrap(), sync_chunks);
+    assert_eq!(*model.ep_words.lock().unwrap(), sync_words);
+    let resumed = &active[1];
+    assert_eq!(resumed.seq.tokens, reference.seq.tokens);
+    assert_eq!(resumed.seq.prompt_len, reference.seq.prompt_len);
+    assert_eq!(resumed.seq.slot_idx, reference.seq.slot_idx);
+    assert_eq!(resumed.last_token, reference.last_token);
+    assert_eq!(resumed.output_tokens, reference.output_tokens);
+    assert_eq!(resumed.remaining, reference.remaining);
+    assert_eq!(
+        resumed.preempt_immune_until_tokens,
+        reference.preempt_immune_until_tokens
+    );
+}
+
+#[test]
+fn chunked_resume_with_nobody_decoding_runs_to_the_end_in_one_call() {
+    let model = chunked_model();
+    let mut preempted = vec![victim_40(&model)];
+    let mut active = Vec::new();
+    resume_calls(&model, &mut active, &mut preempted, true);
+    assert!(preempted.is_empty());
+    assert_eq!(active.len(), 1);
+    assert_eq!(
+        *model.chunks.lock().unwrap(),
+        vec![(0, 16, false), (16, 16, false), (32, 8, true)]
+    );
+}
+
+#[test]
+fn chunked_resume_waits_while_the_rest_does_not_fit_and_never_runs_a_short_chunk() {
+    let model = chunked_model();
+    let mut preempted = vec![victim_40(&model)];
+    let (decoder, _drx) = active_seq(5, 3);
+    let mut active = vec![decoder];
+    resume_calls(&model, &mut active, &mut preempted, true);
+    assert_eq!(model.chunks.lock().unwrap().len(), 1);
+    // 2026-10-15: the decoder took the free blocks: 40 / 16 + 2 = 4 needed, 3 free, none to
+    // reclaim. The resume waits; it does not start a chunk it might not finish.
+    model.free_blocks.store(3, Ordering::Relaxed);
+    for _ in 0..3 {
+        resume_calls(&model, &mut active, &mut preempted, true);
+    }
+    assert_eq!(model.chunks.lock().unwrap().len(), 1, "held, no chunk");
+    assert_eq!(preempted.len(), 1);
+    assert_eq!(active.len(), 1);
+    // 2026-10-15: blocks come back (a row finished): it carries on where it stopped.
+    model.free_blocks.store(100, Ordering::Relaxed);
+    resume_calls(&model, &mut active, &mut preempted, true);
+    assert_eq!(
+        *model.chunks.lock().unwrap(),
+        vec![(0, 16, false), (16, 16, false)]
+    );
+}
+
+#[test]
+fn chunked_resume_of_a_cancelled_row_is_released_between_chunks() {
+    let model = chunked_model();
+    let mut preempted = vec![victim_40(&model)];
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    preempted[0].a.cancel_flag = Some(flag.clone());
+    let (decoder, _drx) = active_seq(5, 3);
+    let mut active = vec![decoder];
+    resume_calls(&model, &mut active, &mut preempted, true);
+    let resume_slot = preempted[0].resume.as_ref().unwrap().seq.slot_idx;
+    let freed_before = model.freed_slots.lock().unwrap().len();
+    flag.store(true, Ordering::Relaxed);
+    resume_calls(&model, &mut active, &mut preempted, true);
+    assert!(preempted.is_empty(), "dropped");
+    assert_eq!(active.len(), 1, "never resumed");
+    assert_eq!(model.chunks.lock().unwrap().len(), 1, "no chunk after the cancel");
+    let freed = model.freed_slots.lock().unwrap().clone();
+    assert_eq!(freed.len(), freed_before + 1);
+    assert_eq!(*freed.last().unwrap(), resume_slot);
+}
+
+#[test]
+fn lever_off_resume_is_unchanged_one_call_and_never_in_flight() {
+    let model = chunked_model();
+    let mut preempted = vec![victim_40(&model)];
+    let (decoder, _drx) = active_seq(5, 3);
+    let mut active = vec![decoder];
+    resume_calls(&model, &mut active, &mut preempted, false);
+    assert!(preempted.is_empty());
+    assert_eq!(active.len(), 2);
+    assert_eq!(model.chunks.lock().unwrap().len(), 3);
 }
 
 // 2026-10-14 (race-memory, A184): batched MTP steps refused for KV. kvagcheck2 (n3n4) saw

@@ -12,6 +12,7 @@ use super::preempt::{
     PREEMPT_IMMUNITY_TOKENS, choose_decode_victim, decode_batch_with_preemption, preempt_requeue,
     resume_preempted_seq, resume_preempted_seqs,
 };
+use super::prefill_b_step::prefill_request;
 use super::sched_ctx::SchedCtx;
 use super::test_support::{PreemptStubModel, active_seq, streaming_seq};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -584,4 +585,48 @@ fn dflash_serial_verify_failure_ends_the_row_with_an_error_not_a_stop() {
         "{:?}",
         a.error
     );
+}
+
+// 2026-10-15 (race-memory, A187): the same mismatch on a new request. With chunking off
+// (`max_prefill_tokens == 0`) `prefill_request` announced one `0xFFFFFFF0` chunk and then ran
+// a whole `prefill` on rank 0, while the worker ran `prefill_chunk`: an unchunked 2-rank serve
+// would hang both ranks on its first prompt.
+
+#[test]
+fn unchunked_prefill_on_two_ranks_runs_the_announced_chunk() {
+    let model = std::sync::Arc::new(PreemptStubModel {
+        ep: true,
+        first_token: Some(5),
+        ..Default::default()
+    });
+    let mut req = super::test_support::blocking_request(None);
+    if let crate::api::InferenceRequest::Blocking {
+        prompt_tokens,
+        max_tokens,
+        ..
+    } = &mut req
+    {
+        *prompt_tokens = std::sync::Arc::new((0..40).collect());
+        *max_tokens = 8;
+    }
+    let a = prefill_request(
+        &SchedCtx::for_test_with(model.clone()),
+        None,
+        None,
+        None,
+        None,
+        &*model,
+        req,
+        &[],
+        &mut None,
+        64,
+        None,
+    )
+    .expect("prefill succeeds on two ranks")
+    .expect("joins decode");
+
+    assert_eq!(*model.chunks.lock().unwrap(), vec![(0, 40, true)]);
+    assert_eq!(model.ep_words.lock().unwrap()[..4], [0xFFFFFFF0, 40, 0, 40]);
+    assert!(model.prefilled.lock().unwrap().is_empty());
+    assert_eq!(a.seq.prompt_len, 40);
 }

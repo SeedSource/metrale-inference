@@ -1168,3 +1168,87 @@ fn unchunked_prefill_on_two_ranks_runs_the_announced_chunk() {
     assert!(model.prefilled.lock().unwrap().is_empty());
     assert_eq!(a.seq.prompt_len, 40);
 }
+
+// 2026-10-15 (race-memory, CAPACITY.md step-2 condition c): a tool-call or forced-format row
+// was never a victim, so under lazy admission a KV refusal on a batch of grammar rows ended
+// them with an error. It is now requeued (never spilled: `SwappedSeq` drops the matcher).
+
+/// 2026-10-15: A JSON-schema matcher over the toy vocabulary of `grammar::tests`.
+fn json_grammar() -> crate::grammar::GrammarState {
+    let vocab = crate::grammar::tests::test_vocab();
+    let mut engine = crate::grammar::GrammarEngine::new(&vocab, &[130]).unwrap();
+    let compiled = engine
+        .compile_json_schema(r#"{"type":"object","properties":{"a":{"type":"integer"}}}"#)
+        .unwrap();
+    crate::grammar::GrammarState::new(&compiled, engine.vocab_size()).unwrap()
+}
+
+#[test]
+fn victim_policy_grammar_row_is_a_requeue_victim() {
+    const PAD: u32 = 999;
+    let model = std::sync::Arc::new(PreemptStubModel {
+        vision_pad: Some(PAD),
+        ..Default::default()
+    });
+    let (mut g, _rg) = active_seq(0, 2);
+    g.grammar_state = Some(json_grammar());
+    let (a1, _r1) = active_seq(1, 8);
+    let active = vec![g, a1];
+    // 2026-10-15: fewest generated tokens wins, with or without spill.
+    assert_eq!(choose_decode_victim(&*model, &active, false), Some(0));
+    assert_eq!(choose_decode_victim(&*model, &active, true), Some(0));
+
+    // 2026-10-15: a grammar row with vision pads can be neither requeued nor spilled.
+    let (mut g, _rg) = active_seq(0, 2);
+    g.grammar_state = Some(json_grammar());
+    g.seq.tokens.insert(2, PAD);
+    let (a1, _r1) = active_seq(1, 8);
+    let active = vec![g, a1];
+    assert_eq!(choose_decode_victim(&*model, &active, false), Some(1));
+    assert_eq!(choose_decode_victim(&*model, &active, true), Some(1));
+}
+
+#[test]
+fn kv_exhaustion_requeues_a_grammar_victim_with_its_matcher_even_with_spill() {
+    let model = std::sync::Arc::new(PreemptStubModel::failing(1));
+    let (a0, _rx0) = active_seq(0, 5);
+    let (mut g, mut g_rx) = streaming_seq(1, 2);
+    let mut gs = json_grammar();
+    assert!(
+        gs.accept_token(b'{' as u32),
+        "toy vocab id of '{{' opens the object"
+    );
+    let steps = gs.num_history_steps();
+    g.grammar_state = Some(gs);
+    let mut active = vec![a0, g];
+    let mut swapped = Vec::new();
+    let mut preempted = Vec::new();
+    let dir = std::env::temp_dir().join(format!(
+        "metrale-preempt-tests-{}-grammar",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let spill = super::io::FileSpill::new(
+        metrale_cache::kv_spill::KvSpillManager::new(dir, 1 << 20).expect("spill dir"),
+    );
+
+    let logits = decode_batch_with_preemption(
+        &SchedCtx::for_test_with(model.clone()),
+        &mut active,
+        Some(&spill),
+        &mut swapped,
+        &mut preempted,
+        &mut Vec::new(),
+    );
+
+    assert!(logits.is_some());
+    assert_eq!(active.len(), 1);
+    assert!(swapped.is_empty(), "a grammar row is never spilled");
+    assert_eq!(preempted.len(), 1);
+    let gs = preempted[0].a.grammar_state.as_ref().expect("matcher kept");
+    assert_eq!(gs.num_history_steps(), steps);
+    assert!(matches!(
+        g_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}

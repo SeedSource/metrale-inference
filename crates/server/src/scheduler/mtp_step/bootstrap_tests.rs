@@ -89,7 +89,10 @@ fn boot(kind: Boot, a: ActiveSeq, want: u32, next: u32, lever: bool) -> (ActiveS
     let sched = sched_with(model.clone(), lever);
     let c = ctx(&sched, &active[0]);
     match kind {
-        Boot::Serial => bootstrap_seq(&*model, &mut active[0], &sched, 3, 3, &c, false),
+        Boot::Serial => {
+            let refusal = bootstrap_seq(&*model, &mut active[0], &sched, 3, 3, &c, false);
+            assert!(refusal.is_none(), "no KV refusal in this test: {refusal:?}");
+        }
         Boot::Batched => {
             let refusal = step_mtp_bootstrap_batched(&*model, &mut active, &sched, &[0, 1], 3, &c);
             assert!(refusal.is_none(), "no KV refusal in this test: {refusal:?}");
@@ -163,8 +166,60 @@ fn a_failed_serial_bootstrap_decode_ends_the_row_with_an_error_not_a_stop() {
     let model = Arc::new(PreemptStubModel::default());
     let sched = sched_with(model.clone(), true);
     let c = ctx(&sched, &a);
-    bootstrap_seq(&*model, &mut a, &sched, 3, 3, &c, false);
+    let refusal = bootstrap_seq(&*model, &mut a, &sched, 3, 3, &c, false);
+    assert!(refusal.is_none(), "not a KV refusal: {refusal:?}");
     assert!(a.finished, "the row ends");
     let err = a.error.as_deref().expect("an error, not a normal finish");
     assert!(err.starts_with("bootstrap decode:"), "{err}");
+}
+
+/// 2026-10-15 (race-memory, CAPACITY.md gap b): a retryable KV refusal of the serial
+/// bootstrap's decode is handed back so `step_mtp`'s caller pauses a victim, as for a batched
+/// bootstrap; the row stays live and unchanged and retries next step. On a 2-rank serve only
+/// a rank-agreed refusal is retryable; any other ends the row with an error.
+#[test]
+fn a_kv_refused_serial_bootstrap_decode_is_handed_back_not_failed() {
+    for (ep, msg, retry) in [
+        (false, "KV cache exhausted: no free blocks", true),
+        (
+            true,
+            "KV cache exhausted: decode/verify step of slot 0 through KV block 256: rank(s) [1] \
+             refused this step's KV/lazy-map admission, so every rank refuses it (rank-agreed)",
+            true,
+        ),
+        (true, "KV cache exhausted: no free blocks", false),
+    ] {
+        let mut a = content_row();
+        let last = a.last_token;
+        let n_out = a.output_tokens.len();
+        let model = Arc::new(PreemptStubModel {
+            ep,
+            hard_error: Some(msg),
+            ..Default::default()
+        });
+        let sched = sched_with(model.clone(), true);
+        let c = ctx(&sched, &a);
+        let refusal = bootstrap_seq(&*model, &mut a, &sched, 3, 3, &c, false);
+        if retry {
+            assert!(
+                refusal.as_deref().is_some_and(|m| m.contains(msg)),
+                "{ep}: {refusal:?}"
+            );
+            assert!(!a.finished && a.error.is_none(), "{ep}: the row stays live");
+            assert_eq!(
+                (a.last_token, a.output_tokens.len()),
+                (last, n_out),
+                "{ep}: unchanged"
+            );
+        } else {
+            assert!(
+                refusal.is_none(),
+                "an unvoted 2-rank refusal is not retryable"
+            );
+            assert!(
+                a.finished && a.error.is_some(),
+                "it ends the row with an error"
+            );
+        }
+    }
 }

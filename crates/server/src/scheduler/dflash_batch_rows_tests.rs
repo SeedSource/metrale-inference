@@ -157,3 +157,82 @@ fn without_the_batched_mark_a_thinking_row_stays_per_sequence() {
         assert!(tr.contains(&"d2h row=0 n=4".to_string()), "{c}");
     }
 }
+
+/// 2026-10-15: The tool-call end id of the stray `</tool_call>` tests (below the fake's vocab,
+/// apart from the fresh ids).
+const TOOL_CALL_END: u32 = 7003;
+
+/// 2026-10-15: A plain-chat row (no tools, no grammar, no open `<tool_call>`, outside
+/// `<think>`) whose second draft is `</tool_call>`. The accept-all fake returns its drafts as
+/// the raw verdict, so that verdict carries the stray id at position 1.
+fn stray_row(m: &StepFake, slot: usize, nd: usize) -> (ActiveSeq, RespRx) {
+    let (mut a, rx) = row(m, slot, nd, false);
+    a.tools_present = false;
+    a.inside_tool_body = false;
+    a.tool_call_end_token = Some(TOOL_CALL_END);
+    a.pending_drafts[1] = TOOL_CALL_END;
+    (a, rx)
+}
+
+/// 2026-10-15: `mask_stray_tool_call_end` (MODEL.toml, GLM-5.3) on the hybrid's DFlash verdicts:
+/// the batched step (pinned or not) and the per-sequence step judge a row whose raw verdict hits
+/// a masked `</tool_call>` through the host pipeline at its own rows, so the draft equal to the
+/// raw `</tool_call>` is rejected there and the id is never committed. A clean row keeps the raw
+/// verdict (no D2H), and with the flag off the stray row does too.
+#[test]
+fn stray_tool_call_end_raw_verdict_takes_the_pipeline_on_every_dflash_verdict() {
+    for (arm, n) in [(Arm::Off, 2usize), (Arm::Batched, 2), (Arm::Off, 1)] {
+        for flag in [true, false] {
+            let m = Arc::new(StepFake::new());
+            let mut s = sched(m.clone(), arm);
+            s.watchdog.mask_stray_tool_call_end = flag;
+            // 2026-10-15: C=2: row 0 clean, row 1 stray; C=1: the lone row is the stray one
+            // and verifies per sequence at the serve's K=8.
+            let nd = if n == 1 { SERVE_DRAFTS } else { 3 };
+            let mut active = Vec::new();
+            let mut rxs = Vec::new();
+            if n == 2 {
+                // 2026-10-15: Same tokenizer ids as the stray row (the step's `LogitsContext`
+                // is built from row 0), but no `</tool_call>` among its drafts.
+                let (mut a, rx) = row(&m, 0, nd, false);
+                a.tool_call_end_token = Some(TOOL_CALL_END);
+                active.push(a);
+                rxs.push(rx);
+            }
+            let (b, rx) = stray_row(&m, n - 1, nd);
+            active.push(b);
+            rxs.push(rx);
+            let before: Vec<usize> = active.iter().map(|a| a.output_tokens.len()).collect();
+            let tr = step(&m, &s, &mut active, if n == 1 { SERVE_DRAFTS } else { nd });
+            let c = format!("{arm:?} C={n} flag={flag}: {tr:#?}");
+            let stray = &active[n - 1];
+            let grown = stray.output_tokens.len() - before[n - 1];
+            if flag {
+                // 2026-10-15: Only the stray row reads its logits, at its own rows.
+                let want = if n == 1 {
+                    "d2h row=0 n=8".to_string()
+                } else {
+                    "d2h row=4 n=4".to_string()
+                };
+                assert_eq!(count(&tr, "d2h"), 1, "{c}");
+                assert!(tr.contains(&want), "{c}");
+                // 2026-10-15: Draft 0 accepted, draft 1 (`</tool_call>`) rejected, one bonus.
+                assert_eq!(grown, 2, "{c}");
+                assert!(
+                    !stray.output_tokens.contains(&TOOL_CALL_END),
+                    "never committed: {c}"
+                );
+            } else {
+                assert_eq!(count(&tr, "d2h"), 0, "flag off: raw verdict: {c}");
+                assert!(stray.output_tokens.contains(&TOOL_CALL_END), "{c}");
+            }
+            if n == 2 {
+                assert_eq!(
+                    active[0].output_tokens.len() - before[0],
+                    nd + 1,
+                    "clean row accepts all on the raw verdict: {c}"
+                );
+            }
+        }
+    }
+}

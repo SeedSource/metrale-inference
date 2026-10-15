@@ -33,9 +33,10 @@ pub(super) const PREEMPT_IMMUNITY_TOKENS: usize = 64;
 ///
 /// Exclusions:
 ///   * finished sequences (2026-10-14);
-///   * grammar-active sequences;
-///   * without spill, sequences whose tokens contain vision pads (their KV
-///     came from image embeddings a token re-prefill cannot reproduce);
+///   * sequences whose tokens contain vision pads, unless they can be spilled (their KV
+///     came from image embeddings a token re-prefill cannot reproduce). A grammar-active
+///     sequence is never spilled (`SwappedSeq` does not carry its matcher), so it is a
+///     victim only when it can be requeued (2026-10-15: before, it was never a victim);
 ///   * immune sequences (see [`PREEMPT_IMMUNITY_TOKENS`]), unless every
 ///     eligible candidate is immune.
 pub(super) fn choose_decode_victim(
@@ -46,10 +47,14 @@ pub(super) fn choose_decode_victim(
     // 2026-10-14 (race-memory, A184): a sequence that already finished this step is never a
     // victim (`preempt_after_spec_refusal` runs before finished rows are retired); requeuing
     // it would resume a reply that has ended.
+    // 2026-10-15 (race-memory, CAPACITY.md step-2 condition c): a grammar-active row is
+    // requeued, never spilled: the requeue keeps the whole `ActiveSeq`, matcher included, and
+    // the matcher has accepted exactly the committed tokens (decode advances it after
+    // sampling; verify after the KV refusal point).
     let eligible = |a: &ActiveSeq| {
         !a.finished
-            && a.grammar_state.is_none()
-            && (can_spill || !model.tokens_contain_vision_pad(&a.seq.tokens))
+            && ((can_spill && a.grammar_state.is_none())
+                || !model.tokens_contain_vision_pad(&a.seq.tokens))
     };
     let pick = |immune_ok: bool| {
         active
@@ -167,7 +172,8 @@ pub(super) fn launch_with_preemption(
                     v.output_tokens.len(),
                     active.len(),
                 );
-                match spill {
+                // 2026-10-15: a grammar-active victim is requeued, never spilled.
+                match spill.filter(|_| v.grammar_state.is_none()) {
                     Some(sp) => match super::preempt::spill_out_sequence(io, v, sp) {
                         Ok(s) => swapped.push(s),
                         Err((v, spill_err)) => {

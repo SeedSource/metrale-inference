@@ -191,8 +191,8 @@ pub(super) fn spec_kv_refusal_retryable(model: &dyn Model, msg: &str) -> bool {
 /// let the others retry on the next step. Every live sequence drops its drafts and the
 /// secondary stream is ordered first, as on an MTP-gate switch to plain decode, so the
 /// next step bootstraps them. With no eligible victim (one live sequence left, or only
-/// grammar rows) every live sequence is failed with `msg`: the client gets an error
-/// frame, never a cut reply ending "stop" (kvagcheck2, 2026-10-14).
+/// rows that can be neither spilled nor requeued) every live sequence is failed with `msg`:
+/// the client gets an error frame, never a cut reply ending "stop" (kvagcheck2, 2026-10-14).
 pub(super) fn preempt_after_spec_refusal(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     active: &mut Vec<ActiveSeq>,
@@ -233,7 +233,8 @@ pub(super) fn preempt_after_spec_refusal(
         v.output_tokens.len(),
         live - 1,
     );
-    match spill {
+    // 2026-10-15: a grammar-active victim is requeued, never spilled.
+    match spill.filter(|_| v.grammar_state.is_none()) {
         Some(sp) => match spill_out_sequence(io, v, sp) {
             Ok(s) => swapped.push(s),
             Err((v, spill_err)) => {

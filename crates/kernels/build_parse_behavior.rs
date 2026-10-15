@@ -26,6 +26,9 @@ pub(crate) struct ParsedBehavior {
     pub effort_capped_at_ceiling: bool,
     /// 2026-10-14: See `behavior_defaults.rs`: effort as a prompt line only, no budget.
     pub effort_prompt_only: bool,
+    /// 2026-10-15: See `behavior_defaults.rs`: the `<tool_call>` start-token logit bias on tool
+    /// requests (+3 for the first two calls).
+    pub tool_call_start_bias: bool,
     /// 2026-10-15: See `behavior_defaults.rs`: with tools active and `tool_choice` auto,
     /// `response_format` is enforced instead of the tool-call grammar.
     pub response_format_with_tools: bool,
@@ -81,6 +84,7 @@ impl Default for ParsedBehavior {
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
             effort_prompt_only: DEFAULT_EFFORT_PROMPT_ONLY,
+            tool_call_start_bias: DEFAULT_TOOL_CALL_START_BIAS,
             response_format_with_tools: DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
@@ -145,6 +149,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("effort_prompt_only"))
         .and_then(|v| v.as_bool())
         .unwrap_or(DEFAULT_EFFORT_PROMPT_ONLY);
+    let tool_call_start_bias = b
+        .and_then(|v| v.get("tool_call_start_bias"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_TOOL_CALL_START_BIAS);
     let response_format_with_tools = b
         .and_then(|v| v.get("response_format_with_tools"))
         .and_then(|v| v.as_bool())
@@ -280,6 +288,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         max_thinking_budget,
         effort_capped_at_ceiling,
         effort_prompt_only,
+        tool_call_start_bias,
         response_format_with_tools,
         thinking_default,
         fp8_kv_calibration_tokens,

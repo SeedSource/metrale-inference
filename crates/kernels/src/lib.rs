@@ -36,7 +36,7 @@ pub use resolve::{ResolveCandidate, TargetResolveError, ptx_for_config, ptx_for_
 mod behavior_defaults;
 pub use behavior_defaults::{
     DEFAULT_EFFORT_CAPPED_AT_CEILING, DEFAULT_EFFORT_PROMPT_ONLY, DEFAULT_MAX_INTER_TOOL_PROSE,
-    DEFAULT_MAX_THINKING_BUDGET, DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
+    DEFAULT_MAX_THINKING_BUDGET, DEFAULT_RESPONSE_FORMAT_WITH_TOOLS, DEFAULT_TOOL_CALL_START_BIAS,
 };
 
 // 2026-09-25: The compiled target's serving defaults, baked from
@@ -193,6 +193,9 @@ pub struct ModelBehavior {
     /// thinking budget unless the client names one. Default
     /// [`DEFAULT_EFFORT_PROMPT_ONLY`].
     pub effort_prompt_only: bool,
+    /// 2026-10-15: the `<tool_call>` start-token logit bias on tool requests (+3 for the first
+    /// two calls). Default [`DEFAULT_TOOL_CALL_START_BIAS`].
+    pub tool_call_start_bias: bool,
     /// 2026-10-15: with tools active and `tool_choice` auto, `response_format` is enforced
     /// instead of the tool-call grammar. Default [`DEFAULT_RESPONSE_FORMAT_WITH_TOOLS`].
     pub response_format_with_tools: bool,
@@ -336,6 +339,7 @@ impl Default for ModelBehavior {
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
             effort_prompt_only: DEFAULT_EFFORT_PROMPT_ONLY,
+            tool_call_start_bias: DEFAULT_TOOL_CALL_START_BIAS,
             response_format_with_tools: DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,

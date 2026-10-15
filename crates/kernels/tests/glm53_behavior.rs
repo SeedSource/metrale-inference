@@ -25,6 +25,7 @@ fn glm53_model_toml_sets_its_parity_flags() {
     assert!(b.effort_prompt_only);
     assert!(b.response_format_with_tools);
     assert!(!b.enable_think_loop_watchdog);
+    assert!(!b.tool_call_start_bias);
 }
 
 #[test]
@@ -37,4 +38,6 @@ fn a_model_without_the_keys_keeps_the_defaults() {
     assert!(!b.response_format_with_tools);
     assert!(b.enable_think_loop_watchdog);
     assert_eq!(d.enable_think_loop_watchdog, lib.enable_think_loop_watchdog);
+    assert!(b.tool_call_start_bias);
+    assert_eq!(d.tool_call_start_bias, lib.tool_call_start_bias);
 }

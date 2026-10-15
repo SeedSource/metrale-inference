@@ -235,23 +235,16 @@ pub(super) fn build_sampling(
         req.logit_bias.clone()
     };
 
-    // 2026-09-26: `<tool_call>` bias by `tool_call_repeat_count`: +3 at 0 or
-    // 1, none at 2, -5 at 3, -10 beyond. Only with tools active, the token not
-    // hard-masked, and `METRALE_FORCE_TEMP_ZERO` off.
-    if !force_temp_zero
-        && tools_active
-        && !suppress_tool_call
-        && let Some(tc_id) = state.tool_call_start_token_id
+    if let Some(tc_id) = state.tool_call_start_token_id
+        && let Some(bias) = tool_call_start_bias(
+            force_temp_zero,
+            tools_active,
+            suppress_tool_call,
+            tool_call_repeat_count,
+            &state.behavior,
+        )
     {
-        let bias = match tool_call_repeat_count {
-            0 | 1 => 3.0,
-            2 => 0.0,
-            3 => -5.0,
-            _ => -10.0,
-        };
-        if bias != 0.0 {
-            logit_bias.push((tc_id, bias));
-        }
+        logit_bias.push((tc_id, bias));
     }
 
     // 2026-09-26: The same `generation_max_tokens` cap `prepare_chat_prompt`
@@ -311,6 +304,31 @@ pub(super) fn build_sampling(
         timeout_at,
         top_logprobs,
     })
+}
+
+/// 2026-09-26: `<tool_call>` bias by `tool_call_repeat_count`: +3 at 0 or
+/// 1, none at 2, -5 at 3, -10 beyond. Only with tools active, the token not
+/// hard-masked, and `METRALE_FORCE_TEMP_ZERO` off.
+///
+/// 2026-10-15: Moved out of `build_sampling` for the tests; none at all under MODEL.toml
+/// `[behavior].tool_call_start_bias = false` (GLM-5.3, as on the official serve).
+fn tool_call_start_bias(
+    force_temp_zero: bool,
+    tools_active: bool,
+    suppress_tool_call: bool,
+    tool_call_repeat_count: usize,
+    behavior: &metrale_kernels::ModelBehavior,
+) -> Option<f32> {
+    if force_temp_zero || !tools_active || suppress_tool_call || !behavior.tool_call_start_bias {
+        return None;
+    }
+    let bias = match tool_call_repeat_count {
+        0 | 1 => 3.0,
+        2 => 0.0,
+        3 => -5.0,
+        _ => -10.0,
+    };
+    (bias != 0.0).then_some(bias)
 }
 
 /// 2026-09-26: One grammar per request. `response_format` is enforced when

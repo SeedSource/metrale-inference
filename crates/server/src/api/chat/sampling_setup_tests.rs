@@ -11,8 +11,8 @@ mod tests {
     // 2026-09-26: `tests` sits inside `sampling_setup_tests`, a child module of
     // `sampling_setup`, so `super::super` is `sampling_setup`.
     use super::super::{
-        request_grammar, response_format_enforced, tool_choice_required_for_parser,
-        tool_grammar_escape_applies,
+        request_grammar, response_format_enforced, tool_call_start_bias,
+        tool_choice_required_for_parser, tool_grammar_escape_applies,
     };
 
     use crate::tool_parser::{ToolChoice, ToolChoiceFunction};
@@ -250,6 +250,41 @@ mod tests {
             GrammarSpec::ToolCall { .. } => "ToolCall",
             GrammarSpec::JsonObject => "JsonObject",
             GrammarSpec::JsonSchema { .. } => "JsonSchema",
+        }
+    }
+
+    #[test]
+    fn tool_call_start_bias_is_unchanged_by_default_and_off_for_glm53() {
+        let default = metrale_kernels::ModelBehavior::default();
+        assert!(default.tool_call_start_bias);
+        let ladder: Vec<Option<f32>> = (0..6)
+            .map(|n| tool_call_start_bias(false, true, false, n, &default))
+            .collect();
+        assert_eq!(
+            ladder,
+            [
+                Some(3.0),
+                Some(3.0),
+                None,
+                Some(-5.0),
+                Some(-10.0),
+                Some(-10.0)
+            ]
+        );
+        assert_eq!(tool_call_start_bias(true, true, false, 0, &default), None);
+        assert_eq!(tool_call_start_bias(false, false, false, 0, &default), None);
+        assert_eq!(tool_call_start_bias(false, true, true, 0, &default), None);
+        // 2026-10-15: GLM-5.3 (`tool_call_start_bias = false`): no bias at any count.
+        let glm = metrale_kernels::ModelBehavior {
+            tool_call_start_bias: false,
+            ..default
+        };
+        for n in 0..6 {
+            assert_eq!(
+                tool_call_start_bias(false, true, false, n, &glm),
+                None,
+                "{n}"
+            );
         }
     }
 }

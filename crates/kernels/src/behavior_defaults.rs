@@ -59,3 +59,11 @@ pub const DEFAULT_EFFORT_PROMPT_ONLY: bool = false;
 /// official serve answers bare JSON 24/24, c30 wraps it in prose 12/12.
 /// `kernels/gb10/glm-5.3-flash` sets it.
 pub const DEFAULT_RESPONSE_FORMAT_WITH_TOOLS: bool = false;
+
+/// 2026-10-15: Default `[behavior].tool_call_start_bias`: whether a tool request gets the
+/// `<tool_call>` start-token logit bias by `tool_call_repeat_count` (+3 at 0 or 1, none at
+/// 2, -5 at 3, -10 beyond; `api/chat/sampling_setup.rs`).
+///
+/// `true` keeps it. `false` adds no bias, as the official serve (vLLM) adds none.
+/// `kernels/gb10/glm-5.3-flash` sets it (spark-bench c30gate TEBGAP-TRACE.md D).
+pub const DEFAULT_TOOL_CALL_START_BIAS: bool = true;

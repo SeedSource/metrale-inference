@@ -77,6 +77,9 @@ response_format_with_tools = true
 # list, so turn 3 ran to max_tokens (spark-bench c30gate TEBGAP-TRACE.md B). The output
 # repetition guards (content-loop and the rest) are separate and unchanged.
 enable_think_loop_watchdog = false
+# 2026-10-15: No <tool_call> start-token logit bias (+3 on the first calls): vLLM adds none
+# (spark-bench c30gate TEBGAP-TRACE.md D, parity; effect ~0 there).
+tool_call_start_bias = false
 
 # 2026-09-25: The target matcher: ptx_for_config (crates/kernels/src/resolve.rs) matches a
 # checkpoint to this target by [[model_types]], and serve refuses a model_type that no

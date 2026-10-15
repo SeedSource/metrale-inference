@@ -777,23 +777,82 @@ fn dflash_batched_verify_failure_that_cannot_retry_fails_rows_with_an_error() {
 }
 
 #[test]
-fn dflash_serial_verify_failure_ends_the_row_with_an_error_not_a_stop() {
-    // 2026-10-14 (race-memory, A184): a bare `finished` reached the client as HTTP 200
-    // finish "stop", as the K4/K3/K2 serial steps no longer do.
-    let model = std::sync::Arc::new(PreemptStubModel::failing(1));
-    let (mut active, _rx0, _rx1) = two_drafted();
-    let sched = SchedCtx::for_test_with(model.clone());
-    let c = super::think_end_token0_tests::ctx(&sched, &active[0]);
-    let a = &mut active[0];
-    super::verify_dflash_step::step_verify_dflash(&*model, a, &sched, &[7, 8, 9], 3, &c, true);
-    assert!(a.finished, "the row ends");
-    assert!(
-        a.error
-            .as_deref()
-            .is_some_and(|m| m.contains("KV cache exhausted")),
-        "{:?}",
-        a.error
-    );
+fn a_serial_verify_kv_refusal_is_handed_back_and_other_failures_end_the_row() {
+    // 2026-10-14 (race-memory, A184): a failed serial verify used to reach the client as a bare
+    // `finished` (HTTP 200 "stop"); it must end with an error frame.
+    // 2026-10-15 (race-memory, gap d, gpause1 VOID): a retryable KV refusal (single rank, or the
+    // 2-rank vote's "rank-agreed") now goes back to `step_mtp` with the row live and unchanged,
+    // so `preempt_after_spec_refusal` can pause a victim (a grammar row included) instead of
+    // the lone plain row being failed. An unvoted 2-rank refusal and a non-KV error still end
+    // the row with an error frame.
+    type Step = fn(
+        &dyn metrale_model_engine::traits::Model,
+        &mut super::types::ActiveSeq,
+        &SchedCtx,
+        &[u32],
+        usize,
+        &crate::scheduler::logit_processors::LogitsContext,
+        bool,
+    ) -> Option<String>;
+    let steps: [(&str, Step, bool); 4] = [
+        ("k2", super::verify_k2_step::step_verify_k2, false),
+        ("k3", super::verify_k3_step::step_verify_k3, false),
+        ("k4", super::verify_k4_step::step_verify_k4, false),
+        (
+            "dflash",
+            super::verify_dflash_step::step_verify_dflash,
+            true,
+        ),
+    ];
+    let cases: [(bool, &'static str, bool); 4] = [
+        (false, "KV cache exhausted: no free blocks", true),
+        (true, VOTED, true),
+        (true, "KV cache exhausted: no free blocks", false),
+        (false, "CUDA error 700: illegal memory access", false),
+    ];
+    for (name, step, raw) in steps {
+        for (ep, msg, retry) in cases {
+            let model = std::sync::Arc::new(PreemptStubModel {
+                ep,
+                hard_error: Some(msg),
+                ..Default::default()
+            });
+            let (mut active, _rx0, _rx1) = two_drafted();
+            let sched = SchedCtx::for_test_with(model.clone());
+            let c = super::think_end_token0_tests::ctx(&sched, &active[0]);
+            let a = &mut active[0];
+            let (last, n_out) = (a.last_token, a.output_tokens.len());
+            let refusal = step(&*model, a, &sched, &[7, 8, 9], 3, &c, raw);
+            assert_eq!(
+                model.decode_calls.load(Ordering::SeqCst),
+                1,
+                "{name} {ep} {msg}: one verify forward"
+            );
+            if retry {
+                assert!(
+                    refusal.as_deref().is_some_and(|m| m.contains(msg)),
+                    "{name} {ep}: {refusal:?}"
+                );
+                assert!(
+                    !a.finished && a.error.is_none(),
+                    "{name} {ep}: the row stays live"
+                );
+                assert_eq!(
+                    (a.last_token, a.output_tokens.len()),
+                    (last, n_out),
+                    "{name} {ep}: unchanged"
+                );
+            } else {
+                assert!(refusal.is_none(), "{name} {ep} {msg}: not retryable");
+                assert!(a.finished, "{name} {ep} {msg}: the row ends");
+                assert!(
+                    a.error.as_deref().is_some_and(|m| m.contains(msg)),
+                    "{name} {ep}: {:?}",
+                    a.error
+                );
+            }
+        }
+    }
 }
 
 #[test]

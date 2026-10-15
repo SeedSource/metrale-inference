@@ -17,6 +17,14 @@ use stats::k4_record_positional;
 /// `verify_pick_all_with_pipeline` unless this is a DFlash serve with
 /// `dflash_masked_verify` off, which judges on the raw argmax. The verdict
 /// and the re-propose of `num_drafts` drafts are `k4_apply_verdict`'s.
+/// 2026-10-15 (race-memory, CAPACITY.md gap d, gpause1 VOID): Returns the error when the verify
+/// forward was refused for KV and the refusal is safe to retry (`preempt::spec_kv_refusal_retryable`):
+/// nothing advanced, so the row stays live and the caller hands the error to
+/// `preempt::preempt_after_spec_refusal`, which pauses a victim (a grammar row included, dde7aff7)
+/// or, with no other live row, fails the live rows with it. Before this, a lone plain row next to
+/// grammar rows (they verify one at a time) was failed instead of a grammar row being paused.
+/// Every other failure still ends the row with an error frame.
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub fn step_verify_k4(
     model: &dyn Model,
     a: &mut ActiveSeq,
@@ -25,7 +33,7 @@ pub fn step_verify_k4(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-) {
+) -> Option<String> {
     // 2026-09-25: the step timer records on drop, so every return below is
     // covered.
     let _step_timer = sched.io.tel.step_timer(a.seq.seq_len);
@@ -33,7 +41,7 @@ pub fn step_verify_k4(
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         super::lifecycle::fail_sequence(a, format!("sync_secondary: {e:#}"));
-        return;
+        return None;
     }
 
     // 2026-09-25: the pre-verify `seq_len`, the join key of the SHADOW_TGT
@@ -47,13 +55,13 @@ pub fn step_verify_k4(
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF4) {
         tracing::error!("EP broadcast verify_k4 cmd: {e:#}");
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k4 cmd: {e:#}"));
-        return;
+        return None;
     }
     for &t in &tokens_k4 {
         if let Err(e) = model.ep_broadcast_cmd(t) {
             tracing::error!("EP broadcast verify_k4 token: {e:#}");
             super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k4 token: {e:#}"));
-            return;
+            return None;
         }
     }
 
@@ -67,18 +75,28 @@ pub fn step_verify_k4(
         match model.decode_and_verify_fused(&tokens_k4, &mut a.seq, 0) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("decode_and_verify_fused (k4): {e:#}");
-                super::lifecycle::fail_sequence(a, format!("decode_and_verify_fused (k4): {e:#}"));
-                return;
+                let msg = format!("decode_and_verify_fused (k4): {e:#}");
+                if super::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
+                }
+                tracing::error!("{msg}");
+                super::lifecycle::fail_sequence(a, msg);
+                return None;
             }
         }
     } else {
         match model.decode_verify_graphed_k4(&tokens_k4, &mut a.seq, 0) {
             Ok(r) => r.to_vec(),
             Err(e) => {
-                tracing::error!("decode_verify_graphed_k4: {e:#}");
-                super::lifecycle::fail_sequence(a, format!("decode_verify_graphed_k4: {e:#}"));
-                return;
+                let msg = format!("decode_verify_graphed_k4: {e:#}");
+                if super::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
+                }
+                tracing::error!("{msg}");
+                super::lifecycle::fail_sequence(a, msg);
+                return None;
             }
         }
     };
@@ -197,7 +215,7 @@ pub fn step_verify_k4(
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
         tracing::error!("EP broadcast verify_k4 result: {e:#}");
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k4 result: {e:#}"));
-        return;
+        return None;
     }
 
     // 2026-09-25: debug level: this fires on every verify step.
@@ -225,4 +243,5 @@ pub fn step_verify_k4(
         K4Hidden::VerifyRow,
         verify_us,
     );
+    None
 }

@@ -15,6 +15,14 @@ use stats::{k3_record_outcome, k3_record_positional};
 /// 2 drafts; `drafts` must hold at least 2. Picks go through
 /// `verify_pick_all_with_pipeline` unless this is a DFlash serve with
 /// `dflash_masked_verify` off, which judges on the raw argmax.
+/// 2026-10-15 (race-memory, CAPACITY.md gap d, gpause1 VOID): Returns the error when the verify
+/// forward was refused for KV and the refusal is safe to retry (`preempt::spec_kv_refusal_retryable`):
+/// nothing advanced, so the row stays live and the caller hands the error to
+/// `preempt::preempt_after_spec_refusal`, which pauses a victim (a grammar row included, dde7aff7)
+/// or, with no other live row, fails the live rows with it. Before this, a lone plain row next to
+/// grammar rows (they verify one at a time) was failed instead of a grammar row being paused.
+/// Every other failure still ends the row with an error frame.
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub fn step_verify_k3(
     model: &dyn Model,
     a: &mut ActiveSeq,
@@ -23,11 +31,11 @@ pub fn step_verify_k3(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-) {
+) -> Option<String> {
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         super::lifecycle::fail_sequence(a, format!("sync_secondary: {e:#}"));
-        return;
+        return None;
     }
 
     // 2026-09-25: the pre-verify `seq_len`, the join key of the SHADOW_TGT
@@ -41,13 +49,13 @@ pub fn step_verify_k3(
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF3) {
         tracing::error!("EP broadcast verify_k3 cmd: {e:#}");
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k3 cmd: {e:#}"));
-        return;
+        return None;
     }
     for &t in &tokens_k3 {
         if let Err(e) = model.ep_broadcast_cmd(t) {
             tracing::error!("EP broadcast verify_k3 token: {e:#}");
             super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k3 token: {e:#}"));
-            return;
+            return None;
         }
     }
 
@@ -61,18 +69,28 @@ pub fn step_verify_k3(
         match model.decode_and_verify_fused(&tokens_k3, &mut a.seq, 0) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("decode_and_verify_fused (k3): {e:#}");
-                super::lifecycle::fail_sequence(a, format!("decode_and_verify_fused (k3): {e:#}"));
-                return;
+                let msg = format!("decode_and_verify_fused (k3): {e:#}");
+                if super::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
+                }
+                tracing::error!("{msg}");
+                super::lifecycle::fail_sequence(a, msg);
+                return None;
             }
         }
     } else {
         match model.decode_verify_graphed_k3(&tokens_k3, &mut a.seq, 0) {
             Ok(r) => r.to_vec(),
             Err(e) => {
-                tracing::error!("decode_verify_graphed_k3: {e:#}");
-                super::lifecycle::fail_sequence(a, format!("decode_verify_graphed_k3: {e:#}"));
-                return;
+                let msg = format!("decode_verify_graphed_k3: {e:#}");
+                if super::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
+                }
+                tracing::error!("{msg}");
+                super::lifecycle::fail_sequence(a, msg);
+                return None;
             }
         }
     };
@@ -182,7 +200,7 @@ pub fn step_verify_k3(
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
         tracing::error!("EP broadcast verify_k3 result: {e:#}");
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k3 result: {e:#}"));
-        return;
+        return None;
     }
 
     // 2026-09-25: debug level: this fires on every verify step.
@@ -205,7 +223,7 @@ pub fn step_verify_k3(
             emit_token(a, v2, verify_lps.get(2).cloned(), sched);
         }
         if a.finished {
-            return;
+            return None;
         }
         a.last_token = v2;
 
@@ -219,11 +237,11 @@ pub fn step_verify_k3(
                 a,
                 format!("commit_accepted_prefix (K=3 accept-3): {e:#}"),
             );
-            return;
+            return None;
         }
         if let Err(e) = model.save_hidden_for_mtp(2, 0) {
             tracing::error!("save_hidden_for_mtp(2): {e:#}");
-            return;
+            return None;
         }
         if let Err(e) = model.trim_proposer_state(&mut a.seq, 2, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
@@ -268,19 +286,19 @@ pub fn step_verify_k3(
                 a,
                 format!("commit_accepted_prefix (K=3 accept-2): {e:#}"),
             );
-            return;
+            return None;
         }
         emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
         if !a.finished {
             emit_token(a, v1, verify_lps.get(1).cloned(), sched);
         }
         if a.finished {
-            return;
+            return None;
         }
         a.last_token = v1;
         if let Err(e) = model.save_hidden_for_mtp(1, 0) {
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
-            return;
+            return None;
         }
         let t_propose = sched.io.clock.now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
@@ -323,16 +341,16 @@ pub fn step_verify_k3(
                 a,
                 format!("commit_accepted_prefix (K=3 accept-1): {e:#}"),
             );
-            return;
+            return None;
         }
         emit_token(a, v0, verify_lps.first().cloned(), sched);
         if a.finished {
-            return;
+            return None;
         }
         a.last_token = v0;
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
-            return;
+            return None;
         }
         let t_propose = sched.io.clock.now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
@@ -362,4 +380,5 @@ pub fn step_verify_k3(
         );
         k3_record_outcome(sched, 0, a.seq.seq_len);
     }
+    None
 }

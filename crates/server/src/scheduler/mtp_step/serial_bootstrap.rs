@@ -51,7 +51,9 @@ pub(super) fn bootstrap_seq(
             _gmask.as_deref(),
         ) {
             Ok(init) if !init.is_empty() => {
-                if eff >= 3 && init.len() >= 3 {
+                // 2026-10-15 (gap d): a retryable KV refusal of the verify goes back to
+                // `step_mtp` like the standalone decode's below.
+                return if eff >= 3 && init.len() >= 3 {
                     step_verify_k4(
                         model,
                         a,
@@ -60,7 +62,7 @@ pub(super) fn bootstrap_seq(
                         num_drafts,
                         verify_ctx,
                         dflash_verify_raw_argmax,
-                    );
+                    )
                 } else if eff >= 2 && init.len() >= 2 {
                     step_verify_k3(
                         model,
@@ -70,7 +72,7 @@ pub(super) fn bootstrap_seq(
                         num_drafts,
                         verify_ctx,
                         dflash_verify_raw_argmax,
-                    );
+                    )
                 } else {
                     step_verify_k2(
                         model,
@@ -80,9 +82,8 @@ pub(super) fn bootstrap_seq(
                         num_drafts,
                         verify_ctx,
                         dflash_verify_raw_argmax,
-                    );
-                }
-                return None;
+                    )
+                };
             }
             Ok(_) => {
                 tracing::warn!(target: "met::scheduler::mtp_step", "DFlash bootstrap propose returned empty; falling back to standalone decode"

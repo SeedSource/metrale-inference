@@ -94,6 +94,8 @@ pub(super) struct RunOptions {
     pub telemetry: &'static metrale_telemetry::Telemetry,
     /// 2026-09-25: Fault injection for the pipelined lane (the negative controls).
     pub pipeline_faults: crate::scheduler::PipelineFaults,
+    /// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_ONE_CHUNK_PER_TICK`.
+    pub resume_one_chunk_per_tick: bool,
 }
 
 /// 2026-09-25: Never configured: every feed into it takes the `Off` branch.
@@ -121,6 +123,7 @@ impl Default for RunOptions {
             lora_rotation: None,
             telemetry: &TELEMETRY_OFF,
             pipeline_faults: crate::scheduler::PipelineFaults::NONE,
+            resume_one_chunk_per_tick: false,
         }
     }
 }
@@ -339,6 +342,7 @@ fn run_scenario_inner(sc: &Scenario, build: DeviceBuilder) -> Vec<String> {
     };
     let mut levers = SchedLevers::defaults();
     levers.mtp_gate_force = opts.mtp_gate_force;
+    levers.resume_one_chunk_per_tick = opts.resume_one_chunk_per_tick;
     let levers = Arc::new(levers);
     levers.set_loop_watchdog(opts.loop_watchdog);
     let masks = VocabMasks {

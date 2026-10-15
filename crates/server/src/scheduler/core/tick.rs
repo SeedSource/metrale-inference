@@ -57,13 +57,21 @@ impl SchedulerCore {
         // tick started one (`prefill_chunk_cap::admit_now`); the rest return to the front of
         // the pending queue in arrival order.
         let mut new_reqs = new_reqs;
-        let admit = crate::scheduler::prefill_chunk_cap::admit_now(
-            sched.levers.prefill_chunk_while_decoding.is_some(),
-            crate::scheduler::prefill_chunk_cap::decoders(active),
-            new_reqs.len(),
-            !prefilling.is_empty(),
-            self.started_prefill,
-        );
+        // 2026-10-15 (race-prefill, A192): a resume re-prefill in flight
+        // (`METRALE_RESUME_ONE_CHUNK_PER_TICK`) holds a sequence the batch-slot count does not
+        // see, and runs only under KV pressure: start nothing until it finishes.
+        let resume_in_flight = preempted.iter().any(|p| p.resume.is_some());
+        let admit = if resume_in_flight {
+            0
+        } else {
+            crate::scheduler::prefill_chunk_cap::admit_now(
+                sched.levers.prefill_chunk_while_decoding.is_some(),
+                crate::scheduler::prefill_chunk_cap::decoders(active),
+                new_reqs.len(),
+                !prefilling.is_empty(),
+                self.started_prefill,
+            )
+        };
         if admit < new_reqs.len() {
             for (i, req) in new_reqs.drain(admit..).enumerate() {
                 pending.requests.insert(i, req);

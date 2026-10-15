@@ -29,6 +29,13 @@ pub(super) fn abort_in_flight_on_shutdown(
             &mut p.a.sink,
             "server shutting down before preempted resume",
         );
+        // 2026-10-15 (race-prefill, A192): a re-prefill part-way through holds a sequence;
+        // free it as a prefilling one is freed below.
+        if let Some(mut r) = p.resume.take() {
+            let seq = &mut r.seq;
+            let _ = model.free_sequence(seq);
+            let _ = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1);
+        }
     }
     for mut p in prefilling {
         send_error_to_sink(io, &mut p.sink, "server shut down during prefill");

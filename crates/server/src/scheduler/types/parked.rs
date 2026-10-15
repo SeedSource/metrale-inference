@@ -117,4 +117,16 @@ pub(in crate::scheduler) struct PreemptedSeq {
     /// resume leaves in place for the first decode step, so no token is
     /// re-sampled or re-emitted.
     pub tokens: Vec<u32>,
+    /// 2026-10-15 (race-prefill, A192): The re-prefill in flight under
+    /// `METRALE_RESUME_ONE_CHUNK_PER_TICK`; `None` until the resume starts, and always `None`
+    /// with the lever off. While it is set the row still counts as preempted everywhere
+    /// (admission demand, idle checks, LoRA wait, shutdown drain), and it holds `seq`.
+    pub resume: Option<ResumeProgress>,
+}
+
+/// 2026-10-15 (race-prefill, A192): A preempt-resume re-prefill part-way through: the freshly
+/// allocated sequence and the next chunk's start in `PreemptedSeq::tokens`.
+pub(in crate::scheduler) struct ResumeProgress {
+    pub seq: SequenceState,
+    pub offset: usize,
 }

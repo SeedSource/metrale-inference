@@ -103,6 +103,7 @@ impl SchedulerCore {
             max_batch_size,
             block_size,
             max_prefill_tokens,
+            sched.levers.resume_one_chunk_per_tick,
         );
         sched.io.tel.mark(mtp_timing::Phase::LoopSwap, t_loop);
     }

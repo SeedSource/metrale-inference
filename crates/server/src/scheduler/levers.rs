@@ -157,6 +157,9 @@ pub struct SchedLevers {
     /// 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING`: the prefill chunk cap while another
     /// sequence decodes (`prefill_chunk_cap`); `None` = off.
     pub prefill_chunk_while_decoding: Option<usize>,
+    /// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_ONE_CHUNK_PER_TICK=1`: a preempt-resume
+    /// re-prefill runs one planned chunk per tick while another sequence decodes (`preempt`).
+    pub resume_one_chunk_per_tick: bool,
     /// 2026-09-25: `METRALE_GRAMMAR_BUDGET_CLOSE` (default on; `0`/`false`
     /// disables).
     pub grammar_budget_close: bool,
@@ -388,6 +391,7 @@ impl SchedLevers {
             prefill_chunk_while_decoding: super::prefill_chunk_cap::resolve(
                 metrale_config::levers::var(super::prefill_chunk_cap::LEVER).as_deref(),
             ),
+            resume_one_chunk_per_tick: opt_in("METRALE_RESUME_ONE_CHUNK_PER_TICK"),
             grammar_budget_close: crate::scheduler::helpers::parse_flag_default_on(
                 metrale_config::levers::var("METRALE_GRAMMAR_BUDGET_CLOSE").as_deref(),
             ),
@@ -461,6 +465,7 @@ impl SchedLevers {
             bisect_no_mix: false,
             mixed_slice_tokens: 0,
             prefill_chunk_while_decoding: None,
+            resume_one_chunk_per_tick: false,
             grammar_budget_close: true,
             think_ended_gpu_argmax: true,
             think_end_at_token0: true,

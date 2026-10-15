@@ -236,6 +236,7 @@ pub(super) fn test_prefill_ident(
 pub(super) struct PreemptStubModel {
     pub(super) fail_decodes: AtomicUsize,
     /// 2026-09-25: When set, `decode_batch` always fails with this message instead.
+    /// 2026-10-15: so does the single-sequence `decode` (the serial MTP bootstrap).
     pub(super) hard_error: Option<&'static str>,
     /// 2026-09-25: When set, `compact_sequence` always fails with this message.
     pub(super) fail_compact: Option<&'static str>,

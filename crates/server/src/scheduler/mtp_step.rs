@@ -23,7 +23,8 @@ mod serial_bootstrap;
 /// (`verify_pipeline_helper`).
 ///
 /// 2026-10-14 (race-memory, A184): Returns the first retryable KV refusal of a batched
-/// bootstrap or batched verify (`preempt::spec_kv_refusal_retryable`). The refused
+/// bootstrap, a serial bootstrap's decode (2026-10-15) or a batched verify
+/// (`preempt::spec_kv_refusal_retryable`). The refused
 /// sequences are left live; the caller must pass the error to
 /// `preempt::preempt_after_spec_refusal` once its per-step accounting is done.
 #[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
@@ -111,7 +112,7 @@ pub fn step_mtp(
     }
     for &idx in &bootstrap_idxs {
         let a = &mut active[idx];
-        serial_bootstrap::bootstrap_seq(
+        let r = serial_bootstrap::bootstrap_seq(
             model,
             a,
             sched,
@@ -120,6 +121,7 @@ pub fn step_mtp(
             verify_ctx,
             dflash_verify_raw_argmax,
         );
+        refusal = refusal.or(r);
     }
 
     // 2026-09-25: Verify. MTP sequences are verified as a batch when at

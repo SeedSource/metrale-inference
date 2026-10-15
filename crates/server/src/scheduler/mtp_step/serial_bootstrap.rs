@@ -11,6 +11,13 @@ use super::*;
 
 /// 2026-09-26: Bootstrap one sequence. Each early `return` ends this
 /// sequence's bootstrap; `step_mtp` moves on to the next one.
+///
+/// 2026-10-15 (race-memory, CAPACITY.md gap b): Returns the error when the standalone decode
+/// was refused for KV and the refusal is safe to retry (`preempt::spec_kv_refusal_retryable`):
+/// nothing advanced, and `step_mtp` hands it to `preempt::preempt_after_spec_refusal`, which
+/// pauses a victim so this row retries next step, as the batched bootstrap does. Every other
+/// failure ends the row with an error frame.
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub(super) fn bootstrap_seq(
     model: &dyn Model,
     a: &mut ActiveSeq,
@@ -19,7 +26,7 @@ pub(super) fn bootstrap_seq(
     ladder_nd: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-) {
+) -> Option<String> {
     // 2026-09-25: DFlash with `dflash_seam_serial` off
     // (`METRALE_DFLASH_SEAM_SERIAL=0`; it is on by default) and
     // speculation allowed: skip the standalone decode. Propose drafts
@@ -75,7 +82,7 @@ pub(super) fn bootstrap_seq(
                         dflash_verify_raw_argmax,
                     );
                 }
-                return;
+                return None;
             }
             Ok(_) => {
                 tracing::warn!(target: "met::scheduler::mtp_step", "DFlash bootstrap propose returned empty; falling back to standalone decode"
@@ -101,14 +108,19 @@ pub(super) fn bootstrap_seq(
             a,
             format!("EP broadcast bootstrap token: {e:#}"),
         );
-        return;
+        return None;
     }
     let logits = match model.decode(a.last_token, &mut a.seq, 0) {
         Ok(l) => l,
         Err(e) => {
+            let msg = format!("bootstrap decode: {e:#}");
+            if crate::scheduler::preempt::spec_kv_refusal_retryable(model, &msg) {
+                tracing::warn!(target: "met::scheduler::mtp_step", "{msg}");
+                return Some(msg);
+            }
             tracing::error!(target: "met::scheduler::mtp_step", "bootstrap decode error: {e:#}");
-            crate::scheduler::lifecycle::fail_sequence(a, format!("bootstrap decode: {e:#}"));
-            return;
+            crate::scheduler::lifecycle::fail_sequence(a, msg);
+            return None;
         }
     };
     // 2026-09-29: A146, spec-in-think parity: a thinking row takes decode's
@@ -130,7 +142,7 @@ pub(super) fn bootstrap_seq(
                     a,
                     "bootstrap pipeline pick: D2H failed".to_string(),
                 );
-                return;
+                return None;
             }
         }
     } else {
@@ -184,7 +196,7 @@ pub(super) fn bootstrap_seq(
             Err(e) => {
                 tracing::error!(target: "met::scheduler::mtp_step", "bootstrap sample error: {e:#}");
                 crate::scheduler::lifecycle::fail_sequence(a, format!("bootstrap sample: {e:#}"));
-                return;
+                return None;
             }
         }
     };
@@ -201,7 +213,7 @@ pub(super) fn bootstrap_seq(
                 a,
                 "bootstrap stray </tool_call> re-pick: D2H failed".to_string(),
             );
-            return;
+            return None;
         }
     };
 
@@ -213,7 +225,7 @@ pub(super) fn bootstrap_seq(
 
     emit_token(a, tok, lp, sched);
     if a.finished {
-        return;
+        return None;
     }
     a.last_token = tok;
     // 2026-09-25: Adaptive speculation: count serial tokens toward the
@@ -246,7 +258,7 @@ pub(super) fn bootstrap_seq(
 
     if let Err(e) = model.save_hidden_for_mtp(0, 0) {
         tracing::error!(target: "met::scheduler::mtp_step", "save_hidden_for_mtp: {e:#}");
-        return;
+        return None;
     }
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
     // 2026-09-25: Under a grammar, propose one draft
@@ -286,4 +298,5 @@ pub(super) fn bootstrap_seq(
     if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
         tracing::error!(target: "met::scheduler::mtp_step", "bootstrap start_checkpoint_async: {e:#}");
     }
+    None
 }

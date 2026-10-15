@@ -91,6 +91,9 @@ impl ModelForward for PreemptStubModel {
         Ok(DevicePtr::NULL)
     }
     fn decode(&self, _t: u32, _s: &mut SequenceState, _st: u64) -> Result<DevicePtr> {
+        if let Some(msg) = self.hard_error {
+            anyhow::bail!("{msg}");
+        }
         // 2026-10-04: only a logits stub (`logit_rows`) decodes.
         if self.logit_rows.is_empty() {
             anyhow::bail!("unused in preempt tests")

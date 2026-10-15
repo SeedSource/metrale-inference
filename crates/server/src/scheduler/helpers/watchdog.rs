@@ -56,6 +56,11 @@ pub struct WatchdogParams {
     /// [`CONTENT_LOOP_MIN_REPEATS`]. A per-request `repetition_detection`
     /// object outranks it (see [`WatchdogParams::content_loop_params`]).
     pub content_loop_min_repeats: Option<u32>,
+    /// 2026-10-15: MODEL.toml `[behavior].mask_stray_tool_call_end`: mask the
+    /// tool-call end token on a row with no tools, no grammar and no open
+    /// `<tool_call>` (`logit_processors::stray_tool_call_end`). No env lever and
+    /// no CLI override: the MODEL.toml flag is the switch.
+    pub mask_stray_tool_call_end: bool,
 }
 
 /// 2026-09-25: What `WatchdogParams::default()` returns. Served runs use
@@ -73,6 +78,7 @@ const DEFAULT_WATCHDOG_PARAMS: WatchdogParams = WatchdogParams {
     enable_think_loop_watchdog: true,
     content_loop_min_repeats: None,
     min_reasoning_floor: 16,
+    mask_stray_tool_call_end: metrale_kernels::DEFAULT_MASK_STRAY_TOOL_CALL_END,
 };
 
 impl Default for WatchdogParams {
@@ -113,6 +119,7 @@ impl WatchdogParams {
             honor_eos_inside_thinking: b.honor_eos_inside_thinking,
             enable_think_loop_watchdog: b.enable_think_loop_watchdog,
             content_loop_min_repeats: None,
+            mask_stray_tool_call_end: b.mask_stray_tool_call_end,
         };
         let env = match std::env::var("METRALE_MAX_INTER_TOOL_PROSE") {
             Ok(v) => match v.parse::<u32>() {

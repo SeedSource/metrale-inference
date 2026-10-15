@@ -102,7 +102,13 @@ pub fn step_verify_dflash(
     // batched step applies under the GLM batched pin.
     let verified = if dflash_verify_raw_argmax
         && !super::dflash_batch_rows::verdict_uses_pipeline(sched, a)
-    {
+        // 2026-10-15: a raw argmax on a masked stray `</tool_call>` takes the
+        // masked pipeline (`StrayToolCallEndMask`).
+        && !crate::scheduler::verify_pipeline_helper::raw_verdict_hits_stray_tool_call_end(
+            a,
+            &verified_argmax,
+            verify_ctx,
+        ) {
         verified_argmax
     } else {
         crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(

@@ -824,6 +824,9 @@ fn spec_think_partial_accept_does_not_leak_pipeline_accumulators() {
         let mut a = thinking_grammarless_seq();
         a.thinking_tokens = 400;
         a.consecutive_confident = 57;
+        // 2026-10-14: F2 runs only with a thinking budget (`effort_prompt_only`
+        // thinking has none); one far above this window keeps it on.
+        a.thinking_budget = Some(100_000);
         a
     };
     let rows = vec![row(&[(HELLO, 10.0)]); 4];
@@ -1097,4 +1100,203 @@ fn masked_chat_fast_path_above_zero_without_verify_sampling_is_unchanged() {
         verify_pick_all_with_pipeline(&model, &[HELLO], &mut a, ctx, 0)
     });
     assert_eq!(picks, vec![HELLO]);
+}
+
+// 2026-10-15: stray `</tool_call>` (`StrayToolCallEndMask`, MODEL.toml
+// `mask_stray_tool_call_end`). On a row with no tools, no grammar and no open
+// `<tool_call>`, a verify window whose GPU argmax is `</tool_call>` must not be
+// returned by any fast path: the host pipeline masks it and the runner-up wins.
+// The callers' accept walks (`drafts[i] == v[i]`, verify_k2/k3/k4,
+// verify_dflash, verify_k4_batch, verify_dflash_batch) then reject a draft equal
+// to the raw `</tool_call>` at that position, as for any mismatch.
+
+/// 2026-10-15: a plain-chat row outside thinking: no tools, no grammar, no
+/// open tool body, greedy.
+fn plain_no_tools_seq() -> ActiveSeq {
+    let (mut a, _rx) = test_seq(Vec::new(), 5000, None, 10);
+    a.finished = false;
+    a.inside_thinking = false;
+    a.think_ended = false;
+    a.think_end_token = Some(THINK_END);
+    a.think_start_token = Some(THINK_START);
+    a.tool_call_start_token = Some(TOOL_CALL_OPEN);
+    a.tool_call_end_token = Some(TOOL_CALL_CLOSE);
+    a.tools_present = false;
+    a.grammar_state = None;
+    a.inside_tool_body = false;
+    a.temperature = 0.0;
+    a
+}
+
+/// 2026-10-15: every verify fast path's levers on (masked chat, grammarless
+/// GPU argmax), so without the guard the GPU argmax would be returned, and the
+/// stray mask flag as given.
+fn with_ctx_all_fast<R>(mask_stray: bool, f: impl FnOnce(&LogitsContext) -> R) -> R {
+    let scratch = crate::scheduler::sched_ctx::DecodeScratch::default();
+    let io = crate::scheduler::io::SchedIo::for_test();
+    let ctx = LogitsContext {
+        scratch: &scratch,
+        tel: &*io.tel,
+        clock: &*io.clock,
+        watchdog: crate::scheduler::helpers::WatchdogParams {
+            mask_stray_tool_call_end: mask_stray,
+            ..crate::scheduler::helpers::WatchdogParams::default()
+        },
+        boundary_mask: None,
+        mid_word_mask: None,
+        sampling: SamplingLevers {
+            dflash_masked_verify: true,
+            fast_masked: true,
+            fast_greedy_chat: true,
+            think_ended_gpu_argmax: true,
+            ..SamplingLevers::default()
+        },
+        think_end_token: Some(THINK_END),
+        think_start_token: Some(THINK_START),
+        tool_call_start_token: Some(TOOL_CALL_OPEN),
+        tool_call_end_token: Some(TOOL_CALL_CLOSE),
+        code_fence_token: None,
+        verify_pos: 0,
+    };
+    f(&ctx)
+}
+
+#[test]
+fn stray_tool_call_end_verify_argmax_falls_back_and_the_runner_up_wins() {
+    let mut a = plain_no_tools_seq();
+    let model = FastPathStubModel::new(
+        VOCAB,
+        &[
+            row(&[(HELLO, 10.0)]),
+            row(&[(TOOL_CALL_CLOSE, 10.0), (WORLD, 5.0)]),
+        ],
+    );
+    let picks = with_ctx_all_fast(true, |ctx| {
+        verify_pick_all_with_pipeline(&model, &[HELLO, TOOL_CALL_CLOSE], &mut a, ctx, 0)
+    });
+    assert_eq!(
+        picks,
+        vec![HELLO, WORLD],
+        "</tool_call> masked, runner-up wins"
+    );
+    // 2026-10-15: a draft that proposed the raw `</tool_call>` at position 1 is
+    // rejected there by the accept walk; position 0 still accepts.
+    let drafts = [HELLO, TOOL_CALL_CLOSE];
+    let accepted = drafts
+        .iter()
+        .zip(&picks)
+        .take_while(|(d, p)| d == p)
+        .count();
+    assert_eq!(accepted, 1);
+    assert!(
+        !a.inside_tool_body && a.output_tokens.is_empty(),
+        "state restored"
+    );
+}
+
+#[test]
+fn stray_tool_call_end_flag_off_keeps_the_fast_path() {
+    // 2026-10-15: no rows in the stub: a D2H would panic, so passing proves a
+    // fast path answered with the raw argmax, as before the flag existed.
+    let mut a = plain_no_tools_seq();
+    let model = FastPathStubModel::new(VOCAB, &[]);
+    let picks = with_ctx_all_fast(false, |ctx| {
+        verify_pick_all_with_pipeline(&model, &[HELLO, TOOL_CALL_CLOSE], &mut a, ctx, 0)
+    });
+    assert_eq!(picks, vec![HELLO, TOOL_CALL_CLOSE]);
+}
+
+#[test]
+fn stray_tool_call_end_tool_request_keeps_the_fast_path() {
+    let mut a = plain_no_tools_seq();
+    a.tools_present = true;
+    let model = FastPathStubModel::new(VOCAB, &[]);
+    let picks = with_ctx_all_fast(true, |ctx| {
+        verify_pick_all_with_pipeline(&model, &[HELLO, TOOL_CALL_CLOSE], &mut a, ctx, 0)
+    });
+    assert_eq!(
+        picks,
+        vec![HELLO, TOOL_CALL_CLOSE],
+        "declared tools: never masked"
+    );
+}
+
+#[test]
+fn stray_tool_call_end_grammarless_fast_path_alone_also_falls_back() {
+    // 2026-10-15: masked chat path off, so only the grammarless GPU-argmax path
+    // could answer; the guard sends it to the host too.
+    let mut a = plain_no_tools_seq();
+    let model = FastPathStubModel::new(VOCAB, &[row(&[(TOOL_CALL_CLOSE, 10.0), (WORLD, 5.0)])]);
+    let picks = with_ctx_fast_greedy_chat(|ctx| {
+        let mut ctx = ctx.clone();
+        ctx.watchdog.mask_stray_tool_call_end = true;
+        verify_pick_all_with_pipeline(&model, &[TOOL_CALL_CLOSE], &mut a, &ctx, 0)
+    });
+    assert_eq!(picks, vec![WORLD]);
+}
+
+#[test]
+fn stray_tool_call_end_close_of_a_call_opened_in_the_window_is_kept() {
+    // 2026-10-15: position 0 opens `<tool_call>`, so position 1's `</tool_call>`
+    // closes it: `pick_positions_from_host` advances `inside_tool_body` per
+    // position and the mask does not apply there.
+    let mut a = plain_no_tools_seq();
+    let model = FastPathStubModel::new(
+        VOCAB,
+        &[
+            row(&[(TOOL_CALL_OPEN, 10.0)]),
+            row(&[(TOOL_CALL_CLOSE, 10.0), (WORLD, 5.0)]),
+        ],
+    );
+    let picks = with_ctx_all_fast(true, |ctx| {
+        verify_pick_all_with_pipeline(&model, &[TOOL_CALL_OPEN, TOOL_CALL_CLOSE], &mut a, ctx, 0)
+    });
+    assert_eq!(picks, vec![TOOL_CALL_OPEN, TOOL_CALL_CLOSE]);
+    assert!(!a.inside_tool_body, "restored on exit");
+}
+
+#[test]
+fn stray_tool_call_end_batched_row_base_reads_its_own_rows() {
+    // 2026-10-15: the batched DFlash re-pick passes `row_base = i * k`: this
+    // sequence's rows start after another sequence's two rows.
+    let mut a = plain_no_tools_seq();
+    let model = FastPathStubModel::new(
+        VOCAB,
+        &[
+            row(&[(HELLO, 10.0)]),
+            row(&[(HELLO, 10.0)]),
+            row(&[(TOOL_CALL_CLOSE, 10.0), (WORLD, 5.0)]),
+            row(&[(HELLO, 10.0)]),
+        ],
+    );
+    let raw = [TOOL_CALL_CLOSE, HELLO];
+    let picks = with_ctx_all_fast(true, |ctx| {
+        assert!(super::raw_verdict_hits_stray_tool_call_end(&a, &raw, ctx));
+        verify_pick_all_with_pipeline(&model, &raw, &mut a, ctx, 2)
+    });
+    assert_eq!(picks, vec![WORLD, HELLO]);
+}
+
+#[test]
+fn stray_tool_call_end_raw_verdict_predicate() {
+    let a = plain_no_tools_seq();
+    with_ctx_all_fast(true, |ctx| {
+        assert!(super::raw_verdict_hits_stray_tool_call_end(
+            &a,
+            &[HELLO, TOOL_CALL_CLOSE],
+            ctx
+        ));
+        assert!(!super::raw_verdict_hits_stray_tool_call_end(
+            &a,
+            &[HELLO, WORLD],
+            ctx
+        ));
+    });
+    with_ctx_all_fast(false, |ctx| {
+        assert!(!super::raw_verdict_hits_stray_tool_call_end(
+            &a,
+            &[TOOL_CALL_CLOSE],
+            ctx
+        ));
+    });
 }

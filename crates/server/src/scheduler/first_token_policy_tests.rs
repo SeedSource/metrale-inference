@@ -211,3 +211,38 @@ fn think_end_leaves_grammar_pristine_and_first_content_token_is_step_one() {
     );
     assert!(!a.finished);
 }
+
+/// 2026-10-15: `</tool_call>` in the toy vocab.
+const TOOL_CALL_CLOSE: u32 = 129;
+
+#[test]
+fn stray_tool_call_end_joins_token0_suppression_only_where_the_mask_applies() {
+    // 2026-10-15: flag on, no tools, no grammar: token 0 suppresses `</tool_call>`
+    // beside the caller's ids.
+    let on = direct(Some(TOOL_CALL_OPEN)).with_stray_tool_call_end(
+        true,
+        false,
+        false,
+        Some(TOOL_CALL_CLOSE),
+    );
+    assert_eq!(on.stray_tool_call_end, Some(TOOL_CALL_CLOSE));
+    let (_, ids, masked) = run(on, None);
+    assert_eq!(ids, vec![EOS, TOOL_CALL_CLOSE]);
+    assert!(!masked);
+    // 2026-10-15: flag off, or declared tools, or a grammar: unchanged.
+    for (enabled, tools, grammar) in [
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let p = direct(Some(TOOL_CALL_OPEN)).with_stray_tool_call_end(
+            enabled,
+            tools,
+            grammar,
+            Some(TOOL_CALL_CLOSE),
+        );
+        assert_eq!(p, direct(Some(TOOL_CALL_OPEN)));
+        let (_, ids, _) = run(p, None);
+        assert_eq!(ids, vec![EOS]);
+    }
+}

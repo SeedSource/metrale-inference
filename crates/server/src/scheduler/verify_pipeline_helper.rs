@@ -272,4 +272,45 @@ pub fn pick_decode_row_with_pipeline(
     Some(verify_pick_with_pipeline(&buf, is_fp32, vocab, a, ctx, 0))
 }
 
+/// 2026-10-15: Whether a DFlash raw-argmax verdict (K2/K3/K4, the single DFlash
+/// step, the batched DFlash step) must be replaced by
+/// [`verify_pick_all_with_pipeline`] because one of its `argmax_ids` is a
+/// `</tool_call>` that `StrayToolCallEndMask` masks on this row. Counts a hit.
+/// The verdict then comes from the host pipeline, where the stage masks the id,
+/// and the caller's accept walk compares the drafts with those picks.
+pub fn raw_verdict_hits_stray_tool_call_end(
+    a: &ActiveSeq,
+    argmax_ids: &[u32],
+    ctx: &LogitsContext,
+) -> bool {
+    let hit = pick_all::fast_hits_stray_tool_call_end(a, argmax_ids, ctx);
+    if hit {
+        crate::scheduler::logit_processors::stray_tool_call_end::count_fallback();
+    }
+    hit
+}
+
+/// 2026-10-15: A serial pick taken outside the pipeline (the MTP bootstrap's
+/// batched argmax or `sample_token_with_grammar`, the self-speculative and
+/// n-gram bootstrap device argmax) that landed on a `</tool_call>`
+/// `StrayToolCallEndMask` masks on this row is re-picked through
+/// [`pick_decode_row_with_pipeline`], where the stage masks it and the
+/// next-best token wins. Any other `tok` is returned unchanged, so a flag-off
+/// model or a tool request is untouched. `None` on a D2H failure, as for
+/// `pick_decode_row_with_pipeline`. `row_logits` must still hold the row the
+/// pick came from.
+pub fn repick_stray_tool_call_end(
+    model: &dyn Model,
+    row_logits: DevicePtr,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    tok: u32,
+) -> Option<u32> {
+    if !pick_all::fast_hits_stray_tool_call_end(a, &[tok], ctx) {
+        return Some(tok);
+    }
+    crate::scheduler::logit_processors::stray_tool_call_end::count_fallback();
+    pick_decode_row_with_pipeline(model, row_logits, a, ctx)
+}
+
 pub use pick_all::verify_pick_all_with_pipeline;

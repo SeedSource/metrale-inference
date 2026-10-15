@@ -57,6 +57,49 @@ routed_scaling_factor = 2.5
 hc_mult = 4
 hc_sinkhorn_iters = 20
 
+# 2026-10-14: Effort is a prompt line only, as on the official model. Its chat_template.jinja
+# (nvidia/GLM-5.3-Flash-NVFP4 @09b04e5e, lines 2-3) renders "Reasoning Effort: Low|High|Max"
+# (any other value, and none, is Max) and vLLM serves it with no thinking budget. So no
+# effort level, and no request without one, gets a budget, a budget-forced </think> or the
+# confidence early stop; an explicit client budget still applies. METRALE_EFFORT_THINKING_BUDGET=1
+# or --max-thinking-budget brings the old ladder back (64/128/256/512/1024 at E = 256).
+# 2026-10-15: That alone still let the thinking-loop watchdog force </think>; it is off too
+# (enable_think_loop_watchdog below), so thinking ends when the model closes it or at max_tokens.
+[behavior]
+effort_prompt_only = true
+# 2026-10-15: response_format wins over the tool-call grammar unless tool_choice is required or
+# names a function, as vLLM applies it with tool_choice auto (TEB TC-65/66/67/69 send the schema
+# after the tool result: official bare JSON 24/24, c30 prose-wrapped 12/12; spark-bench c30gate
+# TEBGAP-TRACE.md). A turn under the JSON grammar cannot call a tool.
+response_format_with_tools = true
+# 2026-10-15: No thinking-loop watchdog (scheduler/think_commit.rs, on by default): the official
+# serve has none, and on TEB TC-88 it forced </think> twice per trial on the model's own digit
+# list, so turn 3 ran to max_tokens (spark-bench c30gate TEBGAP-TRACE.md B). The output
+# repetition guards (content-loop and the rest) are separate and unchanged.
+enable_think_loop_watchdog = false
+# 2026-10-15: No <tool_call> start-token logit bias (+3 on the first calls): vLLM adds none
+# (spark-bench c30gate TEBGAP-TRACE.md D, parity; effect ~0 there).
+tool_call_start_bias = false
+# 2026-10-15: No minimum-reasoning floor (</think> biased -8 for the first 16 thinking tokens,
+# the ModelBehavior default): the official serve has none (TEBGAP-TRACE.md E, rarely binds).
+min_reasoning_floor_tokens = 0
+# 2026-10-15: Tool schemas render as the official template renders them: the spaced HF tojson
+# ({"a": 1}; METRALE_USE_HF_REF_JSON_DUMPS=1 still selects it for any model), and the declared
+# tools are rendered for tool_choice=none too (vLLM's default), with tools still inactive for
+# parsing, the grammar and the bias. TEB turn-1 prompts: 86/88 differed from the official
+# render with the compact form, 87/88 byte-identical with HfSpaced, TC-44 (tool_choice=none)
+# the last (spark-bench c30gate TEBGAP-TRACE.md C).
+hf_tool_json = true
+render_tools_on_tool_choice_none = true
+# 2026-10-15: A reply that offered no tools can end with a stray </tool_call> (id 154844, not
+# special in the tokenizer), e.g. "...careers take root, grow.</tool_call>": seen when the request
+# forces its length (vbench --ignore-eos masks EOS at the natural end, so </tool_call> is the best
+# remaining token; spark-bench runs/race/dec-leak/LEAK-READ.md). The scheduler then ended the turn
+# there (finish_reason tool_calls) and ignored the forced length. With no tools, no grammar and no
+# <tool_call> open the token is never valid, so it is masked and the next-best token wins
+# (server scheduler/logit_processors/stray_tool_call_end.rs).
+mask_stray_tool_call_end = true
+
 # 2026-09-25: The target matcher: ptx_for_config (crates/kernels/src/resolve.rs) matches a
 # checkpoint to this target by [[model_types]], and serve refuses a model_type that no
 # target declares (serve_load.rs). The dimension keys in [model] do not take part.

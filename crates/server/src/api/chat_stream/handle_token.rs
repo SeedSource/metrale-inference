@@ -34,6 +34,26 @@ fn watchdogs_disabled() -> bool {
         )
     })
 }
+
+/// 2026-10-12: Read once per process. `METRALE_GUARD_HONOR_FORCED_LEN=1` makes the
+/// stream-side content guards (SimHash semantic loop, token loop watchdog) stand down on a
+/// request that forces its length (`ignore_eos`, or below `min_tokens`), as vLLM does.
+/// Unset or any other value leaves them as they were.
+fn guard_honor_forced_len() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("METRALE_GUARD_HONOR_FORCED_LEN").as_deref() == Ok("1"))
+}
+
+/// 2026-10-12: Whether a content-guard fire must be let pass because the request forces
+/// its length: `ignore_eos`, or fewer than `min_tokens` completion tokens so far.
+pub(super) fn forced_len_suppresses(
+    lever_on: bool,
+    ignore_eos: bool,
+    min_tokens: usize,
+    tokens_seen: usize,
+) -> bool {
+    lever_on && (ignore_eos || tokens_seen < min_tokens)
+}
 use super::strip::{
     maybe_log_decode_trace, strip_all_preserving_boundary, strip_preserving_boundary,
 };
@@ -86,6 +106,7 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
     // 2026-09-26: Counted as each token arrives, so a rate over DECODED_TOKENS_TOTAL is
     // live rather than one step at completion.
     crate::metrics::DECODED_TOKENS_TOTAL.inc();
+    state.tokens_seen = state.tokens_seen.saturating_add(1);
     let result = handle_token_inner(state, ctx, tok);
     // 2026-09-26: Debug line for the first non-empty delta batch. With the first
     // stable-content line in `handle_token_inner`, it splits first-delta latency into

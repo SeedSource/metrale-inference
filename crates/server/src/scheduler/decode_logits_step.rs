@@ -15,6 +15,8 @@ mod content_emit;
 mod host_sample;
 mod per_token;
 #[cfg(test)]
+mod stray_tool_call_end_tests;
+#[cfg(test)]
 mod token0_tests;
 #[cfg(test)]
 mod tool_eos_hold_tests;
@@ -152,6 +154,31 @@ pub(super) fn decode_row_uses_gpu_argmax(
         && !row_needs_host
 }
 
+/// 2026-10-15: Whether a decode row's device argmax `tok` is a `</tool_call>` that
+/// `StrayToolCallEndMask` masks for this row (MODEL.toml
+/// `mask_stray_tool_call_end` on, no declared tools, no grammar, no open
+/// `<tool_call>`). `process_decode_logits_skipping` then samples the step on the
+/// host, where the stage masks it and the next-best token wins.
+///
+/// Such rows stay eligible for the device argmax
+/// ([`decode_row_uses_gpu_argmax`] does not exclude them), as `think_ended` rows
+/// do for the two think ids: excluding them would send every tool-less row of a
+/// flag-on model to the host on every step, while the fallback costs a host
+/// sample only on the rare step whose argmax is the stray token.
+pub(super) fn decode_argmax_hits_stray_tool_call_end(
+    enabled: bool,
+    a: &ActiveSeq,
+    tool_call_end_token: Option<u32>,
+    tok: u32,
+) -> bool {
+    crate::scheduler::logit_processors::stray_tool_call_end::hits(
+        enabled,
+        a,
+        tool_call_end_token,
+        &[tok],
+    )
+}
+
 /// 2026-09-25: The predicate behind [`decode_readback_plan`]: may these rows take the
 /// device argmax, or must the block come to the host? Also what the
 /// pipelined lane asks of a batch before it runs a step ahead.
@@ -266,17 +293,32 @@ pub fn process_decode_logits_skipping(
     };
     // 2026-09-25: Take the device argmax unless, for a `think_ended` row, it landed on
     // one of the two masked think ids; then every row is sampled on the host.
+    // 2026-10-15: likewise when a row's argmax is a stray `</tool_call>` the
+    // `StrayToolCallEndMask` stage masks (`decode_argmax_hits_stray_tool_call_end`).
     let fast_tokens: Option<Vec<(u32, Option<crate::api::TokenLogprobs>)>> = match rows {
         DecodeRows::Tokens(t) => {
             let hit_mask = t.iter().zip(active.iter()).any(|(&tok, a)| {
                 a.think_ended && (Some(tok) == think_end_token || Some(tok) == a.think_start_token)
             });
-            if hit_mask {
+            let hit_stray = t.iter().zip(active.iter()).any(|(&tok, a)| {
+                decode_argmax_hits_stray_tool_call_end(
+                    sched.watchdog.mask_stray_tool_call_end,
+                    a,
+                    tool_call_end_token,
+                    tok,
+                )
+            });
+            if hit_stray {
+                crate::scheduler::logit_processors::stray_tool_call_end::count_fallback();
+            }
+            if hit_mask || hit_stray {
                 // 2026-09-25: Counts steps that fell back to the host path because a device
                 // argmax landed on a masked think token.
-                sched
-                    .think_mask_fallbacks
-                    .set(sched.think_mask_fallbacks.get() + 1);
+                if hit_mask {
+                    sched
+                        .think_mask_fallbacks
+                        .set(sched.think_mask_fallbacks.get() + 1);
+                }
                 None
             } else {
                 Some(t.into_iter().map(|tok| (tok, None)).collect())

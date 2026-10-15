@@ -349,3 +349,5 @@ pub(super) use penalties::*;
 
 #[cfg(test)]
 mod penalty_scope_tests;
+#[cfg(test)]
+mod reasoning_floor_tests;

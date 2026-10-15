@@ -39,6 +39,23 @@ pub(crate) struct ThinkTokenEnv {
     pub watchdog: WatchdogParams,
 }
 
+impl ThinkTokenEnv {
+    /// 2026-10-15: The env every site builds: the thinking-loop watchdog runs unless
+    /// `--disable-watchdogs` or MODEL.toml `[behavior].enable_think_loop_watchdog = false`
+    /// (GLM-5.3) turns it off.
+    pub(crate) fn new(
+        code_fence_token: Option<u32>,
+        disable_watchdogs: bool,
+        watchdog: WatchdogParams,
+    ) -> Self {
+        Self {
+            code_fence_token,
+            think_loop_enabled: !disable_watchdogs && watchdog.enable_think_loop_watchdog,
+            watchdog,
+        }
+    }
+}
+
 /// 2026-09-29: A146: the commit-time transition for ONE token committed
 /// inside `<think>` that is not `</think>`. That includes an EOS sampled
 /// inside thinking: decode advances the thinking state for it before
@@ -172,3 +189,7 @@ pub(crate) fn apply_spec_think_trail(a: &mut ActiveSeq, tok: u32) {
         a.spec_think_trail.clear();
     }
 }
+
+#[cfg(test)]
+#[path = "think_commit_tests.rs"]
+mod tests;

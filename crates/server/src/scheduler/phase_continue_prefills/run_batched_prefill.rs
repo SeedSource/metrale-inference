@@ -27,6 +27,7 @@ pub(super) fn run_batched_prefill_step(
     prefill_event: u64,
     think_end_token: Option<u32>,
     tool_call_start_token: Option<u32>,
+    tool_call_end_token: Option<u32>,
 ) {
     // 2026-09-25: InnerQ calibration poll (`poll_innerq`).
     super::poll_innerq(model);
@@ -200,6 +201,18 @@ pub(super) fn run_batched_prefill_step(
             // 2026-09-25: `sample_first_token` applies the sequence's `min_p`
             // (0.0 under `METRALE_NO_MTP_MINP=1`) and, when `FirstTokenPolicy`
             // lets it act on token 0, the grammar.
+            // 2026-10-15: token 0 also suppresses a stray `</tool_call>` (`StrayToolCallEndMask`).
+            let ft_policy = FirstTokenPolicy::for_birth(
+                p.enable_thinking,
+                think_end_token,
+                tool_call_start_token,
+            )
+            .with_stray_tool_call_end(
+                sched.watchdog.mask_stray_tool_call_end,
+                p.tools_present,
+                p.grammar_state.is_some(),
+                tool_call_end_token,
+            );
             match sample_first_token(
                 model,
                 logits,
@@ -209,11 +222,7 @@ pub(super) fn run_batched_prefill_step(
                 p.min_p,
                 &p.eos_tokens,
                 p.grammar_state.as_mut(),
-                FirstTokenPolicy::for_birth(
-                    p.enable_thinking,
-                    think_end_token,
-                    tool_call_start_token,
-                ),
+                ft_policy,
                 &sched.levers.sampling(),
                 sched.io.tel.dumps(),
             ) {

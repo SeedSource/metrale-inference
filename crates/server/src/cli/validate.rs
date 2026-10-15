@@ -293,6 +293,14 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         ));
     }
 
+    if args.default_max_tokens == 0 {
+        v.push(Violation::new(
+            "--default-max-tokens is 0.",
+            "a request without max_tokens could then generate nothing.",
+            "set --default-max-tokens to a positive token count (default 4096).",
+        ));
+    }
+
     if args.rank >= args.world_size {
         v.push(Violation::new(
             format!(

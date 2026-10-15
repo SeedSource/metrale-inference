@@ -47,6 +47,29 @@ impl ChatTokenizer {
         repo_root: Option<&Path>,
         disable_template_overrides: bool,
     ) -> Result<Self> {
+        Self::from_model_dir_with(
+            model_dir,
+            eos_token_id,
+            supports_thinking,
+            model_type,
+            repo_root,
+            disable_template_overrides,
+            false,
+        )
+    }
+
+    /// 2026-10-15: [`Self::from_model_dir`] with MODEL.toml `[behavior].hf_tool_json`:
+    /// `true` renders the templates' `tojson` in the spaced HF form whatever
+    /// `METRALE_USE_HF_REF_JSON_DUMPS` says (`jinja_helpers::build_jinja_env_for`).
+    pub fn from_model_dir_with(
+        model_dir: &Path,
+        eos_token_id: u32,
+        supports_thinking: bool,
+        model_type: &str,
+        repo_root: Option<&Path>,
+        disable_template_overrides: bool,
+        hf_tool_json: bool,
+    ) -> Result<Self> {
         let official_k3 = super::kimi_k3::uses_xtml(model_dir, model_type)?;
         let tokenizer_path = model_dir.join("tokenizer.json");
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -79,13 +102,13 @@ impl ChatTokenizer {
             )
         };
 
-        let jinja_env = super::jinja_helpers::build_jinja_env(&chat_template)?;
+        let jinja_env = super::jinja_helpers::build_jinja_env_for(&chat_template, hf_tool_json)?;
 
         // 2026-09-26: A variant template that fails to compile is dropped without a log line.
         let openai_jinja_env = super::jinja_helpers::load_openai_template(model_type, repo_root)
             .and_then(|tmpl| {
                 tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
-                super::jinja_helpers::build_jinja_env(&tmpl).ok()
+                super::jinja_helpers::build_jinja_env_for(&tmpl, hf_tool_json).ok()
             });
         let chat_encoding = if official_k3 {
             ChatEncoding::KimiK3XtmlUnsupported

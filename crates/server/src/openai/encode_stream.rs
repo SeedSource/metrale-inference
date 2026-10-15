@@ -91,12 +91,14 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
                     chunk_json(ChatCompletionChunk::usage_only_chunk(model, id, wire_usage)),
                     chunk_json(
                         ChatCompletionChunk::final_chunk_no_usage(model, id, reason.as_wire())
+                            .with_stop_reason(reason.stop_reason())
                             .with_token_ids(token_ids.clone()),
                     ),
                 ]
             } else {
                 vec![chunk_json(
                     ChatCompletionChunk::done_chunk(model, id, reason.as_wire(), wire_usage)
+                        .with_stop_reason(reason.stop_reason())
                         .with_token_ids(token_ids.clone()),
                 )]
             }
@@ -282,6 +284,44 @@ mod tests {
         assert_eq!(v["usage"]["total_time_ms"], 112.5, "{}", p[0]);
         assert_eq!(v["usage"]["time_to_first_token_ms"], 12.5, "{}", p[0]);
         assert_eq!(v["usage"]["response_token/s"], 40.0, "{}", p[0]);
+    }
+
+    /// 2026-10-14: A repetition guard cut finishes with `finish_reason` "stop" and
+    /// `stop_reason` "repetition_detected" in both framings; any other finish has no
+    /// `stop_reason` key (#82 guard fix).
+    #[test]
+    fn repetition_finish_carries_stop_reason_on_both_framings() {
+        let usage = || crate::ir::Usage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cached_prompt_tokens: 0,
+            reasoning_tokens: 0,
+            accepted_prediction_tokens: 0,
+            time_to_first_token_ms: 1.0,
+            decode_time_ms: 1.0,
+            response_tokens_per_second: 1.0,
+        };
+        for include_usage in [true, false] {
+            let d = StreamDelta::Finish {
+                reason: FinishReason::Repetition,
+                usage: usage(),
+                token_ids: Vec::new(),
+            };
+            let p = delta_to_payloads(&d, "m", "id-1", include_usage);
+            let v: serde_json::Value = serde_json::from_str(p.last().unwrap()).unwrap();
+            assert_eq!(v["choices"][0]["finish_reason"], "stop", "{p:?}");
+            assert_eq!(
+                v["choices"][0]["stop_reason"], "repetition_detected",
+                "{p:?}"
+            );
+            let d = StreamDelta::Finish {
+                reason: FinishReason::Stop,
+                usage: usage(),
+                token_ids: Vec::new(),
+            };
+            let p = delta_to_payloads(&d, "m", "id-1", include_usage);
+            assert!(!p.last().unwrap().contains("stop_reason"), "{p:?}");
+        }
     }
 
     #[test]

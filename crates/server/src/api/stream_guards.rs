@@ -29,13 +29,180 @@ pub fn bump_f12_tool_call_count(count: &mut usize, max: usize, stop: &mut bool) 
     }
 }
 
-/// 2026-09-26: Append `text` to `loop_scan_buf` and report a repetition loop. Once the
-/// buffer passes 10,240 bytes it is cut back to its last 8,192 bytes at most. The needle
-/// is the newest line longer than 15 bytes (trimmed) that is not a code fence, lowercased
-/// with whitespace runs collapsed. True when 4 or more buffer lines normalise to the
-/// needle, or, for a needle of 30 bytes or more, when the lowercased buffer contains it 4
-/// or more times. Returns false, without touching the buffer, when `already_triggered`
-/// or `text` is empty.
+/// 2026-10-14: Lines (`p == 1`) a single repeated line needs, with the default when
+/// `METRALE_LOOP_LINE_REPEATS_SINGLE` is unset or not an integer >= 2.
+const DEFAULT_LINE_REPEATS_SINGLE: usize = 5;
+/// 2026-10-14: Block repeats a block of 2 or more lines needs, with the default when
+/// `METRALE_LOOP_LINE_REPEATS` is unset or not an integer >= 2.
+const DEFAULT_LINE_REPEATS: usize = 3;
+/// 2026-10-14: Longest block, in non-blank lines, the periodic-tail rule looks for.
+const LINE_MAX_PERIOD: usize = 32;
+/// 2026-10-14: Alphanumeric chars a repeating block must carry; box-drawing, punctuation
+/// and whitespace count for nothing, so diagram borders and `}` runs never qualify.
+const LINE_MIN_BLOCK_ALNUM: usize = 16;
+/// 2026-10-14: Phrase rule (one long line, no newline): shortest period in bytes that may
+/// fire. A tail that is periodic at a shorter period (`0, 0, 0`, `na na`, `=-=-`) is
+/// padding or a short token run, not a phrase loop, and never fires.
+const PHRASE_MIN_PERIOD: usize = 8;
+/// 2026-10-14: Longest phrase period, in bytes.
+const PHRASE_MAX_PERIOD: usize = 512;
+/// 2026-10-14: Copies of the phrase the tail must hold (the compared span is at least
+/// `PHRASE_REPEATS * q` bytes).
+const PHRASE_REPEATS: usize = 3;
+/// 2026-10-14: Shortest compared span in bytes, so a short period also needs a long run.
+const PHRASE_MIN_SPAN: usize = 96;
+/// 2026-10-14: Percent of the span's bytes that must equal the byte `q` earlier
+/// (ASCII case folded). 97, not 95: a one-line JSON array of objects that differ in one
+/// digit per ~24 bytes matches at ~96%.
+const PHRASE_MATCH_PCT: usize = 97;
+/// 2026-10-14: Alphanumeric chars the compared span must carry.
+const PHRASE_MIN_SPAN_ALNUM: usize = 48;
+
+/// 2026-10-14: Read once per process: `METRALE_LOOP_LINE_REPEATS` (block of 2 or more
+/// lines) and `METRALE_LOOP_LINE_REPEATS_SINGLE` (one line); an unset, unparsable or
+/// below-2 value keeps the default.
+fn line_repeats() -> (usize, usize) {
+    static R: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let read = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n >= 2)
+                .unwrap_or(default)
+        };
+        (
+            read("METRALE_LOOP_LINE_REPEATS", DEFAULT_LINE_REPEATS),
+            read(
+                "METRALE_LOOP_LINE_REPEATS_SINGLE",
+                DEFAULT_LINE_REPEATS_SINGLE,
+            ),
+        )
+    })
+}
+
+/// 2026-09-26: Trimmed, ASCII-lowercased, whitespace runs collapsed to one space.
+fn norm_line(s: &str) -> String {
+    let lowered = s.trim().to_ascii_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut prev_space = false;
+    for ch in lowered.chars() {
+        if ch.is_ascii_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+fn alnum_chars(s: &str) -> usize {
+    s.chars().filter(|c| c.is_alphanumeric()).count()
+}
+
+/// 2026-10-14: Periodic-tail rule over the complete lines of `complete` (blank lines
+/// dropped, the rest normalised by `norm_line`). `Some((p, repeats))` for the smallest
+/// period `p <= LINE_MAX_PERIOD` such that the newest `repeats * p` lines satisfy
+/// `line[i] == line[i - p]`, with `repeats` = `r_single` for `p == 1` and `r_block`
+/// otherwise, and the newest block carries `LINE_MIN_BLOCK_ALNUM` alphanumeric chars.
+pub(crate) fn periodic_line_tail(
+    complete: &str,
+    r_block: usize,
+    r_single: usize,
+) -> Option<(usize, usize)> {
+    let max_lines = (LINE_MAX_PERIOD * r_block).max(r_single);
+    let mut lines: Vec<String> = complete
+        .lines()
+        .rev()
+        .map(norm_line)
+        .filter(|l| !l.is_empty())
+        .take(max_lines)
+        .collect();
+    lines.reverse();
+    let n = lines.len();
+    for p in 1..=LINE_MAX_PERIOD {
+        let repeats = if p == 1 { r_single } else { r_block };
+        let need = repeats * p;
+        if need > n {
+            if p > 1 {
+                break;
+            }
+            continue;
+        }
+        let periodic = (n - need + p..n).all(|i| lines[i] == lines[i - p]);
+        if periodic
+            && lines[n - p..].iter().map(|l| alnum_chars(l)).sum::<usize>() >= LINE_MIN_BLOCK_ALNUM
+        {
+            return Some((p, repeats));
+        }
+    }
+    None
+}
+
+/// 2026-10-14: Phrase rule over `line`, the unfinished last line: `Some(q)` when the
+/// smallest period `q` (bytes, `1..=PHRASE_MAX_PERIOD`) at which the newest
+/// `max(PHRASE_REPEATS * q, PHRASE_MIN_SPAN)` bytes match the byte `q` earlier in at
+/// least `PHRASE_MATCH_PCT` percent of places is `>= PHRASE_MIN_PERIOD`, and that span
+/// carries `PHRASE_MIN_SPAN_ALNUM` alphanumeric chars. A smaller smallest period (zero
+/// arrays, separator runs) returns `None`.
+pub(crate) fn periodic_phrase_tail(line: &str) -> Option<usize> {
+    let b = line.as_bytes();
+    let n = b.len();
+    if n < PHRASE_MIN_SPAN {
+        return None;
+    }
+    for q in 1..=PHRASE_MAX_PERIOD {
+        let span = (PHRASE_REPEATS * q).max(PHRASE_MIN_SPAN);
+        if span > n {
+            break;
+        }
+        let compared = span - q;
+        let allowed = compared * (100 - PHRASE_MATCH_PCT) / 100;
+        let mut miss = 0usize;
+        for i in n - compared..n {
+            if !b[i].eq_ignore_ascii_case(&b[i - q]) {
+                miss += 1;
+                if miss > allowed {
+                    break;
+                }
+            }
+        }
+        if miss > allowed {
+            continue;
+        }
+        if q < PHRASE_MIN_PERIOD {
+            return None;
+        }
+        let mut start = n - span;
+        while !line.is_char_boundary(start) {
+            start += 1;
+        }
+        return (alnum_chars(&line[start..]) >= PHRASE_MIN_SPAN_ALNUM).then_some(q);
+    }
+    None
+}
+
+/// 2026-10-14 (was: 4 equal lines, or 4 copies of a 30-byte needle, anywhere in the
+/// buffer; that cut ordinary code, markdown and diagram answers, #82): append `text` to
+/// `loop_scan_buf` and report a repetition loop. Once the buffer passes 10,240 bytes it is
+/// cut back to its last 8,192 bytes at most. A loop is a periodic tail, not a repeat
+/// anywhere: legit structure repeats a line or a template with new content in between.
+/// - Line rule (`periodic_line_tail`), when `text` holds a newline: the newest complete
+///   lines are a block of `p` lines repeated back to back, 3 times for `p >= 2`
+///   (`METRALE_LOOP_LINE_REPEATS`) and 5 times for one line
+///   (`METRALE_LOOP_LINE_REPEATS_SINGLE`), the block carrying 16 alphanumeric chars.
+/// - Phrase rule (`periodic_phrase_tail`): the unfinished last line ends in a phrase of 8
+///   to 512 bytes repeated 3 times at 97% byte match over at least 96 bytes.
+///
+/// Returns false, without touching the buffer, when `already_triggered` or `text` is
+/// empty.
 pub fn check_loop_watchdog(
     text: &str,
     loop_scan_buf: &mut String,
@@ -54,66 +221,29 @@ pub fn check_loop_watchdog(
             .unwrap_or(drop);
         loop_scan_buf.drain(..cut);
     }
-    let last_line = loop_scan_buf
-        .lines()
-        .rev()
-        .find(|l| l.trim().len() > 15 && !l.trim_start().starts_with("```"))
-        .map(|s| s.to_string());
-    let Some(line) = last_line else {
-        return false;
-    };
-    fn norm(s: &str) -> String {
-        let lowered = s.trim().to_ascii_lowercase();
-        let mut out = String::with_capacity(lowered.len());
-        let mut prev_space = false;
-        for ch in lowered.chars() {
-            if ch.is_ascii_whitespace() {
-                if !prev_space && !out.is_empty() {
-                    out.push(' ');
-                }
-                prev_space = true;
-            } else {
-                out.push(ch);
-                prev_space = false;
-            }
-        }
-        if out.ends_with(' ') {
-            out.pop();
-        }
-        out
-    }
-    let needle = norm(&line);
-    if needle.is_empty() {
-        return false;
-    }
-    let exact_occurrences = loop_scan_buf.lines().filter(|l| norm(l) == needle).count();
-    if exact_occurrences >= 4 {
-        tracing::warn!(
-            occurrences = exact_occurrences,
-            line_len = needle.len(),
-            "loop watchdog fired — repeated line (fuzzy-match) in post-detector content"
-        );
-        return true;
-    }
-    if needle.len() >= 30 {
-        let lowered_buf = loop_scan_buf.to_ascii_lowercase();
-        let mut count = 0usize;
-        let mut start = 0usize;
-        while let Some(rel) = lowered_buf[start..].find(&needle) {
-            count += 1;
-            start += rel + needle.len();
-            if count >= 4 {
-                break;
-            }
-        }
-        if count >= 4 {
+    let last_nl = loop_scan_buf.rfind('\n');
+    if let Some(nl) = last_nl.filter(|_| text.contains('\n')) {
+        let (r_block, r_single) = line_repeats();
+        if let Some((period, repeats)) = periodic_line_tail(&loop_scan_buf[..nl], r_block, r_single)
+        {
             tracing::warn!(
-                occurrences = count,
-                line_len = needle.len(),
-                "loop watchdog fired — repeated phrase (substring) in post-detector content"
+                period,
+                repeats,
+                "loop watchdog fired — periodic tail of repeated lines in post-detector content"
             );
             return true;
         }
+    }
+    let partial = match last_nl {
+        Some(nl) => &loop_scan_buf[nl + 1..],
+        None => loop_scan_buf.as_str(),
+    };
+    if let Some(period) = periodic_phrase_tail(partial) {
+        tracing::warn!(
+            period,
+            "loop watchdog fired — periodic phrase in one line of post-detector content"
+        );
+        return true;
     }
     false
 }
@@ -217,13 +347,69 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_four_identical_lines_fires() {
+    fn watchdog_five_identical_lines_fire_four_do_not() {
+        // 2026-10-14: one repeated line (p == 1) needs 5 back-to-back copies.
         let mut buf = String::new();
         let line = "Running cargo test on the project\n";
-        assert!(!check_loop_watchdog(line, &mut buf, false));
-        assert!(!check_loop_watchdog(line, &mut buf, false));
-        assert!(!check_loop_watchdog(line, &mut buf, false));
+        for _ in 0..4 {
+            assert!(!check_loop_watchdog(line, &mut buf, false));
+        }
         assert!(check_loop_watchdog(line, &mut buf, false));
+    }
+
+    #[test]
+    fn periodic_line_tail_needs_back_to_back_blocks() {
+        let block = "alpha beta gamma delta\nepsilon zeta eta theta\n";
+        assert_eq!(periodic_line_tail(&block.repeat(3), 3, 5), Some((2, 3)));
+        assert_eq!(periodic_line_tail(&block.repeat(2), 3, 5), None);
+        // A different line between the copies breaks the period.
+        let mut s = String::new();
+        for i in 0..6 {
+            s.push_str(block);
+            s.push_str(&format!("note number {i}\n"));
+        }
+        assert_eq!(periodic_line_tail(&s, 3, 5), None);
+        // Blank lines do not count, so a paragraph loop has period 1.
+        let para = "This exact paragraph keeps coming back again.\n\n";
+        assert_eq!(periodic_line_tail(&para.repeat(5), 3, 5), Some((1, 5)));
+        assert_eq!(periodic_line_tail(&para.repeat(4), 3, 5), None);
+    }
+
+    #[test]
+    fn periodic_line_tail_ignores_content_free_blocks() {
+        let rows = "│                    │\n├────────────────────┤\n";
+        assert_eq!(periodic_line_tail(&rows.repeat(10), 3, 5), None);
+        assert_eq!(periodic_line_tail(&"}\n".repeat(40), 3, 5), None);
+        assert_eq!(periodic_line_tail(&"| -- | -- |\n".repeat(20), 3, 5), None);
+    }
+
+    #[test]
+    fn periodic_phrase_tail_finds_a_phrase_loop_in_one_line() {
+        let phrase = "and then the answer goes back to the start ";
+        let line = format!("Intro text. {}", phrase.repeat(3));
+        assert_eq!(periodic_phrase_tail(&line), Some(phrase.len()));
+        let two = format!("Intro text. {}", phrase.repeat(2));
+        assert_eq!(periodic_phrase_tail(&two), None);
+    }
+
+    #[test]
+    fn periodic_phrase_tail_skips_short_periods_and_prose() {
+        let zeros = format!("let a = [{}];", "0, ".repeat(80));
+        assert_eq!(periodic_phrase_tail(&zeros), None);
+        assert_eq!(periodic_phrase_tail(&"=-".repeat(100)), None);
+        let prose = "The quick brown fox jumps over the lazy dog while the band plays \
+                     a slow tune, and nobody in the room notices the clock on the wall \
+                     ticking past midnight as the rain keeps falling outside.";
+        assert_eq!(periodic_phrase_tail(prose), None);
+        let mut json = String::from("[");
+        for i in 0..9 {
+            json.push_str(&format!("{{\"type\":\"point\",\"x\":{i}}},"));
+        }
+        assert_eq!(
+            periodic_phrase_tail(&json),
+            None,
+            "one digit in 24 bytes differs"
+        );
     }
 
     #[test]

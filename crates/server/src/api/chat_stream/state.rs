@@ -68,6 +68,13 @@ pub(super) struct StreamState {
     /// 2026-09-26: Set when the token loop watchdog, the SimHash guard or the
     /// orphan-suppression streak cuts the stream.
     pub(super) loop_watchdog_triggered: bool,
+    /// 2026-10-12: Tokens that have reached `handle_token` (completion tokens, thinking
+    /// included, like the scheduler's `output_tokens`). The `min_tokens` floor of
+    /// `METRALE_GUARD_HONOR_FORCED_LEN` reads it.
+    pub(super) tokens_seen: usize,
+    /// 2026-10-12: Content-guard fires that `METRALE_GUARD_HONOR_FORCED_LEN` let pass.
+    /// Logged once per request by `handle_done`.
+    pub(super) guard_suppressed: u32,
     /// 2026-09-26: Whether `handle_token` has logged the first non-empty delta batch.
     pub(super) first_result_logged: bool,
     /// 2026-09-26: Never set; `handle_done` reads it as a tool-call signal.
@@ -170,6 +177,8 @@ impl StreamState {
             reasoning_tag_scan_buf: String::new(),
             loop_scan_buf: String::new(),
             loop_watchdog_triggered: false,
+            tokens_seen: 0,
+            guard_suppressed: 0,
             first_result_logged: false,
             salvaged_tool_call: false,
             simhash_guard: crate::loop_simhash::SimHashLoopGuard::new(),

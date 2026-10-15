@@ -267,6 +267,18 @@ pub fn prefill_request(
         model.ep_sync_vision_embeds(&prompt_tokens)?;
 
         let logits = model.prefill(&prompt_tokens, &mut seq, 0)?;
+        // 2026-10-15: token 0 also suppresses a stray `</tool_call>` (`StrayToolCallEndMask`).
+        let ft_policy = FirstTokenPolicy::for_birth(
+            req_enable_thinking,
+            think_end_token,
+            tool_call_start_token,
+        )
+        .with_stray_tool_call_end(
+            sched.watchdog.mask_stray_tool_call_end,
+            req_tools_present,
+            grammar_state.is_some(),
+            tool_call_end_token,
+        );
         sample_first_token(
             model,
             logits,
@@ -276,11 +288,7 @@ pub fn prefill_request(
             min_p,
             eos_tokens,
             grammar_state.as_mut(),
-            FirstTokenPolicy::for_birth(
-                req_enable_thinking,
-                think_end_token,
-                tool_call_start_token,
-            ),
+            ft_policy,
             &sched.levers.sampling(),
             sched.io.tel.dumps(),
         )

@@ -241,8 +241,13 @@ pub(crate) fn load_model(
         min_p: default_min_p,
     } = serve_phases::load_sampling_defaults(&model_dir, &args, &sampling_presets.non_thinking);
 
-    let (tokenizer, supports_thinking) =
-        model_setup::load_tokenizer(&args, &config, &model_dir, &eos_tokens)?;
+    let (tokenizer, supports_thinking) = model_setup::load_tokenizer(
+        &args,
+        &config,
+        &model_dir,
+        &eos_tokens,
+        ptx_set.behavior.hf_tool_json,
+    )?;
 
     let serve_phases::TokenizerRuntime {
         vocab_masks,
@@ -290,6 +295,8 @@ pub(crate) fn load_model(
     )?;
 
     let adaptive_sampling = args.adaptive_sampling;
+    // 2026-10-14: The reply limit of a request that names none.
+    crate::openai::set_default_max_tokens(args.default_max_tokens);
     let session_manager = session_manager::SessionSsmManager::new(600);
     // 2026-09-26: The thinking budget a sequence gets when the model opens
     // `<think>` on its own (`emit_step/token.rs`): `--max-thinking-budget`,

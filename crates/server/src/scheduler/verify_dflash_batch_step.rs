@@ -139,7 +139,17 @@ pub fn step_verify_dflash_batched(
         .enumerate()
         .map(|(i, a)| {
             let raw = &results[i * k..i * k + k];
-            if !(pinned && super::dflash_batch_rows::verdict_uses_pipeline(sched, a)) {
+            // 2026-10-15: the partition in `mtp_step.rs` runs before this forward, so a raw
+            // argmax on a stray `</tool_call>` that `StrayToolCallEndMask` masks on this row
+            // is caught here, pinned or not: this row's verdict comes from the masked pipeline
+            // over its own rows of the shared logits buffer (`row_base = i * k`), and the
+            // accept walk below compares the drafts with those picks. Read before any propose,
+            // like every other read of the shared outputs.
+            let stray =
+                crate::scheduler::verify_pipeline_helper::raw_verdict_hits_stray_tool_call_end(
+                    a, raw, verify_ctx,
+                );
+            if !stray && !(pinned && super::dflash_batch_rows::verdict_uses_pipeline(sched, a)) {
                 return raw.to_vec();
             }
             host_rows += 1;

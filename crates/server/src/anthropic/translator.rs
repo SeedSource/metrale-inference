@@ -312,7 +312,7 @@ impl AnthropicTranslator {
                     serde_json::json!({
                         "type": "message_delta",
                         "delta": {
-                            "stop_reason": convert_stop_reason(reason.as_wire()),
+                            "stop_reason": anthropic_stop_reason(reason),
                             "stop_sequence": serde_json::Value::Null,
                         },
                         "usage": self.final_usage(),

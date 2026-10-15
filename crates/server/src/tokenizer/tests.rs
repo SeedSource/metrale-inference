@@ -446,3 +446,27 @@ fn tojson_filter_default_compact_hf_ref_opt_in() {
         "METRALE_USE_HF_REF_JSON_DUMPS=1 must restore Python json.dumps byte parity\ngot:\n{got_hf}\n"
     );
 }
+
+/// 2026-10-15: MODEL.toml `[behavior].hf_tool_json` (GLM-5.3): `build_jinja_env_for` with
+/// `hf_default` renders the spaced form without the env var; without it, the production
+/// default stays compact.
+#[test]
+fn hf_tool_json_flag_selects_the_spaced_tojson() {
+    assert_eq!(
+        super::jinja_helpers::tool_json_style(true),
+        super::jinja_helpers::ToolJsonStyle::HfSpaced
+    );
+    let value = serde_json::json!({"type": "object", "required": ["a", "b"]});
+    let render = |hf: bool| {
+        super::jinja_helpers::build_jinja_env_for("{{ v | tojson }}", hf)
+            .expect("inline template compiles")
+            .get_template("chat")
+            .unwrap()
+            .render(minijinja::context! { v => minijinja::Value::from_serialize(&value) })
+            .expect("tojson render")
+    };
+    assert_eq!(render(true), "{\"type\": \"object\", \"required\": [\"a\", \"b\"]}");
+    if std::env::var("METRALE_USE_HF_REF_JSON_DUMPS").as_deref() != Ok("1") {
+        assert_eq!(render(false), "{\"type\":\"object\",\"required\":[\"a\",\"b\"]}");
+    }
+}

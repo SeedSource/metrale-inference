@@ -32,6 +32,11 @@ pub struct ChunkChoice {
     pub delta: ChunkDelta,
     pub finish_reason: Option<String>,
     pub logprobs: Option<ChoiceLogprobs>,
+    /// 2026-10-14: vLLM's extra choice field beside `finish_reason`: `"repetition_detected"`
+    /// on the final chunk of a repetition guard cut (`ir::FinishReason::stop_reason`);
+    /// omitted from the JSON otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<&'static str>,
     /// 2026-09-26: Sampled token ids carried by this chunk; omitted from the JSON when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub token_ids: Vec<u32>,
@@ -74,6 +79,7 @@ impl ChatCompletionChunk {
                 },
                 finish_reason: None,
                 logprobs: None,
+                stop_reason: None,
                 token_ids: Vec::new(),
             }],
             usage: None,
@@ -99,6 +105,7 @@ impl ChatCompletionChunk {
                 },
                 finish_reason: None,
                 logprobs: None,
+                stop_reason: None,
                 token_ids: Vec::new(),
             }],
             usage: None,
@@ -124,6 +131,7 @@ impl ChatCompletionChunk {
                 },
                 finish_reason: None,
                 logprobs: None,
+                stop_reason: None,
                 token_ids: Vec::new(),
             }],
             usage: None,
@@ -163,6 +171,7 @@ impl ChatCompletionChunk {
                 },
                 finish_reason: None,
                 logprobs: None,
+                stop_reason: None,
                 token_ids: Vec::new(),
             }],
             usage: None,
@@ -197,6 +206,7 @@ impl ChatCompletionChunk {
                 },
                 finish_reason: None,
                 logprobs: None,
+                stop_reason: None,
                 token_ids: Vec::new(),
             }],
             usage: None,
@@ -222,6 +232,7 @@ impl ChatCompletionChunk {
                 },
                 finish_reason: Some(finish_reason.to_string()),
                 logprobs: None,
+                stop_reason: None,
                 token_ids: Vec::new(),
             }],
             usage: Some(usage),
@@ -263,6 +274,7 @@ impl ChatCompletionChunk {
                 },
                 finish_reason: None,
                 logprobs: None,
+                stop_reason: None,
                 token_ids: Vec::new(),
             }],
             usage: None,
@@ -289,10 +301,19 @@ impl ChatCompletionChunk {
                 },
                 finish_reason: Some(finish_reason.to_string()),
                 logprobs: None,
+                stop_reason: None,
                 token_ids: Vec::new(),
             }],
             usage: None,
         }
+    }
+
+    /// 2026-10-14: Set the first choice's `stop_reason` (`ir::FinishReason::stop_reason`).
+    pub(crate) fn with_stop_reason(mut self, stop_reason: Option<&'static str>) -> Self {
+        if let Some(choice) = self.choices.first_mut() {
+            choice.stop_reason = stop_reason;
+        }
+        self
     }
 
     /// 2026-09-26: Set `ids` as the first choice's `token_ids`. No-op when `ids` is empty or

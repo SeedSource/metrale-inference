@@ -104,6 +104,13 @@ pub fn step_verify_k4(
         && !crate::scheduler::sample_step::speculative_raw_argmax_forbidden(
             a,
             sched.levers.think_ended_gpu_argmax,
+        )
+        // 2026-10-15: a raw argmax on a masked stray `</tool_call>` takes the
+        // masked pipeline (`StrayToolCallEndMask`).
+        && !crate::scheduler::verify_pipeline_helper::raw_verdict_hits_stray_tool_call_end(
+            a,
+            &[v0_argmax, v1_argmax, v2_argmax, v3_argmax],
+            verify_ctx,
         ) {
         // 2026-09-25: DFlash without masked verify: judge on the raw argmax,
         // with no masks or penalties.

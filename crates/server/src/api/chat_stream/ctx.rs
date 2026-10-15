@@ -49,4 +49,8 @@ pub(super) struct StreamCtx {
     pub(super) req_return_token_ids: bool,
     pub(super) req_ctx: Option<crate::rate_limiter::RequestContext>,
     pub(super) dump_seq: Option<u64>,
+    /// 2026-10-12: The request's `ignore_eos` and `min_tokens`, read by the stream-side
+    /// content guards under `METRALE_GUARD_HONOR_FORCED_LEN`.
+    pub(super) ignore_eos: bool,
+    pub(super) min_tokens: usize,
 }

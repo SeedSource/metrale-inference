@@ -7,6 +7,7 @@
 //! - `envelope`: tags inside a declared envelope pass through.
 //! - `error_frames`: a `/v1/completions` stream error reaches the client as JSON.
 //! - `watchdog`: the repetition guard fires on loops and not on varied prose.
+//! - `guard_replay`: replays saved streams (fixtures from `GUARD_REPLAY_DIR`) through the loop guards.
 //! - `health_fault`: readiness reports a GPU fault ahead of a loaded model.
 //! - `model_advertise`: `/v1/models` reports the ceiling the chat path enforces.
 //!
@@ -15,6 +16,7 @@
 
 mod envelope;
 mod error_frames;
+mod guard_replay;
 mod harness;
 mod health_fault;
 mod model_advertise;

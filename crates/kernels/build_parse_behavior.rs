@@ -24,6 +24,22 @@ pub(crate) struct ParsedBehavior {
     pub max_thinking_budget: u32,
     /// 2026-09-25: See `behavior_defaults.rs`: clamp effort levels at the ceiling.
     pub effort_capped_at_ceiling: bool,
+    /// 2026-10-14: See `behavior_defaults.rs`: effort as a prompt line only, no budget.
+    pub effort_prompt_only: bool,
+    /// 2026-10-15: See `behavior_defaults.rs`: with `tool_choice` `none`, the declared tools
+    /// are still rendered in the prompt (only the prompt changes).
+    pub render_tools_on_tool_choice_none: bool,
+    /// 2026-10-15: See `behavior_defaults.rs`: the chat template's `tojson` is the spaced HF
+    /// form (`{"a": 1}`), as `METRALE_USE_HF_REF_JSON_DUMPS=1` selects.
+    pub hf_tool_json: bool,
+    /// 2026-10-15: See `behavior_defaults.rs`: the `<tool_call>` start-token logit bias on tool
+    /// requests (+3 for the first two calls).
+    pub tool_call_start_bias: bool,
+    /// 2026-10-15: See `behavior_defaults.rs`: with tools active and `tool_choice` auto,
+    /// `response_format` is enforced instead of the tool-call grammar.
+    pub response_format_with_tools: bool,
+    /// 2026-10-15: See `behavior_defaults.rs`: mask a stray `</tool_call>` when no tools.
+    pub mask_stray_tool_call_end: bool,
     pub thinking_default: bool,
     pub fp8_kv_calibration_tokens: usize,
     pub default_kv_dtype: String,
@@ -75,6 +91,12 @@ impl Default for ParsedBehavior {
             thinking_in_tools: true,
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
+            effort_prompt_only: DEFAULT_EFFORT_PROMPT_ONLY,
+            render_tools_on_tool_choice_none: DEFAULT_RENDER_TOOLS_ON_TOOL_CHOICE_NONE,
+            hf_tool_json: DEFAULT_HF_TOOL_JSON,
+            tool_call_start_bias: DEFAULT_TOOL_CALL_START_BIAS,
+            response_format_with_tools: DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
+            mask_stray_tool_call_end: DEFAULT_MASK_STRAY_TOOL_CALL_END,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: String::new(),
@@ -134,6 +156,30 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("effort_capped_at_ceiling"))
         .and_then(|v| v.as_bool())
         .unwrap_or(DEFAULT_EFFORT_CAPPED_AT_CEILING);
+    let effort_prompt_only = b
+        .and_then(|v| v.get("effort_prompt_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_EFFORT_PROMPT_ONLY);
+    let render_tools_on_tool_choice_none = b
+        .and_then(|v| v.get("render_tools_on_tool_choice_none"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_RENDER_TOOLS_ON_TOOL_CHOICE_NONE);
+    let hf_tool_json = b
+        .and_then(|v| v.get("hf_tool_json"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_HF_TOOL_JSON);
+    let tool_call_start_bias = b
+        .and_then(|v| v.get("tool_call_start_bias"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_TOOL_CALL_START_BIAS);
+    let response_format_with_tools = b
+        .and_then(|v| v.get("response_format_with_tools"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_RESPONSE_FORMAT_WITH_TOOLS);
+    let mask_stray_tool_call_end = b
+        .and_then(|v| v.get("mask_stray_tool_call_end"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_MASK_STRAY_TOOL_CALL_END);
     let thinking_default = b
         .and_then(|v| v.get("thinking_default"))
         .and_then(|v| v.as_bool())
@@ -264,6 +310,12 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
         effort_capped_at_ceiling,
+        effort_prompt_only,
+        render_tools_on_tool_choice_none,
+        hf_tool_json,
+        tool_call_start_bias,
+        response_format_with_tools,
+        mask_stray_tool_call_end,
         thinking_default,
         fp8_kv_calibration_tokens,
         default_kv_dtype,

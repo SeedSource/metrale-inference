@@ -49,6 +49,24 @@ pub(super) fn fast_hits_post_think_structural(
             .any(|&tok| Some(tok) == think_end_token || Some(tok) == think_start_token)
 }
 
+/// 2026-10-15: true when `StrayToolCallEndMask` applies to this row
+/// (`ctx.watchdog.mask_stray_tool_call_end`, no tools, no grammar, no open
+/// `<tool_call>`) and any verify-window GPU argmax is `ctx.tool_call_end_token`.
+/// The verify twin of `decode_logits_step::decode_argmax_hits_stray_tool_call_end`.
+/// Judged on the step-start state (see `stray_tool_call_end::hits`).
+pub(super) fn fast_hits_stray_tool_call_end(
+    a: &ActiveSeq,
+    argmax_ids: &[u32],
+    ctx: &LogitsContext,
+) -> bool {
+    crate::scheduler::logit_processors::stray_tool_call_end::hits(
+        ctx.watchdog.mask_stray_tool_call_end,
+        a,
+        ctx.tool_call_end_token,
+        argmax_ids,
+    )
+}
+
 /// 2026-09-25: pick a token for each of one sequence's verify positions.
 ///
 /// `argmax_ids` holds the GPU argmax of each position and sets K. The fast
@@ -118,6 +136,16 @@ pub fn verify_pick_all_with_pipeline(
     if think_structural_hit {
         VERIFY_THINK_MASK_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    // 2026-10-15: the same guard for a stray `</tool_call>`: on a row where
+    // `StrayToolCallEndMask` applies, a window argmax on it forces the host
+    // path, where the stage masks it per position and the runner-up wins. The
+    // caller's accept walk then rejects a draft that disagrees with the
+    // replaced pick, as for any mismatch. The masked chat path above refuses
+    // the id itself (`fast_masked.rs`).
+    let stray_tool_call_end_hit = fast_hits_stray_tool_call_end(a, argmax_ids, ctx);
+    if stray_tool_call_end_hit {
+        crate::scheduler::logit_processors::stray_tool_call_end::count_fallback();
+    }
 
     // 2026-09-25: grammar fast path. Eligible when `fast_greedy_grammar` is on
     // (`METRALE_DISABLE_FAST_GREEDY=1` turns it off), a grammar is active,
@@ -153,6 +181,7 @@ pub fn verify_pick_all_with_pipeline(
     };
     if fast_penalty_gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked
         && !think_structural_hit
+        && !stray_tool_call_end_hit
         && !bias_forces_host
     {
         let t_fast = ctx.clock.now();
@@ -262,6 +291,7 @@ pub fn verify_pick_all_with_pipeline(
     };
     if chat_fast_gate != crate::scheduler::fast_greedy::PenaltyGate::Blocked
         && !think_structural_hit
+        && !stray_tool_call_end_hit
         && !bias_forces_host
     {
         let t_fast = ctx.clock.now();

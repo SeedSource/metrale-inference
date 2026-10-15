@@ -21,7 +21,8 @@ use metrale_model_engine::traits::Model;
 /// `</think>` and the tool-call pin all inactive, penalties not `Blocked`,
 /// and at every position an argmax that is not the think-end, think-start
 /// or tool-call-start token and, for `ReduceOnly` penalties, is
-/// penalty-immune (`fast_greedy`).
+/// penalty-immune (`fast_greedy`). 2026-10-15: nor, on a row where
+/// `StrayToolCallEndMask` applies, the tool-call end token.
 ///
 /// Not checked: `MinTokensEosMask`, so an EOS argmax below `min_tokens` is
 /// returned unmasked.
@@ -114,12 +115,21 @@ pub(super) fn try_chat_fast_path(
     let vocab = model.vocab_size();
     let logits_base = model.logits_buffer_ptr();
     let mut all_clear = true;
+    // 2026-10-15: `StrayToolCallEndMask` masks `ctx.tool_call_end_token` on this
+    // row (step-start state; see `stray_tool_call_end::hits`).
+    let stray_end = crate::scheduler::logit_processors::stray_tool_call_end::applies(
+        ctx.watchdog.mask_stray_tool_call_end,
+        a,
+    )
+    .then_some(ctx.tool_call_end_token)
+    .flatten();
     for (i, &tok) in argmax_ids.iter().enumerate() {
         // 2026-09-25: the ids `MidWordThinkEndMask`, `PostCloseThinkMask`
         // and `ToolCallDuringThinkingMask` can mask or lower.
         if Some(tok) == ctx.think_end_token
             || Some(tok) == a.think_start_token
             || Some(tok) == ctx.tool_call_start_token
+            || Some(tok) == stray_end
         {
             all_clear = false;
             break;

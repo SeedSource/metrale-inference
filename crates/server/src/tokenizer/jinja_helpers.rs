@@ -25,12 +25,26 @@ pub(crate) enum ToolJsonStyle {
 /// 2026-09-26: Production entry point: `HfSpaced` when `METRALE_USE_HF_REF_JSON_DUMPS` is
 /// `1`, else `Compact`, then [`build_jinja_env_with`]. Reads the env var on every call.
 pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environment<'static>> {
-    let style = if std::env::var("METRALE_USE_HF_REF_JSON_DUMPS").as_deref() == Ok("1") {
+    build_jinja_env_for(chat_template, false)
+}
+
+/// 2026-10-15: [`build_jinja_env`] for a model whose MODEL.toml sets
+/// `[behavior].hf_tool_json` (`hf_default`, GLM-5.3): `HfSpaced` whatever the env var says.
+pub(super) fn build_jinja_env_for(
+    chat_template: &str,
+    hf_default: bool,
+) -> Result<minijinja::Environment<'static>> {
+    build_jinja_env_with(chat_template, tool_json_style(hf_default))
+}
+
+/// 2026-10-15: `HfSpaced` when the model asks for it or `METRALE_USE_HF_REF_JSON_DUMPS` is
+/// `1`, else `Compact`.
+pub(super) fn tool_json_style(hf_default: bool) -> ToolJsonStyle {
+    if hf_default || std::env::var("METRALE_USE_HF_REF_JSON_DUMPS").as_deref() == Ok("1") {
         ToolJsonStyle::HfSpaced
     } else {
         ToolJsonStyle::Compact
-    };
-    build_jinja_env_with(chat_template, style)
+    }
 }
 
 /// 2026-09-26: Build a chat-template environment with an explicit tool-JSON style.

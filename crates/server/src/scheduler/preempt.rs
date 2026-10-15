@@ -247,6 +247,34 @@ pub(super) fn preempt_after_spec_refusal(
     }
 }
 
+/// 2026-10-15 (race-memory, gap (a); cap2h lost a 324K reply to "preempted: KV cache exhausted
+/// (a prefill needed its blocks)"): free room for a prefill chunk refused for KV by requeuing one
+/// active row for a later resume, as decode-time preemption does, instead of ending it with an
+/// error. The victim rule is decode's (`choose_decode_victim`: fewest output tokens, the resume
+/// immunity, never a finished or grammar row; no spill pool here, so never a vision row). Returns
+/// `false` when no row is eligible: the prefill's own error then stands.
+pub(super) fn preempt_for_prefill(
+    io: &SchedIo,
+    active: &mut Vec<ActiveSeq>,
+    preempted: &mut Vec<PreemptedSeq>,
+) -> bool {
+    let Some(vi) = super::decode_launch::choose_decode_victim(io.dev.model(), active, false) else {
+        return false;
+    };
+    // `remove`, not `swap_remove`, as in `launch_with_preemption`.
+    let v = active.remove(vi);
+    tracing::warn!(
+        "KV cache exhausted during prefill chunk: preempting slot={} ({} blocks, {} tokens \
+         generated) for later RESUME so this prefill can proceed ({} sequence(s) remain)",
+        v.seq.slot_idx,
+        v.seq.block_table.len(),
+        v.output_tokens.len(),
+        active.len(),
+    );
+    preempted.push(preempt_requeue(io, v));
+    true
+}
+
 /// 2026-09-25: Resume a requeued victim: allocate a new sequence and
 /// prefill the saved token history into it. The prefill's logits are
 /// discarded and `a.last_token` stays the next decode input, so no token

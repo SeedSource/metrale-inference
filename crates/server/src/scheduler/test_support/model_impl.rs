@@ -100,6 +100,13 @@ impl ModelForward for PreemptStubModel {
         _st: u64,
     ) -> Result<DevicePtr> {
         self.chunks.lock().unwrap().push((cs, cl, last));
+        if self
+            .fail_prefill_chunks
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!("KV cache exhausted: no free blocks");
+        }
         // 2026-10-04: only a first-token stub (`first_token`) prefills.
         // 2026-10-14: or a resume stub (`chunks_ok`).
         if self.first_token.is_none() && !self.chunks_ok {

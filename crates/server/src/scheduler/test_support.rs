@@ -268,6 +268,9 @@ pub(super) struct PreemptStubModel {
     /// 2026-10-14: Every EP command word sent to the workers, in order: the `cmd` of
     /// `ep_broadcast_cmd_for_seq`, then each `ep_broadcast_cmd` word.
     pub(super) ep_words: Mutex<Vec<u32>>,
+    /// 2026-10-15 (race-memory, gap (a)): the next N `prefill_chunk` calls fail with "KV cache
+    /// exhausted" (recorded in `chunks` first, like every call).
+    pub(super) fail_prefill_chunks: AtomicUsize,
 }
 
 impl PreemptStubModel {

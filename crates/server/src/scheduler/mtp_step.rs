@@ -23,8 +23,8 @@ mod serial_bootstrap;
 /// (`verify_pipeline_helper`).
 ///
 /// 2026-10-14 (race-memory, A184): Returns the first retryable KV refusal of a batched
-/// bootstrap, a serial bootstrap's decode (2026-10-15) or a batched verify
-/// (`preempt::spec_kv_refusal_retryable`). The refused
+/// bootstrap, a serial bootstrap's decode (2026-10-15), a batched verify or a serial
+/// verify (2026-10-15, gap d) (`preempt::spec_kv_refusal_retryable`). The refused
 /// sequences are left live; the caller must pass the error to
 /// `preempt::preempt_after_spec_refusal` once its per-step accounting is done.
 #[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
@@ -249,7 +249,8 @@ pub fn step_mtp(
                     continue;
                 }
             }
-            step_verify_dflash(
+            // 2026-10-15 (race-memory, gap d): as the serial loop below.
+            let r = step_verify_dflash(
                 model,
                 a,
                 sched,
@@ -258,6 +259,7 @@ pub fn step_mtp(
                 verify_ctx,
                 dflash_verify_raw_argmax,
             );
+            refusal = refusal.or(r);
         }
         // 2026-09-25: This arm returns early, so it records `StepOuter`
         // itself, as the end of the function does.
@@ -411,7 +413,9 @@ pub fn step_mtp(
             metrale_speculative::spec_capacity::SerialArm::K3 => step_verify_k3,
             metrale_speculative::spec_capacity::SerialArm::K2 => step_verify_k2,
         };
-        verify(
+        // 2026-10-15 (race-memory, gap d): a serial verify's retryable KV refusal joins the
+        // step's refusal, as the serial bootstrap's does (the row stays live).
+        let r = verify(
             model,
             a,
             sched,
@@ -420,6 +424,7 @@ pub fn step_mtp(
             verify_ctx,
             dflash_verify_raw_argmax,
         );
+        refusal = refusal.or(r);
     }
     sched
         .io

@@ -208,29 +208,35 @@ impl ModelVerify for PreemptStubModel {
     fn decode_verify(&self, _t: &[u32], _s: &mut SequenceState, _st: u64) -> Result<Vec<u32>> {
         anyhow::bail!("unused in preempt tests")
     }
+    /// 2026-10-15 (race-memory, gap d): scripted like `decode_verify_dflash`.
     fn decode_verify_graphed(
         &self,
         _t: &[u32; 2],
         _s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 2]> {
-        anyhow::bail!("unused in preempt tests")
+        self.scripted_verify_failure()?;
+        anyhow::bail!("decode_verify_graphed: success unused in preempt tests")
     }
+    /// 2026-10-15 (race-memory, gap d): scripted like `decode_verify_dflash`.
     fn decode_verify_graphed_k3(
         &self,
         _t: &[u32; 3],
         _s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 3]> {
-        anyhow::bail!("unused in preempt tests")
+        self.scripted_verify_failure()?;
+        anyhow::bail!("decode_verify_graphed_k3: success unused in preempt tests")
     }
+    /// 2026-10-15 (race-memory, gap d): scripted like `decode_verify_dflash`.
     fn decode_verify_graphed_k4(
         &self,
         _t: &[u32; 4],
         _s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 4]> {
-        anyhow::bail!("unused in preempt tests")
+        self.scripted_verify_failure()?;
+        anyhow::bail!("decode_verify_graphed_k4: success unused in preempt tests")
     }
     /// 2026-10-14 (race-memory, A184): scripted like `decode_batch` (`hard_error`, then
     /// `fail_decodes` KV failures), sharing its call count; succeeding is unused.

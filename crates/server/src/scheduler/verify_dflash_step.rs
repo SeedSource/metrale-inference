@@ -32,6 +32,14 @@ const ACCEPT_SUMMARY_EVERY: u64 = 32;
 /// bonus token and the later drafts are dropped. Picks go through
 /// `verify_pick_all_with_pipeline` unless `dflash_masked_verify` is off on a
 /// DFlash serve.
+/// 2026-10-15 (race-memory, CAPACITY.md gap d, gpause1 VOID): Returns the error when the verify
+/// forward was refused for KV and the refusal is safe to retry (`preempt::spec_kv_refusal_retryable`):
+/// nothing advanced, so the row stays live and the caller hands the error to
+/// `preempt::preempt_after_spec_refusal`, which pauses a victim (a grammar row included, dde7aff7)
+/// or, with no other live row, fails the live rows with it. Before this, a lone plain row next to
+/// grammar rows (they verify one at a time) was failed instead of a grammar row being paused.
+/// Every other failure still ends the row with an error frame.
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub fn step_verify_dflash(
     model: &dyn Model,
     a: &mut ActiveSeq,
@@ -40,11 +48,11 @@ pub fn step_verify_dflash(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-) {
+) -> Option<String> {
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         super::lifecycle::fail_sequence(a, format!("sync_secondary (dflash): {e:#}"));
-        return;
+        return None;
     }
 
     let mut tokens = Vec::with_capacity(drafts.len() + 1);
@@ -63,7 +71,7 @@ pub fn step_verify_dflash(
         if let Err(e) = sent {
             tracing::error!("EP broadcast verify_kgamma: {e:#}");
             super::lifecycle::fail_sequence(a, format!("EP broadcast verify_kgamma: {e:#}"));
-            return;
+            return None;
         }
     }
 
@@ -76,9 +84,14 @@ pub fn step_verify_dflash(
         Err(e) => {
             // 2026-10-14 (race-memory, A184): an error frame, as the K4/K3/K2 serial
             // steps send; a bare `finished` reached the client as a normal "stop".
-            tracing::error!("decode_verify_dflash: {e:#}");
-            super::lifecycle::fail_sequence(a, format!("decode_verify_dflash: {e:#}"));
-            return;
+            let msg = format!("decode_verify_dflash: {e:#}");
+            if super::preempt::spec_kv_refusal_retryable(model, &msg) {
+                tracing::warn!("{msg}");
+                return Some(msg);
+            }
+            tracing::error!("{msg}");
+            super::lifecycle::fail_sequence(a, msg);
+            return None;
         }
     };
     let verify_ms = if step_timing {
@@ -137,7 +150,7 @@ pub fn step_verify_dflash(
     if ep && let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
         tracing::error!("EP broadcast verify_kgamma result: {e:#}");
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_kgamma result: {e:#}"));
-        return;
+        return None;
     }
     if let Ok(mut st) = DFLASH_ACCEPT.lock() {
         st.record(drafts.len(), num_accepted);
@@ -199,7 +212,7 @@ pub fn step_verify_dflash(
     for i in 0..num_accepted {
         emit_token(a, drafts[i], None, sched);
         if a.finished {
-            return;
+            return None;
         }
     }
 
@@ -210,7 +223,7 @@ pub fn step_verify_dflash(
         let bonus = verified[bonus_idx];
         emit_token(a, bonus, None, sched);
         if a.finished {
-            return;
+            return None;
         }
         a.last_token = bonus;
     }
@@ -242,7 +255,7 @@ pub fn step_verify_dflash(
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash): {e:#}");
         super::lifecycle::fail_sequence(a, format!("commit_accepted_prefix (dflash): {e:#}"));
-        return;
+        return None;
     }
 
     let bonus_token_idx = total_accepted.saturating_sub(1);
@@ -288,4 +301,5 @@ pub fn step_verify_dflash(
             num_accepted,
         );
     }
+    None
 }

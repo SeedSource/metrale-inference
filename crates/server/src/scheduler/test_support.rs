@@ -11,7 +11,7 @@ use crate::api::InferenceResponse;
 use anyhow::Result;
 use metrale_model_engine::traits::SequenceState;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 mod model_impl;
@@ -277,6 +277,28 @@ impl PreemptStubModel {
             fail_decodes: AtomicUsize::new(n),
             ..Default::default()
         }
+    }
+
+    /// 2026-10-15 (race-memory, gap d): the serial verifies' scripted failure, as
+    /// `decode_verify_dflash` does it: `hard_error`, then `fail_decodes` KV failures
+    /// (shared call count). `Ok` when neither applies.
+    pub(super) fn scripted_verify_failure(&self) -> Result<()> {
+        self.decode_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(msg) = self.hard_error {
+            anyhow::bail!("{msg}");
+        }
+        if self
+            .fail_decodes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!(
+                "{}",
+                self.kv_error
+                    .unwrap_or("KV cache exhausted: no free blocks")
+            );
+        }
+        Ok(())
     }
 
     /// 2026-09-25: A stub whose `compact_sequence` always fails.

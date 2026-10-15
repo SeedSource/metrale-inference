@@ -71,6 +71,14 @@ fn k2_record_outcome(
 /// draft; `drafts` must hold at least 1. Picks go through
 /// `verify_pick_all_with_pipeline` unless this is a DFlash serve with
 /// `dflash_masked_verify` off, which judges on the raw argmax.
+/// 2026-10-15 (race-memory, CAPACITY.md gap d, gpause1 VOID): Returns the error when the verify
+/// forward was refused for KV and the refusal is safe to retry (`preempt::spec_kv_refusal_retryable`):
+/// nothing advanced, so the row stays live and the caller hands the error to
+/// `preempt::preempt_after_spec_refusal`, which pauses a victim (a grammar row included, dde7aff7)
+/// or, with no other live row, fails the live rows with it. Before this, a lone plain row next to
+/// grammar rows (they verify one at a time) was failed instead of a grammar row being paused.
+/// Every other failure still ends the row with an error frame.
+#[must_use = "a KV refusal must reach preempt::preempt_after_spec_refusal"]
 pub fn step_verify_k2(
     model: &dyn Model,
     a: &mut ActiveSeq,
@@ -79,14 +87,14 @@ pub fn step_verify_k2(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-) {
+) -> Option<String> {
     use crate::scheduler::mtp_timing::Phase;
     let t_step = sched.io.clock.now();
     let t_sync = sched.io.clock.now();
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         super::lifecycle::fail_sequence(a, format!("sync_secondary: {e:#}"));
-        return;
+        return None;
     }
     sched.io.tel.mark(Phase::SyncSecondary, t_sync);
     let sync_us = sched
@@ -104,13 +112,13 @@ pub fn step_verify_k2(
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF2) {
         tracing::error!("EP broadcast verify_k2 cmd: {e:#}");
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k2 cmd: {e:#}"));
-        return;
+        return None;
     }
     for &t in &tokens_k2 {
         if let Err(e) = model.ep_broadcast_cmd(t) {
             tracing::error!("EP broadcast verify_k2 token: {e:#}");
             super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k2 token: {e:#}"));
-            return;
+            return None;
         }
     }
 
@@ -132,18 +140,28 @@ pub fn step_verify_k2(
         match model.decode_and_verify_fused(&tokens_k2, &mut a.seq, 0) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("decode_and_verify_fused (k2): {e:#}");
-                super::lifecycle::fail_sequence(a, format!("decode_and_verify_fused (k2): {e:#}"));
-                return;
+                let msg = format!("decode_and_verify_fused (k2): {e:#}");
+                if super::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
+                }
+                tracing::error!("{msg}");
+                super::lifecycle::fail_sequence(a, msg);
+                return None;
             }
         }
     } else {
         match model.decode_verify_graphed(&tokens_k2, &mut a.seq, 0) {
             Ok(r) => r.to_vec(),
             Err(e) => {
-                tracing::error!("decode_verify_graphed: {e:#}");
-                super::lifecycle::fail_sequence(a, format!("decode_verify_graphed: {e:#}"));
-                return;
+                let msg = format!("decode_verify_graphed: {e:#}");
+                if super::preempt::spec_kv_refusal_retryable(model, &msg) {
+                    tracing::warn!("{msg}");
+                    return Some(msg);
+                }
+                tracing::error!("{msg}");
+                super::lifecycle::fail_sequence(a, msg);
+                return None;
             }
         }
     };
@@ -215,7 +233,7 @@ pub fn step_verify_k2(
     if let Err(e) = model.ep_broadcast_cmd(accepted as u32) {
         tracing::error!("EP broadcast verify_k2 result: {e:#}");
         super::lifecycle::fail_sequence(a, format!("EP broadcast verify_k2 result: {e:#}"));
-        return;
+        return None;
     }
 
     sched
@@ -230,7 +248,7 @@ pub fn step_verify_k2(
             emit_token(a, v1, verify_lps.get(1).cloned(), sched);
         }
         if a.finished {
-            return;
+            return None;
         }
         a.last_token = v1;
 
@@ -242,7 +260,7 @@ pub fn step_verify_k2(
             // commit, so the sequence fails.
             tracing::error!("commit_accepted_prefix (accept): {e:#}");
             super::lifecycle::fail_sequence(a, format!("commit_accepted_prefix (accept): {e:#}"));
-            return;
+            return None;
         }
         sched.io.tel.mark(Phase::Commit, t_commit);
 
@@ -259,7 +277,7 @@ pub fn step_verify_k2(
         let t_save = sched.io.clock.now();
         if let Err(e) = model.save_hidden_for_mtp(1, 0) {
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
-            return;
+            return None;
         }
         sched.io.tel.mark(Phase::SaveHidden, t_save);
         let t_trim = sched.io.clock.now();
@@ -321,20 +339,20 @@ pub fn step_verify_k2(
         if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 1, 2) {
             tracing::error!("commit_accepted_prefix (reject): {e:#}");
             super::lifecycle::fail_sequence(a, format!("commit_accepted_prefix (reject): {e:#}"));
-            return;
+            return None;
         }
         sched.io.tel.mark(Phase::Commit, t_commit);
 
         emit_token(a, v0, verify_lps.first().cloned(), sched);
         if a.finished {
-            return;
+            return None;
         }
         a.last_token = v0;
 
         let t_save = sched.io.clock.now();
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
-            return;
+            return None;
         }
         sched.io.tel.mark(Phase::SaveHidden, t_save);
         let t_mask = sched.io.clock.now();
@@ -379,4 +397,5 @@ pub fn step_verify_k2(
         sched.io.tel.mark(Phase::MarconiCkpt, t_marconi);
         sched.io.tel.step_done(t_step, a.seq.seq_len);
     }
+    None
 }

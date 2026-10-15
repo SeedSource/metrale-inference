@@ -105,6 +105,7 @@ pub(super) struct Target {
     pub(super) behavior_hf_tool_json: bool,
     pub(super) behavior_tool_call_start_bias: bool,
     pub(super) behavior_response_format_with_tools: bool,
+    pub(super) behavior_mask_stray_tool_call_end: bool,
     pub(super) behavior_thinking_default: bool,
     pub(super) behavior_fp8_kv_calibration_tokens: usize,
     pub(super) behavior_default_kv_dtype: String,

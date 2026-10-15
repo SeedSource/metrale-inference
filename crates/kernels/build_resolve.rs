@@ -196,6 +196,7 @@ pub(super) fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_hf_tool_json: pb.hf_tool_json,
                 behavior_tool_call_start_bias: pb.tool_call_start_bias,
                 behavior_response_format_with_tools: pb.response_format_with_tools,
+                behavior_mask_stray_tool_call_end: pb.mask_stray_tool_call_end,
                 behavior_thinking_default: pb.thinking_default,
                 behavior_fp8_kv_calibration_tokens: pb.fp8_kv_calibration_tokens,
                 behavior_default_kv_dtype: pb.default_kv_dtype,

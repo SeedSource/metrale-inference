@@ -171,6 +171,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               hf_tool_json: {},\n\
              \x20               tool_call_start_bias: {},\n\
              \x20               response_format_with_tools: {},\n\
+             \x20               mask_stray_tool_call_end: {},\n\
              \x20               thinking_default: {},\n\
              \x20               fp8_kv_calibration_tokens: {},\n\
              \x20               default_kv_dtype: \"{}\",\n\
@@ -219,6 +220,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_hf_tool_json,
             target.behavior_tool_call_start_bias,
             target.behavior_response_format_with_tools,
+            target.behavior_mask_stray_tool_call_end,
             target.behavior_thinking_default,
             target.behavior_fp8_kv_calibration_tokens,
             target.behavior_default_kv_dtype,

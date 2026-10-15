@@ -51,6 +51,16 @@ pub fn step_self_spec(
             return;
         }
     };
+    // 2026-10-15: a device argmax on a stray `</tool_call>` `StrayToolCallEndMask`
+    // masks on this row is re-picked through the pipeline, before `decode_draft`
+    // overwrites `logits`.
+    let Some(token_0) = crate::scheduler::verify_pipeline_helper::repick_stray_tool_call_end(
+        model, logits, a, verify_ctx, token_0,
+    ) else {
+        tracing::error!("self-spec stray </tool_call> re-pick: D2H failed");
+        a.finished = true;
+        return;
+    };
 
     let seq_len_before_draft = a.seq.seq_len;
     let tokens_before_draft = a.seq.tokens.len();
@@ -249,6 +259,15 @@ pub fn step_ngram(
                 a.finished = true;
                 return;
             }
+        };
+        // 2026-10-15: as in `step_self_spec`: a stray `</tool_call>` is re-picked
+        // through the pipeline.
+        let Some(tok) = crate::scheduler::verify_pipeline_helper::repick_stray_tool_call_end(
+            model, logits, a, verify_ctx, tok,
+        ) else {
+            tracing::error!("ngram bootstrap stray </tool_call> re-pick: D2H failed");
+            a.finished = true;
+            return;
         };
 
         proposer.observe(&a.seq.tokens, tok);

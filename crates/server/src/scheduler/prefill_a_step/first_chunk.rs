@@ -63,6 +63,18 @@ pub(super) fn finish_first_chunk(
 ) -> Result<StartPrefillResult> {
     if is_last {
         // 2026-09-25: The prompt fit one chunk: sample the first token.
+        // 2026-10-15: token 0 also suppresses a stray `</tool_call>` (`StrayToolCallEndMask`).
+        let ft_policy = FirstTokenPolicy::for_birth(
+            req_enable_thinking,
+            think_end_token,
+            tool_call_start_token,
+        )
+        .with_stray_tool_call_end(
+            sched.watchdog.mask_stray_tool_call_end,
+            req_tools_present,
+            grammar_state.is_some(),
+            tool_call_end_token,
+        );
         let first = match sample_first_token(
             model,
             logits,
@@ -72,11 +84,7 @@ pub(super) fn finish_first_chunk(
             min_p,
             eos_tokens,
             grammar_state.as_mut(),
-            FirstTokenPolicy::for_birth(
-                req_enable_thinking,
-                think_end_token,
-                tool_call_start_token,
-            ),
+            ft_policy,
             &sched.levers.sampling(),
             sched.io.tel.dumps(),
         ) {

@@ -188,6 +188,19 @@ pub(super) fn bootstrap_seq(
             }
         }
     };
+    // 2026-10-15: `sample_token_with_grammar` skips the pipeline; a stray
+    // `</tool_call>` `StrayToolCallEndMask` masks on this row is re-picked
+    // through it (a no-op for every other token).
+    let tok = match crate::scheduler::verify_pipeline_helper::repick_stray_tool_call_end(
+        model, logits, a, verify_ctx, tok,
+    ) {
+        Some(t) => t,
+        None => {
+            tracing::error!(target: "met::scheduler::mtp_step", "bootstrap stray </tool_call> re-pick: D2H failed");
+            a.finished = true;
+            return;
+        }
+    };
 
     let lp = if let Some(k) = a.top_logprobs {
         extract_single_logprobs(model, logits, tok, k)

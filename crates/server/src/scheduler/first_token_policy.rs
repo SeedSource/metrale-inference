@@ -46,6 +46,11 @@ pub(super) struct FirstTokenPolicy {
     /// grammar is armed and suspended. Later tokens inside `<think>` get it
     /// masked by `ToolCallDuringThinkingMask`.
     pub tool_call_start: Option<u32>,
+    /// 2026-10-15: The `</tool_call>` id `StrayToolCallEndMask` would mask on this
+    /// sequence (MODEL.toml `mask_stray_tool_call_end`, no declared tools, no
+    /// grammar), suppressed at token 0; `None` otherwise. Set with
+    /// [`FirstTokenPolicy::with_stray_tool_call_end`].
+    pub stray_tool_call_end: Option<u32>,
 }
 
 impl FirstTokenPolicy {
@@ -59,7 +64,29 @@ impl FirstTokenPolicy {
         Self {
             grammar_suspended: born_inside_thinking(enable_thinking, think_end_token),
             tool_call_start,
+            stray_tool_call_end: None,
         }
+    }
+
+    /// 2026-10-15: This policy with token 0 also suppressing the stray
+    /// `</tool_call>` id for these birth facts
+    /// (`stray_tool_call_end::first_token_mask_id`): `enabled` is the run's
+    /// `WatchdogParams::mask_stray_tool_call_end`.
+    pub(super) fn with_stray_tool_call_end(
+        mut self,
+        enabled: bool,
+        tools_present: bool,
+        has_grammar: bool,
+        tool_call_end_token: Option<u32>,
+    ) -> Self {
+        self.stray_tool_call_end =
+            crate::scheduler::logit_processors::stray_tool_call_end::first_token_mask_id(
+                enabled,
+                tools_present,
+                has_grammar,
+                tool_call_end_token,
+            );
+        self
     }
 }
 
@@ -79,6 +106,20 @@ pub(super) fn first_token_with<F>(
 where
     F: FnOnce(&[u32], Option<&mut GrammarState>) -> Result<u32>,
 {
+    // 2026-10-15: the stray `</tool_call>` id joins the suppressed ids (it is only
+    // set for a sequence with no grammar). `None` leaves `suppress_ids` as given.
+    let with_stray: Vec<u32>;
+    let suppress_ids = match policy.stray_tool_call_end {
+        Some(t) if !suppress_ids.contains(&t) => {
+            with_stray = suppress_ids
+                .iter()
+                .copied()
+                .chain(std::iter::once(t))
+                .collect();
+            &with_stray[..]
+        }
+        _ => suppress_ids,
+    };
     let Some(gs) = grammar_state else {
         return sample(suppress_ids, None);
     };

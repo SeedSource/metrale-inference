@@ -38,7 +38,7 @@ pub use behavior_defaults::{
     DEFAULT_EFFORT_CAPPED_AT_CEILING, DEFAULT_EFFORT_PROMPT_ONLY, DEFAULT_HF_TOOL_JSON,
     DEFAULT_MAX_INTER_TOOL_PROSE, DEFAULT_MAX_THINKING_BUDGET,
     DEFAULT_RENDER_TOOLS_ON_TOOL_CHOICE_NONE, DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
-    DEFAULT_TOOL_CALL_START_BIAS,
+    DEFAULT_MASK_STRAY_TOOL_CALL_END, DEFAULT_TOOL_CALL_START_BIAS,
 };
 
 // 2026-09-25: The compiled target's serving defaults, baked from
@@ -207,6 +207,10 @@ pub struct ModelBehavior {
     /// 2026-10-15: with tools active and `tool_choice` auto, `response_format` is enforced
     /// instead of the tool-call grammar. Default [`DEFAULT_RESPONSE_FORMAT_WITH_TOOLS`].
     pub response_format_with_tools: bool,
+    /// 2026-10-15: Mask the tool-call end token on a sequence with no tools, no
+    /// grammar and no open `<tool_call>` (the server's `StrayToolCallEndMask` and
+    /// its device-argmax fallbacks). Default [`DEFAULT_MASK_STRAY_TOOL_CALL_END`].
+    pub mask_stray_tool_call_end: bool,
     /// 2026-09-25: Thinking state for a request that carries no thinking
     /// directive. Any explicit directive overrides it, and
     /// `--disable-thinking` turns thinking off for every request. Default
@@ -351,6 +355,7 @@ impl Default for ModelBehavior {
             hf_tool_json: DEFAULT_HF_TOOL_JSON,
             tool_call_start_bias: DEFAULT_TOOL_CALL_START_BIAS,
             response_format_with_tools: DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
+            mask_stray_tool_call_end: DEFAULT_MASK_STRAY_TOOL_CALL_END,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: "",

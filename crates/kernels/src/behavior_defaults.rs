@@ -89,3 +89,13 @@ pub const DEFAULT_HF_TOOL_JSON: bool = false;
 /// do. Tools stay inactive for parsing, the grammar and the `<tool_call>` bias.
 /// `kernels/gb10/glm-5.3-flash` sets it (TEB TC-44; spark-bench c30gate TEBGAP-TRACE.md C).
 pub const DEFAULT_RENDER_TOOLS_ON_TOOL_CHOICE_NONE: bool = false;
+
+/// 2026-10-15: Default `[behavior].mask_stray_tool_call_end`: whether the scheduler
+/// masks the tool-call end token (`</tool_call>`) on a sequence that offered no tools,
+/// has no grammar and has no `<tool_call>` open (server
+/// `scheduler/logit_processors/stray_tool_call_end.rs`), so the next-best token wins.
+///
+/// `false` leaves the token free, as before. `true` is for a model that, under load,
+/// ends a plain answer with a stray `</tool_call>`, which the scheduler reads as the end
+/// of a tool call (finish_reason `tool_calls`). `kernels/gb10/glm-5.3-flash` sets it.
+pub const DEFAULT_MASK_STRAY_TOOL_CALL_END: bool = false;

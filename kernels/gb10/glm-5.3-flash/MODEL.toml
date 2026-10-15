@@ -80,6 +80,9 @@ enable_think_loop_watchdog = false
 # 2026-10-15: No <tool_call> start-token logit bias (+3 on the first calls): vLLM adds none
 # (spark-bench c30gate TEBGAP-TRACE.md D, parity; effect ~0 there).
 tool_call_start_bias = false
+# 2026-10-15: No minimum-reasoning floor (</think> biased -8 for the first 16 thinking tokens,
+# the ModelBehavior default): the official serve has none (TEBGAP-TRACE.md E, rarely binds).
+min_reasoning_floor_tokens = 0
 
 # 2026-09-25: The target matcher: ptx_for_config (crates/kernels/src/resolve.rs) matches a
 # checkpoint to this target by [[model_types]], and serve refuses a model_type that no

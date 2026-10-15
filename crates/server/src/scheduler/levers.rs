@@ -163,6 +163,12 @@ pub struct SchedLevers {
     /// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_ONE_CHUNK_PER_TICK=1`: a preempt-resume
     /// re-prefill runs one planned chunk per tick while another sequence decodes (`preempt`).
     pub resume_one_chunk_per_tick: bool,
+    /// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED=1` (with
+    /// `METRALE_RESUME_ONE_CHUNK_PER_TICK`): while another sequence decodes, a resume chunk is
+    /// capped at `METRALE_PREFILL_CHUNK_WHILE_DECODING`, counts as a prefill chunk for
+    /// `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK`, takes turns with new prefills and no longer
+    /// blocks admission (`core/tick.rs`).
+    pub resume_sliced: bool,
     /// 2026-09-25: `METRALE_GRAMMAR_BUDGET_CLOSE` (default on; `0`/`false`
     /// disables).
     pub grammar_budget_close: bool,
@@ -398,6 +404,10 @@ impl SchedLevers {
                 metrale_config::levers::var(super::decode_slice::LEVER).as_deref(),
             ),
             resume_one_chunk_per_tick: opt_in("METRALE_RESUME_ONE_CHUNK_PER_TICK"),
+            resume_sliced: resolve_resume_sliced(
+                opt_in("METRALE_RESUME_SLICED"),
+                opt_in("METRALE_RESUME_ONE_CHUNK_PER_TICK"),
+            ),
             grammar_budget_close: crate::scheduler::helpers::parse_flag_default_on(
                 metrale_config::levers::var("METRALE_GRAMMAR_BUDGET_CLOSE").as_deref(),
             ),
@@ -473,6 +483,7 @@ impl SchedLevers {
             prefill_chunk_while_decoding: None,
             decode_steps_per_prefill_chunk: None,
             resume_one_chunk_per_tick: false,
+            resume_sliced: false,
             grammar_budget_close: true,
             think_ended_gpu_argmax: true,
             think_end_at_token0: true,
@@ -543,3 +554,15 @@ impl Default for SchedLevers {
 #[cfg(test)]
 #[path = "levers_tests.rs"]
 mod tests;
+
+/// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED` is in force only with
+/// `METRALE_RESUME_ONE_CHUNK_PER_TICK` (a synchronous resume has no chunks to slice).
+pub(crate) fn resolve_resume_sliced(sliced: bool, one_chunk_per_tick: bool) -> bool {
+    if sliced && !one_chunk_per_tick {
+        tracing::warn!(
+            "METRALE_RESUME_SLICED=1 needs METRALE_RESUME_ONE_CHUNK_PER_TICK=1; resume slicing \
+             stays off"
+        );
+    }
+    sliced && one_chunk_per_tick
+}

@@ -428,3 +428,13 @@ fn module_files(dir: &std::path::Path, module: &str) -> Vec<std::path::PathBuf> 
     }
     files
 }
+
+#[test]
+fn resume_sliced_needs_one_chunk_per_tick() {
+    // 2026-10-15 (race-prefill, A192): a synchronous resume has no chunks to slice.
+    use super::resolve_resume_sliced;
+    assert!(resolve_resume_sliced(true, true));
+    assert!(!resolve_resume_sliced(true, false));
+    assert!(!resolve_resume_sliced(false, true));
+    assert!(!resolve_resume_sliced(false, false));
+}

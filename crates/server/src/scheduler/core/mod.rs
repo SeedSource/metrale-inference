@@ -84,6 +84,14 @@ pub struct SchedulerCore {
     /// (set in `plan_tick`, read by ContinuePrefills).
     slice_left: usize,
     slice_hold: bool,
+    /// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED`: this tick's prefill-chunk
+    /// turn belongs to the in-flight (or starting) resume, so StartPrefills admits nothing and
+    /// ContinuePrefills runs no chunk (set in `plan_tick`); `resume_turn`: the resume is owed
+    /// the next turn because the last one went to a new request's prefill; `prefill_ran`: this
+    /// tick's prefill lanes ran a chunk (set by ContinuePrefills).
+    resume_slot: bool,
+    resume_turn: bool,
+    prefill_ran: bool,
     /// 2026-09-25: The pipelined decode lane's steps still in flight.
     pipeline: pipeline::Pipeline,
 }
@@ -312,6 +320,9 @@ impl SchedulerCore {
             started_prefill: false,
             slice_left: 0,
             slice_hold: false,
+            resume_slot: false,
+            resume_turn: false,
+            prefill_ran: false,
             pipeline: pipeline::Pipeline::new(pipeline_faults),
         }
     }

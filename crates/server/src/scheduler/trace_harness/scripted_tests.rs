@@ -322,6 +322,136 @@ fn c_chunked_resume_lets_the_other_rows_decode_between_its_chunks_with_the_same_
     }
 }
 
+/// 2026-10-15 (race-prefill, A192): the KV-exhaustion run for `METRALE_RESUME_SLICED`. s1-s3
+/// decode long replies from the first tick; the ninth decode step is refused and s1 (fewest
+/// tokens out, lowest slot) is the victim: a 4-token-chunk resume of its 13-token history. s4
+/// arrives as it starts to resume. The multi-rank shape: no fused mixed step, the
+/// while-decoding cap on (256, above every chunk here, so the chunk plan is the same with the
+/// lever on or off).
+fn sliced_run(sliced: bool, k: Option<usize>, exhaust_at: usize, s4_at: usize) -> Vec<String> {
+    let reply = |n: u32, base: u32| -> Vec<u32> {
+        let mut v: Vec<u32> = (0..n).map(|i| base + i).collect();
+        v.push(EOS);
+        v
+    };
+    let s3 = ReqSpec::new(3, 4, reply(40, 300));
+    let mut s4 = ReqSpec::new(4, 8, reply(4, 400));
+    s4.arrive_at_tick = Some(s4_at);
+    let mut cfg = ModelCfg::default();
+    cfg.kv_exhaust_at = vec![exhaust_at];
+    let sc = Scenario {
+        name: "sliced_resume",
+        cfg,
+        opts: RunOptions {
+            max_prefill_tokens: 4,
+            no_mix: true,
+            prefill_chunk_while_decoding: Some(256),
+            decode_steps_per_prefill_chunk: k,
+            resume_one_chunk_per_tick: true,
+            resume_sliced: sliced,
+            ..RunOptions::default()
+        },
+        reqs: vec![
+            ReqSpec::new(1, 4, reply(40, 100)),
+            ReqSpec::new(2, 4, reply(40, 200)),
+            s3,
+            s4,
+        ],
+    };
+    run_scenario(&sc)
+}
+
+/// 2026-10-15: per tick after the requeue: (ran a resume chunk of s1, ran a chunk of s4, ran a
+/// decode step).
+fn resume_ticks(lines: &[String]) -> Vec<(bool, bool, bool)> {
+    let requeue = positions(lines, "fx apply ReleaseSeq{cache=true, preempt_requeue}")[0];
+    let mut out: Vec<(bool, bool, bool)> = Vec::new();
+    for l in &lines[requeue..] {
+        if l.starts_with("-- tick ") {
+            out.push((false, false, false));
+        } else if let Some(t) = out.last_mut() {
+            if l.starts_with("prefill_chunk(") && l.contains(" s1@") {
+                t.0 = true;
+            }
+            if l.starts_with("prefill_chunk(") && l.contains(" s4@") {
+                t.1 = true;
+            }
+            if l.starts_with("decode_batch(") || l.starts_with("decode(") {
+                t.2 = true;
+            }
+        }
+    }
+    out
+}
+
+// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED` through the real scheduler loop.
+// Without it (one chunk per tick alone) the late request waits for the whole resume. With it the
+// late request is admitted while the resume is in flight, its chunks and the resume's take turns
+// (never two prefill chunks in one tick), with `k` the decoders take `k` steps per resume chunk,
+// and every reply is the same.
+const EXHAUST_AT: usize = 8;
+const S4_AT: usize = 10;
+
+#[test]
+fn c_sliced_resume_admits_new_requests_and_takes_k_decode_steps_per_chunk() {
+    let base = sliced_run(false, None, EXHAUST_AT, S4_AT);
+    let t = resume_ticks(&base);
+    let s1: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.0).map(|(i, _)| i).collect();
+    let s4: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.1).map(|(i, _)| i).collect();
+    assert!(s1.len() >= 2, "a multi-chunk resume: {t:?}");
+    assert!(!s4.is_empty(), "s4 prefilled: {t:?}");
+    assert!(
+        s4[0] > s1[s1.len() - 1],
+        "one chunk per tick alone: s4 waits for the whole resume: {t:?}"
+    );
+    for k in [None, Some(2), Some(3)] {
+        let lines = sliced_run(true, k, EXHAUST_AT, S4_AT);
+        let t = resume_ticks(&lines);
+        let s1: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.0).map(|(i, _)| i).collect();
+        let s4: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.1).map(|(i, _)| i).collect();
+        assert!(s1.len() >= 2 && !s4.is_empty(), "k={k:?}: {t:?}");
+        assert!(s4[0] < s1[s1.len() - 1], "k={k:?}: s4 starts during the resume: {t:?}");
+        assert!(t.iter().all(|x| !(x.0 && x.1)), "k={k:?}: one prefill chunk per tick: {t:?}");
+        // 2026-10-15: between two resume chunks: the other prefill's chunk ticks plus k - 1
+        // decode-only ticks after each chunk, every one with a decode step.
+        let want = k.unwrap_or(1) - 1;
+        for w in s1.windows(2) {
+            let between = &t[w[0] + 1..w[1]];
+            assert!(between.iter().all(|x| x.2), "k={k:?}: decoders step every tick: {t:?}");
+            let s4_chunks = between.iter().filter(|x| x.1).count();
+            assert_eq!(
+                between.len(),
+                want + s4_chunks * (1 + want),
+                "k={k:?}: decode-only ticks between resume chunks: {t:?}"
+            );
+        }
+        for id in 1..=4 {
+            let (a, b) = (output(&base, id), output(&lines, id));
+            assert!(!b.contains("Error"), "k={k:?} s{id}: {b}");
+            assert!(b.contains("Done(stop"), "k={k:?} s{id}: {b}");
+            assert_eq!(reply_tokens(&a), reply_tokens(&b), "k={k:?} s{id} reply");
+        }
+    }
+}
+
+#[test]
+fn c_resume_sliced_alone_stays_off() {
+    // 2026-10-15 (race-prefill, A192): without one chunk per tick the lever resolves off, so
+    // the run is the synchronous resume's, model call for model call.
+    let mut sc = three_streams();
+    sc.opts.max_prefill_tokens = 4;
+    let off = scripted(&sc, |d| {
+        d.script(1, [70, 71, 72, EOS]);
+        d.fail_next(Fault::KvExhausted);
+    });
+    sc.opts.resume_sliced = true;
+    let on = scripted(&sc, |d| {
+        d.script(1, [70, 71, 72, EOS]);
+        d.fail_next(Fault::KvExhausted);
+    });
+    assert_eq!(off, on);
+}
+
 /// 2026-10-14 (race-memory, A184): the reply tokens of `out` without the closing
 /// `Done(...)` stats (acceptance counts differ when drafts are dropped).
 fn reply_tokens(out: &str) -> &str {

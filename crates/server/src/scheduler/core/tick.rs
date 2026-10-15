@@ -21,7 +21,10 @@ impl SchedulerCore {
             preempted,
             ..
         } = self;
-        let max_batch_size = self.max_batch_size;
+        // 2026-10-15 (race-prefill, A192): an in-flight resume (`METRALE_RESUME_ONE_CHUNK_PER_TICK`)
+        // holds one batch slot that `active` / `prefilling` do not show.
+        let resume_in_flight = preempted.iter().any(|p| p.resume.is_some());
+        let max_batch_size = self.max_batch_size - usize::from(resume_in_flight);
         let admit_watermark = self.admit_watermark;
         let block_size = self.block_size;
         // 2026-09-25: Each `t_loop` read opens one tick section, recorded as a `Loop*`
@@ -66,9 +69,12 @@ impl SchedulerCore {
         );
         // 2026-10-15 (race-prefill, A192): a resume re-prefill in flight
         // (`METRALE_RESUME_ONE_CHUNK_PER_TICK`) holds a sequence the batch-slot count does not
-        // see, and runs only under KV pressure: start nothing until it finishes.
-        let resume_in_flight = preempted.iter().any(|p| p.resume.is_some());
-        let admit = if self.slice_hold || resume_in_flight {
+        // see, and runs only under KV pressure: start nothing until it finishes. With
+        // `METRALE_RESUME_SLICED` new requests are admitted (the KV gate above already counts
+        // the whole resume's demand, and the slot is taken off `max_batch_size`); the resume
+        // and new prefills take turns at the one prefill chunk a decoding tick runs.
+        let sliced = sched.levers.resume_sliced;
+        let admit = if self.slice_hold || (resume_in_flight && !sliced) {
             0
         } else {
             crate::scheduler::prefill_chunk_cap::admit_now(
@@ -82,6 +88,31 @@ impl SchedulerCore {
         if admit < new_reqs.len() {
             for (i, req) in new_reqs.drain(admit..).enumerate() {
                 pending.requests.insert(i, req);
+            }
+        }
+        // 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED`: whose turn this tick's
+        // prefill chunk is. A held tick gives nobody a turn; with no decoder active the resume
+        // runs as without the lever (to the end, at the end of the tick).
+        self.prefill_ran = false;
+        self.resume_slot = false;
+        if sliced
+            && !self.slice_hold
+            && crate::scheduler::prefill_chunk_cap::decoders(active) > 0
+            && !preempted.is_empty()
+        {
+            let prefill_waiting = !new_reqs.is_empty() || !prefilling.is_empty();
+            let slots_free = active.len() + prefilling.len() + new_reqs.len() < self.max_batch_size;
+            let ready = crate::scheduler::preempt::resume_ready(
+                sched.io.dev.model(),
+                preempted,
+                block_size,
+                slots_free,
+            );
+            self.resume_slot = !prefill_waiting || (self.resume_turn && ready);
+            if self.resume_slot {
+                for (i, req) in new_reqs.drain(..).enumerate() {
+                    pending.requests.insert(i, req);
+                }
             }
         }
         self.started_prefill = !new_reqs.is_empty();

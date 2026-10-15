@@ -103,6 +103,9 @@ pub(super) struct RunOptions {
     pub decode_steps_per_prefill_chunk: Option<usize>,
     /// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_ONE_CHUNK_PER_TICK`.
     pub resume_one_chunk_per_tick: bool,
+    /// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED` (in force only with
+    /// `resume_one_chunk_per_tick`, as the lever resolves).
+    pub resume_sliced: bool,
 }
 
 /// 2026-09-25: Never configured: every feed into it takes the `Off` branch.
@@ -134,6 +137,7 @@ impl Default for RunOptions {
             prefill_chunk_while_decoding: None,
             decode_steps_per_prefill_chunk: None,
             resume_one_chunk_per_tick: false,
+            resume_sliced: false,
         }
     }
 }
@@ -357,6 +361,10 @@ fn run_scenario_inner(sc: &Scenario, build: DeviceBuilder) -> Vec<String> {
     levers.prefill_chunk_while_decoding = opts.prefill_chunk_while_decoding;
     levers.decode_steps_per_prefill_chunk = opts.decode_steps_per_prefill_chunk;
     levers.resume_one_chunk_per_tick = opts.resume_one_chunk_per_tick;
+    levers.resume_sliced = crate::scheduler::levers::resolve_resume_sliced(
+        opts.resume_sliced,
+        opts.resume_one_chunk_per_tick,
+    );
     let levers = Arc::new(levers);
     levers.set_loop_watchdog(opts.loop_watchdog);
     let masks = VocabMasks {

@@ -218,6 +218,7 @@ fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
         16,
         0,
         false,
+        None,
     );
     assert_eq!(active.len(), 1);
     assert!(preempted.is_empty());
@@ -239,6 +240,7 @@ fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
         16,
         0,
         false,
+        None,
     );
     assert!(active2.is_empty());
     assert_eq!(preempted2.len(), 1);
@@ -271,6 +273,7 @@ fn resume_loop_errors_out_a_sequence_that_can_never_fit() {
         16,
         0,
         false,
+        None,
     );
     assert!(preempted.is_empty() && active.is_empty());
     assert!(rx.try_recv().expect("error delivered").is_err());
@@ -360,6 +363,7 @@ fn resume_calls(
         16,
         16,
         one_chunk_per_tick,
+        None,
     );
 }
 
@@ -752,4 +756,20 @@ fn dflash_serial_verify_failure_ends_the_row_with_an_error_not_a_stop() {
         "{:?}",
         a.error
     );
+}
+
+#[test]
+fn sliced_resume_chunk_is_capped_like_a_prefill_chunk_and_unchanged_without_a_cap() {
+    // 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED` passes the while-decoding cap in
+    // force; without one the chunk is the synchronous resume's.
+    let model = PreemptStubModel {
+        block_size: Some(16),
+        ..Default::default()
+    };
+    let tokens: Vec<u32> = (0..10_000).collect();
+    assert_eq!(super::preempt::resume_chunk_len(&model, &tokens, 0, 8192, None), 8192);
+    assert_eq!(super::preempt::resume_chunk_len(&model, &tokens, 0, 8192, Some(4096)), 4096);
+    assert_eq!(super::preempt::resume_chunk_len(&model, &tokens, 8192, 8192, Some(4096)), 1808);
+    // 2026-10-15: a cap above the chunk changes nothing.
+    assert_eq!(super::preempt::resume_chunk_len(&model, &tokens, 0, 2048, Some(4096)), 2048);
 }

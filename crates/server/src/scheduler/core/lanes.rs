@@ -85,7 +85,10 @@ impl SchedulerCore {
         // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING`: no second prefill chunk in a tick
         // whose StartPrefills ran one while a sequence decodes (`prefill_chunk_cap`).
         // 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK`: none on a held tick (`decode_slice`).
+        // 2026-10-15 (race-prefill, A192): none when the turn is the resume's
+        // (`METRALE_RESUME_SLICED`, `plan_tick`).
         let skip = self.slice_hold
+            || self.resume_slot
             || crate::scheduler::prefill_chunk_cap::skip_continue(
                 sched.levers.prefill_chunk_while_decoding.is_some(),
                 crate::scheduler::prefill_chunk_cap::decoders(active),
@@ -119,6 +122,7 @@ impl SchedulerCore {
         // started a request or the head prefill moved (advanced or finished).
         let prefill_ran = self.started_prefill
             || before != (prefilling.len(), prefilling.first().map(|p| p.chunk_offset));
+        self.prefill_ran = prefill_ran;
         self.slice_left = crate::scheduler::decode_slice::next_left(
             sched.levers.decode_steps_per_prefill_chunk,
             crate::scheduler::prefill_chunk_cap::decoders(active),
@@ -140,6 +144,7 @@ impl SchedulerCore {
                     block_size,
                     max_prefill_tokens,
                     sched.levers.resume_one_chunk_per_tick,
+                    None,
                 );
             }
             if active.is_empty() {

@@ -272,7 +272,7 @@ pub(super) fn resume_preempted_seq(
     let total = tokens.len();
     let mut offset = 0;
     while offset < total {
-        match resume_chunk(model, &tokens, &mut seq, offset, max_prefill_tokens) {
+        match resume_chunk(model, &tokens, &mut seq, offset, max_prefill_tokens, None) {
             Ok(next) => offset = next,
             Err(e) => {
                 a.seq = seq;
@@ -319,15 +319,18 @@ fn resume_alloc(model: &dyn Model, io: &SchedIo, a: &mut ActiveSeq) -> Result<Se
 /// each announced with its own `0xFFFFFFF0` broadcast. The worker's `0xFFFFFFF0` handler calls
 /// `prefill_chunk`, whose prefix lookup joins an `ep_min_u32` agreement; a rank-0 `prefill`
 /// never joins it, and both ranks of the 2-node car hung on the first resume.
+/// 2026-10-15 (race-prefill, A192): `cap` = the `METRALE_PREFILL_CHUNK_WHILE_DECODING` cap in
+/// force (`METRALE_RESUME_SLICED` only; `None` = the synchronous resume's plan).
 fn resume_chunk(
     model: &dyn Model,
     tokens: &[u32],
     seq: &mut SequenceState,
     offset: usize,
     max_prefill_tokens: usize,
+    cap: Option<usize>,
 ) -> Result<usize> {
     let total = tokens.len();
-    let chunk_len = resume_chunk_len(model, tokens, offset, max_prefill_tokens);
+    let chunk_len = resume_chunk_len(model, tokens, offset, max_prefill_tokens, cap);
     let is_last = offset + chunk_len >= total;
     model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
     model.ep_broadcast_cmd(chunk_len as u32)?;
@@ -363,11 +366,15 @@ fn resume_finish(model: &dyn Model, mut a: ActiveSeq, seq: SequenceState) -> Act
 /// `prefill_a_step` plans chunk 0 and `run_standard` the later ones: at most
 /// `max_prefill_tokens` (0 = unchunked), and a non-last chunk ends on the block grid or the
 /// tail split point. MLA prompts are not split further.
-fn resume_chunk_len(
+/// 2026-10-15 (race-prefill, A192): `cap` shortens the chunk as `run_standard` caps a prefill
+/// chunk while another sequence decodes (`prefill_chunk_cap::plan_capped`); MLA prompts are not
+/// capped there either.
+pub(super) fn resume_chunk_len(
     model: &dyn Model,
     tokens: &[u32],
     offset: usize,
     max_prefill_tokens: usize,
+    while_decoding_cap: Option<usize>,
 ) -> usize {
     let total = tokens.len();
     let remaining = total - offset;
@@ -379,14 +386,17 @@ fn resume_chunk_len(
     if model.is_mla() {
         return cap;
     }
-    metrale_model_engine::prefill_plan::plan_chunk_len_grid(
+    let proposed = cap;
+    crate::scheduler::prefill_chunk_cap::plan_capped(
         offset,
         total,
-        cap,
+        proposed,
         model.kv_block_size(),
         model.prefill_tail_split(tokens),
         model.prefill_grid(tokens),
+        while_decoding_cap,
     )
+    .0
     .max(1)
 }
 
@@ -400,6 +410,9 @@ fn resume_chunk_len(
 /// whole re-prefill (a 324K resume ~160 s). The chunks, their order and their EP words are the
 /// synchronous resume's. One resume is in flight at a time; with nobody decoding it runs to the
 /// end in one call, as before.
+/// 2026-10-15 (race-prefill, A192): `while_decoding_cap` caps each chunk
+/// (`METRALE_RESUME_SLICED`; `None` = the synchronous resume's chunks). Returns whether a
+/// re-prefill chunk ran (the decode slice counts it as a prefill chunk).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resume_preempted_seqs(
     model: &dyn Model,
@@ -410,11 +423,21 @@ pub(super) fn resume_preempted_seqs(
     block_size: usize,
     max_prefill_tokens: usize,
     one_chunk_per_tick: bool,
-) {
+    while_decoding_cap: Option<usize>,
+) -> bool {
     if let Some(i) = preempted.iter().position(|p| p.resume.is_some()) {
-        advance_resume(model, io, active, preempted, i, block_size, max_prefill_tokens);
-        return;
+        return advance_resume(
+            model,
+            io,
+            active,
+            preempted,
+            i,
+            block_size,
+            max_prefill_tokens,
+            while_decoding_cap,
+        );
     }
+    let mut ran = false;
     while !preempted.is_empty() && active.len() < max_batch_size {
         let Some((idx, needed)) = preempted
             .iter()
@@ -422,7 +445,7 @@ pub(super) fn resume_preempted_seqs(
             .map(|(i, p)| (i, p.tokens.len() / block_size.max(1) + 1))
             .min_by_key(|&(_, n)| n)
         else {
-            return;
+            return ran;
         };
         // 2026-09-25: One block of growth: resuming into an exactly full
         // pool would preempt again on the next decode step.
@@ -442,7 +465,7 @@ pub(super) fn resume_preempted_seqs(
             continue;
         }
         if !reclaim_until_free(model, want) {
-            return;
+            return ran;
         }
         if one_chunk_per_tick {
             let mut p = preempted.remove(idx);
@@ -453,8 +476,16 @@ pub(super) fn resume_preempted_seqs(
             p.resume = Some(ResumeProgress { seq, offset: 0 });
             preempted.push(p);
             let i = preempted.len() - 1;
-            advance_resume(model, io, active, preempted, i, block_size, max_prefill_tokens);
-            return;
+            return advance_resume(
+                model,
+                io,
+                active,
+                preempted,
+                i,
+                block_size,
+                max_prefill_tokens,
+                while_decoding_cap,
+            );
         }
         let p = preempted.remove(idx);
         let n_tokens = p.tokens.len();
@@ -469,7 +500,9 @@ pub(super) fn resume_preempted_seqs(
             }
             Err(e) => tracing::error!("Preempt-resume failed: {e:#}"),
         }
+        ran = true;
     }
+    ran
 }
 
 /// 2026-09-25: Reclaim prefix-cache blocks until `want` are free; false when they cannot be.
@@ -491,6 +524,8 @@ fn reclaim_until_free(model: &dyn Model, want: usize) -> bool {
 /// prefix blocks as the start does; otherwise it waits for the next tick, so the decode steps
 /// between chunks can never leave a chunk short of blocks part-way (the decoders free blocks
 /// by finishing or by the rank-agreed preemption). A cancelled row is released between chunks.
+/// Returns whether a chunk ran.
+#[allow(clippy::too_many_arguments)]
 fn advance_resume(
     model: &dyn Model,
     io: &SchedIo,
@@ -499,7 +534,9 @@ fn advance_resume(
     i: usize,
     block_size: usize,
     max_prefill_tokens: usize,
-) {
+    while_decoding_cap: Option<usize>,
+) -> bool {
+    let mut ran = false;
     loop {
         let p = &mut preempted[i];
         let cancelled = p
@@ -517,18 +554,21 @@ fn advance_resume(
                 });
             }
             tracing::info!("Preempt-resume: request cancelled part-way; released");
-            return;
+            return ran;
         }
         let total = p.tokens.len();
         let Some(r) = p.resume.as_mut() else {
-            return;
+            return ran;
         };
-        let want = total / block_size.max(1) + 2;
+        let want = resume_blocks_needed(total, block_size);
         let need = want.saturating_sub(r.seq.block_table.len());
         if !reclaim_until_free(model, need) {
-            return;
+            return ran;
         }
-        match resume_chunk(model, &p.tokens, &mut r.seq, r.offset, max_prefill_tokens) {
+        // 2026-10-15 (race-prefill, A192): with nobody decoding no cap is in force.
+        let cap = if active.is_empty() { None } else { while_decoding_cap };
+        ran = true;
+        match resume_chunk(model, &p.tokens, &mut r.seq, r.offset, max_prefill_tokens, cap) {
             Ok(next) => r.offset = next,
             Err(e) => {
                 let mut p = preempted.remove(i);
@@ -541,7 +581,7 @@ fn advance_resume(
                     &format!("preempt-resume re-prefill failed: {e:#}"),
                 );
                 tracing::error!("Preempt-resume failed: {e:#}");
-                return;
+                return ran;
             }
         }
         if r.offset >= total {
@@ -554,10 +594,40 @@ fn advance_resume(
                 a.output_tokens.len(),
             );
             active.push(a);
-            return;
+            return ran;
         }
         if !active.is_empty() {
-            return;
+            return ran;
         }
     }
+}
+
+/// 2026-10-15 (race-prefill, A192): The blocks a whole resume of `total` tokens needs: its
+/// history, one block for the pending decode input and one of growth (as the start checks).
+fn resume_blocks_needed(total: usize, block_size: usize) -> usize {
+    total / block_size.max(1) + 2
+}
+
+/// 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED`: whether a resume could run a chunk
+/// now without reclaiming prefix-cache blocks: the in-flight one has the blocks the rest of it
+/// needs free, or (none in flight) a batch slot is free (`slots_free`) and the smallest waiting
+/// victim fits the free blocks. Read-only; a tick with no prefill chunk to run gives the resume
+/// its turn without this check (and then reclaims as usual).
+pub(super) fn resume_ready(
+    model: &dyn Model,
+    preempted: &[PreemptedSeq],
+    block_size: usize,
+    slots_free: bool,
+) -> bool {
+    let free = model.num_free_blocks();
+    if let Some(p) = preempted.iter().find(|p| p.resume.is_some()) {
+        let held = p.resume.as_ref().map_or(0, |r| r.seq.block_table.len());
+        return resume_blocks_needed(p.tokens.len(), block_size).saturating_sub(held) <= free;
+    }
+    slots_free
+        && preempted
+            .iter()
+            .map(|p| resume_blocks_needed(p.tokens.len(), block_size))
+            .min()
+            .is_some_and(|want| want <= free)
 }

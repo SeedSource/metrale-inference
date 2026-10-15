@@ -95,16 +95,55 @@ impl SchedulerCore {
             }
         }
         // 2026-09-25: Resume requeued (decode-preempted) sequences when blocks free.
-        preempt::resume_preempted_seqs(
-            sched.io.dev.model(),
-            &sched.io,
-            active,
-            preempted,
-            max_batch_size,
-            block_size,
-            max_prefill_tokens,
-            sched.levers.resume_one_chunk_per_tick,
-        );
+        // 2026-10-15 (race-prefill, A192): `METRALE_RESUME_SLICED`: while a sequence decodes the
+        // resume runs only on its turn (`plan_tick`), its chunk is capped like a prefill chunk,
+        // the decode slice owes `k - 1` decode-only ticks after it, and new prefills (which it
+        // no longer blocks) hold batch slots too.
+        let sliced = sched.levers.resume_sliced;
+        let decoders = crate::scheduler::prefill_chunk_cap::decoders(active);
+        let resume_slot = self.resume_slot;
+        if !sliced || decoders == 0 || resume_slot {
+            let (slots, cap) = if sliced {
+                (
+                    max_batch_size.saturating_sub(self.prefilling.len()),
+                    crate::scheduler::prefill_chunk_cap::active_cap(
+                        sched.levers.prefill_chunk_while_decoding,
+                        decoders,
+                        sched.io.dev.model().kv_block_size(),
+                    )
+                    .filter(|_| !sched.io.dev.model().is_mla()),
+                )
+            } else {
+                (max_batch_size, None)
+            };
+            let ran = preempt::resume_preempted_seqs(
+                sched.io.dev.model(),
+                &sched.io,
+                active,
+                preempted,
+                slots,
+                block_size,
+                max_prefill_tokens,
+                sched.levers.resume_one_chunk_per_tick,
+                cap,
+            );
+            if sliced && ran && decoders > 0 {
+                self.slice_left = crate::scheduler::decode_slice::next_left(
+                    sched.levers.decode_steps_per_prefill_chunk,
+                    decoders,
+                    self.slice_left,
+                    false,
+                    true,
+                );
+            }
+        }
+        if sliced {
+            if resume_slot {
+                self.resume_turn = false;
+            } else if self.prefill_ran && !preempted.is_empty() {
+                self.resume_turn = true;
+            }
+        }
         sched.io.tel.mark(mtp_timing::Phase::LoopSwap, t_loop);
     }
 }

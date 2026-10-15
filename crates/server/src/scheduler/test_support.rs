@@ -260,6 +260,14 @@ pub(super) struct PreemptStubModel {
     /// 2026-10-14: The message of a scripted KV failure (`fail_decodes`); `None` (default)
     /// is "KV cache exhausted: no free blocks".
     pub(super) kv_error: Option<&'static str>,
+    /// 2026-10-14 (race-memory, kvagcheck8): When set, `prefill_chunk` succeeds without
+    /// `first_token` (the preempt-resume re-prefill discards its logits).
+    pub(super) chunks_ok: bool,
+    /// 2026-10-14: Every `prefill_chunk` call as `(chunk_start, chunk_len, is_last)`.
+    pub(super) chunks: Mutex<Vec<(usize, usize, bool)>>,
+    /// 2026-10-14: Every EP command word sent to the workers, in order: the `cmd` of
+    /// `ep_broadcast_cmd_for_seq`, then each `ep_broadcast_cmd` word.
+    pub(super) ep_words: Mutex<Vec<u32>>,
 }
 
 impl PreemptStubModel {

@@ -138,6 +138,7 @@ impl SchedulerCore {
                     preempted,
                     max_batch_size,
                     block_size,
+                    max_prefill_tokens,
                 );
             }
             if active.is_empty() {

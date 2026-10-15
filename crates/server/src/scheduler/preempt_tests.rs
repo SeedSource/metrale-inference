@@ -155,7 +155,10 @@ fn victim_policy_vision_requeue_excluded_but_spill_allowed() {
 
 #[test]
 fn resume_reprefills_exact_history_and_preserves_stream_state() {
-    let model = std::sync::Arc::new(PreemptStubModel::default());
+    let model = std::sync::Arc::new(PreemptStubModel {
+        chunks_ok: true,
+        ..Default::default()
+    });
     let (a, _rx) = active_seq(3, 6);
     let last_token = a.last_token;
     let out_before = a.output_tokens.clone();
@@ -166,9 +169,15 @@ fn resume_reprefills_exact_history_and_preserves_stream_state() {
     assert_eq!(p.tokens, history);
     assert_eq!(*model.freed_slots.lock().unwrap(), vec![3]);
 
-    let resumed = resume_preempted_seq(&*model, &SchedIo::for_test_with(model.clone()), p)
+    let resumed = resume_preempted_seq(&*model, &SchedIo::for_test_with(model.clone()), p, 0)
         .expect("resume succeeds");
-    assert_eq!(*model.prefilled.lock().unwrap(), vec![history.clone()]);
+    // 2026-10-14: one chunk with chunking off (`max_prefill_tokens` 0).
+    assert_eq!(
+        *model.chunks.lock().unwrap(),
+        vec![(0, history.len(), true)]
+    );
+    assert!(model.prefilled.lock().unwrap().is_empty());
+    assert_eq!(resumed.seq.prompt_len, history.len());
     assert_eq!(resumed.seq.tokens, history);
     assert_eq!(resumed.seq.seq_len, history.len());
     assert_eq!(resumed.last_token, last_token);
@@ -187,6 +196,7 @@ fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
         total_blocks: 100,
         free_blocks: AtomicUsize::new(0),
         reclaimable: AtomicUsize::new(50),
+        chunks_ok: true,
         ..Default::default()
     });
     let (a, _rx) = active_seq(0, 4);
@@ -206,6 +216,7 @@ fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
         &mut preempted,
         8,
         16,
+        0,
     );
     assert_eq!(active.len(), 1);
     assert!(preempted.is_empty());
@@ -225,6 +236,7 @@ fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
         &mut preempted2,
         8,
         16,
+        0,
     );
     assert!(active2.is_empty());
     assert_eq!(preempted2.len(), 1);
@@ -255,9 +267,52 @@ fn resume_loop_errors_out_a_sequence_that_can_never_fit() {
         &mut preempted,
         8,
         16,
+        0,
     );
     assert!(preempted.is_empty() && active.is_empty());
     assert!(rx.try_recv().expect("error delivered").is_err());
+}
+
+// 2026-10-14 (race-memory, kvagcheck8): on the 2-node car the first resume after a batched-MTP
+// preemption hung both ranks: rank 0 announced one `0xFFFFFFF0` chunk and then ran a whole
+// `prefill`, while the worker ran `prefill_chunk`, whose prefix lookup joins a collective.
+
+#[test]
+fn resume_on_two_ranks_announces_each_planned_chunk_and_runs_prefill_chunk() {
+    let model = std::sync::Arc::new(PreemptStubModel {
+        ep: true,
+        chunks_ok: true,
+        block_size: Some(16),
+        ..Default::default()
+    });
+    let (a, _rx) = active_seq(2, 4);
+    let p = {
+        let mut s = a;
+        s.seq.tokens = (0..40).collect();
+        preempt_requeue(&SchedIo::for_test_with(model.clone()), s)
+    };
+    // 2026-10-14: the requeue's own release word (`0xFFFFFFF1`) is not under test here.
+    model.ep_words.lock().unwrap().clear();
+    let resumed = resume_preempted_seq(&*model, &SchedIo::for_test_with(model.clone()), p, 16)
+        .expect("resume succeeds on two ranks");
+
+    // 2026-10-14: 40 tokens at a 16-token chunk cap: 16 + 16 + 8, the same plan as a prompt.
+    assert_eq!(
+        *model.chunks.lock().unwrap(),
+        vec![(0, 16, false), (16, 16, false), (32, 8, true)]
+    );
+    // 2026-10-14: each chunk is announced to the worker with the bounds rank 0 then runs.
+    assert_eq!(
+        *model.ep_words.lock().unwrap(),
+        vec![
+            0xFFFFFFF0, 16, 0, 40, //
+            0xFFFFFFF0, 16, 16, 40, //
+            0xFFFFFFF0, 8, 32, 40,
+        ]
+    );
+    assert!(model.prefilled.lock().unwrap().is_empty());
+    assert_eq!(resumed.seq.tokens, (0..40).collect::<Vec<u32>>());
+    assert_eq!(resumed.seq.prompt_len, 40);
 }
 
 // 2026-10-14 (race-memory, A184): batched MTP steps refused for KV. kvagcheck2 (n3n4) saw

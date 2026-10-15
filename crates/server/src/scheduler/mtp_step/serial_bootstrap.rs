@@ -91,16 +91,23 @@ pub(super) fn bootstrap_seq(
 
     // 2026-09-25: Standalone decode. Under EP the token is broadcast to
     // the worker first (`ep_broadcast_cmd_for_seq`).
+    // 2026-10-14: kvagcheck9: every failure below ends the row through
+    // `fail_sequence` (an error frame). A bare `finished` reached the client
+    // as HTTP 200 "stop": a rank-agreed KV refusal here cut a reply at 178
+    // tokens with no error.
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
         tracing::error!(target: "met::scheduler::mtp_step", "EP broadcast bootstrap token: {e:#}");
-        a.finished = true;
+        crate::scheduler::lifecycle::fail_sequence(
+            a,
+            format!("EP broadcast bootstrap token: {e:#}"),
+        );
         return;
     }
     let logits = match model.decode(a.last_token, &mut a.seq, 0) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(target: "met::scheduler::mtp_step", "bootstrap decode error: {e:#}");
-            a.finished = true;
+            crate::scheduler::lifecycle::fail_sequence(a, format!("bootstrap decode: {e:#}"));
             return;
         }
     };
@@ -119,7 +126,10 @@ pub(super) fn bootstrap_seq(
             Some(t) => t,
             None => {
                 tracing::error!(target: "met::scheduler::mtp_step", "bootstrap pipeline pick: D2H failed");
-                a.finished = true;
+                crate::scheduler::lifecycle::fail_sequence(
+                    a,
+                    "bootstrap pipeline pick: D2H failed".to_string(),
+                );
                 return;
             }
         }
@@ -173,7 +183,7 @@ pub(super) fn bootstrap_seq(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(target: "met::scheduler::mtp_step", "bootstrap sample error: {e:#}");
-                a.finished = true;
+                crate::scheduler::lifecycle::fail_sequence(a, format!("bootstrap sample: {e:#}"));
                 return;
             }
         }

@@ -152,3 +152,19 @@ fn lever_off_keeps_the_old_bootstrap_pick_after_a_close() {
         }
     }
 }
+
+/// 2026-10-14: kvagcheck9: a rank-agreed KV refusal in the serial bootstrap's
+/// decode ended the reply as HTTP 200 "stop" at 178 tokens (a bare
+/// `finished`). The row must carry an error, which `finish_sequence` turns
+/// into an error frame. The stub with no `logit_rows` fails every decode.
+#[test]
+fn a_failed_serial_bootstrap_decode_ends_the_row_with_an_error_not_a_stop() {
+    let mut a = content_row();
+    let model = Arc::new(PreemptStubModel::default());
+    let sched = sched_with(model.clone(), true);
+    let c = ctx(&sched, &a);
+    bootstrap_seq(&*model, &mut a, &sched, 3, 3, &c, false);
+    assert!(a.finished, "the row ends");
+    let err = a.error.as_deref().expect("an error, not a normal finish");
+    assert!(err.starts_with("bootstrap decode:"), "{err}");
+}

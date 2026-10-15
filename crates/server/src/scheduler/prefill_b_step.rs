@@ -272,7 +272,21 @@ pub fn prefill_request(
         // `0xFFFFFFF0` handler.
         model.ep_sync_vision_embeds(&prompt_tokens)?;
 
-        let logits = model.prefill(&prompt_tokens, &mut seq, 0)?;
+        // 2026-10-15 (race-memory, A187): the worker answers `0xFFFFFFF0` with `prefill_chunk`,
+        // whose prefix lookup joins an `ep_min_u32` agreement a rank-0 `prefill` never joins, so
+        // an unchunked 2-rank serve would hang both ranks on its first prompt (the kvagcheck8
+        // resume hang). Rank 0 runs the one chunk it announced, as the resume does.
+        let logits = if model.is_ep() {
+            let logits =
+                model.prefill_chunk(&prompt_tokens, &mut seq, 0, prompt_tokens.len(), true, 0)?;
+            // 2026-10-15: The worker normalizes after every chunk; so does `run_standard`.
+            if let Err(e) = model.normalize_ssm_states(&seq, 0) {
+                tracing::warn!("prefill_request SSM state normalization failed: {e:#}");
+            }
+            logits
+        } else {
+            model.prefill(&prompt_tokens, &mut seq, 0)?
+        };
         // 2026-10-15: token 0 also suppresses a stray `</tool_call>` (`StrayToolCallEndMask`).
         let ft_policy = FirstTokenPolicy::for_birth(
             req_enable_thinking,

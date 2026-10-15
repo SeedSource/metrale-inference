@@ -140,6 +140,16 @@ pub(super) fn ahead_allowed(
         && active
             .iter()
             .all(|a| masked_repick_exact(a, adaptive_sampling))
+        // 2026-10-15: The device feed masks only the two `row_mask` ids, so it could
+        // feed a stray `</tool_call>` the host's `StrayToolCallEndMask` replaces: a row
+        // that mask applies to does not run ahead. Inert unless MODEL.toml sets
+        // `mask_stray_tool_call_end` (GLM-5.3, whose model has no device token feed).
+        && !active.iter().any(|a| {
+            crate::scheduler::logit_processors::stray_tool_call_end::applies(
+                sched.watchdog.mask_stray_tool_call_end,
+                a,
+            )
+        })
         // 2026-09-25: A row that finishes by length next step would only over-run.
         && active.iter().all(|a| {
             !a.finished

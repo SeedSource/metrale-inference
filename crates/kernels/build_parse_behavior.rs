@@ -38,6 +38,8 @@ pub(crate) struct ParsedBehavior {
     /// 2026-10-15: See `behavior_defaults.rs`: with tools active and `tool_choice` auto,
     /// `response_format` is enforced instead of the tool-call grammar.
     pub response_format_with_tools: bool,
+    /// 2026-10-15: See `behavior_defaults.rs`: mask a stray `</tool_call>` when no tools.
+    pub mask_stray_tool_call_end: bool,
     pub thinking_default: bool,
     pub fp8_kv_calibration_tokens: usize,
     pub default_kv_dtype: String,
@@ -94,6 +96,7 @@ impl Default for ParsedBehavior {
             hf_tool_json: DEFAULT_HF_TOOL_JSON,
             tool_call_start_bias: DEFAULT_TOOL_CALL_START_BIAS,
             response_format_with_tools: DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
+            mask_stray_tool_call_end: DEFAULT_MASK_STRAY_TOOL_CALL_END,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: String::new(),
@@ -173,6 +176,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("response_format_with_tools"))
         .and_then(|v| v.as_bool())
         .unwrap_or(DEFAULT_RESPONSE_FORMAT_WITH_TOOLS);
+    let mask_stray_tool_call_end = b
+        .and_then(|v| v.get("mask_stray_tool_call_end"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_MASK_STRAY_TOOL_CALL_END);
     let thinking_default = b
         .and_then(|v| v.get("thinking_default"))
         .and_then(|v| v.as_bool())
@@ -308,6 +315,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         hf_tool_json,
         tool_call_start_bias,
         response_format_with_tools,
+        mask_stray_tool_call_end,
         thinking_default,
         fp8_kv_calibration_tokens,
         default_kv_dtype,

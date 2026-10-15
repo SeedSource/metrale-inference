@@ -246,6 +246,19 @@ pub(super) fn step_mtp_bootstrap_batched(
                 }
             }
         };
+        // 2026-10-15: the batched argmax and `sample_token_with_grammar` skip the
+        // pipeline; a stray `</tool_call>` `StrayToolCallEndMask` masks on this row
+        // is re-picked through it (a no-op for every other token).
+        let tok = match crate::scheduler::verify_pipeline_helper::repick_stray_tool_call_end(
+            model, row_logits, a, verify_ctx, tok,
+        ) {
+            Some(t) => t,
+            None => {
+                tracing::error!("batched bootstrap stray </tool_call> re-pick: D2H failed");
+                a.finished = true;
+                continue;
+            }
+        };
         let lp = if let Some(k) = a.top_logprobs {
             extract_single_logprobs(model, row_logits, tok, k)
         } else {

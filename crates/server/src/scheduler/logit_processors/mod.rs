@@ -22,13 +22,17 @@
 //! 5. [`tool_during_think::ToolCallDuringThinkingMask`] — masks
 //!    `<tool_call>` during thinking; biases it down when the tool-loop flag
 //!    is set.
-//! 6. [`forced_think_end::ForcedThinkEndInjector`] — once `force_end_thinking`
+//! 6. [`stray_tool_call_end::StrayToolCallEndMask`] — 2026-10-15: with
+//!    MODEL.toml `[behavior].mask_stray_tool_call_end` (GLM-5.3), masks
+//!    `</tool_call>` on a row with no declared tools, no grammar and no open
+//!    `<tool_call>`. Off by default.
+//! 7. [`forced_think_end::ForcedThinkEndInjector`] — once `force_end_thinking`
 //!    is armed and the boundary gate allows it, masks every token but `</think>`.
-//! 7. [`pin_tool_call::PinToToolCallStart`] — right after `</think>`, when
+//! 8. [`pin_tool_call::PinToToolCallStart`] — right after `</think>`, when
 //!    `require_tool_call` is set, masks every token but `<tool_call>`.
-//! 8. [`forced_token::ForcedTokenFastPath`] — when the grammar admits
+//! 9. [`forced_token::ForcedTokenFastPath`] — when the grammar admits
 //!    exactly one next token, returns it and ends the pipeline.
-//! 9. [`grammar_bitmask::GrammarBitmaskApply`] — applies the grammar's
+//! 10. [`grammar_bitmask::GrammarBitmaskApply`] — applies the grammar's
 //!    next-token bitmask.
 //!
 //! ## Not stages
@@ -51,6 +55,7 @@ pub mod mid_word;
 pub mod min_tokens_eos;
 pub mod pin_tool_call;
 pub mod post_close;
+pub mod stray_tool_call_end;
 pub mod tool_during_think;
 pub(crate) mod tool_eos_hold;
 
@@ -90,7 +95,8 @@ pub struct LogitsContext<'a> {
     pub sampling: SamplingLevers,
     /// 2026-09-25: This model's watchdog tunables, built at serve load by
     /// `WatchdogParams::from_behavior` from MODEL.toml `[behavior]` and two CLI
-    /// overrides. `F2ConfidenceEarlyStop` reads them.
+    /// overrides. `F2ConfidenceEarlyStop` reads them; 2026-10-15:
+    /// `StrayToolCallEndMask` reads `mask_stray_tool_call_end`.
     pub watchdog: crate::scheduler::helpers::WatchdogParams,
 }
 
@@ -194,12 +200,13 @@ pub fn run_pipeline_with_path(
     ctx: &LogitsContext,
     path: &'static str,
 ) -> Option<u32> {
-    let stages: [&dyn LogitsProcessor; 9] = [
+    let stages: [&dyn LogitsProcessor; 10] = [
         &min_tokens_eos::MinTokensEosMask,
         &f2_confidence::F2ConfidenceEarlyStop,
         &mid_word::MidWordThinkEndMask,
         &post_close::PostCloseThinkMask,
         &tool_during_think::ToolCallDuringThinkingMask,
+        &stray_tool_call_end::StrayToolCallEndMask,
         &forced_think_end::ForcedThinkEndInjector,
         &pin_tool_call::PinToToolCallStart,
         &forced_token::ForcedTokenFastPath,
@@ -225,7 +232,7 @@ pub fn run_pipeline_with_path(
 /// Steps, in order:
 ///  1. **`METRALE_FORCE_TEMP_ZERO` bypass** (both kinds): return the raw-logit
 ///     argmax, with no pipeline, penalties or bias.
-///  2. **[`run_pipeline_with_path`]** (the nine stages and the AdaDec
+///  2. **[`run_pipeline_with_path`]** (the ten stages and the AdaDec
 ///     diagnostic). A `Some(tok)` is the forced-token fast path; it is
 ///     returned at once.
 ///  3. **B1 margin observer**, `FinalDecode` only: records the post-mask

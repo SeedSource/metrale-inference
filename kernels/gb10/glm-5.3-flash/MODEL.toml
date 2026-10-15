@@ -91,6 +91,14 @@ min_reasoning_floor_tokens = 0
 # the last (spark-bench c30gate TEBGAP-TRACE.md C).
 hf_tool_json = true
 render_tools_on_tool_choice_none = true
+# 2026-10-15: A reply that offered no tools can end with a stray </tool_call> (id 154844, not
+# special in the tokenizer), e.g. "...careers take root, grow.</tool_call>": seen when the request
+# forces its length (vbench --ignore-eos masks EOS at the natural end, so </tool_call> is the best
+# remaining token; spark-bench runs/race/dec-leak/LEAK-READ.md). The scheduler then ended the turn
+# there (finish_reason tool_calls) and ignored the forced length. With no tools, no grammar and no
+# <tool_call> open the token is never valid, so it is masked and the next-best token wins
+# (server scheduler/logit_processors/stray_tool_call_end.rs).
+mask_stray_tool_call_end = true
 
 # 2026-09-25: The target matcher: ptx_for_config (crates/kernels/src/resolve.rs) matches a
 # checkpoint to this target by [[model_types]], and serve refuses a model_type that no

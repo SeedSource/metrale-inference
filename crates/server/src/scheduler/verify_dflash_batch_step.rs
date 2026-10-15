@@ -23,7 +23,7 @@ pub fn step_verify_dflash_batched(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     drafts_per_seq: usize,
     num_drafts: usize,
-    _verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
 ) {
     let n = batch.len();
     let k = drafts_per_seq + 1;
@@ -101,9 +101,35 @@ pub fn step_verify_dflash_batched(
     let now = sched.io.clock.now();
     for (i, a) in batch.iter_mut().enumerate() {
         let off = i * k;
-        let verified = &results[off..off + k];
+        let raw = &results[off..off + k];
         let drafts = &drafts_all[i];
         a.last_token_time = now;
+
+        // 2026-10-15: the partition in `mtp_step.rs` runs before this forward,
+        // so a raw argmax on a stray `</tool_call>` that `StrayToolCallEndMask`
+        // masks on this row is caught here: this row's verdict comes from the
+        // masked pipeline over its own rows of the shared logits buffer
+        // (`row_base = off`, as `step_verify_k4_batched` reads them after the
+        // same `decode_verify_batched`), and the accept walk below compares the
+        // drafts with those picks. A position with no pick keeps its raw argmax.
+        // Read before any propose, like every other read of the shared outputs.
+        let repicked: Option<Vec<u32>> =
+            if crate::scheduler::verify_pipeline_helper::raw_verdict_hits_stray_tool_call_end(
+                a, raw, verify_ctx,
+            ) {
+                let processed =
+                    crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+                        model, raw, a, verify_ctx, off,
+                    );
+                Some(
+                    (0..k)
+                        .map(|j| processed.get(j).copied().unwrap_or(raw[j]))
+                        .collect(),
+                )
+            } else {
+                None
+            };
+        let verified: &[u32] = repicked.as_deref().unwrap_or(raw);
 
         // 2026-09-25: judged on the raw argmax, the basis the drafter
         // proposes on. Unlike `verify_dflash_step`, this path does not

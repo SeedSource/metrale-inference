@@ -259,6 +259,7 @@ fn drive(seed_depth: usize, ticks: usize) -> Run {
             &policy,
             &mut active,
             &mut prefilling,
+            &mut Vec::new(),
             CHUNK,
             CHUNK,
             false,

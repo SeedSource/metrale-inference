@@ -36,7 +36,7 @@ mod spec_mixing;
 use metrale_model_engine::traits::Model;
 
 use super::phase_promote_prefills::promote_completed_prefills;
-use super::types::{ActiveSeq, PrefillInProgress};
+use super::types::{ActiveSeq, PreemptedSeq, PrefillInProgress};
 use super::{FirstTokenPolicy, sample_first_token};
 use crate::scheduling_policy::{ActiveSeqTiming, SchedulingPolicy};
 
@@ -58,6 +58,7 @@ pub(super) fn continue_in_progress_prefills(
     policy: &dyn SchedulingPolicy,
     active: &mut Vec<ActiveSeq>,
     prefilling: &mut Vec<PrefillInProgress>,
+    preempted: &mut Vec<PreemptedSeq>,
     max_prefill_tokens: usize,
     max_batch_tokens: usize,
     always_mixed: bool,
@@ -336,6 +337,7 @@ pub(super) fn continue_in_progress_prefills(
                 p,
                 idx,
                 active,
+                preempted,
                 max_prefill_tokens,
                 slice_budget,
                 prefill_stream,

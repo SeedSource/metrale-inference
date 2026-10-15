@@ -753,3 +753,124 @@ fn dflash_serial_verify_failure_ends_the_row_with_an_error_not_a_stop() {
         a.error
     );
 }
+
+/// 2026-10-15 (race-memory, gap (a)): a prefill chunk refused for KV frees room by requeuing one
+/// decoding row for a later resume, never by ending it. cap2h (L34, 2026-10-15) lost a 324K reply to
+/// the old path ("preempted: KV cache exhausted (a prefill needed its blocks)"). The victim follows
+/// decode's rule (fewest output tokens), the prefill retries the same chunk, and no row gets a frame.
+#[test]
+fn a_prefill_chunk_refused_for_kv_requeues_a_decoder_and_ends_none() {
+    use super::phase_continue_prefills::continue_in_progress_prefills;
+    use super::test_support::test_prefill_ident;
+    // EP (2 ranks, as cap2h): no fused `mixed_forward`, the plain chunk path.
+    let model = std::sync::Arc::new(PreemptStubModel {
+        first_token: Some(7),
+        ep: true,
+        ..Default::default()
+    });
+    model.fail_prefill_chunks.store(1, Ordering::SeqCst);
+    let sched = SchedCtx::for_test_with(model.clone());
+    let (a0, mut rx0) = active_seq(0, 9);
+    let (a1, mut rx1) = active_seq(1, 3);
+    let mut active = vec![a0, a1];
+    let (p, _rxp) = test_prefill_ident(7, 16);
+    let mut prefilling = vec![p];
+    let mut preempted = Vec::new();
+    continue_in_progress_prefills(
+        &*model,
+        &crate::scheduling_policy::FifoPolicy,
+        &mut active,
+        &mut prefilling,
+        &mut preempted,
+        16,
+        16,
+        false,
+        0,
+        0,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        &sched,
+    );
+    assert_eq!(preempted.len(), 1, "one row requeued for resume");
+    assert_eq!(
+        preempted[0].a.seq.slot_idx, 1,
+        "decode's victim rule: fewest output tokens"
+    );
+    assert_eq!(
+        preempted[0].a.output_tokens.len(),
+        3,
+        "its reply so far is kept for the resume"
+    );
+    assert!(
+        active.iter().any(|a| a.seq.slot_idx == 0),
+        "the other decoder keeps running"
+    );
+    assert!(
+        rx0.try_recv().is_err() && rx1.try_recv().is_err(),
+        "no row got a response frame"
+    );
+    let chunks = model.chunks.lock().unwrap().clone();
+    assert_eq!(
+        chunks.len(),
+        2,
+        "the refused chunk is retried once: {chunks:?}"
+    );
+    assert_eq!(chunks[0], chunks[1]);
+}
+
+/// 2026-10-15 (race-memory, gap (a)): with no decoding row to requeue, the prefill's own refusal
+/// stands (its request fails); nothing is requeued.
+#[test]
+fn a_prefill_chunk_refused_for_kv_with_no_decoder_fails_the_prefill_only() {
+    use super::phase_continue_prefills::continue_in_progress_prefills;
+    use super::test_support::test_prefill_ident;
+    let model = std::sync::Arc::new(PreemptStubModel {
+        first_token: Some(7),
+        ..Default::default()
+    });
+    model.fail_prefill_chunks.store(1, Ordering::SeqCst);
+    let sched = SchedCtx::for_test_with(model.clone());
+    let mut active = Vec::new();
+    let (p, mut rxp) = test_prefill_ident(7, 16);
+    let mut prefilling = vec![p];
+    let mut preempted = Vec::new();
+    continue_in_progress_prefills(
+        &*model,
+        &crate::scheduling_policy::FifoPolicy,
+        &mut active,
+        &mut prefilling,
+        &mut preempted,
+        16,
+        16,
+        false,
+        0,
+        0,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        &sched,
+    );
+    assert!(preempted.is_empty() && active.is_empty() && prefilling.is_empty());
+    let r = rxp
+        .try_recv()
+        .expect("the prefill's request got its answer");
+    assert!(r.is_err(), "the prefill fails with its own refusal");
+    assert_eq!(
+        model.chunks.lock().unwrap().len(),
+        1,
+        "no retry without a victim"
+    );
+}

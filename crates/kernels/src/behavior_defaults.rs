@@ -46,3 +46,16 @@ pub const DEFAULT_EFFORT_CAPPED_AT_CEILING: bool = false;
 /// Low|High|Max" and vLLM serves it with no budget. An explicit client token budget
 /// still applies. `kernels/gb10/glm-5.3-flash` sets it.
 pub const DEFAULT_EFFORT_PROMPT_ONLY: bool = false;
+
+/// 2026-10-15: Default `[behavior].response_format_with_tools`: which grammar a request with
+/// both `response_format` and active tools gets.
+///
+/// `false` keeps the rule every other model has: `response_format` only when tools are
+/// inactive or `tool_choice` is `none`, else the tool-call grammar. `true` enforces
+/// `response_format` unless `tool_choice` is `required` or names a function (those keep the
+/// tool-call grammar), as vLLM applies the response_format structured output with
+/// `tool_choice` auto. The JSON grammar then masks `<tool_call>`, so such a turn answers in
+/// JSON and cannot call a tool. TEB TC-65/66/67/69 (spark-bench c30gate TEBGAP-TRACE.md): the
+/// official serve answers bare JSON 24/24, c30 wraps it in prose 12/12.
+/// `kernels/gb10/glm-5.3-flash` sets it.
+pub const DEFAULT_RESPONSE_FORMAT_WITH_TOOLS: bool = false;

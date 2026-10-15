@@ -26,6 +26,9 @@ pub(crate) struct ParsedBehavior {
     pub effort_capped_at_ceiling: bool,
     /// 2026-10-14: See `behavior_defaults.rs`: effort as a prompt line only, no budget.
     pub effort_prompt_only: bool,
+    /// 2026-10-15: See `behavior_defaults.rs`: with tools active and `tool_choice` auto,
+    /// `response_format` is enforced instead of the tool-call grammar.
+    pub response_format_with_tools: bool,
     pub thinking_default: bool,
     pub fp8_kv_calibration_tokens: usize,
     pub default_kv_dtype: String,
@@ -78,6 +81,7 @@ impl Default for ParsedBehavior {
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
             effort_prompt_only: DEFAULT_EFFORT_PROMPT_ONLY,
+            response_format_with_tools: DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: String::new(),
@@ -141,6 +145,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("effort_prompt_only"))
         .and_then(|v| v.as_bool())
         .unwrap_or(DEFAULT_EFFORT_PROMPT_ONLY);
+    let response_format_with_tools = b
+        .and_then(|v| v.get("response_format_with_tools"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEFAULT_RESPONSE_FORMAT_WITH_TOOLS);
     let thinking_default = b
         .and_then(|v| v.get("thinking_default"))
         .and_then(|v| v.as_bool())
@@ -272,6 +280,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         max_thinking_budget,
         effort_capped_at_ceiling,
         effort_prompt_only,
+        response_format_with_tools,
         thinking_default,
         fp8_kv_calibration_tokens,
         default_kv_dtype,

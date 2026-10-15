@@ -10,7 +10,10 @@
 mod tests {
     // 2026-09-26: `tests` sits inside `sampling_setup_tests`, a child module of
     // `sampling_setup`, so `super::super` is `sampling_setup`.
-    use super::super::{tool_choice_required_for_parser, tool_grammar_escape_applies};
+    use super::super::{
+        request_grammar, response_format_enforced, tool_choice_required_for_parser,
+        tool_grammar_escape_applies,
+    };
 
     use crate::tool_parser::{ToolChoice, ToolChoiceFunction};
 
@@ -115,5 +118,138 @@ mod tests {
             None,
             Some("bare_json")
         ));
+    }
+
+    /// 2026-10-15: TEB TC-65 turn 2 as the bench sends it (tool_eval_bench orchestrator:
+    /// `response_format` only after the first tool call): the tool result is in, tools are
+    /// still declared, `tool_choice` auto, and the weather_report json_schema.
+    fn tc65_turn2(tool_choice: serde_json::Value) -> crate::ir::ChatRequest {
+        let body = serde_json::json!({
+            "model": "glm",
+            "messages": [
+                {"role": "user", "content": "Get the current weather in Tokyo and output it as JSON matching this schema. Include a recommendation for what to wear."},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"location\": \"Tokyo\", \"units\": \"celsius\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_0", "content": "{\"location\": \"Tokyo\", \"temperature\": 28, \"units\": \"celsius\", \"condition\": \"Sunny\"}"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "Get current weather for a specific location",
+                    "parameters": {"type": "object", "properties": {"location": {"type": "string"},
+                        "units": {"type": "string", "enum": ["celsius", "fahrenheit"], "default": "celsius"}},
+                        "required": ["location"], "additionalProperties": false}}},
+                {"type": "function", "function": {"name": "web_search", "description": "Search the web for current information",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+            ],
+            "tool_choice": tool_choice,
+            "response_format": {"type": "json_schema", "json_schema": {"name": "weather_report", "strict": true,
+                "schema": {"type": "object", "properties": {"location": {"type": "string"},
+                    "temperature_celsius": {"type": "number"}, "condition": {"type": "string"},
+                    "recommendation": {"type": "string"}},
+                    "required": ["location", "temperature_celsius", "condition", "recommendation"],
+                    "additionalProperties": false}}}
+        });
+        let req: crate::openai::ChatCompletionRequest =
+            serde_json::from_value(body).expect("chat request");
+        req.into()
+    }
+
+    /// 2026-10-15: `request_grammar` as `build_sampling` calls it, with GLM-5.3's tool
+    /// parser (`poolside_v1`, tool_defaults.toml) and tools active.
+    fn grammar_for(
+        req: &crate::ir::ChatRequest,
+        with_tools: bool,
+    ) -> Option<crate::api::inference_types::GrammarSpec> {
+        let parser: std::sync::Arc<dyn crate::tool_parser::ToolCallParser> =
+            crate::tool_parser::ToolCallFormat::PoolsideV1
+                .into_parser()
+                .into();
+        let behavior = metrale_kernels::ModelBehavior {
+            response_format_with_tools: with_tools,
+            ..metrale_kernels::ModelBehavior::default()
+        };
+        let required =
+            tool_choice_required_for_parser(true, req.tool_choice.as_ref(), Some(parser.name()));
+        request_grammar(req, true, required, &behavior, Some(&parser))
+    }
+
+    fn named(name: &str) -> serde_json::Value {
+        serde_json::json!({"type": "function", "function": {"name": name}})
+    }
+
+    #[test]
+    fn with_the_flag_tools_auto_json_schema_gets_the_json_schema_grammar() {
+        use crate::api::inference_types::GrammarSpec;
+        let req = tc65_turn2(serde_json::json!("auto"));
+        match grammar_for(&req, true) {
+            Some(GrammarSpec::JsonSchema { schema }) => {
+                assert!(schema.contains("temperature_celsius"), "{schema}");
+            }
+            other => panic!("want JsonSchema, got {:?}", other.map(|g| kind(&g))),
+        }
+    }
+
+    #[test]
+    fn with_the_flag_required_and_named_keep_the_tool_call_grammar() {
+        use crate::api::inference_types::GrammarSpec;
+        let req = tc65_turn2(serde_json::json!("required"));
+        assert!(
+            matches!(grammar_for(&req, true), Some(GrammarSpec::ToolCall { tools, use_triggers: false, .. }) if tools.len() == 2)
+        );
+        let req = tc65_turn2(named("get_weather"));
+        match grammar_for(&req, true) {
+            Some(GrammarSpec::ToolCall {
+                tools,
+                use_triggers,
+                ..
+            }) => {
+                assert!(!use_triggers);
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].function.name, "get_weather");
+            }
+            other => panic!("want ToolCall, got {:?}", other.map(|g| kind(&g))),
+        }
+    }
+
+    #[test]
+    fn without_the_flag_tools_keep_the_tool_call_grammar() {
+        // 2026-10-15: Every other model: today's rule, the response format left to the model
+        // while tools are active, enforced when `tool_choice` is `none`.
+        use crate::api::inference_types::GrammarSpec;
+        for choice in [
+            serde_json::json!("auto"),
+            serde_json::json!("required"),
+            named("get_weather"),
+        ] {
+            let req = tc65_turn2(choice.clone());
+            assert!(
+                matches!(grammar_for(&req, false), Some(GrammarSpec::ToolCall { .. })),
+                "{choice}"
+            );
+        }
+        for with_tools in [false, true] {
+            assert!(response_format_enforced(
+                true, false, false, false, with_tools
+            ));
+            assert!(response_format_enforced(
+                true, true, true, false, with_tools
+            ));
+            assert!(!response_format_enforced(
+                false, true, false, false, with_tools
+            ));
+            assert!(!response_format_enforced(
+                true, true, false, true, with_tools
+            ));
+        }
+        assert!(!response_format_enforced(true, true, false, false, false));
+        assert!(response_format_enforced(true, true, false, false, true));
+    }
+
+    fn kind(g: &crate::api::inference_types::GrammarSpec) -> &'static str {
+        use crate::api::inference_types::GrammarSpec;
+        match g {
+            GrammarSpec::ToolCall { .. } => "ToolCall",
+            GrammarSpec::JsonObject => "JsonObject",
+            GrammarSpec::JsonSchema { .. } => "JsonSchema",
+        }
     }
 }

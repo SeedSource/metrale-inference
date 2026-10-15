@@ -278,53 +278,13 @@ pub(super) fn build_sampling(
         state.tool_call_parser.as_ref().map(|p| p.name()),
     );
 
-    // 2026-09-26: One grammar per request. `response_format` is enforced when
-    // tools are inactive or `tool_choice` is `none`; otherwise the tool-call
-    // grammar, if any, is used and the response format is left to the model.
-    // The wire's `{"type":"text"}` is lowered to `None`, so presence means a
-    // constraint.
-    let has_response_format = req.response_format.is_some();
-    let tool_choice_none = req
-        .tool_choice
-        .as_ref()
-        .is_some_and(|tc| matches!(tc, tool_parser::ToolChoice::Mode(m) if m == "none"));
-    let response_format_only = has_response_format && (!tools_active || tool_choice_none);
-
-    let use_triggers = !tool_choice_required;
-    let grammar_spec: Option<GrammarSpec> = if response_format_only {
-        match req.response_format.as_ref().unwrap() {
-            crate::ir::ResponseFormat::JsonObject => Some(GrammarSpec::JsonObject),
-            crate::ir::ResponseFormat::JsonSchema { schema, .. } => Some(GrammarSpec::JsonSchema {
-                schema: schema.to_string(),
-            }),
-        }
-    } else if tools_active
-        && tool_grammar_escape_applies(state.behavior.disable_tool_grammar, tool_choice_required)
-    {
-        // 2026-09-26: No grammar; tool calls are still parsed from the output.
-        tracing::info!("MODEL.toml [behavior].disable_tool_grammar=true — tool-call grammar OFF");
-        None
-    } else if tools_active {
-        if has_response_format {
-            tracing::info!(
-                "response_format + tools both set; enforcing tool-call grammar. \
-                 Schema-shape compliance falls to the model (embed schema text in \
-                 the user/system message for best results)."
-            );
-        }
-        let parser = state.tool_call_parser.as_ref().map(std::sync::Arc::clone);
-        let mut tools = req.tools.clone();
-        if let Some(tool_parser::ToolChoice::Specific { ref function }) = req.tool_choice {
-            tools.retain(|t| t.function.name == function.name);
-        }
-        parser.map(|p| GrammarSpec::ToolCall {
-            tools,
-            parser: p,
-            use_triggers,
-        })
-    } else {
-        None
-    };
+    let grammar_spec = request_grammar(
+        req,
+        tools_active,
+        tool_choice_required,
+        &state.behavior,
+        state.tool_call_parser.as_ref(),
+    );
 
     let timeout_at = state.request_deadline(req.timeout_secs);
 
@@ -351,6 +311,91 @@ pub(super) fn build_sampling(
         timeout_at,
         top_logprobs,
     })
+}
+
+/// 2026-09-26: One grammar per request. `response_format` is enforced when
+/// tools are inactive or `tool_choice` is `none`; otherwise the tool-call
+/// grammar, if any, is used and the response format is left to the model.
+/// The wire's `{"type":"text"}` is lowered to `None`, so presence means a
+/// constraint.
+///
+/// 2026-10-15: Moved out of `build_sampling` so the tests run it. With MODEL.toml
+/// `[behavior].response_format_with_tools` (GLM-5.3) see [`response_format_enforced`].
+fn request_grammar(
+    req: &ChatRequest,
+    tools_active: bool,
+    tool_choice_required: bool,
+    behavior: &metrale_kernels::ModelBehavior,
+    parser: Option<&Arc<dyn tool_parser::ToolCallParser>>,
+) -> Option<GrammarSpec> {
+    let has_response_format = req.response_format.is_some();
+    let tool_choice_none = req
+        .tool_choice
+        .as_ref()
+        .is_some_and(|tc| matches!(tc, tool_parser::ToolChoice::Mode(m) if m == "none"));
+    let response_format_only = response_format_enforced(
+        has_response_format,
+        tools_active,
+        tool_choice_none,
+        tool_choice_required,
+        behavior.response_format_with_tools,
+    );
+
+    let use_triggers = !tool_choice_required;
+    if response_format_only {
+        match req.response_format.as_ref().unwrap() {
+            crate::ir::ResponseFormat::JsonObject => Some(GrammarSpec::JsonObject),
+            crate::ir::ResponseFormat::JsonSchema { schema, .. } => Some(GrammarSpec::JsonSchema {
+                schema: schema.to_string(),
+            }),
+        }
+    } else if tools_active
+        && tool_grammar_escape_applies(behavior.disable_tool_grammar, tool_choice_required)
+    {
+        // 2026-09-26: No grammar; tool calls are still parsed from the output.
+        tracing::info!("MODEL.toml [behavior].disable_tool_grammar=true — tool-call grammar OFF");
+        None
+    } else if tools_active {
+        if has_response_format {
+            tracing::info!(
+                "response_format + tools both set; enforcing tool-call grammar. \
+                 Schema-shape compliance falls to the model (embed schema text in \
+                 the user/system message for best results)."
+            );
+        }
+        let parser = parser.map(std::sync::Arc::clone);
+        let mut tools = req.tools.clone();
+        if let Some(tool_parser::ToolChoice::Specific { ref function }) = req.tool_choice {
+            tools.retain(|t| t.function.name == function.name);
+        }
+        parser.map(|p| GrammarSpec::ToolCall {
+            tools,
+            parser: p,
+            use_triggers,
+        })
+    } else {
+        None
+    }
+}
+
+/// 2026-10-15: Whether `response_format` is the request's grammar. Without
+/// `response_format_with_tools` (every model but GLM-5.3): only when tools are inactive or
+/// `tool_choice` is `none`. With it: unless `tool_choice` is `required` or names a function
+/// (`tool_choice_required`), which keep the tool-call grammar. That is vLLM's precedence,
+/// which applies the response_format structured output with `tool_choice` auto; the JSON
+/// grammar then masks `<tool_call>`, so the turn answers in JSON and calls no tool.
+fn response_format_enforced(
+    has_response_format: bool,
+    tools_active: bool,
+    tool_choice_none: bool,
+    tool_choice_required: bool,
+    with_tools: bool,
+) -> bool {
+    if with_tools {
+        has_response_format && !tool_choice_required
+    } else {
+        has_response_format && (!tools_active || tool_choice_none)
+    }
 }
 
 #[cfg(test)]

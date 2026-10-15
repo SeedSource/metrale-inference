@@ -35,7 +35,8 @@ pub use resolve::{ResolveCandidate, TargetResolveError, ptx_for_config, ptx_for_
 // and `ModelBehavior::default()` read one constant.
 mod behavior_defaults;
 pub use behavior_defaults::{
-    DEFAULT_EFFORT_CAPPED_AT_CEILING, DEFAULT_EFFORT_PROMPT_ONLY, DEFAULT_MAX_INTER_TOOL_PROSE, DEFAULT_MAX_THINKING_BUDGET,
+    DEFAULT_EFFORT_CAPPED_AT_CEILING, DEFAULT_EFFORT_PROMPT_ONLY, DEFAULT_MAX_INTER_TOOL_PROSE,
+    DEFAULT_MAX_THINKING_BUDGET, DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
 };
 
 // 2026-09-25: The compiled target's serving defaults, baked from
@@ -192,6 +193,9 @@ pub struct ModelBehavior {
     /// thinking budget unless the client names one. Default
     /// [`DEFAULT_EFFORT_PROMPT_ONLY`].
     pub effort_prompt_only: bool,
+    /// 2026-10-15: with tools active and `tool_choice` auto, `response_format` is enforced
+    /// instead of the tool-call grammar. Default [`DEFAULT_RESPONSE_FORMAT_WITH_TOOLS`].
+    pub response_format_with_tools: bool,
     /// 2026-09-25: Thinking state for a request that carries no thinking
     /// directive. Any explicit directive overrides it, and
     /// `--disable-thinking` turns thinking off for every request. Default
@@ -332,6 +336,7 @@ impl Default for ModelBehavior {
             max_thinking_budget: DEFAULT_MAX_THINKING_BUDGET,
             effort_capped_at_ceiling: DEFAULT_EFFORT_CAPPED_AT_CEILING,
             effort_prompt_only: DEFAULT_EFFORT_PROMPT_ONLY,
+            response_format_with_tools: DEFAULT_RESPONSE_FORMAT_WITH_TOOLS,
             thinking_default: false,
             fp8_kv_calibration_tokens: 0,
             default_kv_dtype: "",

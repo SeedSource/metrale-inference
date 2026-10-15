@@ -56,6 +56,7 @@ pub fn prefill_request(
     let logit_bias = req.logit_bias().to_vec();
     let req_min_tokens = req.min_tokens();
     let req_session_hash = req.session_hash();
+    let req_cache_salt_hash = req.cache_salt_hash();
     let req_adapter_slot = req.adapter_slot();
     let req_src_lang = req.src_lang_id();
     let req_tgt_lang = req.tgt_lang_id();
@@ -135,7 +136,12 @@ pub fn prefill_request(
     seq.early_stopping = req_early_stopping;
     // 2026-09-25: The adapter id is the prefix-cache identity; slot `-1`
     // resolves to the active adapter.
-    seq.adapter_id = model.adapter_id_for(req_adapter_slot);
+    // 2026-10-14: The request's `cache_salt` is folded in, so different salts never
+    // share prefix-cache entries (A188); no salt leaves the id unchanged.
+    seq.adapter_id = metrale_cache::radix_tree::salted_adapter_id(
+        model.adapter_id_for(req_adapter_slot),
+        req_cache_salt_hash,
+    );
     // 2026-09-25: Take a ref on the resolved LoRA slot, released at the
     // sequence's terminal free.
     seq.acquired_adapter_slot = model.acquire_adapter_slot(req_adapter_slot);

@@ -19,6 +19,11 @@ pub struct CompletionRequest {
     /// `api::lora_control::resolve_request_adapter_slot` as on the chat path.
     #[serde(default)]
     pub adapter: Option<String>,
+    /// 2026-10-14: vLLM / OpenAI `cache_salt`. Requests with different salts never
+    /// share prefix-cache entries (`metrale_cache::radix_tree::salted_adapter_id`);
+    /// unset or empty = no salt.
+    #[serde(default)]
+    pub cache_salt: Option<String>,
     /// 2026-09-26: Source-language token name, resolved to a token id by the
     /// server tokenizer. Unset = token id 0; an unknown name is a 400.
     #[serde(default)]

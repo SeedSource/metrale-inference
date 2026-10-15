@@ -41,6 +41,8 @@ use super::sanitizer::*;
 
 #[cfg(test)]
 mod min_tokens_wiring_tests;
+#[cfg(test)]
+mod cache_salt_wiring_tests;
 mod prompts;
 
 use prompts::resolve_prompts;
@@ -229,6 +231,7 @@ fn build_streaming_request(
     InferenceRequest::Streaming {
         prompt_tokens,
         session_hash,
+        cache_salt_hash: metrale_cache::radix_tree::cache_salt_hash(req.cache_salt.as_deref()),
         adapter_slot: p.adapter_slot,
         src_lang_id: p.src_lang_id,
         tgt_lang_id: p.tgt_lang_id,

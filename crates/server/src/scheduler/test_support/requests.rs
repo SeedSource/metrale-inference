@@ -14,6 +14,7 @@ pub(in crate::scheduler) fn blocking_request(
     crate::api::InferenceRequest::Blocking {
         prompt_tokens: std::sync::Arc::new(vec![0]),
         session_hash: 0,
+        cache_salt_hash: 0,
         adapter_slot: -1,
         src_lang_id: 0,
         tgt_lang_id: 0,

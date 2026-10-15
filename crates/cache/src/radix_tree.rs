@@ -50,6 +50,38 @@ pub(crate) fn hash_token_prefix(tokens: &[u32], count: usize, adapter_id: u64) -
     h
 }
 
+/// 2026-10-14: FNV-1a hash of a request's `cache_salt` (the OpenAI / vLLM field);
+/// `None` or an empty salt is 0 (no salt). A salt that hashes to 0 is mapped to 1.
+pub fn cache_salt_hash(salt: Option<&str>) -> u64 {
+    let Some(s) = salt.filter(|s| !s.is_empty()) else {
+        return 0;
+    };
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in s.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h.max(1)
+}
+
+/// 2026-10-14: The prefix-cache identity of a sequence: its adapter id with the
+/// request's [`cache_salt_hash`] folded in. Salt 0 returns `adapter_id`
+/// unchanged, so unsalted requests keep their keys. A salted id is never 0,
+/// because 0 is the base model's unfolded root (`hash_token_prefix`). Requests
+/// with different salts therefore never share KV blocks or SSM snapshots
+/// (vLLM `cache_salt` semantics: no cross-tenant prefix reuse, no timing signal).
+pub fn salted_adapter_id(adapter_id: u64, salt_hash: u64) -> u64 {
+    if salt_hash == 0 {
+        return adapter_id;
+    }
+    let mut h: u64 = 0xcbf29ce484222325 ^ 0x5341_4c54; // "SALT" domain
+    for w in [adapter_id, salt_hash] {
+        h ^= w;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h.max(1)
+}
+
 /// 2026-09-25: The radix-tree prefix cache. SSM snapshots live in a separate
 /// `SsmSnapshotIndex`, so evicting tree nodes does not remove them.
 pub struct RadixTree {

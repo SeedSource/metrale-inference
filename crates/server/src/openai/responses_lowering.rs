@@ -147,6 +147,7 @@ pub fn lower_responses_to_chat(
     Ok(ChatCompletionRequest {
         model: r.model,
         adapter: None,
+        cache_salt: None,
         src_lang: None,
         tgt_lang: None,
         num_beams: None,

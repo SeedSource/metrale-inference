@@ -52,6 +52,8 @@ pub struct ChatRequest {
     /// when it is `None`, a `model` naming a resident or stageable adapter
     /// selects that adapter, and otherwise the installed active adapter runs.
     pub adapter: Option<String>,
+    /// 2026-10-14: The request's `cache_salt`; see `openai::ChatCompletionRequest::cache_salt`.
+    pub cache_salt: Option<String>,
     /// 2026-09-26: Source-language token name (e.g. `eng_Latn`), resolved to
     /// a token id by the server tokenizer; an unknown name is a 400. `None`
     /// = token id 0.

@@ -6,7 +6,7 @@
 //! Owner: cache.
 //! Invariants: none beyond the types.
 
-use crate::radix_tree::RadixTree;
+use crate::radix_tree::{RadixTree, cache_salt_hash, salted_adapter_id};
 use metrale_telemetry::prefix_cache::PrefixCache;
 
 /// 2026-09-25: A prefix cached under adapter A misses for adapter B and for
@@ -89,4 +89,74 @@ fn test_adapter_insert_does_not_clobber_other_adapter() {
         "adapter B kept its blocks"
     );
     tree.release(&tokens, 16, B);
+}
+
+/// 2026-10-14: `cache_salt` isolation (A188). Two salts on the same prompt never
+/// share blocks; the same salt still hits; an unsalted request neither sees nor
+/// is seen by a salted one; no salt keeps the unsalted key.
+#[test]
+fn test_cache_salt_isolation() {
+    let tree = RadixTree::new();
+    let tokens: Vec<u32> = (0..32).collect();
+    let (s1, s2) = (
+        cache_salt_hash(Some("tenant-a")),
+        cache_salt_hash(Some("tenant-b")),
+    );
+    assert_eq!(cache_salt_hash(None), 0);
+    assert_eq!(cache_salt_hash(Some("")), 0);
+    assert_ne!(s1, s2);
+    assert_eq!(salted_adapter_id(0, 0), 0);
+    assert_eq!(salted_adapter_id(0xABCD, 0), 0xABCD);
+    let (k1, k2) = (salted_adapter_id(0, s1), salted_adapter_id(0, s2));
+    assert!(k1 != 0 && k2 != 0 && k1 != k2);
+    assert_ne!(
+        salted_adapter_id(0xABCD, s1),
+        k1,
+        "adapter and salt both key"
+    );
+
+    tree.insert(&tokens, &[10, 20], &[], 16, 0, k1);
+    tree.release(&tokens, 16, k1);
+    assert!(
+        tree.lookup(&tokens, 16, 0, k2).is_empty(),
+        "salt B must not reuse salt A"
+    );
+    assert!(
+        tree.lookup(&tokens, 16, 0, 0).is_empty(),
+        "no salt must not reuse salt A"
+    );
+    let m = tree.lookup(&tokens, 16, 0, k1);
+    assert_eq!(m.matched_tokens, 32, "same salt still hits");
+    tree.release(&tokens, 16, k1);
+
+    tree.insert(&tokens, &[30, 40], &[], 16, 0, 0);
+    tree.release(&tokens, 16, 0);
+    assert!(
+        tree.lookup(&tokens, 16, 0, k2).is_empty(),
+        "salt B must not reuse unsalted blocks"
+    );
+}
+
+/// 2026-10-14: SSM snapshots follow the same key: a snapshot registered under
+/// salt A is not returned to salt B.
+#[test]
+fn test_cache_salt_snapshot_isolation() {
+    let tree = RadixTree::new();
+    let tokens: Vec<u32> = (0..32).collect();
+    let k1 = salted_adapter_id(0, cache_salt_hash(Some("tenant-a")));
+    let k2 = salted_adapter_id(0, cache_salt_hash(Some("tenant-b")));
+    tree.insert_with_snapshot(&tokens, &[10, 20], &[], 16, 3, 0, 0, k1);
+    tree.release(&tokens, 16, k1);
+    tree.insert(&tokens, &[50, 60], &[], 16, 0, k2);
+    tree.release(&tokens, 16, k2);
+    let m2 = tree.lookup(&tokens, 16, 0, k2);
+    assert_eq!(m2.matched_tokens, 32);
+    assert!(
+        m2.ssm_snapshot.is_none(),
+        "salt B must not get salt A's snapshot"
+    );
+    tree.release(&tokens, 16, k2);
+    let m1 = tree.lookup(&tokens, 16, 0, k1);
+    assert_eq!(m1.ssm_snapshot, Some(3));
+    tree.release(&tokens, 16, k1);
 }

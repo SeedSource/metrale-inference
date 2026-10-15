@@ -67,6 +67,7 @@ pub(crate) async fn run_if_enabled(state: &Arc<AppState>) {
     let (response_tx, rx) = tokio::sync::oneshot::channel();
     let req = InferenceRequest::Blocking {
         session_hash: crate::session_manager::compute_session_hash(&tokens),
+        cache_salt_hash: 0,
         prompt_tokens: Arc::new(tokens),
         adapter_slot: -1,
         src_lang_id: 0,

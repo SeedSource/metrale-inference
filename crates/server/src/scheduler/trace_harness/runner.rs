@@ -194,6 +194,7 @@ fn build_request(r: &ReqSpec, shared: &Shared) -> (InferenceRequest, Sink) {
             InferenceRequest::$variant {
                 prompt_tokens: Arc::new(prompt),
                 session_hash: r.id,
+                cache_salt_hash: 0,
                 adapter_slot: -1,
                 src_lang_id: 0,
                 tgt_lang_id: 0,

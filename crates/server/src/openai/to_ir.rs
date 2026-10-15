@@ -119,6 +119,7 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             preserve_thinking,
             repetition_detection: req.repetition_detection,
             adapter: req.adapter,
+            cache_salt: req.cache_salt,
             src_lang: req.src_lang,
             tgt_lang: req.tgt_lang,
             num_beams: req.num_beams,

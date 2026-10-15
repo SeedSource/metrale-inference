@@ -83,6 +83,7 @@ pub(super) async fn dispatch_streaming(
         state,
         prompt_tokens,
         session_hash,
+        metrale_cache::radix_tree::cache_salt_hash(req.cache_salt.as_deref()),
         adapter_slot,
         src_lang_id,
         tgt_lang_id,

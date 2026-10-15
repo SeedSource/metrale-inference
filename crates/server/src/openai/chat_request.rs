@@ -20,6 +20,11 @@ pub struct ChatCompletionRequest {
     /// `ir::ChatRequest::adapter`.
     #[serde(default)]
     pub adapter: Option<String>,
+    /// 2026-10-14: vLLM / OpenAI `cache_salt`. Requests with different salts never
+    /// share prefix-cache entries (`metrale_cache::radix_tree::salted_adapter_id`);
+    /// unset or empty = no salt.
+    #[serde(default)]
+    pub cache_salt: Option<String>,
     /// 2026-09-26: Source-language token name; see
     /// `ir::ChatRequest::src_lang`.
     #[serde(default)]

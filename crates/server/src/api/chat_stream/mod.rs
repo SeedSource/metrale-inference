@@ -52,6 +52,8 @@ pub(crate) async fn run_chat_stream(
     state: Arc<AppState>,
     prompt_tokens: Vec<u32>,
     session_hash: u64,
+    // 2026-10-14: `cache_salt_hash` of the request's `cache_salt`; 0 = none.
+    cache_salt_hash: u64,
     // 2026-09-26: A negative slot means the active LoRA adapter.
     adapter_slot: i32,
     // 2026-09-26: 0 means the deployment default, for both language ids.
@@ -115,6 +117,7 @@ pub(crate) async fn run_chat_stream(
     let request = InferenceRequest::Streaming {
         prompt_tokens,
         session_hash,
+        cache_salt_hash,
         adapter_slot,
         src_lang_id,
         tgt_lang_id,

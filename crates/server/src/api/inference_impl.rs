@@ -184,6 +184,19 @@ impl InferenceRequest {
         }
     }
 
+    /// 2026-10-14: Hash of the request's `cache_salt` (0 = none), folded into
+    /// `SequenceState.adapter_id` at prefill.
+    pub fn cache_salt_hash(&self) -> u64 {
+        match self {
+            InferenceRequest::Blocking {
+                cache_salt_hash, ..
+            } => *cache_salt_hash,
+            InferenceRequest::Streaming {
+                cache_salt_hash, ..
+            } => *cache_salt_hash,
+        }
+    }
+
     /// 2026-09-26: Session hash, copied onto `SequenceState.session_hash` at
     /// prefill.
     pub fn session_hash(&self) -> u64 {

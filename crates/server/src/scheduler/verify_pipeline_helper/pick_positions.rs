@@ -118,12 +118,11 @@ pub(super) fn pick_positions_from_host(
     // post-think `<tool_call>` pin), and the spontaneous-`<think>` budget.
     let think_state_before = SpecThinkState::capture(a);
     let out_len_before = a.output_tokens.len();
-    let think_env = ThinkTokenEnv {
-        code_fence_token: ctx.code_fence_token,
-        think_loop_enabled: !ctx.sampling.disable_watchdogs
-            && ctx.watchdog.enable_think_loop_watchdog,
-        watchdog: ctx.watchdog,
-    };
+    let think_env = ThinkTokenEnv::new(
+        ctx.code_fence_token,
+        ctx.sampling.disable_watchdogs,
+        ctx.watchdog,
+    );
     a.spec_think_trail.clear();
 
     for i in 0..k {

@@ -60,9 +60,11 @@ hc_sinkhorn_iters = 20
 # 2026-10-14: Effort is a prompt line only, as on the official model. Its chat_template.jinja
 # (nvidia/GLM-5.3-Flash-NVFP4 @09b04e5e, lines 2-3) renders "Reasoning Effort: Low|High|Max"
 # (any other value, and none, is Max) and vLLM serves it with no thinking budget. So no
-# effort level, and no request without one, gets a budget, a forced </think> or the
+# effort level, and no request without one, gets a budget, a budget-forced </think> or the
 # confidence early stop; an explicit client budget still applies. METRALE_EFFORT_THINKING_BUDGET=1
 # or --max-thinking-budget brings the old ladder back (64/128/256/512/1024 at E = 256).
+# 2026-10-15: That alone still let the thinking-loop watchdog force </think>; it is off too
+# (enable_think_loop_watchdog below), so thinking ends when the model closes it or at max_tokens.
 [behavior]
 effort_prompt_only = true
 # 2026-10-15: response_format wins over the tool-call grammar unless tool_choice is required or
@@ -70,6 +72,11 @@ effort_prompt_only = true
 # after the tool result: official bare JSON 24/24, c30 prose-wrapped 12/12; spark-bench c30gate
 # TEBGAP-TRACE.md). A turn under the JSON grammar cannot call a tool.
 response_format_with_tools = true
+# 2026-10-15: No thinking-loop watchdog (scheduler/think_commit.rs, on by default): the official
+# serve has none, and on TEB TC-88 it forced </think> twice per trial on the model's own digit
+# list, so turn 3 ran to max_tokens (spark-bench c30gate TEBGAP-TRACE.md B). The output
+# repetition guards (content-loop and the rest) are separate and unchanged.
+enable_think_loop_watchdog = false
 
 # 2026-09-25: The target matcher: ptx_for_config (crates/kernels/src/resolve.rs) matches a
 # checkpoint to this target by [[model_types]], and serve refuses a model_type that no

@@ -132,12 +132,11 @@ pub(super) fn process_decoded_token(
                 a,
                 tok,
                 history_len,
-                crate::scheduler::think_commit::ThinkTokenEnv {
+                crate::scheduler::think_commit::ThinkTokenEnv::new(
                     code_fence_token,
-                    think_loop_enabled: !sched.levers.disable_watchdogs
-                        && sched.watchdog.enable_think_loop_watchdog,
-                    watchdog: sched.watchdog,
-                },
+                    sched.levers.disable_watchdogs,
+                    sched.watchdog,
+                ),
                 true,
             );
         }

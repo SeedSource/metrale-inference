@@ -243,12 +243,11 @@ pub fn emit_token(
                 a,
                 tok,
                 history_len,
-                crate::scheduler::think_commit::ThinkTokenEnv {
-                    code_fence_token: sched.limits.code_fence_token,
-                    think_loop_enabled: !sched.levers.disable_watchdogs
-                        && sched.watchdog.enable_think_loop_watchdog,
-                    watchdog: sched.watchdog,
-                },
+                crate::scheduler::think_commit::ThinkTokenEnv::new(
+                    sched.limits.code_fence_token,
+                    sched.levers.disable_watchdogs,
+                    sched.watchdog,
+                ),
                 true,
             );
         }

@@ -24,6 +24,7 @@ fn glm53_model_toml_sets_its_parity_flags() {
     let b = parse_behavior(&gb10("glm-5.3-flash"));
     assert!(b.effort_prompt_only);
     assert!(b.response_format_with_tools);
+    assert!(!b.enable_think_loop_watchdog);
 }
 
 #[test]
@@ -34,4 +35,6 @@ fn a_model_without_the_keys_keeps_the_defaults() {
     assert_eq!(d.response_format_with_tools, lib.response_format_with_tools);
     let b = parse_behavior(&gb10("qwen3.5-397b-a17b"));
     assert!(!b.response_format_with_tools);
+    assert!(b.enable_think_loop_watchdog);
+    assert_eq!(d.enable_think_loop_watchdog, lib.enable_think_loop_watchdog);
 }

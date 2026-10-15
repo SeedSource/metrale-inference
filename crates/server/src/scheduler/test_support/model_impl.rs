@@ -69,6 +69,12 @@ impl ModelForward for PreemptStubModel {
         self.block_size
     }
     fn prefill(&self, t: &[u32], s: &mut SequenceState, _st: u64) -> Result<DevicePtr> {
+        // 2026-10-14 (race-memory, kvagcheck8): an EP worker answers every `0xFFFFFFF0` with
+        // `prefill_chunk`, whose prefix lookup joins a collective `prefill` never joins: on
+        // the GPU both ranks hang, here the call fails.
+        if self.ep {
+            anyhow::bail!("rank-0 prefill on an EP serve: the worker runs prefill_chunk");
+        }
         self.prefilled.lock().unwrap().push(t.to_vec());
         // 2026-09-25: like the engine's prefill, record the prompt in tokens,
         // seq_len and prompt_len.
@@ -90,15 +96,21 @@ impl ModelForward for PreemptStubModel {
         s: &mut SequenceState,
         cs: usize,
         cl: usize,
-        _last: bool,
+        last: bool,
         _st: u64,
     ) -> Result<DevicePtr> {
+        self.chunks.lock().unwrap().push((cs, cl, last));
         // 2026-10-04: only a first-token stub (`first_token`) prefills.
-        if self.first_token.is_none() {
+        // 2026-10-14: or a resume stub (`chunks_ok`).
+        if self.first_token.is_none() && !self.chunks_ok {
             anyhow::bail!("unused in preempt tests")
         }
         s.tokens.extend_from_slice(&t[cs..cs + cl]);
         s.seq_len = s.tokens.len();
+        // 2026-10-14: like the engine's prefix lookup on chunk 0.
+        if cs == 0 {
+            s.prompt_len = t.len();
+        }
         Ok(DevicePtr::NULL)
     }
     fn decode_batch(
@@ -328,6 +340,14 @@ impl ModelVision for PreemptStubModel {
 impl ModelEp for PreemptStubModel {
     fn is_ep(&self) -> bool {
         self.ep
+    }
+    fn ep_broadcast_cmd(&self, cmd: u32) -> Result<()> {
+        self.ep_words.lock().unwrap().push(cmd);
+        Ok(())
+    }
+    fn ep_broadcast_cmd_for_seq(&self, _seq_id: u32, cmd: u32) -> Result<()> {
+        self.ep_words.lock().unwrap().push(cmd);
+        Ok(())
     }
 }
 

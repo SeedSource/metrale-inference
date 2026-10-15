@@ -81,7 +81,8 @@ ep_broadcast_cmd(0x0)
 ep_broadcast_cmd(0x6)
 ep_broadcast_tokens(n=6)
 ep_sync_vision_embeds(n=6)
-prefill(n=6, s1@2:len=6, stream=0)
+prefill_chunk(start=0, len=6, last=true, s1@2:len=6, stream=0)
+normalize_ssm_states(s1@2:len=6, stream=0)
 num_free_blocks() -> 997
 -- tick 3
 fx launch Decode{n=3, ctx=Unified, readback=Argmax}

@@ -29,6 +29,7 @@ impl SchedulerCore {
         } = self;
         let max_batch_size = self.max_batch_size;
         let block_size = self.block_size;
+        let max_prefill_tokens = self.max_prefill_tokens;
         let think_end_token = self.think_end_token;
         let think_start_token = self.think_start_token;
         retire_finished_sequences(&sched.io, active, sched.limits.max_seq_len);
@@ -101,6 +102,7 @@ impl SchedulerCore {
             preempted,
             max_batch_size,
             block_size,
+            max_prefill_tokens,
         );
         sched.io.tel.mark(mtp_timing::Phase::LoopSwap, t_loop);
     }

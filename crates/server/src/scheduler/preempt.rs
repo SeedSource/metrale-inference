@@ -252,10 +252,16 @@ pub(super) fn preempt_after_spec_refusal(
 /// discarded and `a.last_token` stays the next decode input, so no token
 /// is sampled or sent twice. On error the client has already been sent an
 /// error frame.
+/// 2026-10-14 (race-memory, kvagcheck8): the re-prefill runs as planned `prefill_chunk` calls,
+/// each announced with its own `0xFFFFFFF0` broadcast, as `prefill_a_step` and
+/// `run_standard` do. The worker's `0xFFFFFFF0` handler calls `prefill_chunk`, whose prefix
+/// lookup joins an `ep_min_u32` agreement; a rank-0 `prefill` never joins it, and both ranks
+/// of the 2-node car hung on the first resume.
 pub(super) fn resume_preempted_seq(
     model: &dyn Model,
     io: &SchedIo,
     p: PreemptedSeq,
+    max_prefill_tokens: usize,
 ) -> Result<ActiveSeq> {
     let PreemptedSeq { mut a, tokens } = p;
     let mut seq = match model.alloc_sequence() {
@@ -280,15 +286,26 @@ pub(super) fn resume_preempted_seq(
     // 2026-09-25: The same EP prefill preamble as `prefill_b_step`, so an
     // EP worker runs the re-prefill too.
     let prefill_result = (|| -> Result<()> {
-        model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-        model.ep_broadcast_cmd(tokens.len() as u32)?;
-        model.ep_broadcast_cmd(0)?;
-        model.ep_broadcast_cmd(tokens.len() as u32)?;
-        model.ep_broadcast_tokens(&tokens)?;
-        // 2026-09-25: The worker makes the matching call in its
-        // `0xFFFFFFF0` handler, so it must run here too.
-        model.ep_sync_vision_embeds(&tokens)?;
-        model.prefill(&tokens, &mut seq, 0)?;
+        let total = tokens.len();
+        let mut offset = 0;
+        while offset < total {
+            let chunk_len = resume_chunk_len(model, &tokens, offset, max_prefill_tokens);
+            let is_last = offset + chunk_len >= total;
+            model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
+            model.ep_broadcast_cmd(chunk_len as u32)?;
+            model.ep_broadcast_cmd(offset as u32)?;
+            model.ep_broadcast_cmd(total as u32)?;
+            model.ep_broadcast_tokens(&tokens)?;
+            // 2026-09-25: The worker makes the matching call in its
+            // `0xFFFFFFF0` handler, so it must run here too.
+            model.ep_sync_vision_embeds(&tokens)?;
+            model.prefill_chunk(&tokens, &mut seq, offset, chunk_len, is_last, 0)?;
+            // 2026-10-14: The worker normalizes after every chunk; so does `run_standard`.
+            if let Err(e) = model.normalize_ssm_states(&seq, 0) {
+                tracing::warn!("preempt-resume SSM state normalization failed: {e:#}");
+            }
+            offset += chunk_len;
+        }
         Ok(())
     })();
     if let Err(e) = prefill_result {
@@ -311,6 +328,37 @@ pub(super) fn resume_preempted_seq(
     Ok(a)
 }
 
+/// 2026-10-14 (race-memory, kvagcheck8): The next re-prefill chunk at `offset`, planned as
+/// `prefill_a_step` plans chunk 0 and `run_standard` the later ones: at most
+/// `max_prefill_tokens` (0 = unchunked), and a non-last chunk ends on the block grid or the
+/// tail split point. MLA prompts are not split further.
+fn resume_chunk_len(
+    model: &dyn Model,
+    tokens: &[u32],
+    offset: usize,
+    max_prefill_tokens: usize,
+) -> usize {
+    let total = tokens.len();
+    let remaining = total - offset;
+    let cap = if max_prefill_tokens == 0 {
+        remaining
+    } else {
+        remaining.min(max_prefill_tokens)
+    };
+    if model.is_mla() {
+        return cap;
+    }
+    metrale_model_engine::prefill_plan::plan_chunk_len_grid(
+        offset,
+        total,
+        cap,
+        model.kv_block_size(),
+        model.prefill_tail_split(tokens),
+        model.prefill_grid(tokens),
+    )
+    .max(1)
+}
+
 /// 2026-09-25: Resume requeued victims, fewest blocks first, while batch
 /// slots and KV blocks allow. A victim needs its history's blocks plus one
 /// block of growth, and prefix-cache blocks are reclaimed to make room. A
@@ -322,6 +370,7 @@ pub(super) fn resume_preempted_seqs(
     preempted: &mut Vec<PreemptedSeq>,
     max_batch_size: usize,
     block_size: usize,
+    max_prefill_tokens: usize,
 ) {
     while !preempted.is_empty() && active.len() < max_batch_size {
         let Some((idx, needed)) = preempted
@@ -362,7 +411,7 @@ pub(super) fn resume_preempted_seqs(
         }
         let p = preempted.remove(idx);
         let n_tokens = p.tokens.len();
-        match resume_preempted_seq(model, io, p) {
+        match resume_preempted_seq(model, io, p, max_prefill_tokens) {
             Ok(a) => {
                 tracing::info!(
                     "Preempt-resume: re-prefilled {n_tokens} tokens \

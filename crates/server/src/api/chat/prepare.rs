@@ -32,11 +32,7 @@ pub(crate) fn prepare_chat_prompt(
     state: &Arc<AppState>,
     req: &mut ChatRequest,
 ) -> Result<PreparedChat, Response> {
-    // 2026-09-26: Tools are active when a parser is configured, the request
-    // declares tools, and `tool_choice` is not `none`.
-    let tools_active = state.tool_call_parser.is_some()
-        && !req.tools.is_empty()
-        && !req.tool_choice.as_ref().is_some_and(|tc| tc.is_none());
+    let tools_active = tools_active(req, state.tool_call_parser.is_some());
 
     if tools_active && let Some(ref parser) = state.tool_call_parser {
         let default_choice = crate::tool_parser::ToolChoice::Mode("auto".to_string());
@@ -123,7 +119,12 @@ pub(crate) fn prepare_chat_prompt(
         // `--default-chat-template-kwargs`). `None` leaves the template
         // variable undefined.
         req.preserve_thinking.or(state.behavior.preserve_thinking),
-        tools_active,
+        template_renders_tools(
+            tools_active,
+            req,
+            state.tool_call_parser.is_some(),
+            &state.behavior,
+        ),
         // 2026-10-12: Only the request's own `Off` closes a template-opened think
         // block; `--disable-thinking`, the server default directive and the model
         // default keep the prompt unchanged.
@@ -162,6 +163,34 @@ fn effective_reasoning_effort(
     } else {
         None
     }
+}
+
+/// 2026-09-26: Tools are active when a parser is configured, the request
+/// declares tools, and `tool_choice` is not `none`.
+pub(super) fn tools_active(req: &ChatRequest, parser_configured: bool) -> bool {
+    parser_configured
+        && !req.tools.is_empty()
+        && !req.tool_choice.as_ref().is_some_and(|tc| tc.is_none())
+}
+
+/// 2026-10-15: Whether the chat template gets the request's tools: when they are active,
+/// and under MODEL.toml `[behavior].render_tools_on_tool_choice_none` (GLM-5.3) also for
+/// declared tools with `tool_choice` `none`, as the official template and vLLM render
+/// them. Only the prompt changes: tools stay inactive for parsing, the grammar and the
+/// `<tool_call>` bias. Such a turn has no tool grammar and `tools_present` false, so a
+/// `</tool_call>` the model still writes outside thinking ends the turn
+/// (`decode_logits_step/per_token.rs`) and the call is not parsed into `tool_calls`.
+pub(super) fn template_renders_tools(
+    tools_active: bool,
+    req: &ChatRequest,
+    parser_configured: bool,
+    behavior: &metrale_kernels::ModelBehavior,
+) -> bool {
+    tools_active
+        || (behavior.render_tools_on_tool_choice_none
+            && parser_configured
+            && !req.tools.is_empty()
+            && req.tool_choice.as_ref().is_some_and(|tc| tc.is_none()))
 }
 
 /// 2026-09-26: The tool prompt the parser contributes. With a native Qwen tool

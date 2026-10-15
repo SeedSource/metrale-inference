@@ -241,8 +241,13 @@ pub(crate) fn load_model(
         min_p: default_min_p,
     } = serve_phases::load_sampling_defaults(&model_dir, &args, &sampling_presets.non_thinking);
 
-    let (tokenizer, supports_thinking) =
-        model_setup::load_tokenizer(&args, &config, &model_dir, &eos_tokens)?;
+    let (tokenizer, supports_thinking) = model_setup::load_tokenizer(
+        &args,
+        &config,
+        &model_dir,
+        &eos_tokens,
+        ptx_set.behavior.hf_tool_json,
+    )?;
 
     let serve_phases::TokenizerRuntime {
         vocab_masks,

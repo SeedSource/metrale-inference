@@ -1,0 +1,2625 @@
+{
+ "source": "spark-bench runs/race/gate-proof/c30gate-n1n2-20261015T160338Z/tebgap: TEB (tool_eval_bench) turn-1 requests and their official renders (HF apply_chat_template, nvidia/GLM-5.3-Flash-NVFP4 chat_template.jinja sha256 34d5ee66, add_generation_prompt, no kwargs)",
+ "rows": [
+  {
+   "id": "TC-10",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request."
+     },
+     {
+      "role": "user",
+      "content": "What year did World War II end?"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "web_search",
+       "description": "Search the web for current information",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "max_results": {
+          "type": "integer",
+          "default": 5
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get current weather for a specific location",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "location": {
+          "type": "string"
+         },
+         "units": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "default": "celsius"
+         }
+        },
+        "required": [
+         "location"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "calculator",
+       "description": "Perform mathematical calculations",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "expression": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "expression"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "send_email",
+       "description": "Send an email to a recipient",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "to": {
+          "type": "string"
+         },
+         "subject": {
+          "type": "string"
+         },
+         "body": {
+          "type": "string"
+         },
+         "cc": {
+          "type": "string",
+          "description": "CC recipient email address"
+         },
+         "bcc": {
+          "type": "string",
+          "description": "BCC recipient email address"
+         },
+         "attachments": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "default": []
+         }
+        },
+        "required": [
+         "to",
+         "subject",
+         "body"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_files",
+       "description": "Search for files by name or content",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "file_type": {
+          "type": "string",
+          "enum": [
+           "pdf",
+           "docx",
+           "xlsx",
+           "any"
+          ],
+          "default": "any"
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "description": "Read the contents of a specific file",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "file_id": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "file_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_calendar_event",
+       "description": "Create a new calendar event",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "date": {
+          "type": "string",
+          "description": "Format: YYYY-MM-DD"
+         },
+         "time": {
+          "type": "string",
+          "description": "Format: HH:MM"
+         },
+         "timezone": {
+          "type": "string",
+          "description": "IANA timezone (e.g. Europe/Berlin, America/New_York). Defaults to UTC.",
+          "default": "UTC"
+         },
+         "duration_minutes": {
+          "type": "integer",
+          "default": 60
+         },
+         "attendees": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "default": []
+         }
+        },
+        "required": [
+         "title",
+         "date",
+         "time"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_contacts",
+       "description": "Look up contacts by name or group",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "translate_text",
+       "description": "Translate text from one language to another",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "text": {
+          "type": "string"
+         },
+         "source_language": {
+          "type": "string",
+          "enum": [
+           "english",
+           "en",
+           "en-us",
+           "en-gb",
+           "en-ca",
+           "en-au",
+           "spanish",
+           "es",
+           "es-es",
+           "es-419",
+           "espanol",
+           "español",
+           "castilian",
+           "spa",
+           "japanese",
+           "ja",
+           "ja-jp",
+           "日本語",
+           "jpn",
+           "german",
+           "de",
+           "deutsch"
+          ]
+         },
+         "target_language": {
+          "type": "string",
+          "enum": [
+           "english",
+           "en",
+           "spanish",
+           "es",
+           "es-es",
+           "es-419",
+           "espanol",
+           "español",
+           "castilian",
+           "spa",
+           "japanese",
+           "ja",
+           "ja-jp",
+           "日本語",
+           "jpn",
+           "german",
+           "de",
+           "deutsch"
+          ]
+         }
+        },
+        "required": [
+         "text",
+         "source_language",
+         "target_language"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_stock_price",
+       "description": "Get the current stock price for a ticker symbol",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "ticker": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "ticker"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "set_reminder",
+       "description": "Set a reminder for a future time",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "message": {
+          "type": "string"
+         },
+         "datetime": {
+          "type": "string",
+          "description": "Format: ISO 8601"
+         }
+        },
+        "required": [
+         "message",
+         "datetime"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "run_code",
+       "description": "Execute a code snippet and return the output",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "language": {
+          "type": "string",
+          "enum": [
+           "python",
+           "javascript"
+          ]
+         },
+         "code": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "language",
+         "code"
+        ],
+        "additionalProperties": false
+       }
+      }
+     }
+    ],
+    "tool_choice": "auto"
+   },
+   "official_text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"web_search\", \"description\": \"Search the web for current information\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"max_results\": {\"type\": \"integer\", \"default\": 5}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"get_weather\", \"description\": \"Get current weather for a specific location\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"units\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"default\": \"celsius\"}}, \"required\": [\"location\"], \"additionalProperties\": false}}\n{\"name\": \"calculator\", \"description\": \"Perform mathematical calculations\", \"parameters\": {\"type\": \"object\", \"properties\": {\"expression\": {\"type\": \"string\"}}, \"required\": [\"expression\"], \"additionalProperties\": false}}\n{\"name\": \"send_email\", \"description\": \"Send an email to a recipient\", \"parameters\": {\"type\": \"object\", \"properties\": {\"to\": {\"type\": \"string\"}, \"subject\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"cc\": {\"type\": \"string\", \"description\": \"CC recipient email address\"}, \"bcc\": {\"type\": \"string\", \"description\": \"BCC recipient email address\"}, \"attachments\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"default\": []}}, \"required\": [\"to\", \"subject\", \"body\"], \"additionalProperties\": false}}\n{\"name\": \"search_files\", \"description\": \"Search for files by name or content\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"file_type\": {\"type\": \"string\", \"enum\": [\"pdf\", \"docx\", \"xlsx\", \"any\"], \"default\": \"any\"}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"read_file\", \"description\": \"Read the contents of a specific file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"file_id\": {\"type\": \"string\"}}, \"required\": [\"file_id\"], \"additionalProperties\": false}}\n{\"name\": \"create_calendar_event\", \"description\": \"Create a new calendar event\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"date\": {\"type\": \"string\", \"description\": \"Format: YYYY-MM-DD\"}, \"time\": {\"type\": \"string\", \"description\": \"Format: HH:MM\"}, \"timezone\": {\"type\": \"string\", \"description\": \"IANA timezone (e.g. Europe/Berlin, America/New_York). Defaults to UTC.\", \"default\": \"UTC\"}, \"duration_minutes\": {\"type\": \"integer\", \"default\": 60}, \"attendees\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"default\": []}}, \"required\": [\"title\", \"date\", \"time\"], \"additionalProperties\": false}}\n{\"name\": \"get_contacts\", \"description\": \"Look up contacts by name or group\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"translate_text\", \"description\": \"Translate text from one language to another\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\"}, \"source_language\": {\"type\": \"string\", \"enum\": [\"english\", \"en\", \"en-us\", \"en-gb\", \"en-ca\", \"en-au\", \"spanish\", \"es\", \"es-es\", \"es-419\", \"espanol\", \"español\", \"castilian\", \"spa\", \"japanese\", \"ja\", \"ja-jp\", \"日本語\", \"jpn\", \"german\", \"de\", \"deutsch\"]}, \"target_language\": {\"type\": \"string\", \"enum\": [\"english\", \"en\", \"spanish\", \"es\", \"es-es\", \"es-419\", \"espanol\", \"español\", \"castilian\", \"spa\", \"japanese\", \"ja\", \"ja-jp\", \"日本語\", \"jpn\", \"german\", \"de\", \"deutsch\"]}}, \"required\": [\"text\", \"source_language\", \"target_language\"], \"additionalProperties\": false}}\n{\"name\": \"get_stock_price\", \"description\": \"Get the current stock price for a ticker symbol\", \"parameters\": {\"type\": \"object\", \"properties\": {\"ticker\": {\"type\": \"string\"}}, \"required\": [\"ticker\"], \"additionalProperties\": false}}\n{\"name\": \"set_reminder\", \"description\": \"Set a reminder for a future time\", \"parameters\": {\"type\": \"object\", \"properties\": {\"message\": {\"type\": \"string\"}, \"datetime\": {\"type\": \"string\", \"description\": \"Format: ISO 8601\"}}, \"required\": [\"message\", \"datetime\"], \"additionalProperties\": false}}\n{\"name\": \"run_code\", \"description\": \"Execute a code snippet and return the output\", \"parameters\": {\"type\": \"object\", \"properties\": {\"language\": {\"type\": \"string\", \"enum\": [\"python\", \"javascript\"]}, \"code\": {\"type\": \"string\"}}, \"required\": [\"language\", \"code\"], \"additionalProperties\": false}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request.<|user|>What year did World War II end?<|assistant|><think>"
+  },
+  {
+   "id": "TC-38",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request."
+     },
+     {
+      "role": "user",
+      "content": "Find the Q3 budget report and email the total to my manager."
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "web_search",
+       "description": "Search the web for current information",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "max_results": {
+          "type": "integer",
+          "default": 5
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get current weather for a specific location",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "location": {
+          "type": "string"
+         },
+         "units": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "default": "celsius"
+         }
+        },
+        "required": [
+         "location"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "calculator",
+       "description": "Perform mathematical calculations",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "expression": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "expression"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "send_email",
+       "description": "Send an email to a recipient",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "to": {
+          "type": "string"
+         },
+         "subject": {
+          "type": "string"
+         },
+         "body": {
+          "type": "string"
+         },
+         "cc": {
+          "type": "string",
+          "description": "CC recipient email address"
+         },
+         "bcc": {
+          "type": "string",
+          "description": "BCC recipient email address"
+         },
+         "attachments": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "default": []
+         }
+        },
+        "required": [
+         "to",
+         "subject",
+         "body"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_files",
+       "description": "Search for files by name or content",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "file_type": {
+          "type": "string",
+          "enum": [
+           "pdf",
+           "docx",
+           "xlsx",
+           "any"
+          ],
+          "default": "any"
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "description": "Read the contents of a specific file",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "file_id": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "file_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_calendar_event",
+       "description": "Create a new calendar event",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "date": {
+          "type": "string",
+          "description": "Format: YYYY-MM-DD"
+         },
+         "time": {
+          "type": "string",
+          "description": "Format: HH:MM"
+         },
+         "timezone": {
+          "type": "string",
+          "description": "IANA timezone (e.g. Europe/Berlin, America/New_York). Defaults to UTC.",
+          "default": "UTC"
+         },
+         "duration_minutes": {
+          "type": "integer",
+          "default": 60
+         },
+         "attendees": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "default": []
+         }
+        },
+        "required": [
+         "title",
+         "date",
+         "time"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_contacts",
+       "description": "Look up contacts by name or group",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "translate_text",
+       "description": "Translate text from one language to another",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "text": {
+          "type": "string"
+         },
+         "source_language": {
+          "type": "string",
+          "enum": [
+           "english",
+           "en",
+           "en-us",
+           "en-gb",
+           "en-ca",
+           "en-au",
+           "spanish",
+           "es",
+           "es-es",
+           "es-419",
+           "espanol",
+           "español",
+           "castilian",
+           "spa",
+           "japanese",
+           "ja",
+           "ja-jp",
+           "日本語",
+           "jpn",
+           "german",
+           "de",
+           "deutsch"
+          ]
+         },
+         "target_language": {
+          "type": "string",
+          "enum": [
+           "english",
+           "en",
+           "spanish",
+           "es",
+           "es-es",
+           "es-419",
+           "espanol",
+           "español",
+           "castilian",
+           "spa",
+           "japanese",
+           "ja",
+           "ja-jp",
+           "日本語",
+           "jpn",
+           "german",
+           "de",
+           "deutsch"
+          ]
+         }
+        },
+        "required": [
+         "text",
+         "source_language",
+         "target_language"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_stock_price",
+       "description": "Get the current stock price for a ticker symbol",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "ticker": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "ticker"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "set_reminder",
+       "description": "Set a reminder for a future time",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "message": {
+          "type": "string"
+         },
+         "datetime": {
+          "type": "string",
+          "description": "Format: ISO 8601"
+         }
+        },
+        "required": [
+         "message",
+         "datetime"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "run_code",
+       "description": "Execute a code snippet and return the output",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "language": {
+          "type": "string",
+          "enum": [
+           "python",
+           "javascript"
+          ]
+         },
+         "code": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "language",
+         "code"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_customer_profile",
+       "description": "Retrieve a customer's profile by name or customer ID",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "customer_id": {
+          "type": "string",
+          "description": "Customer ID or full name"
+         },
+         "include_history": {
+          "type": "boolean",
+          "default": false
+         }
+        },
+        "required": [
+         "customer_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "update_customer",
+       "description": "Update a customer's profile fields",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "customer_id": {
+          "type": "string"
+         },
+         "fields": {
+          "type": "object",
+          "description": "Key-value pairs to update"
+         }
+        },
+        "required": [
+         "customer_id",
+         "fields"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_ticket",
+       "description": "Create a support ticket for a customer issue",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "customer_id": {
+          "type": "string"
+         },
+         "subject": {
+          "type": "string"
+         },
+         "description": {
+          "type": "string"
+         },
+         "priority": {
+          "type": "string",
+          "enum": [
+           "low",
+           "medium",
+           "high",
+           "critical"
+          ]
+         }
+        },
+        "required": [
+         "customer_id",
+         "subject",
+         "description"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "resolve_ticket",
+       "description": "Resolve an existing support ticket",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "ticket_id": {
+          "type": "string"
+         },
+         "resolution_notes": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "ticket_id",
+         "resolution_notes"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_order_status",
+       "description": "Get the current status of a customer order",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "order_id": {
+          "type": "string",
+          "description": "Order ID or customer name"
+         },
+         "include_tracking": {
+          "type": "boolean",
+          "default": true
+         }
+        },
+        "required": [
+         "order_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_shipping_status",
+       "description": "Get shipping and tracking details for a shipment",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "tracking_number": {
+          "type": "string"
+         },
+         "carrier": {
+          "type": "string",
+          "enum": [
+           "fedex",
+           "ups",
+           "usps",
+           "dhl"
+          ]
+         }
+        },
+        "required": [
+         "tracking_number"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_return",
+       "description": "Initiate a return/refund for an order",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "order_id": {
+          "type": "string"
+         },
+         "reason": {
+          "type": "string"
+         },
+         "refund_method": {
+          "type": "string",
+          "enum": [
+           "original",
+           "store_credit"
+          ]
+         }
+        },
+        "required": [
+         "order_id",
+         "reason"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "list_tickets",
+       "description": "List open support tickets, optionally filtered by customer or priority",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "customer_id": {
+          "type": "string",
+          "description": "Filter by customer ID"
+         },
+         "priority": {
+          "type": "string",
+          "enum": [
+           "low",
+           "medium",
+           "high",
+           "critical"
+          ]
+         },
+         "status": {
+          "type": "string",
+          "enum": [
+           "open",
+           "in_progress",
+           "resolved"
+          ]
+         }
+        },
+        "required": [],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_invoice",
+       "description": "Retrieve an invoice by invoice ID",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "invoice_id": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "invoice_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_invoice",
+       "description": "Create a new invoice for a customer",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "customer_id": {
+          "type": "string"
+         },
+         "items": {
+          "type": "array",
+          "items": {
+           "type": "object"
+          }
+         },
+         "due_date": {
+          "type": "string",
+          "description": "Format: YYYY-MM-DD"
+         }
+        },
+        "required": [
+         "customer_id",
+         "items"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "process_payment",
+       "description": "Process a payment against an invoice",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "invoice_id": {
+          "type": "string"
+         },
+         "amount": {
+          "type": "number"
+         },
+         "method": {
+          "type": "string",
+          "enum": [
+           "credit_card",
+           "bank_transfer",
+           "crypto"
+          ]
+         }
+        },
+        "required": [
+         "invoice_id",
+         "amount"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_account_balance",
+       "description": "Get the current account balance for a customer or account",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "account_id": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "account_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "transfer_funds",
+       "description": "Transfer funds between accounts",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "from_account": {
+          "type": "string"
+         },
+         "to_account": {
+          "type": "string"
+         },
+         "amount": {
+          "type": "number"
+         },
+         "currency": {
+          "type": "string",
+          "default": "USD"
+         }
+        },
+        "required": [
+         "from_account",
+         "to_account",
+         "amount"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "generate_financial_report",
+       "description": "Generate a financial report for a given period",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "report_type": {
+          "type": "string",
+          "enum": [
+           "income",
+           "balance_sheet",
+           "cash_flow"
+          ]
+         },
+         "start_date": {
+          "type": "string"
+         },
+         "end_date": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "report_type",
+         "start_date",
+         "end_date"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "deploy_service",
+       "description": "Deploy a service to production or staging environment",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "service_name": {
+          "type": "string"
+         },
+         "version": {
+          "type": "string"
+         },
+         "environment": {
+          "type": "string",
+          "enum": [
+           "staging",
+           "production"
+          ]
+         }
+        },
+        "required": [
+         "service_name",
+         "version",
+         "environment"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "rollback_deploy",
+       "description": "Rollback a deployment to the previous version",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "service_name": {
+          "type": "string"
+         },
+         "environment": {
+          "type": "string",
+          "enum": [
+           "staging",
+           "production"
+          ]
+         }
+        },
+        "required": [
+         "service_name",
+         "environment"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_service_health",
+       "description": "Check the health and status of a running service",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "service_name": {
+          "type": "string"
+         },
+         "environment": {
+          "type": "string",
+          "enum": [
+           "staging",
+           "production"
+          ]
+         }
+        },
+        "required": [
+         "service_name"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "list_containers",
+       "description": "List running containers for a service",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "service_name": {
+          "type": "string"
+         },
+         "status_filter": {
+          "type": "string",
+          "enum": [
+           "running",
+           "stopped",
+           "all"
+          ]
+         }
+        },
+        "required": [
+         "service_name"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "scale_service",
+       "description": "Scale a service up or down by adjusting replica count",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "service_name": {
+          "type": "string"
+         },
+         "replicas": {
+          "type": "integer"
+         },
+         "environment": {
+          "type": "string",
+          "enum": [
+           "staging",
+           "production"
+          ]
+         }
+        },
+        "required": [
+         "service_name",
+         "replicas"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_logs",
+       "description": "Retrieve logs for a service or container",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "service_name": {
+          "type": "string"
+         },
+         "lines": {
+          "type": "integer",
+          "default": 100
+         },
+         "level": {
+          "type": "string",
+          "enum": [
+           "debug",
+           "info",
+           "warn",
+           "error"
+          ]
+         }
+        },
+        "required": [
+         "service_name"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "restart_service",
+       "description": "Restart a running service",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "service_name": {
+          "type": "string"
+         },
+         "environment": {
+          "type": "string",
+          "enum": [
+           "staging",
+           "production"
+          ]
+         },
+         "graceful": {
+          "type": "boolean",
+          "default": true
+         }
+        },
+        "required": [
+         "service_name"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_employee",
+       "description": "Look up employee details by name or employee ID",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "employee_id": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "employee_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "submit_timesheet",
+       "description": "Submit a weekly timesheet for an employee",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "employee_id": {
+          "type": "string"
+         },
+         "week_start": {
+          "type": "string",
+          "description": "Format: YYYY-MM-DD"
+         },
+         "hours": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "employee_id",
+         "week_start",
+         "hours"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "request_leave",
+       "description": "Submit a leave/vacation request",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "employee_id": {
+          "type": "string"
+         },
+         "start_date": {
+          "type": "string"
+         },
+         "end_date": {
+          "type": "string"
+         },
+         "type": {
+          "type": "string",
+          "enum": [
+           "vacation",
+           "sick",
+           "personal"
+          ]
+         }
+        },
+        "required": [
+         "employee_id",
+         "start_date",
+         "end_date"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_payslip",
+       "description": "Get a payslip for an employee for a specific month",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "employee_id": {
+          "type": "string"
+         },
+         "month": {
+          "type": "string",
+          "description": "Format: YYYY-MM"
+         }
+        },
+        "required": [
+         "employee_id",
+         "month"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_org_chart",
+       "description": "Retrieve the organizational chart for a department",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "department": {
+          "type": "string"
+         },
+         "include_contractors": {
+          "type": "boolean",
+          "default": false
+         }
+        },
+        "required": [
+         "department"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "query_database",
+       "description": "Execute a read-only SQL query against the analytics database",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "database": {
+          "type": "string",
+          "enum": [
+           "analytics",
+           "reporting",
+           "warehouse"
+          ]
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "export_csv",
+       "description": "Export query results to a CSV file",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "filename": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query",
+         "filename"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_dashboard",
+       "description": "Create a new analytics dashboard",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "widgets": {
+          "type": "array",
+          "items": {
+           "type": "object"
+          }
+         }
+        },
+        "required": [
+         "title"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "run_analytics",
+       "description": "Run a predefined analytics pipeline",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "pipeline_name": {
+          "type": "string"
+         },
+         "parameters": {
+          "type": "object"
+         }
+        },
+        "required": [
+         "pipeline_name"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_metrics",
+       "description": "Get system or business metrics for a time range",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "metric_name": {
+          "type": "string"
+         },
+         "start_time": {
+          "type": "string"
+         },
+         "end_time": {
+          "type": "string"
+         },
+         "granularity": {
+          "type": "string",
+          "enum": [
+           "minute",
+           "hour",
+           "day",
+           "week"
+          ]
+         }
+        },
+        "required": [
+         "metric_name"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "send_slack_message",
+       "description": "Send a message to a Slack channel or user",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "channel": {
+          "type": "string"
+         },
+         "message": {
+          "type": "string"
+         },
+         "thread_ts": {
+          "type": "string",
+          "description": "Thread timestamp for replies"
+         }
+        },
+        "required": [
+         "channel",
+         "message"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_channel",
+       "description": "Create a new Slack channel",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "name": {
+          "type": "string"
+         },
+         "purpose": {
+          "type": "string"
+         },
+         "is_private": {
+          "type": "boolean",
+          "default": false
+         }
+        },
+        "required": [
+         "name"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "schedule_meeting",
+       "description": "Schedule a meeting with participants via calendar integration",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "participants": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "datetime": {
+          "type": "string"
+         },
+         "duration_minutes": {
+          "type": "integer",
+          "default": 30
+         }
+        },
+        "required": [
+         "title",
+         "participants",
+         "datetime"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_meeting_notes",
+       "description": "Retrieve notes from a past meeting",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "meeting_id": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "meeting_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "post_announcement",
+       "description": "Post a company-wide announcement",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "body": {
+          "type": "string"
+         },
+         "audience": {
+          "type": "string",
+          "enum": [
+           "all",
+           "engineering",
+           "management"
+          ]
+         }
+        },
+        "required": [
+         "title",
+         "body"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "publish_page",
+       "description": "Publish a wiki or documentation page",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "content": {
+          "type": "string"
+         },
+         "space": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "title",
+         "content"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "draft_blog_post",
+       "description": "Create a draft blog post",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "body": {
+          "type": "string"
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        },
+        "required": [
+         "title",
+         "body"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "upload_asset",
+       "description": "Upload a file or media asset to the asset library",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "file_path": {
+          "type": "string"
+         },
+         "category": {
+          "type": "string",
+          "enum": [
+           "images",
+           "documents",
+           "videos"
+          ]
+         }
+        },
+        "required": [
+         "file_path"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_content_calendar",
+       "description": "Retrieve the content publication calendar for a given week",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "week_start": {
+          "type": "string",
+          "description": "Format: YYYY-MM-DD"
+         }
+        },
+        "required": [
+         "week_start"
+        ],
+        "additionalProperties": false
+       }
+      }
+     }
+    ],
+    "tool_choice": "auto"
+   },
+   "official_text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"web_search\", \"description\": \"Search the web for current information\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"max_results\": {\"type\": \"integer\", \"default\": 5}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"get_weather\", \"description\": \"Get current weather for a specific location\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"units\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"default\": \"celsius\"}}, \"required\": [\"location\"], \"additionalProperties\": false}}\n{\"name\": \"calculator\", \"description\": \"Perform mathematical calculations\", \"parameters\": {\"type\": \"object\", \"properties\": {\"expression\": {\"type\": \"string\"}}, \"required\": [\"expression\"], \"additionalProperties\": false}}\n{\"name\": \"send_email\", \"description\": \"Send an email to a recipient\", \"parameters\": {\"type\": \"object\", \"properties\": {\"to\": {\"type\": \"string\"}, \"subject\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"cc\": {\"type\": \"string\", \"description\": \"CC recipient email address\"}, \"bcc\": {\"type\": \"string\", \"description\": \"BCC recipient email address\"}, \"attachments\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"default\": []}}, \"required\": [\"to\", \"subject\", \"body\"], \"additionalProperties\": false}}\n{\"name\": \"search_files\", \"description\": \"Search for files by name or content\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"file_type\": {\"type\": \"string\", \"enum\": [\"pdf\", \"docx\", \"xlsx\", \"any\"], \"default\": \"any\"}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"read_file\", \"description\": \"Read the contents of a specific file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"file_id\": {\"type\": \"string\"}}, \"required\": [\"file_id\"], \"additionalProperties\": false}}\n{\"name\": \"create_calendar_event\", \"description\": \"Create a new calendar event\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"date\": {\"type\": \"string\", \"description\": \"Format: YYYY-MM-DD\"}, \"time\": {\"type\": \"string\", \"description\": \"Format: HH:MM\"}, \"timezone\": {\"type\": \"string\", \"description\": \"IANA timezone (e.g. Europe/Berlin, America/New_York). Defaults to UTC.\", \"default\": \"UTC\"}, \"duration_minutes\": {\"type\": \"integer\", \"default\": 60}, \"attendees\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"default\": []}}, \"required\": [\"title\", \"date\", \"time\"], \"additionalProperties\": false}}\n{\"name\": \"get_contacts\", \"description\": \"Look up contacts by name or group\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"translate_text\", \"description\": \"Translate text from one language to another\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\"}, \"source_language\": {\"type\": \"string\", \"enum\": [\"english\", \"en\", \"en-us\", \"en-gb\", \"en-ca\", \"en-au\", \"spanish\", \"es\", \"es-es\", \"es-419\", \"espanol\", \"español\", \"castilian\", \"spa\", \"japanese\", \"ja\", \"ja-jp\", \"日本語\", \"jpn\", \"german\", \"de\", \"deutsch\"]}, \"target_language\": {\"type\": \"string\", \"enum\": [\"english\", \"en\", \"spanish\", \"es\", \"es-es\", \"es-419\", \"espanol\", \"español\", \"castilian\", \"spa\", \"japanese\", \"ja\", \"ja-jp\", \"日本語\", \"jpn\", \"german\", \"de\", \"deutsch\"]}}, \"required\": [\"text\", \"source_language\", \"target_language\"], \"additionalProperties\": false}}\n{\"name\": \"get_stock_price\", \"description\": \"Get the current stock price for a ticker symbol\", \"parameters\": {\"type\": \"object\", \"properties\": {\"ticker\": {\"type\": \"string\"}}, \"required\": [\"ticker\"], \"additionalProperties\": false}}\n{\"name\": \"set_reminder\", \"description\": \"Set a reminder for a future time\", \"parameters\": {\"type\": \"object\", \"properties\": {\"message\": {\"type\": \"string\"}, \"datetime\": {\"type\": \"string\", \"description\": \"Format: ISO 8601\"}}, \"required\": [\"message\", \"datetime\"], \"additionalProperties\": false}}\n{\"name\": \"run_code\", \"description\": \"Execute a code snippet and return the output\", \"parameters\": {\"type\": \"object\", \"properties\": {\"language\": {\"type\": \"string\", \"enum\": [\"python\", \"javascript\"]}, \"code\": {\"type\": \"string\"}}, \"required\": [\"language\", \"code\"], \"additionalProperties\": false}}\n{\"name\": \"get_customer_profile\", \"description\": \"Retrieve a customer's profile by name or customer ID\", \"parameters\": {\"type\": \"object\", \"properties\": {\"customer_id\": {\"type\": \"string\", \"description\": \"Customer ID or full name\"}, \"include_history\": {\"type\": \"boolean\", \"default\": false}}, \"required\": [\"customer_id\"], \"additionalProperties\": false}}\n{\"name\": \"update_customer\", \"description\": \"Update a customer's profile fields\", \"parameters\": {\"type\": \"object\", \"properties\": {\"customer_id\": {\"type\": \"string\"}, \"fields\": {\"type\": \"object\", \"description\": \"Key-value pairs to update\"}}, \"required\": [\"customer_id\", \"fields\"], \"additionalProperties\": false}}\n{\"name\": \"create_ticket\", \"description\": \"Create a support ticket for a customer issue\", \"parameters\": {\"type\": \"object\", \"properties\": {\"customer_id\": {\"type\": \"string\"}, \"subject\": {\"type\": \"string\"}, \"description\": {\"type\": \"string\"}, \"priority\": {\"type\": \"string\", \"enum\": [\"low\", \"medium\", \"high\", \"critical\"]}}, \"required\": [\"customer_id\", \"subject\", \"description\"], \"additionalProperties\": false}}\n{\"name\": \"resolve_ticket\", \"description\": \"Resolve an existing support ticket\", \"parameters\": {\"type\": \"object\", \"properties\": {\"ticket_id\": {\"type\": \"string\"}, \"resolution_notes\": {\"type\": \"string\"}}, \"required\": [\"ticket_id\", \"resolution_notes\"], \"additionalProperties\": false}}\n{\"name\": \"get_order_status\", \"description\": \"Get the current status of a customer order\", \"parameters\": {\"type\": \"object\", \"properties\": {\"order_id\": {\"type\": \"string\", \"description\": \"Order ID or customer name\"}, \"include_tracking\": {\"type\": \"boolean\", \"default\": true}}, \"required\": [\"order_id\"], \"additionalProperties\": false}}\n{\"name\": \"get_shipping_status\", \"description\": \"Get shipping and tracking details for a shipment\", \"parameters\": {\"type\": \"object\", \"properties\": {\"tracking_number\": {\"type\": \"string\"}, \"carrier\": {\"type\": \"string\", \"enum\": [\"fedex\", \"ups\", \"usps\", \"dhl\"]}}, \"required\": [\"tracking_number\"], \"additionalProperties\": false}}\n{\"name\": \"create_return\", \"description\": \"Initiate a return/refund for an order\", \"parameters\": {\"type\": \"object\", \"properties\": {\"order_id\": {\"type\": \"string\"}, \"reason\": {\"type\": \"string\"}, \"refund_method\": {\"type\": \"string\", \"enum\": [\"original\", \"store_credit\"]}}, \"required\": [\"order_id\", \"reason\"], \"additionalProperties\": false}}\n{\"name\": \"list_tickets\", \"description\": \"List open support tickets, optionally filtered by customer or priority\", \"parameters\": {\"type\": \"object\", \"properties\": {\"customer_id\": {\"type\": \"string\", \"description\": \"Filter by customer ID\"}, \"priority\": {\"type\": \"string\", \"enum\": [\"low\", \"medium\", \"high\", \"critical\"]}, \"status\": {\"type\": \"string\", \"enum\": [\"open\", \"in_progress\", \"resolved\"]}}, \"required\": [], \"additionalProperties\": false}}\n{\"name\": \"get_invoice\", \"description\": \"Retrieve an invoice by invoice ID\", \"parameters\": {\"type\": \"object\", \"properties\": {\"invoice_id\": {\"type\": \"string\"}}, \"required\": [\"invoice_id\"], \"additionalProperties\": false}}\n{\"name\": \"create_invoice\", \"description\": \"Create a new invoice for a customer\", \"parameters\": {\"type\": \"object\", \"properties\": {\"customer_id\": {\"type\": \"string\"}, \"items\": {\"type\": \"array\", \"items\": {\"type\": \"object\"}}, \"due_date\": {\"type\": \"string\", \"description\": \"Format: YYYY-MM-DD\"}}, \"required\": [\"customer_id\", \"items\"], \"additionalProperties\": false}}\n{\"name\": \"process_payment\", \"description\": \"Process a payment against an invoice\", \"parameters\": {\"type\": \"object\", \"properties\": {\"invoice_id\": {\"type\": \"string\"}, \"amount\": {\"type\": \"number\"}, \"method\": {\"type\": \"string\", \"enum\": [\"credit_card\", \"bank_transfer\", \"crypto\"]}}, \"required\": [\"invoice_id\", \"amount\"], \"additionalProperties\": false}}\n{\"name\": \"get_account_balance\", \"description\": \"Get the current account balance for a customer or account\", \"parameters\": {\"type\": \"object\", \"properties\": {\"account_id\": {\"type\": \"string\"}}, \"required\": [\"account_id\"], \"additionalProperties\": false}}\n{\"name\": \"transfer_funds\", \"description\": \"Transfer funds between accounts\", \"parameters\": {\"type\": \"object\", \"properties\": {\"from_account\": {\"type\": \"string\"}, \"to_account\": {\"type\": \"string\"}, \"amount\": {\"type\": \"number\"}, \"currency\": {\"type\": \"string\", \"default\": \"USD\"}}, \"required\": [\"from_account\", \"to_account\", \"amount\"], \"additionalProperties\": false}}\n{\"name\": \"generate_financial_report\", \"description\": \"Generate a financial report for a given period\", \"parameters\": {\"type\": \"object\", \"properties\": {\"report_type\": {\"type\": \"string\", \"enum\": [\"income\", \"balance_sheet\", \"cash_flow\"]}, \"start_date\": {\"type\": \"string\"}, \"end_date\": {\"type\": \"string\"}}, \"required\": [\"report_type\", \"start_date\", \"end_date\"], \"additionalProperties\": false}}\n{\"name\": \"deploy_service\", \"description\": \"Deploy a service to production or staging environment\", \"parameters\": {\"type\": \"object\", \"properties\": {\"service_name\": {\"type\": \"string\"}, \"version\": {\"type\": \"string\"}, \"environment\": {\"type\": \"string\", \"enum\": [\"staging\", \"production\"]}}, \"required\": [\"service_name\", \"version\", \"environment\"], \"additionalProperties\": false}}\n{\"name\": \"rollback_deploy\", \"description\": \"Rollback a deployment to the previous version\", \"parameters\": {\"type\": \"object\", \"properties\": {\"service_name\": {\"type\": \"string\"}, \"environment\": {\"type\": \"string\", \"enum\": [\"staging\", \"production\"]}}, \"required\": [\"service_name\", \"environment\"], \"additionalProperties\": false}}\n{\"name\": \"get_service_health\", \"description\": \"Check the health and status of a running service\", \"parameters\": {\"type\": \"object\", \"properties\": {\"service_name\": {\"type\": \"string\"}, \"environment\": {\"type\": \"string\", \"enum\": [\"staging\", \"production\"]}}, \"required\": [\"service_name\"], \"additionalProperties\": false}}\n{\"name\": \"list_containers\", \"description\": \"List running containers for a service\", \"parameters\": {\"type\": \"object\", \"properties\": {\"service_name\": {\"type\": \"string\"}, \"status_filter\": {\"type\": \"string\", \"enum\": [\"running\", \"stopped\", \"all\"]}}, \"required\": [\"service_name\"], \"additionalProperties\": false}}\n{\"name\": \"scale_service\", \"description\": \"Scale a service up or down by adjusting replica count\", \"parameters\": {\"type\": \"object\", \"properties\": {\"service_name\": {\"type\": \"string\"}, \"replicas\": {\"type\": \"integer\"}, \"environment\": {\"type\": \"string\", \"enum\": [\"staging\", \"production\"]}}, \"required\": [\"service_name\", \"replicas\"], \"additionalProperties\": false}}\n{\"name\": \"get_logs\", \"description\": \"Retrieve logs for a service or container\", \"parameters\": {\"type\": \"object\", \"properties\": {\"service_name\": {\"type\": \"string\"}, \"lines\": {\"type\": \"integer\", \"default\": 100}, \"level\": {\"type\": \"string\", \"enum\": [\"debug\", \"info\", \"warn\", \"error\"]}}, \"required\": [\"service_name\"], \"additionalProperties\": false}}\n{\"name\": \"restart_service\", \"description\": \"Restart a running service\", \"parameters\": {\"type\": \"object\", \"properties\": {\"service_name\": {\"type\": \"string\"}, \"environment\": {\"type\": \"string\", \"enum\": [\"staging\", \"production\"]}, \"graceful\": {\"type\": \"boolean\", \"default\": true}}, \"required\": [\"service_name\"], \"additionalProperties\": false}}\n{\"name\": \"get_employee\", \"description\": \"Look up employee details by name or employee ID\", \"parameters\": {\"type\": \"object\", \"properties\": {\"employee_id\": {\"type\": \"string\"}}, \"required\": [\"employee_id\"], \"additionalProperties\": false}}\n{\"name\": \"submit_timesheet\", \"description\": \"Submit a weekly timesheet for an employee\", \"parameters\": {\"type\": \"object\", \"properties\": {\"employee_id\": {\"type\": \"string\"}, \"week_start\": {\"type\": \"string\", \"description\": \"Format: YYYY-MM-DD\"}, \"hours\": {\"type\": \"number\"}}, \"required\": [\"employee_id\", \"week_start\", \"hours\"], \"additionalProperties\": false}}\n{\"name\": \"request_leave\", \"description\": \"Submit a leave/vacation request\", \"parameters\": {\"type\": \"object\", \"properties\": {\"employee_id\": {\"type\": \"string\"}, \"start_date\": {\"type\": \"string\"}, \"end_date\": {\"type\": \"string\"}, \"type\": {\"type\": \"string\", \"enum\": [\"vacation\", \"sick\", \"personal\"]}}, \"required\": [\"employee_id\", \"start_date\", \"end_date\"], \"additionalProperties\": false}}\n{\"name\": \"get_payslip\", \"description\": \"Get a payslip for an employee for a specific month\", \"parameters\": {\"type\": \"object\", \"properties\": {\"employee_id\": {\"type\": \"string\"}, \"month\": {\"type\": \"string\", \"description\": \"Format: YYYY-MM\"}}, \"required\": [\"employee_id\", \"month\"], \"additionalProperties\": false}}\n{\"name\": \"get_org_chart\", \"description\": \"Retrieve the organizational chart for a department\", \"parameters\": {\"type\": \"object\", \"properties\": {\"department\": {\"type\": \"string\"}, \"include_contractors\": {\"type\": \"boolean\", \"default\": false}}, \"required\": [\"department\"], \"additionalProperties\": false}}\n{\"name\": \"query_database\", \"description\": \"Execute a read-only SQL query against the analytics database\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"database\": {\"type\": \"string\", \"enum\": [\"analytics\", \"reporting\", \"warehouse\"]}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"export_csv\", \"description\": \"Export query results to a CSV file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"filename\": {\"type\": \"string\"}}, \"required\": [\"query\", \"filename\"], \"additionalProperties\": false}}\n{\"name\": \"create_dashboard\", \"description\": \"Create a new analytics dashboard\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"widgets\": {\"type\": \"array\", \"items\": {\"type\": \"object\"}}}, \"required\": [\"title\"], \"additionalProperties\": false}}\n{\"name\": \"run_analytics\", \"description\": \"Run a predefined analytics pipeline\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pipeline_name\": {\"type\": \"string\"}, \"parameters\": {\"type\": \"object\"}}, \"required\": [\"pipeline_name\"], \"additionalProperties\": false}}\n{\"name\": \"get_metrics\", \"description\": \"Get system or business metrics for a time range\", \"parameters\": {\"type\": \"object\", \"properties\": {\"metric_name\": {\"type\": \"string\"}, \"start_time\": {\"type\": \"string\"}, \"end_time\": {\"type\": \"string\"}, \"granularity\": {\"type\": \"string\", \"enum\": [\"minute\", \"hour\", \"day\", \"week\"]}}, \"required\": [\"metric_name\"], \"additionalProperties\": false}}\n{\"name\": \"send_slack_message\", \"description\": \"Send a message to a Slack channel or user\", \"parameters\": {\"type\": \"object\", \"properties\": {\"channel\": {\"type\": \"string\"}, \"message\": {\"type\": \"string\"}, \"thread_ts\": {\"type\": \"string\", \"description\": \"Thread timestamp for replies\"}}, \"required\": [\"channel\", \"message\"], \"additionalProperties\": false}}\n{\"name\": \"create_channel\", \"description\": \"Create a new Slack channel\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, \"purpose\": {\"type\": \"string\"}, \"is_private\": {\"type\": \"boolean\", \"default\": false}}, \"required\": [\"name\"], \"additionalProperties\": false}}\n{\"name\": \"schedule_meeting\", \"description\": \"Schedule a meeting with participants via calendar integration\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"participants\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"datetime\": {\"type\": \"string\"}, \"duration_minutes\": {\"type\": \"integer\", \"default\": 30}}, \"required\": [\"title\", \"participants\", \"datetime\"], \"additionalProperties\": false}}\n{\"name\": \"get_meeting_notes\", \"description\": \"Retrieve notes from a past meeting\", \"parameters\": {\"type\": \"object\", \"properties\": {\"meeting_id\": {\"type\": \"string\"}}, \"required\": [\"meeting_id\"], \"additionalProperties\": false}}\n{\"name\": \"post_announcement\", \"description\": \"Post a company-wide announcement\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"audience\": {\"type\": \"string\", \"enum\": [\"all\", \"engineering\", \"management\"]}}, \"required\": [\"title\", \"body\"], \"additionalProperties\": false}}\n{\"name\": \"publish_page\", \"description\": \"Publish a wiki or documentation page\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}, \"space\": {\"type\": \"string\"}}, \"required\": [\"title\", \"content\"], \"additionalProperties\": false}}\n{\"name\": \"draft_blog_post\", \"description\": \"Create a draft blog post\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"title\", \"body\"], \"additionalProperties\": false}}\n{\"name\": \"upload_asset\", \"description\": \"Upload a file or media asset to the asset library\", \"parameters\": {\"type\": \"object\", \"properties\": {\"file_path\": {\"type\": \"string\"}, \"category\": {\"type\": \"string\", \"enum\": [\"images\", \"documents\", \"videos\"]}}, \"required\": [\"file_path\"], \"additionalProperties\": false}}\n{\"name\": \"get_content_calendar\", \"description\": \"Retrieve the content publication calendar for a given week\", \"parameters\": {\"type\": \"object\", \"properties\": {\"week_start\": {\"type\": \"string\", \"description\": \"Format: YYYY-MM-DD\"}}, \"required\": [\"week_start\"], \"additionalProperties\": false}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request.<|user|>Find the Q3 budget report and email the total to my manager.<|assistant|><think>"
+  },
+  {
+   "id": "TC-65",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request."
+     },
+     {
+      "role": "user",
+      "content": "Get the current weather in Tokyo and output it as JSON matching this schema. Include a recommendation for what to wear.\n\nSchema:\n```json\n{\n  \"type\": \"object\",\n  \"properties\": {\n    \"location\": {\n      \"type\": \"string\"\n    },\n    \"temperature_celsius\": {\n      \"type\": \"number\"\n    },\n    \"condition\": {\n      \"type\": \"string\"\n    },\n    \"recommendation\": {\n      \"type\": \"string\"\n    }\n  },\n  \"required\": [\n    \"location\",\n    \"temperature_celsius\",\n    \"condition\",\n    \"recommendation\"\n  ],\n  \"additionalProperties\": false\n}\n```"
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "web_search",
+       "description": "Search the web for current information",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "max_results": {
+          "type": "integer",
+          "default": 5
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get current weather for a specific location",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "location": {
+          "type": "string"
+         },
+         "units": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "default": "celsius"
+         }
+        },
+        "required": [
+         "location"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "calculator",
+       "description": "Perform mathematical calculations",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "expression": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "expression"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "send_email",
+       "description": "Send an email to a recipient",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "to": {
+          "type": "string"
+         },
+         "subject": {
+          "type": "string"
+         },
+         "body": {
+          "type": "string"
+         },
+         "cc": {
+          "type": "string",
+          "description": "CC recipient email address"
+         },
+         "bcc": {
+          "type": "string",
+          "description": "BCC recipient email address"
+         },
+         "attachments": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "default": []
+         }
+        },
+        "required": [
+         "to",
+         "subject",
+         "body"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_files",
+       "description": "Search for files by name or content",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "file_type": {
+          "type": "string",
+          "enum": [
+           "pdf",
+           "docx",
+           "xlsx",
+           "any"
+          ],
+          "default": "any"
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "description": "Read the contents of a specific file",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "file_id": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "file_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_calendar_event",
+       "description": "Create a new calendar event",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "date": {
+          "type": "string",
+          "description": "Format: YYYY-MM-DD"
+         },
+         "time": {
+          "type": "string",
+          "description": "Format: HH:MM"
+         },
+         "timezone": {
+          "type": "string",
+          "description": "IANA timezone (e.g. Europe/Berlin, America/New_York). Defaults to UTC.",
+          "default": "UTC"
+         },
+         "duration_minutes": {
+          "type": "integer",
+          "default": 60
+         },
+         "attendees": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "default": []
+         }
+        },
+        "required": [
+         "title",
+         "date",
+         "time"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_contacts",
+       "description": "Look up contacts by name or group",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "translate_text",
+       "description": "Translate text from one language to another",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "text": {
+          "type": "string"
+         },
+         "source_language": {
+          "type": "string",
+          "enum": [
+           "english",
+           "en",
+           "en-us",
+           "en-gb",
+           "en-ca",
+           "en-au",
+           "spanish",
+           "es",
+           "es-es",
+           "es-419",
+           "espanol",
+           "español",
+           "castilian",
+           "spa",
+           "japanese",
+           "ja",
+           "ja-jp",
+           "日本語",
+           "jpn",
+           "german",
+           "de",
+           "deutsch"
+          ]
+         },
+         "target_language": {
+          "type": "string",
+          "enum": [
+           "english",
+           "en",
+           "spanish",
+           "es",
+           "es-es",
+           "es-419",
+           "espanol",
+           "español",
+           "castilian",
+           "spa",
+           "japanese",
+           "ja",
+           "ja-jp",
+           "日本語",
+           "jpn",
+           "german",
+           "de",
+           "deutsch"
+          ]
+         }
+        },
+        "required": [
+         "text",
+         "source_language",
+         "target_language"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_stock_price",
+       "description": "Get the current stock price for a ticker symbol",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "ticker": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "ticker"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "set_reminder",
+       "description": "Set a reminder for a future time",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "message": {
+          "type": "string"
+         },
+         "datetime": {
+          "type": "string",
+          "description": "Format: ISO 8601"
+         }
+        },
+        "required": [
+         "message",
+         "datetime"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "run_code",
+       "description": "Execute a code snippet and return the output",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "language": {
+          "type": "string",
+          "enum": [
+           "python",
+           "javascript"
+          ]
+         },
+         "code": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "language",
+         "code"
+        ],
+        "additionalProperties": false
+       }
+      }
+     }
+    ],
+    "tool_choice": "auto"
+   },
+   "official_text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"web_search\", \"description\": \"Search the web for current information\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"max_results\": {\"type\": \"integer\", \"default\": 5}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"get_weather\", \"description\": \"Get current weather for a specific location\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"units\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"default\": \"celsius\"}}, \"required\": [\"location\"], \"additionalProperties\": false}}\n{\"name\": \"calculator\", \"description\": \"Perform mathematical calculations\", \"parameters\": {\"type\": \"object\", \"properties\": {\"expression\": {\"type\": \"string\"}}, \"required\": [\"expression\"], \"additionalProperties\": false}}\n{\"name\": \"send_email\", \"description\": \"Send an email to a recipient\", \"parameters\": {\"type\": \"object\", \"properties\": {\"to\": {\"type\": \"string\"}, \"subject\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"cc\": {\"type\": \"string\", \"description\": \"CC recipient email address\"}, \"bcc\": {\"type\": \"string\", \"description\": \"BCC recipient email address\"}, \"attachments\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"default\": []}}, \"required\": [\"to\", \"subject\", \"body\"], \"additionalProperties\": false}}\n{\"name\": \"search_files\", \"description\": \"Search for files by name or content\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"file_type\": {\"type\": \"string\", \"enum\": [\"pdf\", \"docx\", \"xlsx\", \"any\"], \"default\": \"any\"}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"read_file\", \"description\": \"Read the contents of a specific file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"file_id\": {\"type\": \"string\"}}, \"required\": [\"file_id\"], \"additionalProperties\": false}}\n{\"name\": \"create_calendar_event\", \"description\": \"Create a new calendar event\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"date\": {\"type\": \"string\", \"description\": \"Format: YYYY-MM-DD\"}, \"time\": {\"type\": \"string\", \"description\": \"Format: HH:MM\"}, \"timezone\": {\"type\": \"string\", \"description\": \"IANA timezone (e.g. Europe/Berlin, America/New_York). Defaults to UTC.\", \"default\": \"UTC\"}, \"duration_minutes\": {\"type\": \"integer\", \"default\": 60}, \"attendees\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"default\": []}}, \"required\": [\"title\", \"date\", \"time\"], \"additionalProperties\": false}}\n{\"name\": \"get_contacts\", \"description\": \"Look up contacts by name or group\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"translate_text\", \"description\": \"Translate text from one language to another\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\"}, \"source_language\": {\"type\": \"string\", \"enum\": [\"english\", \"en\", \"en-us\", \"en-gb\", \"en-ca\", \"en-au\", \"spanish\", \"es\", \"es-es\", \"es-419\", \"espanol\", \"español\", \"castilian\", \"spa\", \"japanese\", \"ja\", \"ja-jp\", \"日本語\", \"jpn\", \"german\", \"de\", \"deutsch\"]}, \"target_language\": {\"type\": \"string\", \"enum\": [\"english\", \"en\", \"spanish\", \"es\", \"es-es\", \"es-419\", \"espanol\", \"español\", \"castilian\", \"spa\", \"japanese\", \"ja\", \"ja-jp\", \"日本語\", \"jpn\", \"german\", \"de\", \"deutsch\"]}}, \"required\": [\"text\", \"source_language\", \"target_language\"], \"additionalProperties\": false}}\n{\"name\": \"get_stock_price\", \"description\": \"Get the current stock price for a ticker symbol\", \"parameters\": {\"type\": \"object\", \"properties\": {\"ticker\": {\"type\": \"string\"}}, \"required\": [\"ticker\"], \"additionalProperties\": false}}\n{\"name\": \"set_reminder\", \"description\": \"Set a reminder for a future time\", \"parameters\": {\"type\": \"object\", \"properties\": {\"message\": {\"type\": \"string\"}, \"datetime\": {\"type\": \"string\", \"description\": \"Format: ISO 8601\"}}, \"required\": [\"message\", \"datetime\"], \"additionalProperties\": false}}\n{\"name\": \"run_code\", \"description\": \"Execute a code snippet and return the output\", \"parameters\": {\"type\": \"object\", \"properties\": {\"language\": {\"type\": \"string\", \"enum\": [\"python\", \"javascript\"]}, \"code\": {\"type\": \"string\"}}, \"required\": [\"language\", \"code\"], \"additionalProperties\": false}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request.<|user|>Get the current weather in Tokyo and output it as JSON matching this schema. Include a recommendation for what to wear.\n\nSchema:\n```json\n{\n  \"type\": \"object\",\n  \"properties\": {\n    \"location\": {\n      \"type\": \"string\"\n    },\n    \"temperature_celsius\": {\n      \"type\": \"number\"\n    },\n    \"condition\": {\n      \"type\": \"string\"\n    },\n    \"recommendation\": {\n      \"type\": \"string\"\n    }\n  },\n  \"required\": [\n    \"location\",\n    \"temperature_celsius\",\n    \"condition\",\n    \"recommendation\"\n  ],\n  \"additionalProperties\": false\n}\n```<|assistant|><think>"
+  },
+  {
+   "id": "TC-44",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request."
+     },
+     {
+      "role": "user",
+      "content": "What is the value of pi? Answer from your knowledge."
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "web_search",
+       "description": "Search the web for current information",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "max_results": {
+          "type": "integer",
+          "default": 5
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get current weather for a specific location",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "location": {
+          "type": "string"
+         },
+         "units": {
+          "type": "string",
+          "enum": [
+           "celsius",
+           "fahrenheit"
+          ],
+          "default": "celsius"
+         }
+        },
+        "required": [
+         "location"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "calculator",
+       "description": "Perform mathematical calculations",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "expression": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "expression"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "send_email",
+       "description": "Send an email to a recipient",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "to": {
+          "type": "string"
+         },
+         "subject": {
+          "type": "string"
+         },
+         "body": {
+          "type": "string"
+         },
+         "cc": {
+          "type": "string",
+          "description": "CC recipient email address"
+         },
+         "bcc": {
+          "type": "string",
+          "description": "BCC recipient email address"
+         },
+         "attachments": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "default": []
+         }
+        },
+        "required": [
+         "to",
+         "subject",
+         "body"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search_files",
+       "description": "Search for files by name or content",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         },
+         "file_type": {
+          "type": "string",
+          "enum": [
+           "pdf",
+           "docx",
+           "xlsx",
+           "any"
+          ],
+          "default": "any"
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "description": "Read the contents of a specific file",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "file_id": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "file_id"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "create_calendar_event",
+       "description": "Create a new calendar event",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "title": {
+          "type": "string"
+         },
+         "date": {
+          "type": "string",
+          "description": "Format: YYYY-MM-DD"
+         },
+         "time": {
+          "type": "string",
+          "description": "Format: HH:MM"
+         },
+         "timezone": {
+          "type": "string",
+          "description": "IANA timezone (e.g. Europe/Berlin, America/New_York). Defaults to UTC.",
+          "default": "UTC"
+         },
+         "duration_minutes": {
+          "type": "integer",
+          "default": 60
+         },
+         "attendees": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          },
+          "default": []
+         }
+        },
+        "required": [
+         "title",
+         "date",
+         "time"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_contacts",
+       "description": "Look up contacts by name or group",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "translate_text",
+       "description": "Translate text from one language to another",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "text": {
+          "type": "string"
+         },
+         "source_language": {
+          "type": "string",
+          "enum": [
+           "english",
+           "en",
+           "en-us",
+           "en-gb",
+           "en-ca",
+           "en-au",
+           "spanish",
+           "es",
+           "es-es",
+           "es-419",
+           "espanol",
+           "español",
+           "castilian",
+           "spa",
+           "japanese",
+           "ja",
+           "ja-jp",
+           "日本語",
+           "jpn",
+           "german",
+           "de",
+           "deutsch"
+          ]
+         },
+         "target_language": {
+          "type": "string",
+          "enum": [
+           "english",
+           "en",
+           "spanish",
+           "es",
+           "es-es",
+           "es-419",
+           "espanol",
+           "español",
+           "castilian",
+           "spa",
+           "japanese",
+           "ja",
+           "ja-jp",
+           "日本語",
+           "jpn",
+           "german",
+           "de",
+           "deutsch"
+          ]
+         }
+        },
+        "required": [
+         "text",
+         "source_language",
+         "target_language"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_stock_price",
+       "description": "Get the current stock price for a ticker symbol",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "ticker": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "ticker"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "set_reminder",
+       "description": "Set a reminder for a future time",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "message": {
+          "type": "string"
+         },
+         "datetime": {
+          "type": "string",
+          "description": "Format: ISO 8601"
+         }
+        },
+        "required": [
+         "message",
+         "datetime"
+        ],
+        "additionalProperties": false
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "run_code",
+       "description": "Execute a code snippet and return the output",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "language": {
+          "type": "string",
+          "enum": [
+           "python",
+           "javascript"
+          ]
+         },
+         "code": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "language",
+         "code"
+        ],
+        "additionalProperties": false
+       }
+      }
+     }
+    ],
+    "tool_choice": "none"
+   },
+   "official_text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"web_search\", \"description\": \"Search the web for current information\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"max_results\": {\"type\": \"integer\", \"default\": 5}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"get_weather\", \"description\": \"Get current weather for a specific location\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"units\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"default\": \"celsius\"}}, \"required\": [\"location\"], \"additionalProperties\": false}}\n{\"name\": \"calculator\", \"description\": \"Perform mathematical calculations\", \"parameters\": {\"type\": \"object\", \"properties\": {\"expression\": {\"type\": \"string\"}}, \"required\": [\"expression\"], \"additionalProperties\": false}}\n{\"name\": \"send_email\", \"description\": \"Send an email to a recipient\", \"parameters\": {\"type\": \"object\", \"properties\": {\"to\": {\"type\": \"string\"}, \"subject\": {\"type\": \"string\"}, \"body\": {\"type\": \"string\"}, \"cc\": {\"type\": \"string\", \"description\": \"CC recipient email address\"}, \"bcc\": {\"type\": \"string\", \"description\": \"BCC recipient email address\"}, \"attachments\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"default\": []}}, \"required\": [\"to\", \"subject\", \"body\"], \"additionalProperties\": false}}\n{\"name\": \"search_files\", \"description\": \"Search for files by name or content\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"file_type\": {\"type\": \"string\", \"enum\": [\"pdf\", \"docx\", \"xlsx\", \"any\"], \"default\": \"any\"}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"read_file\", \"description\": \"Read the contents of a specific file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"file_id\": {\"type\": \"string\"}}, \"required\": [\"file_id\"], \"additionalProperties\": false}}\n{\"name\": \"create_calendar_event\", \"description\": \"Create a new calendar event\", \"parameters\": {\"type\": \"object\", \"properties\": {\"title\": {\"type\": \"string\"}, \"date\": {\"type\": \"string\", \"description\": \"Format: YYYY-MM-DD\"}, \"time\": {\"type\": \"string\", \"description\": \"Format: HH:MM\"}, \"timezone\": {\"type\": \"string\", \"description\": \"IANA timezone (e.g. Europe/Berlin, America/New_York). Defaults to UTC.\", \"default\": \"UTC\"}, \"duration_minutes\": {\"type\": \"integer\", \"default\": 60}, \"attendees\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"default\": []}}, \"required\": [\"title\", \"date\", \"time\"], \"additionalProperties\": false}}\n{\"name\": \"get_contacts\", \"description\": \"Look up contacts by name or group\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"], \"additionalProperties\": false}}\n{\"name\": \"translate_text\", \"description\": \"Translate text from one language to another\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\"}, \"source_language\": {\"type\": \"string\", \"enum\": [\"english\", \"en\", \"en-us\", \"en-gb\", \"en-ca\", \"en-au\", \"spanish\", \"es\", \"es-es\", \"es-419\", \"espanol\", \"español\", \"castilian\", \"spa\", \"japanese\", \"ja\", \"ja-jp\", \"日本語\", \"jpn\", \"german\", \"de\", \"deutsch\"]}, \"target_language\": {\"type\": \"string\", \"enum\": [\"english\", \"en\", \"spanish\", \"es\", \"es-es\", \"es-419\", \"espanol\", \"español\", \"castilian\", \"spa\", \"japanese\", \"ja\", \"ja-jp\", \"日本語\", \"jpn\", \"german\", \"de\", \"deutsch\"]}}, \"required\": [\"text\", \"source_language\", \"target_language\"], \"additionalProperties\": false}}\n{\"name\": \"get_stock_price\", \"description\": \"Get the current stock price for a ticker symbol\", \"parameters\": {\"type\": \"object\", \"properties\": {\"ticker\": {\"type\": \"string\"}}, \"required\": [\"ticker\"], \"additionalProperties\": false}}\n{\"name\": \"set_reminder\", \"description\": \"Set a reminder for a future time\", \"parameters\": {\"type\": \"object\", \"properties\": {\"message\": {\"type\": \"string\"}, \"datetime\": {\"type\": \"string\", \"description\": \"Format: ISO 8601\"}}, \"required\": [\"message\", \"datetime\"], \"additionalProperties\": false}}\n{\"name\": \"run_code\", \"description\": \"Execute a code snippet and return the output\", \"parameters\": {\"type\": \"object\", \"properties\": {\"language\": {\"type\": \"string\", \"enum\": [\"python\", \"javascript\"]}, \"code\": {\"type\": \"string\"}}, \"required\": [\"language\", \"code\"], \"additionalProperties\": false}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant with access to the tools provided.\n\nRules:\n- Use a tool ONLY when it is necessary to fulfill the user's request.\n- If you can answer directly from your own knowledge, do so without calling a tool.\n- If a tool call fails, explain the failure and suggest an alternative approach.\n- Never invent information that a tool should provide.\n\nBenchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request.<|user|>What is the value of pi? Answer from your knowledge.<|assistant|><think>"
+  }
+ ]
+}

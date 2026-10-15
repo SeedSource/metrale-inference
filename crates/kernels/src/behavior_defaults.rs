@@ -67,3 +67,25 @@ pub const DEFAULT_RESPONSE_FORMAT_WITH_TOOLS: bool = false;
 /// `true` keeps it. `false` adds no bias, as the official serve (vLLM) adds none.
 /// `kernels/gb10/glm-5.3-flash` sets it (spark-bench c30gate TEBGAP-TRACE.md D).
 pub const DEFAULT_TOOL_CALL_START_BIAS: bool = true;
+
+/// 2026-10-15: Default `[behavior].hf_tool_json`: the `tojson` filter style of this model's
+/// chat template (`tokenizer/jinja_helpers.rs`).
+///
+/// `false` keeps minijinja's compact `tojson` (`{"a":1}`) unless
+/// `METRALE_USE_HF_REF_JSON_DUMPS=1`. `true` always uses the spaced Python `json.dumps`
+/// form (`{"a": 1}`, `ToolJsonStyle::HfSpaced`), which renders tool schemas byte for byte
+/// as the official HF / vLLM template does; the env var still works for every model.
+/// `kernels/gb10/glm-5.3-flash` sets it (TEB turn-1 prompts: 86/88 differ from the official
+/// render with compact, 87/88 byte-identical with HfSpaced; spark-bench c30gate
+/// TEBGAP-TRACE.md C).
+pub const DEFAULT_HF_TOOL_JSON: bool = false;
+
+/// 2026-10-15: Default `[behavior].render_tools_on_tool_choice_none`: whether a request with
+/// tools and `tool_choice` `none` passes them to the chat template.
+///
+/// `false` keeps the rule every other model has: tools reach the template only when tools
+/// are active. `true` renders them for `tool_choice` `none` too, as the official template
+/// (HF `apply_chat_template`) and vLLM (default `exclude_tools_when_tool_choice_none` false)
+/// do. Tools stay inactive for parsing, the grammar and the `<tool_call>` bias.
+/// `kernels/gb10/glm-5.3-flash` sets it (TEB TC-44; spark-bench c30gate TEBGAP-TRACE.md C).
+pub const DEFAULT_RENDER_TOOLS_ON_TOOL_CHOICE_NONE: bool = false;

@@ -101,6 +101,8 @@ pub(super) struct Target {
     pub(super) behavior_max_thinking_budget: u32,
     pub(super) behavior_effort_capped_at_ceiling: bool,
     pub(super) behavior_effort_prompt_only: bool,
+    pub(super) behavior_render_tools_on_tool_choice_none: bool,
+    pub(super) behavior_hf_tool_json: bool,
     pub(super) behavior_tool_call_start_bias: bool,
     pub(super) behavior_response_format_with_tools: bool,
     pub(super) behavior_thinking_default: bool,

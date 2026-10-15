@@ -35,29 +35,21 @@ pub(super) fn render_template(
     thinking_budget: Option<u32>,
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
     preserve_thinking: Option<bool>,
-    tools_active: bool,
+    // 2026-10-15: `prepare::template_renders_tools`: tools active, or GLM-5.3's
+    // `tool_choice` `none` (MODEL.toml `render_tools_on_tool_choice_none`).
+    render_tools: bool,
     close_open_think: bool,
 ) -> Result<TemplateOut, Response> {
     let template_thinking = enable_thinking;
 
     let json_messages =
         build_json_messages_for(messages, state.tokenizer.uses_deepseek_v4_encoding());
-    // 2026-09-26: With TSCG on, the parser's `system_prompt()` already put compact tool
-    // signatures into the first system message (`prepare::inject_tool_system_prompt`),
-    // so the template gets no `tools` and does not render the JSON schemas again. The
-    // DeepSeek-V4 encoding always gets `tools`.
-    let jinja_tools: Option<Vec<serde_json::Value>> = if tools_active
-        && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
-    {
-        Some(
-            tools
-                .iter()
-                .map(|t| serde_json::to_value(t).unwrap_or_default())
-                .collect(),
-        )
-    } else {
-        None
-    };
+    let jinja_tools = template_tools(
+        tools,
+        render_tools,
+        state.tokenizer.uses_deepseek_v4_encoding(),
+        state.chat.prompt.tscg,
+    );
 
     let auto_compact_active = state
         .auto_compact_threshold
@@ -136,6 +128,26 @@ pub(super) fn render_template(
         prompt_tokens,
         enable_thinking,
         thinking_budget,
+    })
+}
+
+/// 2026-09-26: With TSCG on, the parser's `system_prompt()` already put compact tool
+/// signatures into the first system message (`prepare::inject_tool_system_prompt`),
+/// so the template gets no `tools` and does not render the JSON schemas again. The
+/// DeepSeek-V4 encoding always gets `tools`.
+///
+/// 2026-10-15: Moved out of `render_template` so the tool-render tests run it.
+pub(super) fn template_tools(
+    tools: &[crate::tool_parser::ToolDefinition],
+    render_tools: bool,
+    deepseek_v4_encoding: bool,
+    tscg: bool,
+) -> Option<Vec<serde_json::Value>> {
+    (render_tools && (deepseek_v4_encoding || !tscg)).then(|| {
+        tools
+            .iter()
+            .map(|t| serde_json::to_value(t).unwrap_or_default())
+            .collect()
     })
 }
 
@@ -442,3 +454,7 @@ mod json_message_tests {
 #[cfg(test)]
 #[path = "template_think_tail_tests.rs"]
 mod think_tail_tests;
+
+#[cfg(test)]
+#[path = "template_tool_render_tests.rs"]
+mod tool_render_tests;

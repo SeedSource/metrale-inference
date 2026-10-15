@@ -13,8 +13,7 @@ use anyhow::Result;
 use metrale_model_engine::traits::{Model, SequenceState};
 
 use super::super::decode_logits_step::process_decode_logits;
-use super::super::lifecycle::send_error;
-use super::super::types::{ActiveSeq, PrefillInProgress};
+use super::super::types::{ActiveSeq, PreemptedSeq, PrefillInProgress};
 use super::super::{FirstTokenPolicy, sample_first_token};
 
 #[allow(clippy::too_many_arguments)]
@@ -23,6 +22,7 @@ pub(super) fn run_standard_chunk_loop(
     p: &mut PrefillInProgress,
     idx: usize,
     active: &mut Vec<ActiveSeq>,
+    preempted: &mut Vec<PreemptedSeq>,
     max_prefill_tokens: usize,
     slice_budget: usize,
     prefill_stream: u64,
@@ -245,10 +245,12 @@ pub(super) fn run_standard_chunk_loop(
         return;
     }
 
-    // 2026-09-25: While `prefill_chunk` fails with "KV cache exhausted",
-    // end the active sequence without a grammar that holds the most KV
-    // blocks with a "preempted" error (`send_error`), then retry. With no
-    // such sequence left, the error stands and this prefill fails.
+    // 2026-09-25: While `prefill_chunk` fails with "KV cache exhausted", free
+    // room and retry. With no eligible sequence left, the error stands and this
+    // prefill fails.
+    // 2026-10-15 (race-memory, gap (a)): the room comes from requeuing one active
+    // sequence for a later resume (`preempt::preempt_for_prefill`, decode's victim
+    // rule), no longer from ending the largest one with a "preempted" error.
     let mut chunk_res = model.prefill_chunk(
         &p.prompt_tokens,
         &mut p.seq,
@@ -262,28 +264,9 @@ pub(super) fn run_standard_chunk_loop(
         .err()
         .is_some_and(|e| format!("{e:#}").contains("KV cache exhausted"))
     {
-        let Some(vi) = active
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.grammar_state.is_none())
-            .max_by_key(|(_, a)| a.seq.block_table.len())
-            .map(|(i, _)| i)
-        else {
+        if !crate::scheduler::preempt::preempt_for_prefill(&sched.io, active, preempted) {
             break;
-        };
-        let mut victim = active.remove(vi);
-        tracing::warn!(
-            "KV cache exhausted during prefill chunk: preempting slot={} ({} blocks) \
-             so this prefill can proceed ({} sequence(s) remain)",
-            victim.seq.slot_idx,
-            victim.seq.block_table.len(),
-            active.len(),
-        );
-        send_error(
-            &sched.io,
-            &mut victim,
-            "preempted: KV cache exhausted (a prefill needed its blocks)",
-        );
+        }
         // 2026-10-05: Under EP the worker refused the same chunk (the admission is
         // rank-agreed, `prefill_b/lazy_agree.rs`) and is waiting for its next command, so
         // the retry is announced to it like the first attempt; without this the head's

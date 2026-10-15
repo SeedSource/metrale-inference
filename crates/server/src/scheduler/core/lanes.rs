@@ -101,6 +101,7 @@ impl SchedulerCore {
             &**policy,
             active,
             prefilling,
+            preempted,
             max_prefill_tokens,
             max_batch_tokens,
             always_mixed,

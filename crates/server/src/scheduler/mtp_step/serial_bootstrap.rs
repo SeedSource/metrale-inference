@@ -197,7 +197,10 @@ pub(super) fn bootstrap_seq(
         Some(t) => t,
         None => {
             tracing::error!(target: "met::scheduler::mtp_step", "bootstrap stray </tool_call> re-pick: D2H failed");
-            a.finished = true;
+            crate::scheduler::lifecycle::fail_sequence(
+                a,
+                "bootstrap stray </tool_call> re-pick: D2H failed".to_string(),
+            );
             return;
         }
     };

@@ -176,6 +176,9 @@ impl ModelLogits for PreemptStubModel {
     /// 2026-10-04: BF16 (each f32's high half) from the rows laid end to
     /// end, starting at the pointer's element offset; a no-op without rows.
     fn copy_logits_to_host(&self, p: DevicePtr, d: &mut [u8]) -> Result<()> {
+        if self.fail_logit_copy {
+            anyhow::bail!("scripted D2H failure");
+        }
         let src = self.logit_rows.iter().flatten().skip(p.0 as usize / 2);
         for (dst, v) in d.chunks_exact_mut(2).zip(src) {
             dst.copy_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());

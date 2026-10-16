@@ -229,7 +229,10 @@ pub(super) fn step_mtp_bootstrap_batched(
                     Some(t) => t,
                     None => {
                         tracing::error!("batched bootstrap pipeline pick: D2H failed");
-                        a.finished = true;
+                        super::lifecycle::fail_sequence(
+                            a,
+                            "batched bootstrap pipeline pick: D2H failed".to_string(),
+                        );
                         continue;
                     }
                 }
@@ -274,7 +277,10 @@ pub(super) fn step_mtp_bootstrap_batched(
             Some(t) => t,
             None => {
                 tracing::error!("batched bootstrap stray </tool_call> re-pick: D2H failed");
-                a.finished = true;
+                super::lifecycle::fail_sequence(
+                    a,
+                    "batched bootstrap stray </tool_call> re-pick: D2H failed".to_string(),
+                );
                 continue;
             }
         };

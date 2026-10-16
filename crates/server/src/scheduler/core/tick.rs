@@ -95,6 +95,7 @@ impl SchedulerCore {
         // runs as without the lever (to the end, at the end of the tick).
         self.prefill_ran = false;
         self.resume_slot = false;
+        self.prefill_turn = false;
         if sliced
             && !self.slice_hold
             && crate::scheduler::prefill_chunk_cap::decoders(active) > 0
@@ -109,6 +110,7 @@ impl SchedulerCore {
                 slots_free,
             );
             self.resume_slot = !prefill_waiting || (self.resume_turn && ready);
+            self.prefill_turn = !self.resume_slot;
             if self.resume_slot {
                 for (i, req) in new_reqs.drain(..).enumerate() {
                     pending.requests.insert(i, req);

@@ -65,6 +65,10 @@ pub(super) struct ModelCfg {
     /// 2026-10-14 (race-memory, A184): Indexes of `decode_verify_batched` calls (0-based,
     /// counted per model) that fail with "KV cache exhausted" instead of running.
     pub verify_kv_exhaust_at: Vec<usize>,
+    /// 2026-10-15 (race-prefill, A194): (session, n): the first n `prefill_chunk` calls at
+    /// offset 0 for that session fail with a rank-agreed "KV cache exhausted" (a new request
+    /// refused at chunk 0, as fchr arm A's DSA indexer pool refusals).
+    pub chunk0_kv_refuse: Option<(u64, usize)>,
     /// 2026-09-25: Blocks the prefix cache can give back on `reclaim_prefix_blocks`.
     pub reclaimable: usize,
     /// 2026-09-25: Blocks pinned outside any live sequence (a warm prefix cache): they
@@ -100,6 +104,7 @@ impl Default for ModelCfg {
             slot_draft_capacity: 8,
             kv_exhaust_at: Vec::new(),
             verify_kv_exhaust_at: Vec::new(),
+            chunk0_kv_refuse: None,
             reclaimable: 0,
             held_blocks: 0,
             device_token_feed: true,
@@ -121,6 +126,8 @@ pub(super) struct State {
     pub decode_batch_calls: usize,
     /// 2026-10-14: `decode_verify_batched` calls so far (`verify_kv_exhaust_at`).
     pub verify_batched_calls: usize,
+    /// 2026-10-15: chunk-0 refusals so far (`chunk0_kv_refuse`).
+    pub chunk0_refused: usize,
     pub ticks: usize,
     /// 2026-09-25: What the last feed argmax wrote, per row.
     pub feed_cells: Vec<u32>,
@@ -423,6 +430,18 @@ impl RecordingModel {
         let c = st.decode_batch_calls;
         st.decode_batch_calls += 1;
         c
+    }
+
+    /// 2026-10-15 (race-prefill, A194): whether this chunk-0 `prefill_chunk` of `session`
+    /// is refused (`chunk0_kv_refuse`); counts the refusal.
+    pub fn refuse_chunk0(&self, session: u64, start: usize) -> bool {
+        let Some((s, n)) = self.cfg.chunk0_kv_refuse else { return false };
+        let mut st = self.state.lock().unwrap();
+        if s != session || start != 0 || st.chunk0_refused >= n {
+            return false;
+        }
+        st.chunk0_refused += 1;
+        true
     }
 
     /// 2026-10-14 (race-memory, A184): the index of this `decode_verify_batched` call.

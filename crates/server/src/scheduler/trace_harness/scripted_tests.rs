@@ -329,6 +329,17 @@ fn c_chunked_resume_lets_the_other_rows_decode_between_its_chunks_with_the_same_
 /// while-decoding cap on (256, above every chunk here, so the chunk plan is the same with the
 /// lever on or off).
 fn sliced_run(sliced: bool, k: Option<usize>, exhaust_at: usize, s4_at: usize) -> Vec<String> {
+    sliced_run_with(sliced, k, exhaust_at, s4_at, None)
+}
+
+/// 2026-10-15 (A194): `sliced_run`, with s4's first `refuse` chunk-0 calls refused for KV.
+fn sliced_run_with(
+    sliced: bool,
+    k: Option<usize>,
+    exhaust_at: usize,
+    s4_at: usize,
+    refuse: Option<usize>,
+) -> Vec<String> {
     let reply = |n: u32, base: u32| -> Vec<u32> {
         let mut v: Vec<u32> = (0..n).map(|i| base + i).collect();
         v.push(EOS);
@@ -339,6 +350,7 @@ fn sliced_run(sliced: bool, k: Option<usize>, exhaust_at: usize, s4_at: usize) -
     s4.arrive_at_tick = Some(s4_at);
     let mut cfg = ModelCfg::default();
     cfg.kv_exhaust_at = vec![exhaust_at];
+    cfg.chunk0_kv_refuse = refuse.map(|n| (4, n));
     let sc = Scenario {
         name: "sliced_resume",
         cfg,
@@ -431,6 +443,43 @@ fn c_sliced_resume_admits_new_requests_and_takes_k_decode_steps_per_chunk() {
             assert!(b.contains("Done(stop"), "k={k:?} s{id}: {b}");
             assert_eq!(reply_tokens(&a), reply_tokens(&b), "k={k:?} s{id} reply");
         }
+    }
+}
+
+#[test]
+fn c_sliced_resume_keeps_its_turns_while_a_new_request_waits_refused_at_chunk_0() {
+    // 2026-10-15 (race-prefill, A194): with gap (e)'s fix a new request refused for KV at
+    // chunk 0 waits as an offset-0 prefill. Its turn runs no chunk; the resume must still get
+    // every other turn, not stall until a decoder ends.
+    const REFUSE: usize = 5;
+    let lines = sliced_run_with(true, None, EXHAUST_AT, S4_AT, Some(REFUSE));
+    let requeue = positions(&lines, "fx apply ReleaseSeq{cache=true, preempt_requeue}")[0];
+    // per tick after the requeue: (s1 resume chunk ran, s4 chunk 0 refused, s4 chunk ran)
+    let mut t: Vec<(bool, bool, bool)> = Vec::new();
+    for l in &lines[requeue..] {
+        if l.starts_with("-- tick ") {
+            t.push((false, false, false));
+        } else if let Some(x) = t.last_mut() {
+            let chunk = l.starts_with("prefill_chunk(");
+            let refused = l.ends_with("-> ERR KV cache exhausted");
+            x.0 |= chunk && l.contains(" s1@");
+            x.1 |= chunk && l.contains(" s4@") && refused;
+            x.2 |= chunk && l.contains(" s4@") && !refused;
+        }
+    }
+    let refused: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.1).map(|(i, _)| i).collect();
+    assert_eq!(refused.len(), REFUSE, "s4 refused {REFUSE} times: {t:?}");
+    let last_resume = t.iter().rposition(|x| x.0).expect("a resume chunk");
+    let window = &t[refused[0]..=refused[REFUSE - 1]];
+    let resumed = window.iter().filter(|x| x.0).count();
+    if last_resume > refused[REFUSE - 1] {
+        assert!(resumed >= REFUSE - 1, "the resume takes turns with the waiting s4: {t:?}");
+    }
+    assert!(resumed >= 2, "the resume ran during s4's wait: {t:?}");
+    for id in 1..=4 {
+        let b = output(&lines, id);
+        assert!(!b.contains("Error"), "s{id}: {b}");
+        assert!(b.contains("Done(stop"), "s{id}: {b}");
     }
 }
 

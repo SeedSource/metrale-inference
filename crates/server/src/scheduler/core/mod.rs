@@ -88,10 +88,13 @@ pub struct SchedulerCore {
     /// turn belongs to the in-flight (or starting) resume, so StartPrefills admits nothing and
     /// ContinuePrefills runs no chunk (set in `plan_tick`); `resume_turn`: the resume is owed
     /// the next turn because the last one went to a new request's prefill; `prefill_ran`: this
-    /// tick's prefill lanes ran a chunk (set by ContinuePrefills).
+    /// tick's prefill lanes ran a chunk (set by ContinuePrefills); `prefill_turn`: this tick's
+    /// turn went to the new prefills, whether or not their chunk ran (a chunk-0 KV refusal
+    /// waits without running, A194).
     resume_slot: bool,
     resume_turn: bool,
     prefill_ran: bool,
+    prefill_turn: bool,
     /// 2026-09-25: The pipelined decode lane's steps still in flight.
     pipeline: pipeline::Pipeline,
 }
@@ -323,6 +326,7 @@ impl SchedulerCore {
             resume_slot: false,
             resume_turn: false,
             prefill_ran: false,
+            prefill_turn: false,
             pipeline: pipeline::Pipeline::new(pipeline_faults),
         }
     }

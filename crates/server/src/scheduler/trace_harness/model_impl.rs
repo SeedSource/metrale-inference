@@ -135,6 +135,11 @@ impl ModelForward for RecordingModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
+        if self.refuse_chunk0(seq.session_hash, chunk_start) {
+            let id = sid(seq);
+            rec!(self, "prefill_chunk(start=0, len={chunk_len}, {id}) -> ERR KV cache exhausted");
+            anyhow::bail!("rank-agreed refusal: KV cache exhausted (scripted chunk-0 refusal)");
+        }
         Ok(self.fx_prefill_chunk(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream))
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {

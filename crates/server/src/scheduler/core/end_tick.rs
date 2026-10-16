@@ -140,7 +140,10 @@ impl SchedulerCore {
         if sliced {
             if resume_slot {
                 self.resume_turn = false;
-            } else if self.prefill_ran && !preempted.is_empty() {
+            } else if (self.prefill_ran || self.prefill_turn) && !preempted.is_empty() {
+                // 2026-10-15 (A194): a turn the new prefills took counts even when their
+                // chunk 0 was refused for KV and waits: else the resume never gets the turn
+                // back while that head waits, and stalls until a decoder ends.
                 self.resume_turn = true;
             }
         }

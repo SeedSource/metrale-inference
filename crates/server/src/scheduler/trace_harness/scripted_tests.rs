@@ -350,7 +350,7 @@ fn sliced_run_with(
     s4.arrive_at_tick = Some(s4_at);
     let mut cfg = ModelCfg::default();
     cfg.kv_exhaust_at = vec![exhaust_at];
-    cfg.chunk0_kv_refuse = refuse.map(|n| (4, n));
+    cfg.chunk0_kv_refuse = refuse.map(|n| vec![(4, n)]).unwrap_or_default();
     let sc = Scenario {
         name: "sliced_resume",
         cfg,
@@ -480,6 +480,69 @@ fn c_sliced_resume_keeps_its_turns_while_a_new_request_waits_refused_at_chunk_0(
         let b = output(&lines, id);
         assert!(!b.contains("Error"), "s{id}: {b}");
         assert!(b.contains("Done(stop"), "s{id}: {b}");
+    }
+}
+
+#[test]
+fn c_sliced_resume_with_a_full_ssm_pool_runs_before_later_arrivals() {
+    // 2026-10-15 (race-prefill, A195): the SSM pool has exactly max_batch_size slots (4 here) and
+    // new requests arrive one and two ticks after s1's requeue. Regression guard, not red/green:
+    // the turn order (57c4fc20) already starts s1's resume before s5, and no alloc hits a full
+    // pool; it passed with and without a tried admission reservation, which was not kept.
+    let reply = |n: u32, base: u32| -> Vec<u32> {
+        let mut v: Vec<u32> = (0..n).map(|i| base + i).collect();
+        v.push(EOS);
+        v
+    };
+    let run = |arrive: Option<usize>| {
+        let mut cfg = ModelCfg::default();
+        cfg.kv_exhaust_at = vec![EXHAUST_AT];
+        cfg.ssm_slots = Some(4);
+        let mut reqs = vec![
+            ReqSpec::new(1, 4, reply(40, 100)),
+            ReqSpec::new(2, 4, reply(40, 200)),
+            ReqSpec::new(3, 4, reply(40, 300)),
+        ];
+        if let Some(t) = arrive {
+            for (id, base, at) in [(4, 400, t), (5, 500, t + 1)] {
+                let mut r = ReqSpec::new(id, 8, reply(4, base));
+                r.arrive_at_tick = Some(at);
+                reqs.push(r);
+            }
+        }
+        let sc = Scenario {
+            name: "sliced_resume_slot",
+            cfg,
+            opts: RunOptions {
+                max_batch_size: 4,
+                max_prefill_tokens: 4,
+                no_mix: true,
+                prefill_chunk_while_decoding: Some(256),
+                resume_one_chunk_per_tick: true,
+                resume_sliced: true,
+                ..RunOptions::default()
+            },
+            reqs,
+        };
+        run_scenario(&sc)
+    };
+    let base = run(None);
+    let requeue = positions(&base, "fx apply ReleaseSeq{cache=true, preempt_requeue}")[0];
+    let tick = base[..requeue].iter().filter(|l| l.starts_with("-- tick ")).count();
+    let lines = run(Some(tick));
+    let first = |pat: &str| {
+        lines.iter().position(|l| l.starts_with("prefill_chunk(") && l.contains(pat))
+    };
+    let requeue = positions(&lines, "fx apply ReleaseSeq{cache=true, preempt_requeue}")[0];
+    let s1 = lines[requeue..].iter().position(|l| l.starts_with("prefill_chunk(") && l.contains(" s1@"));
+    let (s1, s4, s5) = (s1.map(|i| i + requeue), first(" s4@"), first(" s5@"));
+    assert!(s1.is_some() && s4.is_some() && s5.is_some(), "{lines:#?}");
+    assert!(s4.unwrap() > requeue, "s4 arrives after the requeue: {lines:#?}");
+    assert!(s1 < s5, "s1's resume runs before s5 is admitted: {lines:#?}");
+    assert!(lines.iter().all(|l| !l.contains("SSM state pool exhausted")), "{lines:#?}");
+    for id in 1..=5 {
+        let b = output(&lines, id);
+        assert!(!b.contains("Error") && b.contains("Done(stop"), "s{id}: {b}");
     }
 }
 

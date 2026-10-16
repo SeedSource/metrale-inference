@@ -69,6 +69,10 @@ impl RecordingModel {
         out
     }
     pub(super) fn alloc(&self, what: String) -> Result<SequenceState> {
+        if let Some(n) = self.cfg.ssm_slots.filter(|&n| self.live_slots() >= n) {
+            rec!(self, "{what} -> ERR SSM state pool exhausted");
+            anyhow::bail!("SSM state pool exhausted (max {n} slots)");
+        }
         let slot = self.alloc_slot();
         rec!(self, "{what} -> slot {slot}");
         Ok(SequenceState::host_only(slot))

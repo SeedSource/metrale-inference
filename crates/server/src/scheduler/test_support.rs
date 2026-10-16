@@ -274,6 +274,9 @@ pub(super) struct PreemptStubModel {
     /// 2026-10-15 (race-memory, gap (a)): the next N `prefill_chunk` calls fail with "KV cache
     /// exhausted" (recorded in `chunks` first, like every call).
     pub(super) fail_prefill_chunks: AtomicUsize,
+    /// 2026-10-15 (race-prefill, A195): the next N `alloc_sequence` calls fail with "SSM state
+    /// pool exhausted" (every slot held, e.g. by rows waiting at chunk 0).
+    pub(super) fail_allocs: AtomicUsize,
 }
 
 impl PreemptStubModel {

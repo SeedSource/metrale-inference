@@ -68,7 +68,10 @@ pub(super) struct ModelCfg {
     /// 2026-10-15 (race-prefill, A194): (session, n): the first n `prefill_chunk` calls at
     /// offset 0 for that session fail with a rank-agreed "KV cache exhausted" (a new request
     /// refused at chunk 0, as fchr arm A's DSA indexer pool refusals).
-    pub chunk0_kv_refuse: Option<(u64, usize)>,
+    pub chunk0_kv_refuse: Vec<(u64, usize)>,
+    /// 2026-10-15 (race-prefill, A195): live sequences the SSM state pool holds (the engine sizes
+    /// it to max_batch_size); `alloc_sequence` past it fails "SSM state pool exhausted".
+    pub ssm_slots: Option<usize>,
     /// 2026-09-25: Blocks the prefix cache can give back on `reclaim_prefix_blocks`.
     pub reclaimable: usize,
     /// 2026-09-25: Blocks pinned outside any live sequence (a warm prefix cache): they
@@ -104,7 +107,8 @@ impl Default for ModelCfg {
             slot_draft_capacity: 8,
             kv_exhaust_at: Vec::new(),
             verify_kv_exhaust_at: Vec::new(),
-            chunk0_kv_refuse: None,
+            chunk0_kv_refuse: Vec::new(),
+            ssm_slots: None,
             reclaimable: 0,
             held_blocks: 0,
             device_token_feed: true,
@@ -126,8 +130,8 @@ pub(super) struct State {
     pub decode_batch_calls: usize,
     /// 2026-10-14: `decode_verify_batched` calls so far (`verify_kv_exhaust_at`).
     pub verify_batched_calls: usize,
-    /// 2026-10-15: chunk-0 refusals so far (`chunk0_kv_refuse`).
-    pub chunk0_refused: usize,
+    /// 2026-10-15: chunk-0 refusals so far per session (`chunk0_kv_refuse`).
+    pub chunk0_refused: std::collections::HashMap<u64, usize>,
     pub ticks: usize,
     /// 2026-09-25: What the last feed argmax wrote, per row.
     pub feed_cells: Vec<u32>,
@@ -370,6 +374,12 @@ impl RecordingModel {
 
     // 2026-09-25: slots and blocks.
 
+    /// 2026-10-15 (A195): slots held by live sequences.
+    pub fn live_slots(&self) -> usize {
+        let st = self.state.lock().unwrap();
+        st.next_slot - st.free_slots.len()
+    }
+
     pub fn alloc_slot(&self) -> usize {
         let mut st = self.state.lock().unwrap();
         if let Some(s) = st.free_slots.pop() {
@@ -435,12 +445,15 @@ impl RecordingModel {
     /// 2026-10-15 (race-prefill, A194): whether this chunk-0 `prefill_chunk` of `session`
     /// is refused (`chunk0_kv_refuse`); counts the refusal.
     pub fn refuse_chunk0(&self, session: u64, start: usize) -> bool {
-        let Some((s, n)) = self.cfg.chunk0_kv_refuse else { return false };
+        let Some(&(_, n)) = self.cfg.chunk0_kv_refuse.iter().find(|(s, _)| *s == session) else {
+            return false;
+        };
         let mut st = self.state.lock().unwrap();
-        if s != session || start != 0 || st.chunk0_refused >= n {
+        let done = st.chunk0_refused.entry(session).or_insert(0);
+        if start != 0 || *done >= n {
             return false;
         }
-        st.chunk0_refused += 1;
+        *done += 1;
         true
     }
 

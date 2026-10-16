@@ -22,6 +22,13 @@ impl ModelLifecycle for PreemptStubModel {
         Ok(())
     }
     fn alloc_sequence(&self) -> Result<SequenceState> {
+        if self
+            .fail_allocs
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!("SSM state pool exhausted (max 4 slots)");
+        }
         Ok(SequenceState::host_only(0))
     }
     fn cache_sequence(&self, _s: &SequenceState) {

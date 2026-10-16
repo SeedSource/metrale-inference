@@ -191,6 +191,43 @@ fn resume_reprefills_exact_history_and_preserves_stream_state() {
 }
 
 #[test]
+fn a_resume_start_with_the_ssm_pool_full_waits_and_never_fails_the_row() {
+    // 2026-10-15 (race-prefill, A195; race-memory's code read of 57c4fc20): the SSM pool has one
+    // slot per batch slot, and rows still prefilling (gap (e)'s waiting chunk-0 heads) hold
+    // theirs, so a resume can start with every slot taken. Before the fix the victim got
+    // "preempt-resume alloc failed" and lost its reply; now it stays preempted, nothing is sent,
+    // and it resumes once a slot frees. Both the synchronous and the one-chunk-per-tick paths.
+    for one_chunk in [false, true] {
+        let model = std::sync::Arc::new(PreemptStubModel {
+            total_blocks: 100,
+            free_blocks: AtomicUsize::new(100),
+            chunks_ok: true,
+            fail_allocs: AtomicUsize::new(1),
+            ..Default::default()
+        });
+        let io = SchedIo::for_test_with(model.clone());
+        let (a, mut rx) = active_seq(0, 4);
+        let mut preempted = vec![preempt_requeue(&io, a)];
+        let mut active = Vec::new();
+        let run = |active: &mut Vec<_>, preempted: &mut Vec<_>| {
+            resume_preempted_seqs(&*model, &io, active, preempted, 8, 16, 0, one_chunk, None)
+        };
+        assert!(!run(&mut active, &mut preempted), "one_chunk={one_chunk}: no chunk ran");
+        assert!(active.is_empty(), "one_chunk={one_chunk}");
+        assert_eq!(preempted.len(), 1, "one_chunk={one_chunk}: still preempted");
+        assert!(preempted[0].resume.is_none(), "one_chunk={one_chunk}");
+        assert!(
+            matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "one_chunk={one_chunk}: no error frame"
+        );
+        // 2026-10-15: a slot is free on the next tick: the resume runs to the end (nobody decodes).
+        run(&mut active, &mut preempted);
+        assert_eq!(active.len(), 1, "one_chunk={one_chunk}: resumed");
+        assert!(preempted.is_empty(), "one_chunk={one_chunk}");
+    }
+}
+
+#[test]
 fn resume_loop_gates_on_blocks_and_reclaims_from_prefix_cache() {
     let model = std::sync::Arc::new(PreemptStubModel {
         total_blocks: 100,

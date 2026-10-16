@@ -296,11 +296,24 @@ pub(super) fn resume_preempted_seq(
     max_prefill_tokens: usize,
 ) -> Result<ActiveSeq> {
     let PreemptedSeq { mut a, tokens, .. } = p;
-    let mut seq = resume_alloc(model, io, &mut a)?;
+    let seq = resume_alloc(model, io, &mut a)?;
+    resume_prefill_all(model, io, a, &tokens, seq, max_prefill_tokens)
+}
+
+/// 2026-10-15 (race-prefill, A195): The synchronous re-prefill of `tokens` into `seq`, already
+/// allocated for `a`. On failure the client has been sent an error frame.
+fn resume_prefill_all(
+    model: &dyn Model,
+    io: &SchedIo,
+    mut a: ActiveSeq,
+    tokens: &[u32],
+    mut seq: SequenceState,
+    max_prefill_tokens: usize,
+) -> Result<ActiveSeq> {
     let total = tokens.len();
     let mut offset = 0;
     while offset < total {
-        match resume_chunk(model, &tokens, &mut seq, offset, max_prefill_tokens, None) {
+        match resume_chunk(model, tokens, &mut seq, offset, max_prefill_tokens, None) {
             Ok(next) => offset = next,
             Err(e) => {
                 a.seq = seq;
@@ -318,8 +331,43 @@ pub(super) fn resume_preempted_seq(
 
 /// 2026-10-15 (race-prefill, A192): The start of a resume: a new sequence with the victim's
 /// session and adapter. On failure the client has been sent an error frame.
+/// 2026-10-15 (race-prefill, A195; race-memory's code read): the start of a resume, where a
+/// full SSM state pool means "not yet": the pool has one slot per batch slot, and rows still
+/// prefilling (a new request waiting at chunk 0, gap (e)) hold theirs. `Ok(None)` = wait,
+/// nothing sent; the caller keeps the row preempted and retries on a later tick. Any other
+/// failure is `Err`, with the error frame sent (as `resume_alloc`).
+fn resume_try_alloc(
+    model: &dyn Model,
+    io: &SchedIo,
+    a: &mut ActiveSeq,
+) -> Result<Option<SequenceState>> {
+    match model.alloc_sequence() {
+        Err(e) if format!("{e:#}").contains("SSM state pool exhausted") => {
+            tracing::warn!("Preempt-resume waits: {e:#}");
+            Ok(None)
+        }
+        Err(e) => {
+            send_error_to_sink(io, &mut a.sink, &format!("preempt-resume alloc failed: {e:#}"));
+            Err(e)
+        }
+        Ok(seq) => Ok(Some(resume_seq_setup(model, a, seq))),
+    }
+}
+
+/// 2026-10-15: The resumed sequence takes the victim's session and adapter.
+fn resume_seq_setup(model: &dyn Model, a: &ActiveSeq, mut seq: SequenceState) -> SequenceState {
+    seq.session_hash = a.session_hash;
+    seq.adapter_slot = a.seq.adapter_slot;
+    // 2026-09-25: Re-acquire the adapter slot the preempt-time release
+    // gave up. LoRA rotations wait while `preempted` is non-empty
+    // (`core/tick.rs`), so the slot still holds the same adapter.
+    seq.adapter_id = a.seq.adapter_id;
+    seq.acquired_adapter_slot = model.acquire_adapter_slot(a.seq.adapter_slot);
+    seq
+}
+
 fn resume_alloc(model: &dyn Model, io: &SchedIo, a: &mut ActiveSeq) -> Result<SequenceState> {
-    let mut seq = match model.alloc_sequence() {
+    let seq = match model.alloc_sequence() {
         Ok(s) => s,
         Err(e) => {
             send_error_to_sink(
@@ -330,14 +378,7 @@ fn resume_alloc(model: &dyn Model, io: &SchedIo, a: &mut ActiveSeq) -> Result<Se
             return Err(e);
         }
     };
-    seq.session_hash = a.session_hash;
-    seq.adapter_slot = a.seq.adapter_slot;
-    // 2026-09-25: Re-acquire the adapter slot the preempt-time release
-    // gave up. LoRA rotations wait while `preempted` is non-empty
-    // (`core/tick.rs`), so the slot still holds the same adapter.
-    seq.adapter_id = a.seq.adapter_id;
-    seq.acquired_adapter_slot = model.acquire_adapter_slot(a.seq.adapter_slot);
-    Ok(seq)
+    Ok(resume_seq_setup(model, a, seq))
 }
 
 /// 2026-10-15 (race-prefill, A192): One planned re-prefill chunk at `offset`, with the same EP
@@ -495,12 +536,19 @@ pub(super) fn resume_preempted_seqs(
         if !reclaim_until_free(model, want) {
             return ran;
         }
-        if one_chunk_per_tick {
-            let mut p = preempted.remove(idx);
-            let Ok(seq) = resume_alloc(model, io, &mut p.a) else {
+        let mut p = preempted.remove(idx);
+        let seq = match resume_try_alloc(model, io, &mut p.a) {
+            Ok(Some(seq)) => seq,
+            Ok(None) => {
+                preempted.insert(idx, p);
+                return ran;
+            }
+            Err(_) => {
                 tracing::error!("Preempt-resume failed: sequence alloc");
                 continue;
-            };
+            }
+        };
+        if one_chunk_per_tick {
             p.resume = Some(ResumeProgress { seq, offset: 0 });
             preempted.push(p);
             let i = preempted.len() - 1;
@@ -515,9 +563,9 @@ pub(super) fn resume_preempted_seqs(
                 while_decoding_cap,
             );
         }
-        let p = preempted.remove(idx);
         let n_tokens = p.tokens.len();
-        match resume_preempted_seq(model, io, p, max_prefill_tokens) {
+        let PreemptedSeq { a, tokens, .. } = p;
+        match resume_prefill_all(model, io, a, &tokens, seq, max_prefill_tokens) {
             Ok(a) => {
                 tracing::info!(
                     "Preempt-resume: re-prefilled {n_tokens} tokens \

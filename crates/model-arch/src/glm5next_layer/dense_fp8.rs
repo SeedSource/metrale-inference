@@ -763,9 +763,20 @@ fn nv4_kernels(gpu: &dyn GpuBackend) -> Option<Nv4Kernels> {
     *NV4_KERNELS.get_or_init(|| {
         let r = (|| -> Result<Nv4Kernels> {
             let t = |m: u32| gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_batch{m}"));
+            let plain = super::dense_nv4_plain::nv4_plain_scale();
+            let quant = gpu.kernel(
+                "quantize_nvfp4",
+                super::dense_nv4_plain::quant_kernel_name(plain),
+            )?;
+            if plain {
+                tracing::info!(
+                    "METRALE_GLM_NV4_PLAIN_SCALE=1: ENGAGED - GLM dense NVFP4 decode copies use \
+                     the plain block scale (quantize_bf16_to_nvfp4, no MSE pick)"
+                );
+            }
             Ok(Nv4Kernels {
                 absmax: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-                quant: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4_mse")?,
+                quant,
                 gemv1: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
                 b2: t(2)?,
                 b3: t(3)?,

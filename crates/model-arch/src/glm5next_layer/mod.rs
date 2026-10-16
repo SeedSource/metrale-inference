@@ -77,6 +77,7 @@ pub mod dense_fp8_min_rows;
 pub mod dense_nv4_b3;
 // 2026-10-12: `METRALE_GLM_NV4_B3_GROUP` (grouped same-input 3-row NVFP4 projections).
 pub mod dense_nv4_b3_group;
+pub mod dense_nv4_plain;
 pub mod dense_nv4_bm;
 // 2026-10-09: `METRALE_GLM_NV4_TC_GROUP` (grouped persistent tensor-core NVFP4 projections).
 pub mod dense_nv4_group;

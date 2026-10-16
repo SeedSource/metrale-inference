@@ -132,6 +132,14 @@
 //!   [`w8a8_fused_input`] declines such a call, so its caller writes the BF16 input unfused.
 //!   Each entry records its class at registration (MTP block: `Class::Mtp`; the
 //!   `convert_weight*` helpers: `Class::Keep` unless given one).
+//! - 2026-10-16: `METRALE_GLM_DENSE_MLP_CKPT=1` ([`dense_mlp_ckpt`]; inert, warned once,
+//!   without `METRALE_GLM_DENSE_FP8=1`): when the loader hands [`register_layer`] a dense
+//!   MLP's checkpoint NVFP4 slices (`glm5next_mlp::dense_ckpt`, packed checkpoints only), its
+//!   gate/up/down get an NVFP4 decode copy uploaded from those bytes ([`upload_ckpt_copy`])
+//!   instead of `quantize_to_nvfp4` on the BF16 dequant, whether or not
+//!   `METRALE_GLM_DENSE_NVFP4` lists `mlp` ([`nv4_source`]); [`route`] serves such a copy as it
+//!   serves that lever's ([`nv4_any`]). The FP8 copy (prefill) still comes from the BF16
+//!   dequant. Off, [`nv4_any`] is `dense_nvfp4().any()` and no copy changes.
 
 // 2026-10-07: `METRALE_GLM_NORM_FP8_QUANT_FUSE`: the fused norm + quant entry (child module,
 // so it reaches this file's private W8A8 state).
@@ -336,6 +344,95 @@ pub fn dense_nvfp4() -> Nvfp4Classes {
     })
 }
 
+/// 2026-10-16: A `METRALE_GLM_DENSE_MLP_CKPT` value: `1` is on; unset or anything else off.
+pub fn parse_mlp_ckpt(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+/// 2026-10-16: `METRALE_GLM_DENSE_MLP_CKPT=1` (module doc); read once. False, with a warning,
+/// without `METRALE_GLM_DENSE_FP8=1`.
+pub fn dense_mlp_ckpt() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        if !parse_mlp_ckpt(std::env::var("METRALE_GLM_DENSE_MLP_CKPT").ok().as_deref()) {
+            return false;
+        }
+        if !dense_fp8() {
+            tracing::warn!(
+                "METRALE_GLM_DENSE_MLP_CKPT=1 is ignored without METRALE_GLM_DENSE_FP8=1 (it \
+                 replaces the dense MLP's NVFP4 decode copy)"
+            );
+            return false;
+        }
+        tracing::warn!(
+            "METRALE_GLM_DENSE_MLP_CKPT=1 - GLM-5.3 dense-layer gate/up/down NVFP4 decode copies \
+             come from the checkpoint's packed NVFP4 bytes (no re-quantization of the BF16 \
+             dequant); prefill keeps the FP8 copy; NOT byte-identical to the re-quantized copy"
+        );
+        true
+    })
+}
+
+/// 2026-10-16: Whether any weight can have an NVFP4 decode copy: `METRALE_GLM_DENSE_NVFP4`
+/// selects a class or `METRALE_GLM_DENSE_MLP_CKPT` is on. Lever off: `dense_nvfp4().any()`.
+fn nv4_any() -> bool {
+    dense_nvfp4().any() || dense_mlp_ckpt()
+}
+
+/// 2026-10-16: Where a weight's NVFP4 decode copy comes from ([`nv4_source`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nv4Source {
+    /// No NVFP4 copy (FP8 only).
+    None,
+    /// `quantize_to_nvfp4` on the BF16 original (`METRALE_GLM_DENSE_NVFP4`).
+    Requant,
+    /// The checkpoint's own NVFP4 bytes (`METRALE_GLM_DENSE_MLP_CKPT`).
+    Ckpt,
+}
+
+/// 2026-10-16: The NVFP4 copy source of one weight: `listed` (`METRALE_GLM_DENSE_NVFP4` selects
+/// its class) and `ckpt` (the loader handed its checkpoint NVFP4 slice, which it does only for
+/// a packed dense MLP with `METRALE_GLM_DENSE_MLP_CKPT=1`). A checkpoint slice wins.
+pub fn nv4_source(listed: bool, ckpt: bool) -> Nv4Source {
+    match (listed, ckpt) {
+        (_, true) => Nv4Source::Ckpt,
+        (true, false) => Nv4Source::Requant,
+        (false, false) => Nv4Source::None,
+    }
+}
+
+/// 2026-10-16: Upload one checkpoint NVFP4 slice `h` (`[n, k]`, the layout [`nv4_gemv`] reads)
+/// as an NVFP4 copy: packed and scale bytes copied as they are, `scale_2` from the checkpoint,
+/// no input scale. An error when the byte counts are not `n k / 2` and `n k / 16`.
+pub fn upload_ckpt_copy(
+    gpu: &dyn GpuBackend,
+    h: &crate::glm5next_mlp::expert_tp::Nvfp4Host,
+    n: usize,
+    k: usize,
+) -> Result<QuantizedWeight> {
+    if !k.is_multiple_of(16) || h.packed.len() != n * k / 2 || h.scale.len() != n * k / 16 {
+        bail!(
+            "METRALE_GLM_DENSE_MLP_CKPT: a [{n}, {k}] copy needs {} packed and {} scale bytes, got \
+             {} and {}",
+            n * k / 2,
+            n * k / 16,
+            h.packed.len(),
+            h.scale.len()
+        );
+    }
+    let weight = gpu.alloc(h.packed.len())?;
+    gpu.copy_h2d(&h.packed, weight)?;
+    let weight_scale = gpu.alloc(h.scale.len())?;
+    gpu.copy_h2d(&h.scale, weight_scale)?;
+    Ok(QuantizedWeight {
+        weight,
+        weight_scale,
+        weight_scale_2: h.scale_2,
+        input_scale: DevicePtr::NULL,
+        weight_scale_2_vec: DevicePtr::NULL,
+    })
+}
+
 /// 2026-10-05: Most rows an NVFP4 decode GEMV takes (`w4a16_gemv_batch16`); wider calls keep
 /// the FP8 path.
 pub const NV4_MAX_M: usize = 16;
@@ -463,6 +560,8 @@ static NV4_KERNELS: OnceLock<Option<Nv4Kernels>> = OnceLock::new();
 static NV4_HITS: AtomicU64 = AtomicU64::new(0);
 static NV4_BYTES: AtomicUsize = AtomicUsize::new(0);
 static NV4_WEIGHTS: AtomicUsize = AtomicUsize::new(0);
+/// 2026-10-16: NVFP4 copies uploaded from checkpoint bytes (`METRALE_GLM_DENSE_MLP_CKPT`).
+static NV4_CKPT_WEIGHTS: AtomicUsize = AtomicUsize::new(0);
 static NV4_FIRST_HIT: AtomicBool = AtomicBool::new(false);
 static DEQUANTS: AtomicU64 = AtomicU64::new(0);
 static FIRST_HIT: AtomicBool = AtomicBool::new(false);
@@ -699,6 +798,7 @@ fn register(
     nv4: bool,
     class: Class,
     proj: &'static str,
+    ckpt: Option<&crate::glm5next_mlp::expert_tp::Nvfp4Host>,
 ) -> Result<Option<Fp8DenseWeight>> {
     if !dense_fp8() || n == 0 || k == 0 || !k.is_multiple_of(16) || bf16.is_null() {
         return Ok(None);
@@ -734,15 +834,21 @@ fn register(
     let nv = if nv4
         && let Some(q) = nv4_kernels(gpu)
     {
-        let w4 = metrale_model_layers::weight_map::quantize_to_nvfp4(
-            &DenseWeight { weight: bf16 },
-            n,
-            k,
-            gpu,
-            q.absmax,
-            q.quant,
-            s,
-        )?;
+        // 2026-10-16: `METRALE_GLM_DENSE_MLP_CKPT`: the checkpoint's bytes, not a re-quantization.
+        let w4 = if let Some(h) = ckpt {
+            NV4_CKPT_WEIGHTS.fetch_add(1, Ordering::Relaxed);
+            upload_ckpt_copy(gpu, h, n, k)?
+        } else {
+            metrale_model_layers::weight_map::quantize_to_nvfp4(
+                &DenseWeight { weight: bf16 },
+                n,
+                k,
+                gpu,
+                q.absmax,
+                q.quant,
+                s,
+            )?
+        };
         NV4_BYTES.fetch_add(n * k / 2 + n * k / 16, Ordering::Relaxed);
         NV4_WEIGHTS.fetch_add(1, Ordering::Relaxed);
         Some(w4)
@@ -857,7 +963,7 @@ pub fn route(
     // 2026-10-05: `METRALE_GLM_DENSE_NVFP4`: 1..=16 rows on the BF16-out GEMV of a weight with
     // an NVFP4 copy run the NVFP4 GEMV, ahead of the tensor-core FP8 GEMV below; M = 1 takes
     // it too, so decode and verify rows read the same weights with the same per-row bits.
-    if dense_nvfp4().any()
+    if nv4_any()
         && (1..=NV4_MAX_M).contains(&m)
         && gemv.0 != 0
         && gemv.0 == bf16_gemv_handle(gpu).0
@@ -1036,7 +1142,7 @@ pub fn nv4_copy_routed(
     n: usize,
     k: usize,
 ) -> Option<QuantizedWeight> {
-    if !(dense_nvfp4().any()
+    if !(nv4_any()
         && (1..=NV4_MAX_M).contains(&m)
         && gemv.0 != 0
         && gemv.0 == bf16_gemv_handle(gpu).0
@@ -1500,11 +1606,15 @@ pub struct LayerFp8 {
 /// 2026-10-03: Convert one text layer's weights (see the module doc for the list and what
 /// stays BF16): quantize, free the BF16 originals, rewrite the fields to the FP8 keys and
 /// lay the layer's dequant span out from arena offset 0.
+/// 2026-10-16: `mlp_ckpt`: this rank's checkpoint NVFP4 slices of a dense MLP
+/// (`METRALE_GLM_DENSE_MLP_CKPT`; `None` otherwise): its gate/up/down NVFP4 copies are those
+/// bytes ([`nv4_source`]). Ignored on a MoE layer.
 pub fn register_layer(
     gpu: &dyn GpuBackend,
     mixer: &mut crate::glm5next_layer::Glm5NextMixer,
     mlp: &mut crate::glm5next_layer::Glm5NextMlpSite,
     mlp_cfg: &crate::glm5next_mlp::Glm5NextMlpConfig,
+    mlp_ckpt: Option<&crate::glm5next_mlp::dense_ckpt::DenseMlpCkpt>,
 ) -> Result<LayerFp8> {
     use crate::glm5next_layer::{Glm5NextMixer, Glm5NextMlpSite};
     if !dense_fp8() {
@@ -1536,20 +1646,34 @@ pub fn register_layer(
             list.push((&mut w.o_absorb, c.hidden, heads_lat, Class::DsaO, "o_absorb"));
         }
     }
-    let (w, inter, class) = match mlp {
-        Glm5NextMlpSite::Dense(w) => (w, mlp_cfg.local_dense_intermediate, Class::Mlp),
+    let (w, inter, class, ckpt) = match mlp {
+        Glm5NextMlpSite::Dense(w) => (w, mlp_cfg.local_dense_intermediate, Class::Mlp, mlp_ckpt),
         Glm5NextMlpSite::Moe(w) => (
             &mut w.shared,
             mlp_cfg.local_shared_intermediate,
             Class::Shared,
+            None,
         ),
     };
-    list.push((&mut w.gate_proj, inter, mlp_cfg.hidden, class, "gate_proj"));
-    list.push((&mut w.up_proj, inter, mlp_cfg.hidden, class, "up_proj"));
-    list.push((&mut w.down_proj, mlp_cfg.hidden, inter, class, "down_proj"));
+    let mut ck: [Option<&crate::glm5next_mlp::expert_tp::Nvfp4Host>; 3] = [None; 3];
+    if let Some(c) = ckpt {
+        ck = [Some(&c.gate_proj), Some(&c.up_proj), Some(&c.down_proj)];
+    }
     let mut out = LayerFp8::default();
     for (field, n, k, class, proj) in list {
-        convert_weight_with(gpu, field, n, k, &mut out, true, nvc.has(class), class, proj)?;
+        convert_weight_with(gpu, field, n, k, &mut out, true, nvc.has(class), class, proj, None)?;
+    }
+    let hid = mlp_cfg.hidden;
+    for ((field, n, k, proj), c) in [
+        (&mut w.gate_proj, inter, hid, "gate_proj"),
+        (&mut w.up_proj, inter, hid, "up_proj"),
+        (&mut w.down_proj, hid, inter, "down_proj"),
+    ]
+    .into_iter()
+    .zip(ck)
+    {
+        let nv4 = nv4_source(nvc.has(class), c.is_some()) != Nv4Source::None;
+        convert_weight_with(gpu, field, n, k, &mut out, true, nv4, class, proj, c)?;
     }
     Ok(out)
 }
@@ -1566,7 +1690,7 @@ pub fn convert_weight(
     k: usize,
     acc: &mut LayerFp8,
 ) -> Result<bool> {
-    convert_weight_with(gpu, field, n, k, acc, true, false, Class::Keep, "-")
+    convert_weight_with(gpu, field, n, k, acc, true, false, Class::Keep, "-", None)
 }
 
 /// 2026-10-05: [`convert_weight`] that also makes the NVFP4 decode copy (as
@@ -1580,7 +1704,7 @@ pub fn convert_weight_nvfp4(
     k: usize,
     acc: &mut LayerFp8,
 ) -> Result<bool> {
-    convert_weight_with(gpu, field, n, k, acc, true, true, Class::Keep, "-")
+    convert_weight_with(gpu, field, n, k, acc, true, true, Class::Keep, "-", None)
 }
 
 /// 2026-10-08: [`convert_weight_nvfp4`] registering the weight as `class` / `proj` (what
@@ -1595,7 +1719,7 @@ pub fn convert_weight_nvfp4_class(
     class: Class,
     proj: &'static str,
 ) -> Result<bool> {
-    convert_weight_with(gpu, field, n, k, acc, true, true, class, proj)
+    convert_weight_with(gpu, field, n, k, acc, true, true, class, proj, None)
 }
 
 /// 2026-10-05: [`convert_weight`], with `free_original = false` for a store-owned BF16 original
@@ -1611,9 +1735,10 @@ fn convert_weight_with(
     nv4: bool,
     class: Class,
     proj: &'static str,
+    ckpt: Option<&crate::glm5next_mlp::expert_tp::Nvfp4Host>,
 ) -> Result<bool> {
     let off = acc.arena_bytes;
-    let Some(w) = register(gpu, *field, n, k, off, free_original, nv4, class, proj)? else {
+    let Some(w) = register(gpu, *field, n, k, off, free_original, nv4, class, proj, ckpt)? else {
         return Ok(false);
     };
     *field = w.weight;
@@ -1652,7 +1777,8 @@ pub fn register_mtp(
     let nv_mtp = dense_nvfp4().has(Class::Mtp);
     let mut out = LayerFp8::default();
     let eh = &mut eh_proj.weight;
-    convert_weight_with(gpu, eh, hid, 2 * hid, &mut out, false, nv_mtp, Class::Mtp, "eh_proj")?;
+    let eh_k = 2 * hid;
+    convert_weight_with(gpu, eh, hid, eh_k, &mut out, false, nv_mtp, Class::Mtp, "eh_proj", None)?;
     let mut list: Vec<(&mut DevicePtr, usize, usize, &'static str)> = Vec::new();
     match &mut layer.mixer {
         Glm5NextMixer::Dsa(l) => {
@@ -1677,7 +1803,7 @@ pub fn register_mtp(
     list.push((&mut w.up_proj, inter, mlp_cfg.hidden, "up_proj"));
     list.push((&mut w.down_proj, mlp_cfg.hidden, inter, "down_proj"));
     for (field, n, k, proj) in list {
-        convert_weight_with(gpu, field, n, k, &mut out, true, nv_mtp, Class::Mtp, proj)?;
+        convert_weight_with(gpu, field, n, k, &mut out, true, nv_mtp, Class::Mtp, proj, None)?;
     }
     let arena = finish_load(gpu)?;
     tracing::info!(
@@ -1735,12 +1861,19 @@ pub fn finish_load(gpu: &dyn GpuBackend) -> Result<usize> {
     finish_load_w4a4()?;
     // 2026-10-12: `METRALE_GLM_NV4_B3_GROUP`: resolve the grouped kernel before any capture.
     super::dense_nv4_b3_group::finish_load(gpu);
-    if dense_nvfp4().any() {
+    if nv4_any() {
         tracing::info!(
             "METRALE_GLM_DENSE_NVFP4: {} NVFP4 decode copies, {:.2} GB/rank (on top of the FP8 \
              copies, which prefill keeps reading)",
             NV4_WEIGHTS.load(Ordering::Relaxed),
             NV4_BYTES.load(Ordering::Relaxed) as f64 / 1e9
+        );
+    }
+    // 2026-10-16: `METRALE_GLM_DENSE_MLP_CKPT`: how many of them are checkpoint bytes.
+    if dense_mlp_ckpt() {
+        tracing::info!(
+            "METRALE_GLM_DENSE_MLP_CKPT: {} NVFP4 decode copies from checkpoint NVFP4 bytes",
+            NV4_CKPT_WEIGHTS.load(Ordering::Relaxed)
         );
     }
     Ok(arena)
@@ -1773,7 +1906,7 @@ fn alloc_arena(gpu: &dyn GpuBackend, need: usize) -> Result<usize> {
 /// `ptr` is a registered key, else the BF16 matrix.
 pub fn decode_span(ptr: DevicePtr, n: usize, k: usize) -> crate::glm5next_layer::L2Span {
     // 2026-10-05: A weight with an NVFP4 copy streams its packed E2M1 bytes in decode.
-    if dense_nvfp4().any()
+    if nv4_any()
         && let Some(q) = lookup_nv4(ptr, n, k)
     {
         return crate::glm5next_layer::L2Span {

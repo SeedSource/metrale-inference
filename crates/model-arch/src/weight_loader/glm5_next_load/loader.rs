@@ -614,15 +614,43 @@ impl Glm5NextWeightLoader {
             let t_mixer = t_layer.elapsed();
 
             let load = |n: &str| src.f32(n);
+            // 2026-10-16: `METRALE_GLM_DENSE_MLP_CKPT=1`: this rank's checkpoint NVFP4 slices of
+            // a packed dense MLP, for its NVFP4 decode copies (`register_layer` below); a BF16
+            // checkpoint warns once and keeps the path without the lever.
+            let mut mlp_ckpt = None;
             let mut mlp = match sl.mlp {
-                Mlp::Dense => Glm5NextMlpSite::Dense(mlp_build::build_dense_mlp(
-                    gpu,
-                    &mlp_cfg,
-                    config.tp_rank,
-                    config.intermediate_size,
-                    "mlp",
-                    &load,
-                )?),
+                Mlp::Dense => {
+                    if crate::glm5next_layer::dense_fp8::dense_mlp_ckpt() {
+                        let get = |n: &str| src.packed_nvfp4(n);
+                        mlp_ckpt = crate::glm5next_mlp::dense_ckpt::for_rank(
+                            mlp_cfg.hidden,
+                            config.intermediate_size,
+                            config.tp_rank,
+                            mlp_cfg.tp_world_size,
+                            "mlp",
+                            &get,
+                        )
+                        .with_context(|| format!("glm5_next: layer {idx} checkpoint NVFP4 MLP"))?;
+                        if mlp_ckpt.is_none() {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| {
+                                tracing::warn!(
+                                    "METRALE_GLM_DENSE_MLP_CKPT=1: layer {idx}'s dense MLP is not \
+                                     packed NVFP4 in the checkpoint; dense MLP layers keep the \
+                                     path without the lever"
+                                );
+                            });
+                        }
+                    }
+                    Glm5NextMlpSite::Dense(mlp_build::build_dense_mlp(
+                        gpu,
+                        &mlp_cfg,
+                        config.tp_rank,
+                        config.intermediate_size,
+                        "mlp",
+                        &load,
+                    )?)
+                }
                 Mlp::RoutedMoe => {
                     // 2026-10-06: `METRALE_GLM_WEIGHT_ARENA=1`: plan this layer's uploads into
                     // the derived weight arena; a no-op when the lever is off.
@@ -645,7 +673,11 @@ impl Glm5NextWeightLoader {
             // projections replace the BF16 originals, which are freed and whose fields now name
             // the copies (`glm5next_layer::dense_fp8`); a no-op when the lever is off.
             let fp8 = crate::glm5next_layer::dense_fp8::register_layer(
-                gpu, &mut mixer, &mut mlp, &mlp_cfg,
+                gpu,
+                &mut mixer,
+                &mut mlp,
+                &mlp_cfg,
+                mlp_ckpt.as_ref(),
             )
             .with_context(|| format!("glm5_next: FP8 dense copies of layer {idx}"))?;
             fp8_total.fp8_bytes += fp8.fp8_bytes;

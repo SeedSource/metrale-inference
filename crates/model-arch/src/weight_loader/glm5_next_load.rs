@@ -347,6 +347,61 @@ impl LayerSource {
         };
         nvfp4_dequant::dequant_nvfp4_to_f32(name, bytes, shape, scale_bytes, scale_2)
     }
+
+    /// 2026-10-16: `METRALE_GLM_DENSE_MLP_CKPT`: the packed-NVFP4 `.weight` `name` with its
+    /// `.weight_scale` and scalar `.weight_scale_2` siblings, as stored (`input_scale` is not
+    /// read); `Ok(None)` when `name` is not packed U8 (a BF16 checkpoint). The same sibling
+    /// checks as [`Self::dequant_packed_nvfp4`], plus the byte counts.
+    pub(super) fn packed_nvfp4(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::glm5next_mlp::dense_ckpt::PackedTensor>> {
+        let (dtype, shape, bytes) = self
+            .tensors
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))?;
+        if *dtype != WeightDtype::UInt8 {
+            return Ok(None);
+        }
+        let [rows, half_k] = shape[..] else {
+            bail!("{name}: packed NVFP4 must be 2-D, got shape {shape:?}");
+        };
+        let cols = half_k * 2;
+        let base = name.strip_suffix(".weight").with_context(|| {
+            format!("{name}: packed NVFP4 must be a `.weight`, with scale siblings beside it")
+        })?;
+        let (scale_dtype, _, scale_bytes) = self
+            .tensors
+            .get(&format!("{base}.weight_scale"))
+            .with_context(|| format!("{name} is packed NVFP4 but {base}.weight_scale is absent"))?;
+        if *scale_dtype != WeightDtype::FP8E4M3 {
+            bail!("{base}.weight_scale is {scale_dtype:?}, expected F8_E4M3 block scales");
+        }
+        if !cols.is_multiple_of(16)
+            || bytes.len() != rows * half_k
+            || scale_bytes.len() != rows * cols / 16
+        {
+            bail!(
+                "{name}: [{rows}, {cols}] packed NVFP4 with {} packed and {} scale bytes",
+                bytes.len(),
+                scale_bytes.len()
+            );
+        }
+        let s2 = self.f32(&format!("{base}.weight_scale_2"))?;
+        let [scale_2] = s2[..] else {
+            bail!("{base}.weight_scale_2 is not a scalar");
+        };
+        Ok(Some(crate::glm5next_mlp::dense_ckpt::PackedTensor {
+            host: crate::glm5next_mlp::expert_tp::Nvfp4Host {
+                packed: bytes.clone(),
+                scale: scale_bytes.clone(),
+                scale_2,
+                input_scale: 0.0,
+            },
+            rows,
+            cols,
+        }))
+    }
 }
 
 impl KdaTensorSource for LayerSource {

@@ -126,3 +126,60 @@ fn real_lazy_buffers_with_uneven_room_refuse_together() {
     let out = decide([it.next().unwrap(), it.next().unwrap()]);
     assert_refused_everywhere(&out);
 }
+
+/// 2026-10-16 (race-memory, A194): `METRALE_KV_PREFILL_FAIL_CHUNK0` fires on every `every`-th
+/// chunk-0 attempt of a short prompt only; other chunks and long prompts neither fire nor count.
+#[test]
+fn chunk0_fault_fires_on_every_nth_short_chunk0_attempt_only() {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::lazy_agree::{CHUNK0_FAULT_MAX_PROMPT, chunk0_fault_fires};
+
+    let off = AtomicUsize::new(0);
+    assert!(
+        !(0..4).any(|_| chunk0_fault_fires(0, 0, 25, &off)),
+        "0 = off"
+    );
+    let n = AtomicUsize::new(0);
+    let fired: Vec<bool> = (0..4).map(|_| chunk0_fault_fires(2, 0, 25, &n)).collect();
+    assert_eq!(
+        fired,
+        [false, true, false, true],
+        "a refused request gets through on its retry"
+    );
+    assert!(
+        !chunk0_fault_fires(2, 0, 32_768, &n),
+        "the warmup / long prompts never fire"
+    );
+    assert!(
+        !chunk0_fault_fires(2, 0, CHUNK0_FAULT_MAX_PROMPT, &n),
+        "the bound is exclusive"
+    );
+    assert!(!chunk0_fault_fires(2, 8_192, 25, &n), "only chunk 0");
+    assert!(
+        !chunk0_fault_fires(2, 0, 25, &n),
+        "uncounted attempts left the parity alone"
+    );
+    assert!(chunk0_fault_fires(2, 0, 25, &n));
+}
+
+/// 2026-10-16 (race-memory, A194): `N@R` arms one rank; that rank's fault refusal goes through the
+/// vote, and both ranks' errors carry the two phrases the scheduler's chunk-0 wait keys on
+/// (`spec_kv_refusal_retryable`: "KV cache exhausted" and, under EP, "rank-agreed").
+#[test]
+fn one_rank_chunk0_fault_is_refused_on_every_rank_as_retryable() {
+    use super::super::decode_lazy_agree::{fail_above_for_rank, parse_fail_above};
+    use super::lazy_agree::chunk0_fault_error;
+
+    let lever = parse_fail_above("2@1");
+    assert_eq!(
+        [fail_above_for_rank(lever, 0), fail_above_for_rank(lever, 1)],
+        [0, 2]
+    );
+    let out = decide([Ok(()), Err(chunk0_fault_error(2, 25))]);
+    assert_refused_everywhere(&out);
+    for (rank, r) in out.iter().enumerate() {
+        let e = format!("{:#}", r.as_ref().expect_err("every rank refuses"));
+        assert!(e.contains("rank-agreed"), "rank {rank}: {e}");
+    }
+}

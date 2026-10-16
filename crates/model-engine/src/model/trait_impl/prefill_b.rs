@@ -205,15 +205,28 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         let end_pos = chunk_start + chunk_len;
         let blocks_needed = (end_pos - 1) / bs + 1;
-        let admitted = super::super::block_mgmt::ensure_blocks_through_prefill(
-            seq,
-            blocks_needed - 1,
-            &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
-            stream,
-            self.levers.kv_poison,
+        // 2026-10-16 (race-memory, A194): `METRALE_KV_PREFILL_FAIL_CHUNK0` (test-only) refuses
+        // a short prompt's chunk 0 here, before any block is allocated (`lazy_agree`).
+        static CHUNK0_ATTEMPTS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let chunk0_fault = super::decode_lazy_agree::fail_above_for_rank(
+            lazy_agree::kv_prefill_fail_chunk0(),
+            self.comm.as_ref().map_or(0, |c| c.rank()),
         );
+        let admitted =
+            if lazy_agree::chunk0_fault_fires(chunk0_fault, chunk_start, total, &CHUNK0_ATTEMPTS) {
+                Err(lazy_agree::chunk0_fault_error(chunk0_fault, total))
+            } else {
+                super::super::block_mgmt::ensure_blocks_through_prefill(
+                    seq,
+                    blocks_needed - 1,
+                    &mut kv_cache,
+                    self.prefix_cache.as_ref(),
+                    self.gpu.as_ref(),
+                    stream,
+                    self.levers.kv_poison,
+                )
+            };
         // 2026-10-05: Rank-agreed admission (race-memory #79, A168): the KV blocks and the
         // lazily mapped DSA indexer rows are admitted per rank (the lazy-map floor reads this
         // rank's free memory), so every rank votes before the chunk's first forward

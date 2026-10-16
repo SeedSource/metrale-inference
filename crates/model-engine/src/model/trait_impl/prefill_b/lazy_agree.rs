@@ -27,6 +27,9 @@
 //! - Without the multi-rank protocol `agree_admission` returns the local result unchanged:
 //!   no collective, today's single-rank behaviour.
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::{Result, anyhow};
 
 use super::super::super::types::TransformerModel;
@@ -70,4 +73,48 @@ impl TransformerModel {
         let votes = self.ep_gather_u32(u32::from(local.is_ok()))?;
         agreed_outcome(local, &votes, what)
     }
+}
+
+/// 2026-10-16 (race-memory, A194): Prompts shorter than this many tokens are the only ones
+/// `METRALE_KV_PREFILL_FAIL_CHUNK0` refuses, so the serve warmup and long prompts are untouched.
+pub(in crate::model) const CHUNK0_FAULT_MAX_PROMPT: usize = 1024;
+
+/// 2026-10-16 (race-memory, A194): `METRALE_KV_PREFILL_FAIL_CHUNK0` (test-only fault injection;
+/// unset, 0 or unparsable = off): `N` refuses every N-th chunk-0 admission attempt of a prompt
+/// shorter than `CHUNK0_FAULT_MAX_PROMPT` tokens, on every rank; `N@R` on rank R only (the
+/// 2-rank GPU check of gap (e): the other rank admits, so the refusal goes through the vote).
+/// The refusal happens before any KV block is allocated, as a real chunk-0 refusal leaves the
+/// request. Retries count as attempts, so `N` >= 2 lets every refused request through on a
+/// later try; `1` refuses every short chunk 0. Same `N` / `N@R` form as
+/// `METRALE_KV_DECODE_FAIL_ABOVE_BLOCKS`. Read once, per process; deliberately NOT rank-agreed.
+pub(in crate::model) fn kv_prefill_fail_chunk0() -> (usize, Option<usize>) {
+    static N: OnceLock<(usize, Option<usize>)> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("METRALE_KV_PREFILL_FAIL_CHUNK0")
+            .map(|v| super::super::decode_lazy_agree::parse_fail_above(&v))
+            .unwrap_or((0, None))
+    })
+}
+
+/// 2026-10-16 (race-memory, A194): Whether this admission attempt is refused by the fault lever:
+/// `every` > 0 (this rank's value, `fail_above_for_rank`), chunk 0 of a short prompt, and the
+/// attempt's 1-based number (`count`, called only for such attempts) a multiple of `every`.
+pub(in crate::model) fn chunk0_fault_fires(
+    every: usize,
+    chunk_start: usize,
+    prompt_len: usize,
+    count: &AtomicUsize,
+) -> bool {
+    every > 0
+        && chunk_start == 0
+        && prompt_len < CHUNK0_FAULT_MAX_PROMPT
+        && (count.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(every)
+}
+
+/// 2026-10-16 (race-memory, A194): The local refusal the fault lever stands in for.
+pub(in crate::model) fn chunk0_fault_error(every: usize, prompt_len: usize) -> anyhow::Error {
+    anyhow!(
+        "KV cache exhausted: test fault-injection lever METRALE_KV_PREFILL_FAIL_CHUNK0={every} \
+         (chunk 0 of a {prompt_len}-token prompt)"
+    )
 }

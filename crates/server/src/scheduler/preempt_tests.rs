@@ -1002,6 +1002,7 @@ fn a_new_request_refused_for_kv_at_chunk_0_is_kept_waiting_not_failed() {
         let req = InferenceRequest::Blocking {
             prompt_tokens: std::sync::Arc::new(vec![1, 2, 3]),
             session_hash: 0,
+            cache_salt_hash: 0,
             adapter_slot: -1,
             src_lang_id: 0,
             tgt_lang_id: 0,

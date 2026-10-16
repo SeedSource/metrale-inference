@@ -105,7 +105,13 @@ impl ModelForward for PreemptStubModel {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            anyhow::bail!("KV cache exhausted: no free blocks");
+            // 2026-10-15 (race-memory, gap (e)): `kv_error` names the refusal here too, so a
+            // test can script the rank-agreed one an EP serve gives.
+            anyhow::bail!(
+                "{}",
+                self.kv_error
+                    .unwrap_or("KV cache exhausted: no free blocks")
+            );
         }
         // 2026-10-04: only a first-token stub (`first_token`) prefills.
         // 2026-10-14: or a resume stub (`chunks_ok`).

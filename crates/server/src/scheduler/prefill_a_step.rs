@@ -318,31 +318,11 @@ pub fn start_chunked_prefill(
         return Ok(StartPrefillResult::Finished);
     }
 
-    if defer {
-        debug_assert!(
-            image_pixels.is_empty(),
-            "vision must be excluded from co-dispatch"
-        );
-        if let Err(e) = (|| -> Result<()> {
-            model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-            model.ep_broadcast_cmd(chunk_len as u32)?;
-            model.ep_broadcast_cmd(0)?;
-            model.ep_broadcast_cmd(prompt_tokens.len() as u32)?;
-            model.ep_broadcast_tokens(&prompt_tokens)?;
-            // 2026-09-25: The worker makes the matching call in its
-            // `0xFFFFFFF0` handler, so it runs here too.
-            model.ep_sync_vision_embeds(&prompt_tokens)?;
-            Ok(())
-        })() {
-            let msg = format!("deferred prefill EP broadcast failed: {e:#}");
-            send_error_to_sink(&sched.io, &mut sink, &msg);
-            if let Err(fe) = model.free_sequence(&mut seq) {
-                tracing::error!("prefill_a_step: free_sequence (deferred broadcast error): {fe:#}");
-            }
-            return Err(e);
-        }
-        return Ok(StartPrefillResult::InProgress(
-            super::prefill_a_step_params::build_prefill_in_progress(
+    // 2026-10-15 (race-memory, gap (e)): the request as a prefill at offset 0 that has not run
+    // its chunk 0; built here for `defer` and for a chunk-0 KV refusal (below).
+    macro_rules! in_progress_at_offset_0 {
+        () => {
+            StartPrefillResult::InProgress(super::prefill_a_step_params::build_prefill_in_progress(
                 prompt_tokens,
                 req_session_hash,
                 seq,
@@ -378,10 +358,37 @@ pub fn start_chunked_prefill(
                 req_seed,
                 req_top_logprobs,
                 req_timeout_at,
-            ),
-        ));
+            ))
+        };
     }
 
+    if defer {
+        debug_assert!(
+            image_pixels.is_empty(),
+            "vision must be excluded from co-dispatch"
+        );
+        if let Err(e) = (|| -> Result<()> {
+            model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
+            model.ep_broadcast_cmd(chunk_len as u32)?;
+            model.ep_broadcast_cmd(0)?;
+            model.ep_broadcast_cmd(prompt_tokens.len() as u32)?;
+            model.ep_broadcast_tokens(&prompt_tokens)?;
+            // 2026-09-25: The worker makes the matching call in its
+            // `0xFFFFFFF0` handler, so it runs here too.
+            model.ep_sync_vision_embeds(&prompt_tokens)?;
+            Ok(())
+        })() {
+            let msg = format!("deferred prefill EP broadcast failed: {e:#}");
+            send_error_to_sink(&sched.io, &mut sink, &msg);
+            if let Err(fe) = model.free_sequence(&mut seq) {
+                tracing::error!("prefill_a_step: free_sequence (deferred broadcast error): {fe:#}");
+            }
+            return Err(e);
+        }
+        return Ok(in_progress_at_offset_0!());
+    }
+
+    let has_images = vision_slice.is_some() || !image_pixels.is_empty();
     // 2026-09-25: An error from this block frees the sequence below.
     let prefill_result = (|| -> Result<DevicePtr> {
         if vision_slice.is_none() && !image_pixels.is_empty() {
@@ -441,6 +448,22 @@ pub fn start_chunked_prefill(
 
     let logits = match prefill_result {
         Ok(l) => l,
+        // 2026-10-15 (race-memory, gap (e); fchr arm A, 2026-10-15 23:59:41 UTC: two new requests
+        // ended with "prefill_chunk failed: ... KV cache exhausted: the DSA indexer pool cannot map
+        // 2.0 MiB more"): a rank-agreed KV refusal of chunk 0 runs no forward on any rank, so the
+        // request is kept as a prefill at offset 0 and `run_standard` retries it once there is
+        // room. Under EP the worker refused the same chunk and waits for its next command; the
+        // retry re-sends it (`broadcast_chunk`). A request with images still fails here.
+        Err(e)
+            if !has_images
+                && super::preempt::spec_kv_refusal_retryable(model, &format!("{e:#}")) =>
+        {
+            tracing::warn!(
+                "KV cache exhausted at chunk 0 of a new request ({} tokens): kept as a waiting prefill",
+                prompt_tokens.len(),
+            );
+            return Ok(in_progress_at_offset_0!());
+        }
         Err(e) => {
             let msg = format!("prefill_chunk failed: {e:#}");
             send_error_to_sink(&sched.io, &mut sink, &msg);

@@ -793,7 +793,10 @@ fn a_prefill_chunk_refused_for_kv_requeues_a_decoder_and_ends_none() {
     let (a0, mut rx0) = active_seq(0, 9);
     let (a1, mut rx1) = active_seq(1, 3);
     let mut active = vec![a0, a1];
-    let (p, _rxp) = test_prefill_ident(7, 16);
+    let (mut p, _rxp) = test_prefill_ident(7, 16);
+    // 2026-10-15 (gap (e)): mid-prefill, as cap2h's f#2 (311,296 of 324,383); a prefill still at
+    // chunk 0 waits instead (`a_new_prefill_refused_at_chunk_0_waits_...`).
+    p.chunk_offset = 8;
     let mut prefilling = vec![p];
     let mut preempted = Vec::new();
     continue_in_progress_prefills(
@@ -892,5 +895,193 @@ fn a_prefill_chunk_refused_for_kv_with_no_decoder_fails_the_prefill_only() {
         model.chunks.lock().unwrap().len(),
         1,
         "no retry without a victim"
+    );
+}
+
+/// 2026-10-15 (race-memory, gap (e)): fchr arm A (L34, 2026-10-15 23:59:41 UTC) lost two new
+/// requests to "prefill_chunk failed: ... rank-agreed refusal ...: KV cache exhausted: the DSA
+/// indexer pool cannot map 2.0 MiB more". A prefill still at chunk 0 holds no KV blocks: while rows
+/// decode it waits for room and retries next tick; it never requeues a decoder (gap (a)'s rule is
+/// for a prefill that already holds blocks) and nobody gets a frame.
+#[test]
+fn a_new_prefill_refused_at_chunk_0_waits_while_rows_decode_and_preempts_none() {
+    use super::phase_continue_prefills::continue_in_progress_prefills;
+    use super::test_support::test_prefill_ident;
+    let model = std::sync::Arc::new(PreemptStubModel {
+        first_token: Some(7),
+        ep: true,
+        kv_error: Some(VOTED),
+        ..Default::default()
+    });
+    model.fail_prefill_chunks.store(1, Ordering::SeqCst);
+    let sched = SchedCtx::for_test_with(model.clone());
+    let (a0, mut rx0) = active_seq(0, 9);
+    let (a1, mut rx1) = active_seq(1, 3);
+    let mut active = vec![a0, a1];
+    let (p, mut rxp) = test_prefill_ident(7, 16);
+    let mut prefilling = vec![p];
+    let mut preempted = Vec::new();
+    let tick = |active: &mut Vec<_>, prefilling: &mut Vec<_>, preempted: &mut Vec<_>| {
+        continue_in_progress_prefills(
+            &*model,
+            &crate::scheduling_policy::FifoPolicy,
+            active,
+            prefilling,
+            preempted,
+            16,
+            16,
+            false,
+            0,
+            0,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            &sched,
+        )
+    };
+    tick(&mut active, &mut prefilling, &mut preempted);
+    assert!(
+        preempted.is_empty(),
+        "no decoder is requeued for a new request"
+    );
+    assert_eq!(active.len(), 2, "both decoders keep running");
+    assert_eq!(prefilling.len(), 1, "the request waits as a prefill");
+    assert!(prefilling[0].kv_wait_logged && prefilling[0].chunk_offset == 0);
+    assert!(
+        rx0.try_recv().is_err() && rx1.try_recv().is_err() && rxp.try_recv().is_err(),
+        "no frame to anyone"
+    );
+    assert_eq!(
+        model.chunks.lock().unwrap().len(),
+        1,
+        "no retry in the same tick"
+    );
+    // Next tick there is room: the same chunk 0 is re-sent to the worker and runs.
+    tick(&mut active, &mut prefilling, &mut preempted);
+    let chunks = model.chunks.lock().unwrap().clone();
+    assert_eq!(chunks.len(), 2, "{chunks:?}");
+    assert_eq!(chunks[0], chunks[1]);
+    assert!(prefilling.is_empty() && preempted.is_empty());
+    assert_eq!(active.len(), 3, "the request now decodes");
+    let starts = model
+        .ep_words
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|&&w| w == 0xFFFFFFF0)
+        .count();
+    assert_eq!(
+        starts, 2,
+        "the worker got the chunk command for each attempt"
+    );
+}
+
+/// 2026-10-15 (race-memory, gap (e)): the start of a request: a rank-agreed (or single-rank) KV
+/// refusal of chunk 0 keeps the request as a waiting prefill at offset 0 with its sink unanswered;
+/// on an EP serve a refusal without the rank vote still fails the request (the ranks may be apart).
+#[test]
+fn a_new_request_refused_for_kv_at_chunk_0_is_kept_waiting_not_failed() {
+    use super::emit_step::StartPrefillResult;
+    use crate::api::InferenceRequest;
+    let run = |ep: bool, kv_error: &'static str| {
+        let model = PreemptStubModel {
+            first_token: Some(7),
+            ep,
+            kv_error: Some(kv_error),
+            ..Default::default()
+        };
+        model.fail_prefill_chunks.store(1, Ordering::SeqCst);
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        let mut engine = None;
+        let req = InferenceRequest::Blocking {
+            prompt_tokens: std::sync::Arc::new(vec![1, 2, 3]),
+            session_hash: 0,
+            adapter_slot: -1,
+            src_lang_id: 0,
+            tgt_lang_id: 0,
+            num_beams: 1,
+            length_penalty: 1.0,
+            early_stopping: false,
+            image_pixels: vec![],
+            max_tokens: 4,
+            min_tokens: 0,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            top_n_sigma: 0.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            dry_multiplier: 0.0,
+            dry_base: 0.0,
+            dry_allowed_length: 0,
+            lz_penalty: 0.0,
+            logit_bias: vec![],
+            stop_tokens: vec![],
+            enable_thinking: false,
+            thinking_budget: None,
+            repetition_detection: None,
+            require_tool_call: false,
+            tools_present: false,
+            suppress_tool_call: false,
+            disable_mtp: true,
+            grammar_spec: None,
+            seed: Some(42),
+            top_logprobs: None,
+            prompt_logprobs: None,
+            echo: false,
+            timeout_at: None,
+            response_tx,
+        };
+        let r = super::prefill_a_step::start_chunked_prefill(
+            &SchedCtx::for_test(),
+            None,
+            None,
+            None,
+            None,
+            &model,
+            req,
+            &[],
+            64,
+            0,
+            0,
+            &mut engine,
+            0,
+            false,
+            None,
+            None,
+        );
+        let waiting = match r {
+            Ok(StartPrefillResult::InProgress(p)) => {
+                assert_eq!(p.chunk_offset, 0);
+                assert_eq!(p.seq.slot_idx, 0);
+                true
+            }
+            Ok(_) => panic!("neither waiting nor failed"),
+            Err(_) => false,
+        };
+        (waiting, response_rx.try_recv().is_ok())
+    };
+    assert_eq!(
+        run(true, VOTED),
+        (true, false),
+        "EP, rank-agreed: waits, no answer yet"
+    );
+    assert_eq!(
+        run(false, "KV cache exhausted: no free blocks"),
+        (true, false),
+        "single rank: waits"
+    );
+    assert_eq!(
+        run(true, "KV cache exhausted: no free blocks"),
+        (false, true),
+        "EP without the rank vote: fails, and the caller is answered"
     );
 }

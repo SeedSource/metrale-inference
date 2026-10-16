@@ -163,6 +163,7 @@ pub(super) fn test_prefill(prompt: Vec<u32>) -> (super::types::PrefillInProgress
         top_logprobs: None,
         timeout_at: None,
         chunk_cap_logged: false,
+        kv_wait_logged: false,
     };
     (p, rx)
 }
@@ -218,6 +219,7 @@ pub(super) fn test_prefill_ident(
         top_logprobs: None,
         timeout_at: None,
         chunk_cap_logged: false,
+        kv_wait_logged: false,
     };
     (p, rx)
 }
@@ -257,7 +259,8 @@ pub(super) struct PreemptStubModel {
     pub(super) logit_rows: Vec<Vec<f32>>,
     /// 2026-10-14 (race-memory, A184): `is_ep` (default `false`, single rank).
     pub(super) ep: bool,
-    /// 2026-10-14: The message of a scripted KV failure (`fail_decodes`); `None` (default)
+    /// 2026-10-14: The message of a scripted KV failure (`fail_decodes`, and since 2026-10-15
+    /// `fail_prefill_chunks`); `None` (default)
     /// is "KV cache exhausted: no free blocks".
     pub(super) kv_error: Option<&'static str>,
     /// 2026-10-14 (race-memory, kvagcheck8): When set, `prefill_chunk` succeeds without

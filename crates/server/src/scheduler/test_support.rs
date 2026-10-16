@@ -164,6 +164,7 @@ pub(super) fn test_prefill(prompt: Vec<u32>) -> (super::types::PrefillInProgress
         timeout_at: None,
         chunk_cap_logged: false,
         kv_wait_logged: false,
+        chunk0_refused: false,
     };
     (p, rx)
 }
@@ -220,6 +221,7 @@ pub(super) fn test_prefill_ident(
         timeout_at: None,
         chunk_cap_logged: false,
         kv_wait_logged: false,
+        chunk0_refused: false,
     };
     (p, rx)
 }

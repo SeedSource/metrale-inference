@@ -117,6 +117,34 @@ impl SchedulerCore {
                 }
             }
         }
+        // 2026-10-16 (race-memory, A194 gapF): a request whose chunk 0 was refused for KV waits
+        // in `prefilling`. With the while-decoding cap's start/continue alternation, a start turn
+        // retries it (new requests wait for the next start turn) and counts as a start, so the
+        // next turn continues the long prefill (`prefill_chunk_cap::waiting_head`). With the cap
+        // off, or nothing decoding, the order is unchanged.
+        let mut waiting_retry = false;
+        if sched.levers.prefill_chunk_while_decoding.is_some()
+            && crate::scheduler::prefill_chunk_cap::decoders(active) > 0
+            && !self.slice_hold
+            && !self.resume_slot
+        {
+            let waiting: Vec<bool> = prefilling
+                .iter()
+                .map(|p| p.chunk0_refused && p.chunk_offset == 0)
+                .collect();
+            let retry_turn = !self.last_turn_started && waiting.iter().any(|&w| w);
+            if retry_turn {
+                for (i, req) in new_reqs.drain(..).enumerate() {
+                    pending.requests.insert(i, req);
+                }
+                waiting_retry = true;
+            }
+            if let Some(i) = crate::scheduler::prefill_chunk_cap::waiting_head(&waiting, retry_turn)
+            {
+                let p = prefilling.remove(i);
+                prefilling.insert(0, p);
+            }
+        }
         self.started_prefill = !new_reqs.is_empty();
         // 2026-10-16 (race-prefill, A197): only a prefill turn updates the alternation. Before
         // this, the k-1 held ticks of `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK` and the resume's
@@ -124,7 +152,7 @@ impl SchedulerCore {
         // (`skip_continue`): a steady stream of short requests starved a long prefill (gape E,
         // 2026-10-16: 648 s stall, cut by the server deadline).
         if !self.slice_hold && !self.resume_slot {
-            self.last_turn_started = self.started_prefill;
+            self.last_turn_started = self.started_prefill || waiting_retry;
         }
         sched.io.tel.mark(mtp_timing::Phase::LoopDrain, t_loop);
 

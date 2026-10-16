@@ -37,6 +37,10 @@ use metrale_config::{Glm5NextRouterMode, ModelConfig};
 use metrale_gpu_runtime::gpu::{GpuBackend, KernelHandle};
 
 pub mod build;
+// 2026-10-16: `METRALE_GLM_DENSE_MLP_CKPT`: dense-MLP NVFP4 copies from the checkpoint.
+pub mod dense_ckpt;
+#[cfg(test)]
+mod dense_ckpt_tests;
 pub mod expert_tp;
 #[cfg(test)]
 mod expert_tp_tests;

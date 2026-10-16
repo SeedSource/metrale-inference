@@ -328,3 +328,73 @@ fn only_a_bf16_expert_weight_is_prunable() {
         WeightDtype::BF16
     ));
 }
+
+/// 2026-10-16: `METRALE_GLM_DENSE_MLP_CKPT`: a packed dense MLP read through
+/// `LayerSource::packed_nvfp4` and `dense_ckpt::for_rank` gives each TP rank an NVFP4 copy whose
+/// GEMV decode (`dense_ckpt::gemv_weights_f32`) matches the same rank's slice of the BF16-path
+/// source (`LayerSource::f32`, the loader's dequant, sliced as `build_dense_mlp` slices it) to
+/// within one f32 ulp (the GEMV forms `e4m3 * scale_2` first), with no second rounding; a BF16
+/// tensor is not packed (`None`).
+#[test]
+fn a_packed_dense_mlp_gives_each_rank_its_checkpoint_nvfp4_copy() {
+    use crate::glm5next_mlp::dense_ckpt::{for_rank, gemv_weights_f32};
+    let (hidden, inter, tp) = (32usize, 64usize, 2usize);
+    let mut b = StoreBuilder::new();
+    for (i, (p, rows, cols)) in [
+        ("gate_proj", inter, hidden),
+        ("up_proj", inter, hidden),
+        ("down_proj", hidden, inter),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let packed: Vec<u8> = (0..rows * cols / 2)
+            .map(|j| (j as u8).wrapping_mul(37).wrapping_add(i as u8 * 11))
+            .collect();
+        let scales: Vec<u8> = (0..rows * cols / 16)
+            .map(|j| 0x30 + ((j * 7 + i) % 0x18) as u8)
+            .collect();
+        let s2 = [0.0123f32, 0.25, 3.1e-4][i];
+        b.put(&qualified(&format!("mlp.{p}.weight")), &packed, &[rows, cols / 2], WeightDtype::UInt8);
+        b.put(
+            &qualified(&format!("mlp.{p}.weight_scale")),
+            &scales,
+            &[rows, cols / 16],
+            WeightDtype::FP8E4M3,
+        );
+        b.put(
+            &qualified(&format!("mlp.{p}.weight_scale_2")),
+            &s2.to_le_bytes(),
+            &[],
+            WeightDtype::FP32,
+        );
+    }
+    b.put(&qualified("mlp.extra.weight"), &bf16_bytes(&ramp(64)), &[4, 16], WeightDtype::BF16);
+    let (gpu, store) = b.finish();
+    let src = LayerSource::collect(&gpu, &store, LAYER).unwrap();
+    assert!(src.packed_nvfp4("mlp.extra.weight").unwrap().is_none(), "BF16 is not packed");
+
+    let get = |n: &str| src.packed_nvfp4(n);
+    let gate = src.f32("mlp.gate_proj.weight").unwrap();
+    let down = src.f32("mlp.down_proj.weight").unwrap();
+    let near = |got: &[f32], want: &[f32], what: &str| {
+        assert_eq!(got.len(), want.len(), "{what}");
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            let ulp = f32::from_bits(w.abs().to_bits() + 1) - w.abs();
+            assert!((g - w).abs() <= ulp, "{what}[{i}]: {g} vs {w}");
+        }
+    };
+    let local = inter / tp;
+    for rank in 0..tp {
+        let lo = rank * local;
+        let c = for_rank(hidden, inter, rank, tp, "mlp", &get).unwrap().expect("packed");
+        let g = gemv_weights_f32(&c.gate_proj, local, hidden);
+        near(&g, &gate[lo * hidden..(lo + local) * hidden], "gate");
+        let d = gemv_weights_f32(&c.down_proj, hidden, local);
+        let want: Vec<f32> = down
+            .chunks(inter)
+            .flat_map(|r| r[lo..lo + local].iter().copied())
+            .collect();
+        near(&d, &want, "down");
+    }
+}

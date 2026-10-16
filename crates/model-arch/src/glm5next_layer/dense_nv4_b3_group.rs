@@ -160,7 +160,7 @@ fn wired_groups() -> String {
     if c.kda {
         v.push("kda_qkv");
     }
-    if c.shared || c.mlp || c.mtp {
+    if c.shared || c.mlp || c.mtp || dense_fp8::dense_mlp_ckpt() {
         v.push("shared_gateup");
     }
     if c.dsa {

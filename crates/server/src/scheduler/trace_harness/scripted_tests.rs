@@ -668,3 +668,73 @@ fn c_kv_refusal_in_a_batched_dflash_verify_preempts_one_victim_and_no_reply_is_c
         );
     }
 }
+
+#[test]
+fn c_sliced_resume_turns_do_not_starve_a_long_prefill_behind_a_backlog() {
+    // 2026-10-16 (race-prefill, A197): under `METRALE_RESUME_SLICED` the resume's turns ran no
+    // new-request chunk and reset the start/continue alternation, so while a resume was in flight
+    // every prefill turn started a backlogged short request and seq 2's in-progress prefill got
+    // no chunk until the resume ended. No `decode_slice` here: the resume turns alone. Starts and
+    // continues alternate across them: a seq-2 chunk at least every fourth tick (resume, start,
+    // resume, continue).
+    let reply = |n: u32, base: u32| -> Vec<u32> {
+        let mut v: Vec<u32> = (0..n).map(|i| base + i).collect();
+        v.push(EOS);
+        v
+    };
+    let mut cfg = ModelCfg::default();
+    cfg.kv_exhaust_at = vec![EXHAUST_AT];
+    // seq 1's 40-token prompt makes its resume ~12 chunks long.
+    let mut reqs = vec![
+        ReqSpec::new(1, 40, reply(60, 100)),
+        ReqSpec::new(3, 4, reply(60, 300)),
+    ];
+    // seq 2 and the backlog arrive once seq 1 has been requeued; queued together so the gate's
+    // single park holds them all (later timed arrivals race the loop).
+    let mut s2 = ReqSpec::new(2, 64, reply(3, 200));
+    s2.arrive_at_tick = Some(S4_AT);
+    reqs.push(s2);
+    for i in 0..30u64 {
+        let mut r = ReqSpec::new(10 + i, 4, reply(1, 40));
+        r.arrive_at_tick = Some(S4_AT);
+        reqs.push(r);
+    }
+    let sc = Scenario {
+        name: "sliced_resume_backlog",
+        cfg,
+        opts: RunOptions {
+            max_batch_size: 6,
+            max_prefill_tokens: 4,
+            no_mix: true,
+            prefill_chunk_while_decoding: Some(256),
+            resume_one_chunk_per_tick: true,
+            resume_sliced: true,
+            ..RunOptions::default()
+        },
+        reqs,
+    };
+    let lines = run_scenario(&sc);
+    // per tick: (a resume chunk of s1 ran, a chunk of s2 ran)
+    let mut t: Vec<(bool, bool)> = Vec::new();
+    for l in &lines {
+        if l.starts_with("-- tick ") {
+            t.push((false, false));
+        } else if let Some(x) = t.last_mut() {
+            x.0 |= l.starts_with("prefill_chunk(") && l.contains(" s1@");
+            x.1 |= l.starts_with("prefill_chunk(") && l.contains(" s2@");
+        }
+    }
+    let s2_ticks: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.1).map(|(i, _)| i).collect();
+    let resume_ticks: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.0).map(|(i, _)| i).collect();
+    assert_eq!(s2_ticks.len(), 16, "s2 chunks {s2_ticks:?}");
+    assert!(resume_ticks.len() >= 3, "a resume in flight: {resume_ticks:?}");
+    // the s2 chunk gaps that overlap the resume
+    let (r0, r1) = (resume_ticks[0], *resume_ticks.last().unwrap());
+    let worst = s2_ticks.windows(2).filter(|w| w[1] > r0 && w[0] < r1).map(|w| w[1] - w[0]).max();
+    assert!(worst.is_some(), "s2 prefilled during the resume ({r0}..{r1}): {s2_ticks:?}");
+    assert!(worst.unwrap() <= 4, "s2 waited {worst:?} ticks during the resume {resume_ticks:?}: {s2_ticks:?}");
+    for id in [1u64, 2, 3] {
+        let b = output(&lines, id);
+        assert!(b.contains("Done(stop"), "s{id}: {b}");
+    }
+}

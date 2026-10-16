@@ -79,6 +79,12 @@ pub struct SchedulerCore {
     /// `plan_tick`); with `METRALE_PREFILL_CHUNK_WHILE_DECODING` on it decides the next tick's
     /// admissions and whether this tick's ContinuePrefills runs (`prefill_chunk_cap`).
     started_prefill: bool,
+    /// 2026-10-16 (race-prefill, A197): the last prefill turn (a tick that is neither a
+    /// `slice_hold` tick nor the resume's `resume_slot`) started a request. `admit_now` reads it
+    /// in place of the previous tick's `started_prefill`, so held and resume ticks between two
+    /// turns do not reset the start/continue alternation. With neither tick kind it equals the
+    /// previous tick's `started_prefill`.
+    last_turn_started: bool,
     /// 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK`: decode-only ticks still owed after
     /// the last prefill chunk (`decode_slice::next_left`), and whether this tick is one of them
     /// (set in `plan_tick`, read by ContinuePrefills).
@@ -321,6 +327,7 @@ impl SchedulerCore {
             snapshot_steps: 0,
             did_mixed_step: false,
             started_prefill: false,
+            last_turn_started: false,
             slice_left: 0,
             slice_hold: false,
             resume_slot: false,

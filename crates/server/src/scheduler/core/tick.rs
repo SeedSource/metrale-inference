@@ -57,7 +57,7 @@ impl SchedulerCore {
         );
         // 2026-10-03: `METRALE_PREFILL_CHUNK_WHILE_DECODING`: while a sequence decodes, start
         // at most one request this tick, and none when a prefill is in progress and the last
-        // tick started one (`prefill_chunk_cap::admit_now`); the rest return to the front of
+        // prefill turn started one (`last_turn_started`, A197) (`prefill_chunk_cap::admit_now`); the rest return to the front of
         // the pending queue in arrival order.
         let mut new_reqs = new_reqs;
         // 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK`: a held tick (decode only, owed
@@ -82,7 +82,7 @@ impl SchedulerCore {
                 crate::scheduler::prefill_chunk_cap::decoders(active),
                 new_reqs.len(),
                 !prefilling.is_empty(),
-                self.started_prefill,
+                self.last_turn_started,
             )
         };
         if admit < new_reqs.len() {
@@ -118,6 +118,14 @@ impl SchedulerCore {
             }
         }
         self.started_prefill = !new_reqs.is_empty();
+        // 2026-10-16 (race-prefill, A197): only a prefill turn updates the alternation. Before
+        // this, the k-1 held ticks of `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK` and the resume's
+        // turns reset it, so every free tick started a new request and ContinuePrefills skipped
+        // (`skip_continue`): a steady stream of short requests starved a long prefill (gape E,
+        // 2026-10-16: 648 s stall, cut by the server deadline).
+        if !self.slice_hold && !self.resume_slot {
+            self.last_turn_started = self.started_prefill;
+        }
         sched.io.tel.mark(mtp_timing::Phase::LoopDrain, t_loop);
 
         // 2026-09-25: Settle a step running ahead of the host before this tick starts

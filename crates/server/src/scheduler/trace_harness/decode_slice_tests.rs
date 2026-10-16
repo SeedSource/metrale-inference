@@ -113,3 +113,39 @@ fn a_lone_request_runs_the_same_model_calls() {
         assert_eq!(run_scenario(&scenario(Some(k), false)), off, "k={k}");
     }
 }
+
+/// 2026-10-16 (race-prefill, A197): seq 1 decodes, seq 2's 64-token prompt prefills in 8-token
+/// chunks, and 40 short requests (one chunk, a 1-token reply) wait behind them: more than the
+/// one start per prefill turn can serve before seq 2 is done. All are queued before the loop
+/// starts (the gate parks only at the first `arrive_at_tick`, so timed arrivals after it race the
+/// loop): tick 1 has no decoder and starts the first `max_batch_size`, the rest stay pending.
+fn stream_scenario(k: Option<usize>) -> Scenario {
+    let mut sc = scenario(k, true);
+    sc.reqs[0] = ReqSpec::new(1, 4, reply(200, 100));
+    sc.reqs[1].arrive_at_tick = None;
+    for i in 0..40u64 {
+        sc.reqs.push(ReqSpec::new(10 + i, 4, reply(1, 40)));
+    }
+    sc
+}
+
+#[test]
+fn a_steady_stream_of_short_requests_does_not_starve_a_long_prefill() {
+    // 2026-10-16 (race-prefill, A197): with `k` the held ticks reset the start/continue
+    // alternation, so every free tick started a short request and seq 2 got no chunk until the
+    // stream ended (gape E on GPU: 648 s). Starts and continues must alternate across the held
+    // ticks: a seq-2 chunk at least every second prefill turn, i.e. within 2k ticks. `None`
+    // (no held ticks, the c29 car's setting) alternates every tick.
+    for k in [None, Some(2usize), Some(3)] {
+        let lines = run_scenario(&stream_scenario(k));
+        let t = ticks(&lines);
+        let chunk_ticks: Vec<usize> = t.iter().enumerate().filter(|(_, x)| x.0).map(|(i, _)| i).collect();
+        assert_eq!(chunk_ticks.len(), 8, "k={k:?}: seq 2 ran {} chunks", chunk_ticks.len());
+        let worst = chunk_ticks.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        let bound = 2 * k.unwrap_or(1);
+        assert!(worst <= bound, "k={k:?}: seq 2 waited {worst} ticks between chunks (bound {bound}): {chunk_ticks:?}");
+        let outs = outputs(&lines);
+        assert_eq!(outs.len(), 42, "k={k:?}: {outs:?}");
+        assert!(outs.iter().all(|o| o.contains("Done(stop")), "k={k:?}: {outs:?}");
+    }
+}

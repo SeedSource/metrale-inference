@@ -40,7 +40,7 @@ pub(super) const USER: u32 = 154_827;
 /// only their distinctness matters here.
 pub(super) const THINK_START: u32 = 154_841;
 pub(super) const TOOL_CALL: u32 = 154_843;
-const TOOL_CALL_END: u32 = 154_844;
+pub(super) const TOOL_CALL_END: u32 = 154_844;
 /// 2026-10-04: The checkpoint's padded vocab (config fixture `vocab_size`).
 pub(super) const VOCAB: usize = 154_880;
 /// 2026-10-04: A short thinking budget. With no boundary mask the forced

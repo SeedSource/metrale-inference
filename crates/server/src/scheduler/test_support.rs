@@ -277,6 +277,8 @@ pub(super) struct PreemptStubModel {
     /// 2026-10-15 (race-prefill, A195): the next N `alloc_sequence` calls fail with "SSM state
     /// pool exhausted" (every slot held, e.g. by rows waiting at chunk 0).
     pub(super) fail_allocs: AtomicUsize,
+    /// 2026-10-16 (race-decode): when set, `copy_logits_to_host` (the D2H read) fails.
+    pub(super) fail_logit_copy: bool,
 }
 
 impl PreemptStubModel {

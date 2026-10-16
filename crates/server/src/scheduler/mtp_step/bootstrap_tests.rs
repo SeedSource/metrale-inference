@@ -22,7 +22,8 @@ use crate::scheduler::emit_step::emit_token;
 use crate::scheduler::mtp_bootstrap_step::step_mtp_bootstrap_batched;
 use crate::scheduler::test_support::PreemptStubModel;
 use crate::scheduler::think_end_token0_tests::{
-    EOS_IDS, SITES, Site, THINK_END, THINK_START, TOOL_CALL, VOCAB, WORD, born, ctx, sched_with,
+    EOS_IDS, SITES, Site, THINK_END, THINK_START, TOOL_CALL, TOOL_CALL_END, VOCAB, WORD, born, ctx,
+    sched_with,
 };
 use crate::scheduler::types::ActiveSeq;
 
@@ -167,4 +168,68 @@ fn a_failed_serial_bootstrap_decode_ends_the_row_with_an_error_not_a_stop() {
     assert!(a.finished, "the row ends");
     let err = a.error.as_deref().expect("an error, not a normal finish");
     assert!(err.starts_with("bootstrap decode:"), "{err}");
+}
+
+/// 2026-10-16: the same for the stray `</tool_call>` re-pick and the pipeline pick: the
+/// decode succeeds, the device argmax is the masked `</tool_call>` (no tools, flag
+/// on), and the host read the re-pick needs fails. A bare `finished` here was an
+/// HTTP 200 "stop" with no error (A184 class).
+fn failing_copy_boot(kind: Boot, a: ActiveSeq, want: u32) -> ActiveSeq {
+    let mut rows = vec![prefer(want, WORD)];
+    let mut active = vec![a];
+    if let Boot::Batched = kind {
+        rows.push(prefer(CONTROL, CONTROL + 1));
+        active.push(content_row());
+    }
+    let model = Arc::new(PreemptStubModel {
+        logit_rows: rows,
+        fail_logit_copy: true,
+        ..Default::default()
+    });
+    let mut sched = sched_with(model.clone(), true);
+    sched.watchdog.mask_stray_tool_call_end = true;
+    let c = ctx(&sched, &active[0]);
+    match kind {
+        Boot::Serial => bootstrap_seq(&*model, &mut active[0], &sched, 3, 3, &c, false),
+        Boot::Batched => {
+            let refusal = step_mtp_bootstrap_batched(&*model, &mut active, &sched, &[0, 1], 3, &c);
+            assert!(refusal.is_none(), "no KV refusal in this test: {refusal:?}");
+        }
+    }
+    active.swap_remove(0)
+}
+
+#[test]
+fn a_failed_stray_tool_call_end_repick_d2h_ends_the_row_with_an_error_not_a_stop() {
+    for (kind, prefix) in [
+        (
+            Boot::Serial,
+            "bootstrap stray </tool_call> re-pick: D2H failed",
+        ),
+        (
+            Boot::Batched,
+            "batched bootstrap stray </tool_call> re-pick: D2H failed",
+        ),
+    ] {
+        let a = failing_copy_boot(kind, content_row(), TOOL_CALL_END);
+        let at = format!("{kind:?}");
+        assert!(a.finished, "{at}: the row ends");
+        let err = a.error.as_deref().expect("an error, not a normal finish");
+        assert!(err.starts_with(prefix), "{at}: {err}");
+    }
+}
+
+#[test]
+fn a_failed_batched_bootstrap_pipeline_pick_d2h_ends_the_row_with_an_error_not_a_stop() {
+    let a = failing_copy_boot(
+        Boot::Batched,
+        closed(Site::PrefillRequest, false, false),
+        WORD,
+    );
+    assert!(a.finished, "the row ends");
+    let err = a.error.as_deref().expect("an error, not a normal finish");
+    assert!(
+        err.starts_with("batched bootstrap pipeline pick: D2H failed"),
+        "{err}"
+    );
 }

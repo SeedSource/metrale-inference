@@ -149,3 +149,76 @@ fn a_steady_stream_of_short_requests_does_not_starve_a_long_prefill() {
         assert!(outs.iter().all(|o| o.contains("Done(stop")), "k={k:?}: {outs:?}");
     }
 }
+
+/// 2026-10-16 (race-memory, A194 gapF): seq 1 decodes; seq 2 and seq 3 (64-token prompts, 8-token
+/// chunks) and seq 4 (a 4-token prompt) arrive together, queued at one park. seq 4's first
+/// chunk-0 attempt is refused for KV (`chunk0_kv_refuse`), so it waits as a prefill at offset 0.
+fn refused_short_scenario(k: Option<usize>) -> Scenario {
+    let mut sc = scenario(k, true);
+    sc.reqs[0] = ReqSpec::new(1, 4, reply(200, 100));
+    sc.reqs[1].arrive_at_tick = Some(3);
+    let mut s3 = ReqSpec::new(3, 64, reply(3, 600));
+    s3.arrive_at_tick = Some(3);
+    sc.reqs.push(s3);
+    let mut s4 = ReqSpec::new(4, 4, reply(2, 40));
+    s4.arrive_at_tick = Some(3);
+    sc.reqs.push(s4);
+    sc.cfg.chunk0_kv_refuse = vec![(4, 1)];
+    sc.opts.single_stream_prefill = true;
+    sc
+}
+
+#[test]
+fn a_refused_short_request_is_retried_at_the_next_start_turn_not_behind_the_long_prefills() {
+    // 2026-10-16 (race-memory, A194 gapF on GPU): the refused request was pushed behind both long
+    // prefills, and only the head advances on the single-stream path (the multi-rank shape), so a
+    // 25-token request waited 518 s behind two 324K prefills. It is retried at the next start
+    // turn: within two prefill turns (2k ticks) of the refusal, while seq 2 still gets a chunk at
+    // least every second prefill turn.
+    for k in [None, Some(2usize), Some(3)] {
+        let lines = run_scenario(&refused_short_scenario(k));
+        let mut tick = 0usize;
+        let (mut refused_at, mut ran_at, mut s2) = (None, None, Vec::new());
+        for l in &lines {
+            if l.starts_with("-- tick ") {
+                tick += 1;
+            } else if l.starts_with("prefill_chunk(") && l.contains(" s4@") {
+                if l.contains("-> ERR") {
+                    refused_at.get_or_insert(tick);
+                } else {
+                    ran_at.get_or_insert(tick);
+                }
+            } else if l.starts_with("prefill_chunk(") && l.contains(" s2@") {
+                s2.push(tick);
+            }
+        }
+        let s4_lines: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("s4@") || l.contains("out s4") || l.starts_with("-- tick"))
+            .collect();
+        let (Some(r), Some(a)) = (refused_at, ran_at) else {
+            panic!("k={k:?}: s4 refused at {refused_at:?}, ran at {ran_at:?}: {s4_lines:#?}");
+        };
+        let bound = 2 * k.unwrap_or(1);
+        let s2_last = *s2.last().unwrap();
+        assert!(
+            a <= r + bound,
+            "k={k:?}: s4 refused at tick {r}, ran at {a} (bound {bound}); s2 chunks {s2:?}"
+        );
+        assert!(
+            a < s2_last,
+            "k={k:?}: s4 ran at {a}, after seq 2's prefill ended ({s2_last})"
+        );
+        let worst = s2.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(
+            worst <= bound,
+            "k={k:?}: seq 2 waited {worst} ticks between chunks (bound {bound}): {s2:?}"
+        );
+        let outs = outputs(&lines);
+        assert_eq!(outs.len(), 4, "k={k:?}: {outs:?}");
+        assert!(
+            outs.iter().all(|o| o.contains("Done(stop")),
+            "k={k:?}: {outs:?}"
+        );
+    }
+}

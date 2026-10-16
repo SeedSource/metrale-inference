@@ -97,6 +97,10 @@ pub(super) struct RunOptions {
     /// 2026-10-14: `METRALE_BISECT_NO_MIX`: no fused mixed step, so a tick runs its prefill chunk
     /// and then a separate decode step, as a multi-rank serve does (`decode_slice` tests).
     pub no_mix: bool,
+    /// 2026-10-16 (race-memory, A194 gapF): `METRALE_BISECT_Q12_DISABLE`: no batched prefill or
+    /// batched mixed step, so ContinuePrefills advances only the head of `prefilling`, as on a
+    /// multi-rank serve (`continue_in_progress_prefills`: both batched paths need `!is_ep()`).
+    pub single_stream_prefill: bool,
     /// 2026-10-14: `METRALE_PREFILL_CHUNK_WHILE_DECODING` (resolved value).
     pub prefill_chunk_while_decoding: Option<usize>,
     /// 2026-10-14: `METRALE_DECODE_STEPS_PER_PREFILL_CHUNK` (resolved value).
@@ -134,6 +138,7 @@ impl Default for RunOptions {
             telemetry: &TELEMETRY_OFF,
             pipeline_faults: crate::scheduler::PipelineFaults::NONE,
             no_mix: false,
+            single_stream_prefill: false,
             prefill_chunk_while_decoding: None,
             decode_steps_per_prefill_chunk: None,
             resume_one_chunk_per_tick: false,
@@ -358,6 +363,7 @@ fn run_scenario_inner(sc: &Scenario, build: DeviceBuilder) -> Vec<String> {
     let mut levers = SchedLevers::defaults();
     levers.mtp_gate_force = opts.mtp_gate_force;
     levers.bisect_no_mix = opts.no_mix;
+    levers.bisect_q12_disable = opts.single_stream_prefill;
     levers.prefill_chunk_while_decoding = opts.prefill_chunk_while_decoding;
     levers.decode_steps_per_prefill_chunk = opts.decode_steps_per_prefill_chunk;
     levers.resume_one_chunk_per_tick = opts.resume_one_chunk_per_tick;

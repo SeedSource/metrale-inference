@@ -137,6 +137,10 @@ pub(super) struct PrefillInProgress {
     /// 2026-10-15 (race-memory, gap (e)): the "waits for room" line was logged for this
     /// prefill (`run_standard`, a chunk-0 KV refusal while sequences decode).
     pub kv_wait_logged: bool,
+    /// 2026-10-16 (race-memory, A194 gapF): chunk 0 was refused for KV and has not run since
+    /// (`prefill_a_step`, `run_standard`); `plan_tick` retries it at the next start turn
+    /// (`prefill_chunk_cap::waiting_head`) instead of behind the long prefills.
+    pub chunk0_refused: bool,
 }
 
 mod active;

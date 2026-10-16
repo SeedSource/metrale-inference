@@ -151,6 +151,19 @@ pub(crate) fn admit_now(
     }
 }
 
+/// 2026-10-16 (race-memory, A194 gapF): which prefill to move to the head of `prefilling` this
+/// tick, given which ones wait after a chunk-0 KV refusal (`waiting`, in queue order). On a
+/// multi-rank serve ContinuePrefills advances only the head, and a refused request was queued
+/// behind the long prefills: on GPU a 25-token request waited 518 s behind two 324K prefills. On a
+/// start turn (`retry_turn`) the first waiting request takes the head, so it is retried in the
+/// start's place; on a continue turn the first prefill that is not waiting does, so a request
+/// refused again cannot hold the head and the long prefill keeps every second turn (A197).
+/// `None`: the order stays.
+pub(crate) fn waiting_head(waiting: &[bool], retry_turn: bool) -> Option<usize> {
+    let i = waiting.iter().position(|&w| w == retry_turn)?;
+    (i > 0 && waiting[0] != retry_turn).then_some(i)
+}
+
 /// 2026-10-03: Whether ContinuePrefills skips this tick: the lever is on, a decoder is active,
 /// and StartPrefills already ran a chunk 0 this tick, so Decode runs before the next chunk.
 pub(crate) fn skip_continue(lever_on: bool, decoders: usize, started_this_tick: bool) -> bool {

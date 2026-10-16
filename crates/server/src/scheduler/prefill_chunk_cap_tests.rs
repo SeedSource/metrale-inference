@@ -256,3 +256,29 @@ fn ticks_alternate_and_never_run_two_chunks() {
     assert_eq!(done, 2);
     assert!(pending.is_empty() && prefilling.is_empty());
 }
+
+#[test]
+fn waiting_head_alternates_a_refused_request_with_the_long_prefill() {
+    // 2026-10-16 (race-memory, A194 gapF): (waiting flags in queue order, start turn) -> the
+    // prefill moved to the head. Start turn: the first waiting one; continue turn: the first one
+    // not waiting; already at the head, or none of that kind: no move.
+    let cases: &[(&[bool], bool, Option<usize>)] = &[
+        (&[false, false, true], true, Some(2)),
+        (&[false, true, true], true, Some(1)),
+        (&[true, false], true, None),
+        (&[false, false], true, None),
+        (&[true, false, false], false, Some(1)),
+        (&[true, true, false], false, Some(2)),
+        (&[false, true], false, None),
+        (&[true, true], false, None),
+        (&[], true, None),
+        (&[], false, None),
+    ];
+    for &(w, turn, want) in cases {
+        assert_eq!(
+            waiting_head(w, turn),
+            want,
+            "waiting {w:?} retry_turn {turn}"
+        );
+    }
+}

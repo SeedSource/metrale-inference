@@ -97,5 +97,6 @@ pub(super) fn build_prefill_in_progress(
         timeout_at,
         chunk_cap_logged: false,
         kv_wait_logged: false,
+        chunk0_refused: false,
     }
 }

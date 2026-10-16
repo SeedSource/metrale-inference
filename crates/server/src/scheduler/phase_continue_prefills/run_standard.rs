@@ -284,6 +284,7 @@ pub(super) fn run_standard_chunk_loop(
                 crate::scheduler::preempt::spec_kv_refusal_retryable(model, &format!("{e:#}"))
             })
         {
+            p.chunk0_refused = true;
             if !p.kv_wait_logged {
                 p.kv_wait_logged = true;
                 tracing::warn!(

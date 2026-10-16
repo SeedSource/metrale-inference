@@ -462,7 +462,11 @@ pub fn start_chunked_prefill(
                 "KV cache exhausted at chunk 0 of a new request ({} tokens): kept as a waiting prefill",
                 prompt_tokens.len(),
             );
-            return Ok(in_progress_at_offset_0!());
+            let mut waiting = in_progress_at_offset_0!();
+            if let StartPrefillResult::InProgress(p) = &mut waiting {
+                p.chunk0_refused = true;
+            }
+            return Ok(waiting);
         }
         Err(e) => {
             let msg = format!("prefill_chunk failed: {e:#}");

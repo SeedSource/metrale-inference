@@ -264,6 +264,29 @@ pub(super) fn run_standard_chunk_loop(
         .err()
         .is_some_and(|e| format!("{e:#}").contains("KV cache exhausted"))
     {
+        // 2026-10-15 (race-memory, gap (e); fchr arm A lost two new requests to a chunk-0
+        // refusal): a prefill still at chunk 0 holds no KV blocks, so it waits for room while
+        // sequences decode (they free it by finishing or through decode's own preemption)
+        // and is retried next tick; it never requeues a decoder. A waiting request does not
+        // preempt running ones, as in vLLM's scheduler. A refusal without the rank vote, or
+        // with nothing decoding to free room, still fails the prefill below.
+        if p.chunk_offset == 0
+            && !active.is_empty()
+            && chunk_res.as_ref().err().is_some_and(|e| {
+                crate::scheduler::preempt::spec_kv_refusal_retryable(model, &format!("{e:#}"))
+            })
+        {
+            if !p.kv_wait_logged {
+                p.kv_wait_logged = true;
+                tracing::warn!(
+                    "KV cache exhausted at chunk 0 of a new prefill ({} tokens): it waits for room \
+                     ({} sequence(s) decoding); no sequence is preempted for it",
+                    p.prompt_tokens.len(),
+                    active.len(),
+                );
+            }
+            return;
+        }
         if !crate::scheduler::preempt::preempt_for_prefill(&sched.io, active, preempted) {
             break;
         }

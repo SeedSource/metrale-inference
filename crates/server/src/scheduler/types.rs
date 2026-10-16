@@ -134,6 +134,9 @@ pub(super) struct PrefillInProgress {
     /// 2026-10-03: The "prefill chunk capped" line was logged for this prefill
     /// (`prefill_chunk_cap::log_capped`).
     pub chunk_cap_logged: bool,
+    /// 2026-10-15 (race-memory, gap (e)): the "waits for room" line was logged for this
+    /// prefill (`run_standard`, a chunk-0 KV refusal while sequences decode).
+    pub kv_wait_logged: bool,
 }
 
 mod active;

@@ -43,6 +43,7 @@ mod expert_tp_tests;
 pub mod forward;
 pub mod forward_prefill_gemm;
 pub mod weights;
+pub mod scale_rows;
 
 pub use weights::{Glm5NextDenseMlpWeights, Glm5NextExpertWeights, Glm5NextMoeWeights};
 

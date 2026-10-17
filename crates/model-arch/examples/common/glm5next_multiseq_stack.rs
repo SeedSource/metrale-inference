@@ -361,6 +361,7 @@ pub(crate) fn build_stack(
             prefetch: Default::default(),
             dflash_tap: false,
             premix: Default::default(),
+            sp_tap: Default::default(),
         });
     }
     Ok(layers)

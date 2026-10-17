@@ -44,7 +44,7 @@ fn defaults_are_spelled_out_not_derived() {
 fn every_opt_in_is_off_until_it_is_exactly_one() {
     // 2026-09-25: `=1` arms and no other spelling does. One row per field, so
     // a field read from the wrong variable fails its own row.
-    let cases: [(&str, fn(&DFlashLevers) -> bool); 14] = [
+    let cases: [(&str, fn(&DFlashLevers) -> bool); 25] = [
         ("METRALE_DFLASH_DEBUG_DUMP", |l| l.debug_dump),
         ("METRALE_DFLASH_DEBUG_DUMP_FULL", |l| l.debug_dump_full),
         ("METRALE_DFLASH_LOG_DRAFTS", |l| l.log_drafts),
@@ -61,6 +61,17 @@ fn every_opt_in_is_off_until_it_is_exactly_one() {
             l.full_precompute
         }),
         ("METRALE_DFLASH_CTXLEN_PROBE", |l| l.ctxlen_probe),
+        ("METRALE_DFLASH_CONF_LOG", |l| l.conf_log),
+        ("METRALE_DFLASH_DRAFT_GEMV", |l| l.draft_gemv),
+        ("METRALE_DFLASH_DRAFT_TP2", |l| l.draft_tp2),
+        ("METRALE_DFLASH_TP_GRAPHS", |l| l.tp_graphs),
+        ("METRALE_DFLASH_AUX_FP8", |l| l.aux_fp8),
+        ("METRALE_DFLASH_NV4_HEAD", |l| l.nv4_head),
+        ("METRALE_DFLASH_NV4_LAYERS", |l| l.nv4_layers),
+        ("METRALE_DFLASH_NV4_AUX", |l| l.nv4_aux),
+        ("METRALE_DFLASH_NV4_TC", |l| l.nv4_tc),
+        ("METRALE_DFLASH_TOPK_REG", |l| l.topk_reg),
+        ("METRALE_DFLASH_NV4_GROUP", |l| l.nv4_group),
     ];
     for (var, read) in cases {
         assert!(!read(&resolve(&[])), "{var} armed with nothing set");
@@ -122,6 +133,25 @@ fn conf_tau_is_off_until_a_positive_threshold_is_given() {
         0.0
     );
     assert_eq!(resolve(&[("METRALE_DSPARK_CONF_TAU", "0.7")]).conf_tau, 0.7);
+}
+
+#[test]
+fn dflash_conf_tau_is_off_outside_the_open_unit_interval() {
+    // 2026-10-09: Only a finite `t` with 0 < t < 1 engages; everything else is 0.0 (off).
+    assert_eq!(resolve(&[]).dflash_conf_tau, 0.0);
+    for bad in ["junk", "0", "1", "1.5", "-0.2", "NaN", "inf", ""] {
+        assert_eq!(
+            resolve(&[("METRALE_DFLASH_CONF_TAU", bad)]).dflash_conf_tau,
+            0.0,
+            "{bad:?} must leave the lever off"
+        );
+    }
+    assert_eq!(
+        resolve(&[("METRALE_DFLASH_CONF_TAU", "0.4")]).dflash_conf_tau,
+        0.4
+    );
+    // 2026-10-09: Independent of the log lever.
+    assert!(!resolve(&[("METRALE_DFLASH_CONF_TAU", "0.4")]).conf_log);
 }
 
 #[test]
@@ -198,4 +228,21 @@ fn the_block_dump_arms_only_at_or_past_its_position() {
     assert!(armed.block_dump_armed_at(65));
     let off = resolve(&[("METRALE_DFLASH_BLOCK_DUMP_AT_POS", "0")]);
     assert!(!off.block_dump_armed_at(1_000_000));
+}
+
+/// 2026-10-12: The NVFP4 drafter levers are declared in the config lever table, so `met` boots
+/// with them set (it refuses an undeclared `METRALE_*` name), and each one is read here.
+#[test]
+fn the_nv4_levers_are_declared() {
+    let keys = [
+        "METRALE_DFLASH_NV4_HEAD",
+        "METRALE_DFLASH_NV4_LAYERS",
+        "METRALE_DFLASH_NV4_AUX",
+        "METRALE_DFLASH_NV4_TC",
+    ];
+    assert!(metrale_config::levers::undeclared(keys).is_empty());
+    let src = include_str!("levers.rs");
+    for k in keys {
+        assert!(src.contains(&format!("value(\"{k}\")")), "{k} not read");
+    }
 }

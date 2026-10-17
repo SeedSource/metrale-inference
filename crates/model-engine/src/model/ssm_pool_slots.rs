@@ -52,6 +52,9 @@ impl SsmStatePool {
         }
     }
 
+    /// 2026-10-10: On a hybrid serve (`METRALE_HYBRID_DFLASH=1`) the lowest free index, so
+    /// a request that starts alone gets `ssm_reserve::HYBRID_DFLASH_SLOT`, the only slot sized
+    /// for the DFlash verify. Both ranks claim and release in the same order, so they agree.
     pub(super) fn claim_slot(&self) -> Result<usize> {
         let mut free = self.free_slots.lock();
         // 2026-10-10: Under `METRALE_MTP_POOL_CAP` with an uncovered tail
@@ -59,10 +62,14 @@ impl SsmStatePool {
         // `mtp_max_seqs` sequences sits on covered slots without compaction (EP v2 has
         // none). Both EP ranks run this rule, so the worker's mirrored claim still
         // returns the head's slot. Otherwise the last released slot (LIFO), as before.
-        let lowest_first =
+        // 2026-10-11: The hybrid MTP + DFlash serve also claims lowest-first, so a lone
+        // sequence takes slot 0 (the DFlash slot, `HYBRID_DFLASH_SLOT`).
+        let cap_lowest =
             self.mtp_slots < self.max_slots && metrale_model_layers::ssm_reserve::mtp_pool_cap();
+        let lowest_first =
+            cap_lowest || metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled();
         let slot = take_free_slot(&mut free, lowest_first);
-        if lowest_first {
+        if cap_lowest {
             // 2026-10-10: Gate evidence (boundary probe): which slot each sequence gets.
             if let Some(s) = slot {
                 tracing::info!(

@@ -19,6 +19,11 @@
 //! `steps/multi_seq.rs`, `steps/verify_multi.rs`): a single sequence's decode, verify and
 //! prefill keep the car's CUDA-core bits, and only C>1 batched rows move (their bits then
 //! depend on the batch). The scope is read when a kernel is launched or captured.
+//! 2026-10-10: `multi` also routes the launches of a DFlash-mode K=gamma target verify of at
+//! least [`DFLASH_VERIFY_MIN_ROWS`] rows ([`MultiSeqScope::enter_dflash_verify`], model-engine
+//! `verify_d.rs`), the path every DFlash speed number was measured on (`=4`). Single-sequence
+//! MTP decode / verify and prefill still keep the CUDA-core bits. This also moves a pure
+//! DFlash serve run with `multi`.
 
 use std::cell::Cell;
 use std::sync::{Once, OnceLock};
@@ -62,9 +67,28 @@ thread_local! {
 /// when `seqs >= 2`); the previous value comes back on drop, so nesting is safe.
 pub struct MultiSeqScope(bool);
 
+/// 2026-10-10: The fewest rows of a DFlash-mode K=gamma verify that `multi` routes.
+pub const DFLASH_VERIFY_MIN_ROWS: usize = 4;
+
+/// 2026-10-10: Whether a step of `seqs` sequences, or a DFlash-mode verify of
+/// `dflash_verify_rows` rows (0 for any other step), is in the `multi` scope.
+pub fn multi_scope_for(seqs: usize, dflash_verify_rows: usize) -> bool {
+    seqs >= 2 || dflash_verify_rows >= DFLASH_VERIFY_MIN_ROWS
+}
+
 impl MultiSeqScope {
     pub fn enter(seqs: usize) -> Self {
-        Self(IN_MULTI.with(|c| c.replace(c.get() || seqs >= 2)))
+        Self::enter_step(multi_scope_for(seqs, 0))
+    }
+
+    /// 2026-10-10: Marks a DFlash-mode K=gamma verify of `rows` rows (one sequence). Every rank
+    /// runs that verify for the same step, so every rank takes the same route.
+    pub fn enter_dflash_verify(rows: usize) -> Self {
+        Self::enter_step(multi_scope_for(1, rows))
+    }
+
+    fn enter_step(on: bool) -> Self {
+        Self(IN_MULTI.with(|c| c.replace(c.get() || on)))
     }
 }
 
@@ -77,10 +101,15 @@ impl Drop for MultiSeqScope {
 /// 2026-10-09: Whether the lever takes an `m`-row launch on this thread now ([`Nv4Tc`]), before
 /// the shape route; [`try_launch`] and `dense_nv4_group` both ask it.
 pub fn takes(m: usize) -> bool {
-    match nv4_tc() {
+    routes(nv4_tc(), IN_MULTI.with(Cell::get), m)
+}
+
+/// 2026-10-10: [`takes`] as a pure function of the lever, the `multi` scope and the rows.
+fn routes(lever: Option<Nv4Tc>, in_multi: bool, m: usize) -> bool {
+    match lever {
         None => false,
         Some(Nv4Tc::Floor(min_m)) => m >= min_m,
-        Some(Nv4Tc::Multi) => IN_MULTI.with(Cell::get),
+        Some(Nv4Tc::Multi) => in_multi,
     }
 }
 
@@ -113,6 +142,47 @@ pub fn try_launch(
             std::env::var("METRALE_GLM_NV4_TC").unwrap_or_default()
         );
     });
+    launch_tc(gpu, (h, grid_x), a, q, c, (m, n, k), stream)?;
+    Ok(true)
+}
+
+/// 2026-10-12: [`try_launch`] without the lever and its scope: the tensor-core kernel takes the
+/// launch whenever the route takes the shape (`gemv_tc::tc_kernel`: 1..=16 rows, `K % 128 == 0`,
+/// kernels present, `METRALE_NO_W4A16_TC` unset). For callers that choose the route themselves
+/// (the DFlash drafter, `METRALE_DFLASH_NV4_TC`). `Ok(false)` when the route declines.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_explicit(
+    gpu: &dyn GpuBackend,
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<bool> {
+    let Some(hk) = gemv_tc::tc_kernel(gpu, m as u32, n as u32, k as u32) else {
+        return Ok(false);
+    };
+    launch_tc(gpu, hk, a, q, c, (m, n, k), stream)?;
+    Ok(true)
+}
+
+/// 2026-10-12: Whether [`launch_explicit`] would take an `m`-row `[n, k]` launch now.
+pub fn explicit_route(gpu: &dyn GpuBackend, m: usize, n: usize, k: usize) -> bool {
+    gemv_tc::tc_kernel(gpu, m as u32, n as u32, k as u32).is_some()
+}
+
+/// 2026-10-12: The tensor-core launch [`try_launch`] and [`launch_explicit`] share.
+fn launch_tc(
+    gpu: &dyn GpuBackend,
+    (h, grid_x): (metrale_gpu_runtime::gpu::KernelHandle, u32),
+    a: DevicePtr,
+    q: &QuantizedWeight,
+    c: DevicePtr,
+    (m, n, k): (usize, usize, usize),
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, h)
         .grid([grid_x, 1, 1])
         .block([gemv_tc::TC_BLOCK, 1, 1])
@@ -124,8 +194,7 @@ pub fn try_launch(
         .arg_u32(m as u32)
         .arg_u32(n as u32)
         .arg_u32(k as u32)
-        .launch(stream)?;
-    Ok(true)
+        .launch(stream)
 }
 
 #[cfg(test)]
@@ -153,5 +222,39 @@ mod tests {
             assert!(!get());
         }
         assert!(!get());
+        {
+            let _mtp_verify = MultiSeqScope::enter_dflash_verify(3);
+            assert!(!get());
+            let _dflash = MultiSeqScope::enter_dflash_verify(9);
+            assert!(get());
+        }
+        assert!(!get());
+    }
+
+    /// 2026-10-10: The routing predicate: `multi` moves a C>=2 step and a DFlash verify of 9
+    /// rows, never a single-sequence MTP step; an integer floor ignores the scope.
+    #[test]
+    fn multi_routes_batched_steps_and_the_dflash_verify_only() {
+        let multi = Some(Nv4Tc::Multi);
+        // MTP decode (1 row) and MTP verify (K = 2..4 rows) of one sequence: no.
+        for m in 1..=4 {
+            assert!(!routes(multi, multi_scope_for(1, 0), m));
+        }
+        // DFlash-mode K=gamma verify, gamma + 1 = 9 rows: yes.
+        assert!(routes(multi, multi_scope_for(1, 9), 9));
+        assert!(routes(multi, multi_scope_for(1, 4), 4));
+        assert!(!routes(multi, multi_scope_for(1, 3), 3));
+        // Multi-sequence decode or batched verify: yes.
+        for n in [2usize, 4, 16] {
+            assert!(routes(multi, multi_scope_for(n, 0), n));
+        }
+        // `=4`: unchanged, rows only.
+        let four = Some(Nv4Tc::Floor(4));
+        for scope in [false, true] {
+            assert!(!routes(four, scope, 3));
+            assert!(routes(four, scope, 4));
+            assert!(routes(four, scope, 9));
+        }
+        assert!(!routes(None, true, 9));
     }
 }

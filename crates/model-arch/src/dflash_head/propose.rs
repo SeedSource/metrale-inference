@@ -123,52 +123,7 @@ impl BlockDiffusionDraftHead {
         let option_b_enabled = self.levers.option_b;
         let option_b_arg: Option<(DevicePtr, u32)> = if option_b_enabled {
             const BLOCK_SIZE: usize = 16;
-            let blocks_needed = (dstate.max_ctx_len + self.gamma + 1).div_ceil(BLOCK_SIZE);
-            if dstate.block_table_dev.is_none() {
-                let mut cache = self.kv_cache.lock();
-                dstate.block_table.clear();
-                for _ in 0..blocks_needed {
-                    match cache.try_alloc_block() {
-                        Some(b) => dstate.block_table.push(b),
-                        None => {
-                            // 2026-09-25: Free the partial grab before failing:
-                            // the next attempt starts with `block_table.clear()`,
-                            // which would drop these ids without freeing them.
-                            // provenance-id: 526f6e616c6420522e205374657369616b
-                            let got = dstate.block_table.len();
-                            cache.free_blocks(&dstate.block_table);
-                            dstate.block_table.clear();
-                            anyhow::bail!(
-                                "DFlash Option B: paged KV cache exhausted at block {}/{}",
-                                got,
-                                blocks_needed
-                            );
-                        }
-                    }
-                }
-                drop(cache);
-                // 2026-09-25: The pool's free list is a stack (`try_alloc_block`
-                // pops, `free_blocks` pushes in table order), so a freed table
-                // comes back reversed. Sorting gives every sequence ascending
-                // blocks. Measured 2026-08-29: the two orders alternated between
-                // runs at 68.1 and 60.6 tok/s with byte-identical output.
-                // provenance-id: 526f6e616c6420522e205374657369616b
-                dstate.block_table.sort_unstable();
-                let bt_bytes: Vec<u8> = dstate
-                    .block_table
-                    .iter()
-                    .flat_map(|b| b.to_le_bytes())
-                    .collect();
-                let bt_dev = ctx.gpu.alloc(bt_bytes.len())?;
-                ctx.gpu.copy_h2d(&bt_bytes, bt_dev)?;
-                dstate.block_table_dev = Some(bt_dev);
-                dstate.max_ctx_count_drafter = blocks_needed * BLOCK_SIZE;
-                tracing::info!(
-                    "DFlash Option B: allocated {} blocks ({} slots) for drafter paged cache",
-                    blocks_needed,
-                    dstate.max_ctx_count_drafter
-                );
-            }
+            self.ensure_block_table(dstate, ctx.gpu)?;
             // 2026-09-25: Only the tail `[ctx_committed, ctx_len)` needs K/V:
             // each committed row was roped at its own stamped position, so it
             // stays valid as `position` moves.

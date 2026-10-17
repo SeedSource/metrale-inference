@@ -218,18 +218,21 @@ impl TransformerModel {
     }
 
     /// 2026-10-02: Whether the batched verify may run with the comm backend: the multi-rank
-    /// protocol live in its v2 shape, no DFlash drafter (its capture is not mirrored), and every
-    /// layer driving its own verify state, so the forward's collectives depend only on what
-    /// `EP_CMD_VERIFY_BATCH` carries.
+    /// protocol live in its v2 shape, no DFlash drafter unless `METRALE_GLM_DFLASH_BATCHED_VERIFY`
+    /// (2026-10-09: its capture is rank 0's alone), and every layer driving its own verify state,
+    /// so the forward's collectives depend only on what `EP_CMD_VERIFY_BATCH` carries.
     pub(super) fn batched_verify_ep_ok(&self) -> bool {
-        self.multi_rank_protocol_active()
-            && self.ep_protocol_v2
-            && self.dflash_hidden_save.is_none()
-            && !self.layers.is_empty()
-            && self
-                .layers
-                .iter()
-                .all(|l| l.decode_verify_multi_own_states())
+        use metrale_model_layers::speculative::glm_dflash_batch as gdb;
+        let own = !self.layers.is_empty()
+            && self.layers.iter().all(|l| l.decode_verify_multi_own_states());
+        gdb::batched_verify_ep_admits(
+            self.multi_rank_protocol_active(),
+            self.ep_protocol_v2,
+            // 2026-10-10: `dflash_step`: a hybrid serve's MTP batch is admitted as on the MTP car.
+            self.dflash_step(),
+            gdb::glm_dflash_batched_verify(),
+            own,
+        )
     }
 
     /// 2026-10-02: Rank 0: send `EP_CMD_VERIFY_BATCH` with the batch (module docs) and return
@@ -353,7 +356,7 @@ impl TransformerModel {
                     stash_rows.push(row + v.accepted);
                     row += k;
                 }
-                if let Err(e) = self.stash_verify_hidden_rows_dispatch(&stash_rows, 0) {
+                if let Err(e) = self.ep_worker_stash_verify_rows(&stash_rows) {
                     fail_mask = all_seqs_mask(n);
                     err = Some(e);
                 }

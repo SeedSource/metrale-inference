@@ -31,3 +31,11 @@ mod tests;
 pub(crate) use app_state::AppState;
 pub(crate) use kv_dtypes::{auto_high_precision_layers, build_layer_kv_dtypes};
 pub(crate) use serve::serve;
+
+/// 2026-10-10: Whether this is a hybrid serve: `METRALE_HYBRID_DFLASH=1` with `--dflash
+/// --speculative` (`validate_serve_args` refuses the lever without both).
+pub(crate) fn hybrid_serve(args: &crate::cli::ServeArgs) -> bool {
+    args.dflash
+        && args.speculative
+        && metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled()
+}

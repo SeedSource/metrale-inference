@@ -138,6 +138,17 @@ impl WeightStore {
         Ok((count, bytes))
     }
 
+    /// 2026-10-14: The bytes `free_matching(pred)` would free now: the matching tensors
+    /// outside the weight arena. A caller that sizes memory before a later free (the DFlash
+    /// KV credit, #82 hybrid M1) predicts with this, so the two agree on what counts.
+    pub fn freeable_bytes_matching(&self, pred: impl Fn(&str, &WeightTensor) -> bool) -> usize {
+        self.weights
+            .iter()
+            .filter(|(n, t)| pred(n, t) && !self.arena.contains(t.ptr))
+            .map(|(_, t)| t.byte_size())
+            .sum()
+    }
+
     /// 2026-10-06: Install the arena the fast loader filled (replacing the empty default).
     pub fn set_arena(&mut self, arena: WeightArena) {
         self.arena = arena;

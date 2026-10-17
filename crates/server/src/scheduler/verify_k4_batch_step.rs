@@ -194,15 +194,22 @@ pub(super) fn step_verify_k4_batched(
     // 2026-10-02: Multi-rank (`METRALE_GLM_BATCHED_VERIFY`, model-engine `verify_ep.rs`): the
     // worker ranks wait for every sequence's accepted count, in batch order, then stash and roll
     // back as this rank does below. It goes out before anything else this step sends.
-    if model.is_ep() {
-        let words: Vec<u32> = verdicts.iter().map(|&(_, na, _)| na as u32).collect();
-        if let Err(e) = model.ep_broadcast_tokens(&words) {
-            tracing::error!("EP broadcast batched-verify verdict (n={n}): {e:#}");
-            fail_batch(
-                batch,
-                &format!("EP broadcast batched-verify verdict (n={n}): {e:#}"),
-            );
-            return None;
+    // 2026-10-09: Clamped to `ks[i] - 1`, which the walk above already holds.
+    let accepted_all: Vec<usize> = verdicts.iter().map(|&(_, na, _)| na).collect();
+    if !broadcast_batch_verdict(model, batch, &accepted_all, ks) {
+        return None;
+    }
+    // 2026-10-10: Hybrid serve: each sequence's accepted rows into its DFlash drafter context,
+    // from its capture band (`i * dflash_capture_band()`, written by the batched verify forward),
+    // before `k4_apply_verdict` rewinds `seq_len`.
+    if model.hybrid_dflash() {
+        let band = model.dflash_capture_band();
+        for (i, a) in batch.iter_mut().enumerate() {
+            let na = accepted_all[i].min(ks[i] - 1);
+            let pre_verify_len = a.seq.seq_len.saturating_sub(ks[i]);
+            if let Err(e) = model.commit_ctx(&mut a.seq, na + 1, pre_verify_len, i * band) {
+                tracing::error!("commit_ctx (hybrid batched MTP verify, row {i}): {e:#}");
+            }
         }
     }
     let t_stash = sched.io.clock.now();
@@ -446,44 +453,5 @@ pub(super) fn step_verify_k4_batched(
 fn fail_batch(batch: &mut [&mut ActiveSeq], msg: &str) {
     for a in batch.iter_mut() {
         super::lifecycle::fail_sequence(a, msg.to_string());
-    }
-}
-
-/// 2026-10-02: Multi-rank batched verify: join the workers' commit-failure gather
-/// (`Model::ep_agree_verify_failures`, a no-op without EP) with `local_mask`, and finish every
-/// sequence whose bit (batch order) any rank set. Must run on every path that follows the
-/// verdict broadcast, since the workers block on the gather.
-fn retire_failed_on_workers(model: &dyn Model, batch: &mut [&mut ActiveSeq], local_mask: u32) {
-    if !model.is_ep() {
-        return;
-    }
-    match model.ep_agree_verify_failures(local_mask) {
-        Ok(mask) => {
-            for (i, a) in batch.iter_mut().enumerate().take(32) {
-                if (mask >> i) & 1 == 1 {
-                    tracing::error!("batched verify: worker commit failed, retiring seq {i}");
-                    // 2026-10-14 (race-memory, A184): an error frame, not a bare finish. A
-                    // sequence that already ended (its own stop, or an earlier error) keeps
-                    // its outcome.
-                    if a.error.is_none() && !a.finished {
-                        super::lifecycle::fail_sequence(
-                            a,
-                            "batched verify: worker commit failed".to_string(),
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("EP batched-verify failure gather: {e:#}");
-            for a in batch.iter_mut() {
-                if a.error.is_none() && !a.finished {
-                    super::lifecycle::fail_sequence(
-                        a,
-                        format!("EP batched-verify failure gather: {e:#}"),
-                    );
-                }
-            }
-        }
     }
 }

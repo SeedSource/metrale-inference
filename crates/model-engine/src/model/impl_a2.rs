@@ -157,6 +157,9 @@ impl TransformerModel {
     /// - 0xFFFFFFF9 (`EP_CMD_VERIFY_BATCH`): batched MTP verify → `verify_ep.rs`
     /// - 0xFFFFFFFA (`EP_CMD_MTP_PROPOSE_BATCH`): batched MTP propose → `propose_batch_ep.rs`
     /// - 0xFFFFFFFB (`EP_CMD_MIGRATE_SLOT`): cap slot migration → target slot (`sequence_compact.rs`)
+    /// - 0xFFFFFFFC (`EP_CMD_SPEC_MODE`, 2026-10-10; 0xFFFFFFFB until 2026-10-11, which the car's
+    ///   `EP_CMD_MIGRATE_SLOT` took): hybrid step mode → one mode word (`hybrid_spec.rs`); handled
+    ///   before the `EpCommandFailed` tag, so its failure is fatal
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored)
     /// - any other value: a token id, decoded in the addressed slot
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
@@ -165,6 +168,18 @@ impl TransformerModel {
         // command is request-scoped, so it is tagged `EpCommandFailed` and the
         // worker loop keeps running.
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
+        // 2026-10-10: A failed hybrid step-mode switch is NOT request-scoped: rank 0 stored the
+        // new mode before it sent the word, so a worker that stays up would route the next
+        // proposes through the other proposer and desynchronize the collectives. Its error is
+        // left untagged, so the worker loop treats it as fatal and exits.
+        if cmd == metrale_model_layers::speculative::hybrid::EP_CMD_SPEC_MODE {
+            return self.ep_worker_set_spec_mode().map_err(|e| {
+                e.context(
+                    "FATAL: hybrid step-mode switch failed on this worker; rank 0 already \
+                     switched, so this rank exits rather than run the wrong proposer",
+                )
+            });
+        }
         self.ep_worker_execute(seq_id, cmd, slots)
             .map_err(|e| anyhow::Error::new(crate::traits::EpCommandFailed(e)))
     }

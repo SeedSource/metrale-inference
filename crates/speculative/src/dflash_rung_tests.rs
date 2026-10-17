@@ -263,3 +263,63 @@ fn pinned_returns_num_drafts_unchanged() {
     assert_eq!(rung.drafts_for(16, 9), 3);
     assert_eq!(rung.drafts_for(1, 9), 9);
 }
+
+/// 2026-10-09: The GLM DFlash levers (`glm_dflash_multi_k`) under `--dflash-gamma 8`
+/// (pinned, write-on-accept off so the C>=2 rung is the cap): lever off, every C keeps K=8;
+/// lever on, C>=2 gets K=4 (3 drafts) and C=1 keeps K=8. Armed by the resolver env, the pin
+/// still sets C>=2 and C=1 keeps the wide rung.
+#[test]
+fn glm_dflash_levers_pin_c2_to_k4_under_explicit_gamma_8() {
+    use metrale_model_layers::speculative::glm_dflash_batch::glm_dflash_multi_k;
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let cap_rungs = Rungs {
+        multi: 8,
+        ..Rungs::defaults(8)
+    };
+    for (batched, perseq) in [(false, false), (true, false), (false, true), (true, true)] {
+        let rung = DflashRung::new();
+        rung.configure_with(8, true, cap_rungs);
+        assert!(!rung.armed());
+        if let Some(k) = glm_dflash_multi_k("glm5_next", batched, perseq) {
+            rung.pin_multi(k);
+        }
+        let on = batched || perseq;
+        assert_eq!(rung.drafts_for(1, 7), 7, "C=1 unchanged (lever {on})");
+        for c in [2, 4] {
+            let want = if on { 3 } else { 7 };
+            assert_eq!(rung.drafts_for(c, 7), want, "C={c} lever {on}");
+        }
+    }
+    // 2026-10-09: Not GLM: no pin.
+    assert_eq!(glm_dflash_multi_k("qwen3_5", true, true), None);
+    // 2026-10-09: Armed (METRALE_DFLASH_GAMMA_RESOLVER): the pin wins at C>=2 only.
+    let rung = DflashRung::new();
+    rung.configure_with(8, false, cap_rungs);
+    rung.pin_multi(4);
+    assert!(rung.armed());
+    assert_eq!(rung.drafts_for(2, 7), 3);
+    assert_eq!(rung.drafts_for(4, 7), 3);
+    assert_eq!(rung.drafts_for(1, 7), 7);
+    // 2026-10-09: Other pinned widths flow through (a later per-step K in 2..=4).
+    for (k, nd) in [(2, 1), (3, 2), (4, 3)] {
+        let rung = DflashRung::new();
+        rung.configure_with(8, true, cap_rungs);
+        rung.pin_multi(k);
+        assert_eq!(rung.drafts_for(2, 7), nd, "K={k}");
+        assert_eq!(rung.drafts_for(1, 7), 7, "K={k} C=1");
+    }
+}
+
+/// 2026-10-09: `multi_batched` needs both the pin and the batched mark; the per-sequence control
+/// arm pins without the mark.
+#[test]
+fn multi_batched_needs_pin_and_mark() {
+    let rung = DflashRung::new();
+    rung.mark_multi_batched();
+    assert!(!rung.multi_batched(), "mark without a pin");
+    rung.pin_multi(4);
+    assert!(rung.multi_batched());
+    let control = DflashRung::new();
+    control.pin_multi(4);
+    assert!(control.multi_pinned() && !control.multi_batched(), "PERSEQ_K4 control");
+}

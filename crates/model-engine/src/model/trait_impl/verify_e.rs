@@ -64,17 +64,15 @@ impl TransformerModel {
     /// (`cache_blocks_per_seq`), and, with an adapter loaded, no
     /// `METRALE_LORA_NO_BATCH_VERIFY=1`. Without DFlash every `ks[i]` must be
     /// in 2..=4. With DFlash the batch must be uniform with k in
-    /// 2..=`dflash_kgamma`, and `n * dflash_kgamma` must fit
-    /// `dflash_hidden_save_rows`.
+    /// 2..=`dflash_kgamma` (2..=4 with a comm backend), and `n * dflash_kgamma`
+    /// must fit `dflash_hidden_save_rows`.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
-        let shape_ok = if self.dflash_hidden_save.is_some() {
-            // 2026-09-25: DFlash: one k for the whole batch, any value a
-            // capture band holds, and a full band per sequence.
-            self.dflash_kgamma >= 2
-                && ks.iter().all(|&k| (2..=self.dflash_kgamma).contains(&k))
-                && ks.iter().all(|&k| k == ks[0])
-                && n * self.dflash_kgamma <= self.dflash_hidden_save_rows
+        // 2026-10-10: `dflash_step`: a DFlash serve, or a hybrid serve's DFLASH step.
+        let shape_ok = if self.dflash_step() {
+            // 2026-09-25: DFlash: one k for the whole batch, any value a capture band holds
+            // (2026-10-09: at most 4 with a comm backend), and a full band per sequence.
+            self.dflash_batch_shape_ok(ks)
         } else {
             ks.iter().all(|k| (2..=4).contains(k))
         };
@@ -145,10 +143,7 @@ impl TransformerModel {
         // 2026-09-25: Re-checks the row-count range `can_batch_verify_dispatch`
         // admits: 2..=4 without DFlash, 2..=dflash_kgamma with it. DFlash
         // uniformity is not re-checked here.
-        let dflash_k = self
-            .dflash_hidden_save
-            .is_some()
-            .then_some(self.dflash_kgamma);
+        let dflash_k = self.dflash_step().then_some(self.dflash_kgamma);
         ensure!(
             n >= 2
                 && ks.len() == n

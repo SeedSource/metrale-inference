@@ -400,6 +400,8 @@ fn run_scenario_inner(sc: &Scenario, build: DeviceBuilder) -> Vec<String> {
                 max_batch_size: opts.max_batch_size,
                 use_speculative: opts.use_speculative,
                 dflash_verify_raw_argmax: opts.dflash,
+                // 2026-10-10: The harness never runs a hybrid serve.
+                hybrid: None,
                 // 2026-09-29: A146: the harness's scripted model is not GLM-5.3.
                 mtp_spec_think_default: false,
                 num_drafts: opts.num_drafts,

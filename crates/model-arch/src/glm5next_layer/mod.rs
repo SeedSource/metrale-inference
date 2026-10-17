@@ -107,6 +107,24 @@ pub use types::{Glm5NextLayer, Glm5NextMhc, Glm5NextMixer, Glm5NextMlpSite};
 pub use prefetch::{Glm5NextPrefetch, L2Span};
 
 impl TransformerLayer for Glm5NextLayer {
+    /// 2026-10-10: Hybrid serve: swap the tap rows `rows` of this chunk's `hidden` when this
+    /// layer's SP prefill left each rank only its own (`seq_parallel/tap.rs`).
+    fn prefill_tap_gather(
+        &self,
+        comm: &dyn metrale_comm::CommBackend,
+        hidden: DevicePtr,
+        seq_len_start: usize,
+        num_tokens: usize,
+        rows: (usize, usize),
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(plan) = self.sp_tap.take_for(seq_len_start, num_tokens, hidden.0)? else {
+            return Ok(false);
+        };
+        seq_parallel::gather_tap_rows(comm, plan, hidden, rows, self.hidden * 2, stream)?;
+        Ok(true)
+    }
+
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         Ok(match &self.mixer {
             // 2026-09-25: On the model path a KDA layer gets SSM pool addresses instead
@@ -186,6 +204,9 @@ impl TransformerLayer for Glm5NextLayer {
                 self.layer_idx
             );
         }
+        // 2026-10-10: Only an SP prefill of this chunk leaves tap rows split across the ranks
+        // (`seq_parallel/tap.rs`); `prefill_staged_sp` sets the record again.
+        self.sp_tap.set(None);
         // 2026-09-25: A text layer runs the prompt in sub-chunks of `prefill_rows()` tokens
         // through `forward_k`. The MTP block (`mhc: None`) walks token by token, because
         // `forward_k` refuses a layer without a highway.

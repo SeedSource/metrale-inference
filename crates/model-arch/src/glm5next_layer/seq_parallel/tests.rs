@@ -250,3 +250,90 @@ fn rows_of_both(plan: SpPlan, item: Span) -> Vec<usize> {
     v.extend(rows(&plan.spans(1, item)));
     v
 }
+
+/// 2026-10-10: Hybrid SP tap capture: the chunk rows inside a window, for the window the DFlash
+/// capture keeps today (`[0, max_ctx_len)`) and a last-W window, across 8K chunks of a prompt
+/// longer than the window. The chunks' spans, mapped back to absolute rows, are the window in
+/// order, each row once.
+#[test]
+fn tap_window_rows_across_chunks() {
+    let (prompt, chunk, w) = (20_000usize, 8192usize, 16_384usize);
+    let chunks = sub_chunks(prompt, chunk);
+    let absolute = |win: Span| -> Vec<usize> {
+        chunks
+            .iter()
+            .flat_map(|&(cs, n)| {
+                let (t, k) = tap_window_rows(cs, n, win);
+                assert!(t + k <= n, "span ({t}, {k}) leaves the {n}-row chunk");
+                (cs + t)..(cs + t + k)
+            })
+            .collect()
+    };
+    let first: Vec<usize> = (0..w).collect();
+    assert_eq!(absolute((0, w)), first);
+    assert_eq!(tap_window_rows(16_384, 3616, (0, w)), (0, 0));
+    let last: Vec<usize> = (prompt - w..prompt).collect();
+    assert_eq!(absolute((prompt - w, prompt)), last);
+    assert_eq!(tap_window_rows(0, 8192, (prompt - w, prompt)), (3616, 4576));
+    assert_eq!(tap_window_rows(8192, 8192, (prompt - w, prompt)), (0, 8192));
+    assert_eq!(
+        tap_window_rows(16_384, 3616, (prompt - w, prompt)),
+        (0, 3616)
+    );
+    // A window wider than the prompt keeps every row; an empty one keeps none.
+    assert_eq!(absolute((0, usize::MAX)), (0..prompt).collect::<Vec<_>>());
+    assert!(absolute((5, 5)).is_empty());
+}
+
+/// 2026-10-10: Hybrid SP tap capture: for every staged shape and window cut, the rows a rank
+/// sends in the tap swap (`plan.spans(rank, rows)`) are exactly the window rows it owns, and the
+/// two ranks' rows tile the window rows: after the swap each rank holds every one.
+#[test]
+fn tap_swap_rows_are_the_owned_window_rows() {
+    for &(n, rows_w, ffn) in &SHAPES {
+        for window_owner in [false, true] {
+            let plan = SpPlan::new(&owner_chunks(n, rows_w, ffn, window_owner)).unwrap();
+            for cut in [0, 1, n / 3, n / 2, n.saturating_sub(1), n, n + 7] {
+                for win in [(0, cut), (cut, usize::MAX)] {
+                    let item = tap_window_rows(0, n, win);
+                    for rank in 0..2 {
+                        assert_eq!(
+                            rows(&plan.spans(rank, item)),
+                            owned_rows(plan, rank, item),
+                            "n={n} rows={rows_w} ffn={ffn} win={win:?} rank={rank}"
+                        );
+                    }
+                    let mut both = rows_of_both(plan, item);
+                    both.sort_unstable();
+                    let want: Vec<usize> = (item.0..item.0 + item.1).collect();
+                    assert_eq!(both, want, "n={n} rows={rows_w} ffn={ffn} win={win:?}");
+                }
+            }
+        }
+    }
+}
+
+/// 2026-10-10: The SP tap swap moves exactly the rows the non-SP capture keeps
+/// (`PrefillCtxWindow::chunk_rows`), for prompts shorter than, equal to and longer than the
+/// window, chunk by chunk, so rank 0 holds every row it captures.
+#[test]
+fn tap_swap_rows_match_the_non_sp_kept_rows() {
+    use crate::dflash_head::PrefillCtxWindow;
+    let w = 2048;
+    for p in [1000usize, 2048, 5000, 8193] {
+        for chunk in [256usize, 2048, 2952, 4096] {
+            let mut cs = 0;
+            while cs < p {
+                let n = chunk.min(p - cs);
+                let win = PrefillCtxWindow::new(p, cs + n, w, 0);
+                let sp = tap_window_rows(cs, n, win.span());
+                assert_eq!(sp, win.chunk_rows(cs, n), "p={p} chunk={chunk} cs={cs}");
+                let plan = SpPlan::new(&owner_chunks(n, 256, 2048, true)).unwrap();
+                let mut both = rows_of_both(plan, sp);
+                both.sort_unstable();
+                assert_eq!(both, (sp.0..sp.0 + sp.1).collect::<Vec<_>>());
+                cs += n;
+            }
+        }
+    }
+}

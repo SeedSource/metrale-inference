@@ -120,6 +120,9 @@ impl ModelVerify for TransformerModel {
         if r.is_ok() {
             self.kda_defer_post_verify(seq, consumer);
         }
+        // 2026-10-14: Hybrid DFLASH step: ring the verify rows for the MTP catch-up while
+        // `hidden_states` still holds them (`hybrid_mtp_catchup.rs`). Both ranks run this verify.
+        let r = r.and_then(|v| self.hybrid_mtp_ring_stage(seq, tokens.len()).map(|()| v));
         self.release_verify_capture_on_err(r)
     }
 
@@ -172,11 +175,21 @@ impl TransformerModel {
             .filter(|l| l.decode_verify_multi_own_states())
             .map(|l| l.decode_verify_multi_max_rows())
             .min();
+        // 2026-10-09: With a DFlash drafter the route is the batched DFlash verify
+        // (`METRALE_GLM_DFLASH_BATCHED_VERIFY` across ranks).
+        // 2026-10-10: `dflash_step` (a hybrid serve's MTP steps verify through the MTP route).
+        let (kind, admits) = match (self.dflash_step(), ok) {
+            (true, true) => ("DFlash", "ADMITS: batched DFlash verify admitted (route engaged)"),
+            (false, true) => ("MTP", "ADMITS (route engaged)"),
+            (_, false) => (
+                if self.dflash_step() { "DFlash" } else { "MTP" },
+                "REFUSES (per-sequence verify)",
+            ),
+        };
         tracing::info!(
-            "batched MTP verify gate {}: ks={ks:?} rows={rows} comm={} ep_ok={} v2={} dflash_save={} \
-             stash={} layers_declining={} layers_own_states={}/{} min_row_cap={min_cap:?} \
-             lora={} hss={}",
-            if ok { "ADMITS (route engaged)" } else { "REFUSES (per-sequence verify)" },
+            "batched {kind} verify gate {admits}: ks={ks:?} rows={rows} comm={} ep_ok={} v2={} \
+             dflash_save={} stash={} layers_declining={} layers_own_states={}/{} \
+             min_row_cap={min_cap:?} lora={} hss={}",
             self.comm.is_some(),
             self.batched_verify_ep_ok(),
             self.ep_protocol_v2,

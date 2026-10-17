@@ -21,6 +21,21 @@ impl ModelDraft for TransformerModel {
         self.ssm_pool.verify_draft_capacity(slot_idx)
     }
 
+    fn hybrid_dflash(&self) -> bool {
+        self.hybrid_on()
+    }
+
+    fn set_spec_step_mode(
+        &self,
+        mode: metrale_model_layers::speculative::hybrid::SpecStepMode,
+    ) -> Result<()> {
+        self.set_spec_step_mode_dispatch(mode)
+    }
+
+    fn hybrid_dflash_ready(&self, seq: &SequenceState) -> bool {
+        self.hybrid_dflash_ready_dispatch(seq)
+    }
+
     fn generate_speculative(
         &self,
         prompt_tokens: &[u32],
@@ -37,7 +52,8 @@ impl ModelDraft for TransformerModel {
     }
 
     fn dflash_gamma(&self) -> Option<usize> {
-        self.proposer.as_ref().and_then(|p| p.block_gamma())
+        // 2026-10-10: The DFlash drafter's, on a hybrid serve too (`dflash_head`).
+        self.dflash_head().and_then(|p| p.block_gamma())
     }
 
     fn has_self_speculative(&self) -> bool {
@@ -117,7 +133,10 @@ impl ModelDraft for TransformerModel {
             Some(p) => p,
             None => return Ok(()),
         };
-        let prop = match seq.proposer_state.as_mut() {
+        // 2026-10-10: `legacy_dflash_state`: inert on a hybrid serve, which appends through
+        // `commit_ctx` only.
+        let seq_len_now = seq.seq_len;
+        let prop = match self.legacy_dflash_state(seq) {
             Some(p) => p.as_mut(),
             None => return Ok(()),
         };
@@ -134,7 +153,7 @@ impl ModelDraft for TransformerModel {
         let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
         self.gpu
             .copy_d2d_async(save_1, dst, ctx_slot_bytes, self.gpu.default_stream())?;
-        d.ctx_positions.push((seq.seq_len as i32).saturating_sub(1));
+        d.ctx_positions.push((seq_len_now as i32).saturating_sub(1));
         d.ctx_len += 1;
         Ok(())
     }
@@ -144,7 +163,10 @@ impl ModelDraft for TransformerModel {
             Some(p) => p,
             None => return Ok(()),
         };
-        let prop = match seq.proposer_state.as_mut() {
+        // 2026-10-10: `legacy_dflash_state`: inert on a hybrid serve, which appends through
+        // `commit_ctx` only.
+        let seq_len_now = seq.seq_len;
+        let prop = match self.legacy_dflash_state(seq) {
             Some(p) => p.as_mut(),
             None => return Ok(()),
         };
@@ -158,8 +180,8 @@ impl ModelDraft for TransformerModel {
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
         let stream = self.gpu.default_stream();
-        let pos_row0 = (seq.seq_len as i32).saturating_sub(2);
-        let pos_row1 = (seq.seq_len as i32).saturating_sub(1);
+        let pos_row0 = (seq_len_now as i32).saturating_sub(2);
+        let pos_row1 = (seq_len_now as i32).saturating_sub(1);
         let save_0 = base;
         let dst_0 = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
         self.gpu
@@ -186,7 +208,9 @@ impl ModelDraft for TransformerModel {
             Some(p) => p,
             None => return Ok(()),
         };
-        let prop = match seq.proposer_state.as_mut() {
+        // 2026-10-10: `legacy_dflash_state`: inert on a hybrid serve, which appends through
+        // `commit_ctx` only.
+        let prop = match self.legacy_dflash_state(seq) {
             Some(p) => p.as_mut(),
             None => return Ok(()),
         };
@@ -230,7 +254,9 @@ impl ModelDraft for TransformerModel {
             Some(p) => p,
             None => return Ok(()),
         };
-        let prop = match seq.proposer_state.as_mut() {
+        // 2026-10-10: `dflash_ctx_state`: the hybrid serve's DFlash state, else `proposer_state`.
+        let slot_now = seq.slot_idx;
+        let prop = match self.dflash_ctx_state(seq) {
             Some(p) => p.as_mut(),
             None => return Ok(()),
         };
@@ -301,7 +327,7 @@ impl ModelDraft for TransformerModel {
         d.skip_next_decode_append = true;
 
         tracing::debug!(target: "metrale_model_engine::model::trait_impl", "CTX_COMMIT slot={} rows={} base_pos={} ctx_len_after={}",
-            seq.slot_idx,
+            slot_now,
             num_committed,
             base_pos,
             d.ctx_len,
@@ -325,7 +351,10 @@ impl ModelDraft for TransformerModel {
             Some(p) => p,
             None => return Ok(()),
         };
-        let prop = match seq.proposer_state.as_mut() {
+        // 2026-10-10: `legacy_dflash_state`: inert on a hybrid serve, which appends through
+        // `commit_ctx` only.
+        let seq_len_now = seq.seq_len;
+        let prop = match self.legacy_dflash_state(seq) {
             Some(p) => p.as_mut(),
             None => return Ok(()),
         };
@@ -370,13 +399,13 @@ impl ModelDraft for TransformerModel {
         if self.stats.once("log:dflash_serial_append") {
             tracing::info!(target: "metrale_model_engine::model::trait_impl", "DFlash SERIAL_APPEND ACTIVE: first serial ctx append at ctx_len={} pos={}",
                 d.ctx_len,
-                seq.seq_len.saturating_sub(1),
+                seq_len_now.saturating_sub(1),
             );
         }
         // 2026-09-25: Decode has already advanced `seq_len` past this token, so
         // its position is `seq_len - 1`.
         debug_assert_eq!(d.ctx_positions.len(), d.ctx_len);
-        d.ctx_positions.push(seq.seq_len.saturating_sub(1) as i32);
+        d.ctx_positions.push(seq_len_now.saturating_sub(1) as i32);
         d.ctx_len += 1;
         // 2026-09-25: The latest capture is in the context now, so the next
         // propose skips its own decode-append of it.

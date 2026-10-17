@@ -118,6 +118,9 @@ impl TransformerModel {
         }
 
         seq.slot_idx = new_slot;
+        // 2026-10-14: The hybrid MTP catch-up ring keeps neither slot's rows across a move.
+        self.hybrid_mtp_ring_reset_slot(old_slot);
+        self.hybrid_mtp_ring_reset_slot(new_slot);
         // 2026-09-25: `copy_slot` is enqueued, so wait for it before the old slot is
         // released and can be claimed while the copy still reads it.
         self.gpu.synchronize(stream)?;

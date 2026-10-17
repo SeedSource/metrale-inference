@@ -84,4 +84,7 @@ pub struct Glm5NextLayer {
     /// the next text layer's attention site and the shared ticket, set by the loader's
     /// post-pass. `Default` (no next site) for the MTP block.
     pub premix: super::seq_parallel::CrossLayerPremix,
+    /// 2026-10-10: Hybrid serve: this tap layer's last SP prefill, while its tap rows are split
+    /// across the ranks (`seq_parallel/tap.rs`). `Default` (none) everywhere else.
+    pub sp_tap: super::seq_parallel::SpTapRecord,
 }

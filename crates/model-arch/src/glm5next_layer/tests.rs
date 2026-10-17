@@ -358,6 +358,7 @@ fn batched_verify_graphs_stays_behind_its_lever() {
     assert!(gr.contains("graph_borrow_enabled()\n                && !self.any_verify_own_states()"));
     assert!(gr.contains("layer.check_replay_room(&*seq.layer_states[i], seq.seq_len, k)?;"));
     assert!(gr.contains("layer.sync_replayed_step(seq.layer_states[i].as_mut(), seq.seq_len, k)?;"));
+    // 2026-10-11: The release moved to `sequence_compact.rs` with METRALE_MTP_POOL_CAP (198cb05d).
     let s = include_str!("../../../model-engine/src/model/trait_impl/sequence_compact.rs");
     assert!(s.contains("let mut vb = self.verify_batched_graphs.lock();"));
     let x = include_str!("../glm5next_dsa/layer/xseq.rs");

@@ -35,6 +35,8 @@ pub(super) fn load_kernels(gpu: &dyn GpuBackend, head_dim: usize) -> Result<Dfla
         dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
         w4a16_gemm: metrale_model_layers::layers::try_kernel(gpu, "w4a16", "w4a16_gemm"),
         dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+        // 2026-10-08: Filled by `arm_draft_gemv` when METRALE_DFLASH_DRAFT_GEMV=1.
+        dense_gemv_batchm: metrale_gpu_runtime::gpu::KernelHandle(0),
         // 2026-09-25: `rope_forward_yarn` takes the inverse-frequency table
         // (`yarn_inv_freq`, built below) as an argument, so it also runs plain RoPE.
         rope_qwen3: gpu.kernel("rope", "rope_forward_yarn")?,
@@ -125,10 +127,40 @@ pub(super) fn load_kernels(gpu: &dyn GpuBackend, head_dim: usize) -> Result<Dfla
         // loads other drafters; `dflash2_active` is then false.
         dflash2_conv2: metrale_model_layers::layers::try_kernel(gpu, "dflash2", "dflash2_conv2"),
         dflash2_topk16: metrale_model_layers::layers::try_kernel(gpu, "dflash2", "dflash2_topk16"),
+        dflash2_topk16_reg: metrale_model_layers::layers::try_kernel(
+            gpu,
+            "dflash2",
+            "dflash2_topk16_reg",
+        ),
         dflash2_selector_walk: metrale_model_layers::layers::try_kernel(
             gpu,
             "dflash2",
             "dflash2_selector_walk",
         ),
     })
+}
+
+/// 2026-10-08: Module of the GLM-5.3 target's own row-scaled FP8 drafter GEMMs
+/// (`kernels/gb10/glm-5.3-flash/nvfp4/dflash_fp8_gemm.cu`, SeedHQ/seed-skills#71 S1b).
+pub(super) const GLM_FP8_GEMM_MODULE: &str = "dflash_fp8_gemm";
+
+/// 2026-10-08: `fp8_gemm_t_row_scaled` and `fp8_gemm_t_row_scaled_m16` from
+/// [`GLM_FP8_GEMM_MODULE`], each `KernelHandle(0)` when absent. Probed only when the
+/// `w4a16` module lacks them and METRALE_DFLASH_DRAFTER_FP8=1 is explicit
+/// (`fp8_weights::arm_drafter_fp8`), so other targets and lever-off boots issue no new
+/// lookup.
+pub(super) fn load_fp8_row_scaled_fallback(
+    gpu: &dyn GpuBackend,
+) -> (
+    metrale_gpu_runtime::gpu::KernelHandle,
+    metrale_gpu_runtime::gpu::KernelHandle,
+) {
+    (
+        metrale_model_layers::layers::try_kernel(gpu, "dflash_fp8_gemm", "fp8_gemm_t_row_scaled"),
+        metrale_model_layers::layers::try_kernel(
+            gpu,
+            "dflash_fp8_gemm",
+            "fp8_gemm_t_row_scaled_m16",
+        ),
+    )
 }

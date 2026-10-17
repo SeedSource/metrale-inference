@@ -449,7 +449,8 @@ impl TransformerModel {
     }
 
     pub(super) fn read_deferred_draft_token_dispatch(&self) -> Result<u32> {
-        let proposer = match &self.proposer {
+        // 2026-10-10: The step's proposer (`hybrid_spec.rs`).
+        let proposer = match self.step_proposer() {
             Some(p) => p.as_ref(),
             None => return Ok(0),
         };
@@ -462,12 +463,14 @@ impl TransformerModel {
         num_accepted: usize,
         _stream: u64,
     ) -> Result<()> {
-        let proposer = match &self.proposer {
-            Some(p) => p.as_ref(),
+        // 2026-10-10: The step's proposer and its state (`hybrid_spec.rs`): on a hybrid serve the
+        // verify trims the proposer that drafted, which rank 0's mode names on every rank.
+        let proposer = match self.step_proposer() {
+            Some(p) => p.clone(),
             None => return Ok(()),
         };
         let stream = self.gpu.default_stream();
-        if let Some(ref mut state) = seq.proposer_state {
+        if let Some(state) = self.step_state_mut(seq) {
             proposer.after_verify(num_accepted, state.as_mut(), stream)?;
         }
         Ok(())

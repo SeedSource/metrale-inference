@@ -61,13 +61,13 @@ pub(super) fn lora_build_args<'a>(
 
 pub(super) fn dflash_build_args<'a>(
     args: &cli::ServeArgs,
-    dflash_drafter_state: &'a Option<(
+    dflash_drafter_state: &'a mut Option<(
         metrale_model_weights::weights::WeightStore,
         metrale_model_arch::weight_loader::DflashConfig,
     )>,
 ) -> Option<metrale_model_engine::factory::DflashBuildArgs<'a>> {
     dflash_drafter_state
-        .as_ref()
+        .as_mut()
         .map(|(s, c)| metrale_model_engine::factory::DflashBuildArgs {
             drafter_store: s,
             drafter_config: c.clone(),

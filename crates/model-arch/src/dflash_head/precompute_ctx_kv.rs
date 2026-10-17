@@ -93,19 +93,10 @@ impl BlockDiffusionDraftHead {
             Ok(())
         };
 
-        // 2026-09-25: Step 1: `fc` maps `[n, L_t * h_t]` to `[n, h]`.
+        // 2026-09-25: Step 1: `fc` maps `[n, L_t * h_t]` to `[n, h]` (2026-10-09: split
+        // across ranks under `METRALE_DFLASH_DRAFT_TP2`, see `tp/collectives.rs`).
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        ops::dense_gemm_bf16_pipelined(
-            gpu,
-            self.kernels.dense_gemm_pipelined,
-            src,
-            &self.fc,
-            self.scratch.fc_proj,
-            n,
-            h,
-            target_hidden_dim as u32,
-            stream,
-        )?;
+        self.fc_project(ctx, src, n, target_hidden_dim as u32, stream)?;
         dump_buf(
             "fc_proj",
             self.scratch.fc_proj,
@@ -135,11 +126,16 @@ impl BlockDiffusionDraftHead {
         // `[K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}]`.
         let fused_w = DenseWeight { weight: fused_kv };
         let fused_n_cols = (l_total as u32) * 2 * kv_dim;
-        ops::dense_gemm_bf16_pipelined(
+        // 2026-10-12: METRALE_DFLASH_AUX_FP8: up to 16 rows on the FP8 mirror; BF16 kept.
+        self.draft_gemm_aux(
             gpu,
-            self.kernels.dense_gemm_pipelined,
             self.scratch.fc_proj,
-            &fused_w,
+            (
+                &fused_w,
+                self.fused_kv_fp8.as_ref(),
+                self.nv4.fused_kv.as_ref(),
+                true,
+            ),
             self.scratch.fused_kv_out,
             n,
             fused_n_cols,

@@ -5,6 +5,18 @@
 //! Owner: scheduler.
 //! Invariants:
 //! - Every read of the shared verify outputs (the accept walk, `commit_ctx`, the hidden stash) happens for all sequences before the first propose; the early returns before that point propose nothing.
+//! - 2026-10-09: Multi-rank (`METRALE_GLM_DFLASH_BATCHED_VERIFY`): after an `Ok` forward rank 0
+//!   sends the verdict words (`broadcast_batch_verdict`) once every accept is walked, and then
+//!   makes exactly one failure-mask gather (`retire_failed_on_workers`) on every exit (short
+//!   result, fold error, normal tail) before any propose. An `Err` forward sends nothing more
+//!   (`decode_verify_batched` sent the abort words) and finishes the batch, since a worker may
+//!   have advanced. The verify width `k` is whatever the caller's drafts carry (2..=4 across
+//!   ranks); nothing here assumes 4.
+//! - 2026-10-09: `METRALE_GLM_DFLASH_KSEL` (`dflash_ksel`) may cut every row to one narrower
+//!   width before the rows are built; the worker learns it from the `ks` meta only.
+//! - 2026-10-09: Under the batched GLM pin (`DflashRung::multi_batched`) each sequence's
+//!   verdict is picked on `step_verify_dflash`'s basis (`dflash_batch_rows::verdict_uses_pipeline`,
+//!   the logits pipeline at rows `i * k..`), before the verdict words; otherwise on the raw argmax.
 //!
 //! The single-sequence [`super::verify_dflash_step::step_verify_dflash`] runs
 //! one target forward per sequence. This step packs the `n` sequences'
@@ -34,6 +46,11 @@ pub fn step_verify_dflash_batched(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
 ) -> Option<String> {
+    // 2026-10-09: `METRALE_GLM_DFLASH_KSEL`: under the batched GLM pin, one width for this batch
+    // from the drafter p and the measured cost table (`dflash_ksel`); the rows' drafts are cut
+    // to it here, so `ks` below (and the `EP_CMD_VERIFY_BATCH` meta the worker reads) carry it.
+    let drafts_per_seq =
+        super::dflash_ksel::select_and_truncate(model, batch, sched, drafts_per_seq);
     let n = batch.len();
     let k = drafts_per_seq + 1;
     debug_assert!(n >= 2 && drafts_per_seq >= 1);
@@ -108,58 +125,87 @@ pub fn step_verify_dflash_batched(
                 n * k
             ),
         );
+        // 2026-10-09: Multi-rank: the workers wait for verdict words and then the gather;
+        // zero accepts (a valid verdict) and every sequence failed.
+        if broadcast_batch_verdict(model, batch, &vec![0; n], &ks) {
+            retire_failed_on_workers(model, batch, u32::MAX);
+        }
         return None;
     }
 
-    // 2026-09-25: First pass, per sequence: verdict, rewind, ctx commit and
-    // emit. The shared-buffer reads happen here, before any propose.
-    let mut accepted_per_seq: Vec<usize> = Vec::with_capacity(n);
-    let mut stash_rows: Vec<usize> = Vec::with_capacity(n);
+    // 2026-10-09: The accept walk for every sequence, then the verdict words (multi-rank)
+    // before anything else this step does.
+    // 2026-10-09: Under the batched GLM pin (`DflashRung::multi_batched`) a row is judged on
+    // the basis `step_verify_dflash` would use for it (`verdict_uses_pipeline`): thinking and
+    // biased rows, and every row while `dflash_masked_verify` is on, go through the logits
+    // pipeline at their own rows (`row_base = i * k`), as the MTP batch does. Without the pin
+    // every row is judged on the raw argmax, the basis the drafter proposes on.
+    let pinned = sched.dflash_rung.multi_batched();
     let now = sched.io.clock.now();
+    let mut host_rows = 0usize;
+    let verdicts: Vec<Vec<u32>> = batch
+        .iter_mut()
+        .enumerate()
+        .map(|(i, a)| {
+            let raw = &results[i * k..i * k + k];
+            // 2026-10-15: the partition in `mtp_step.rs` runs before this forward, so a raw
+            // argmax on a stray `</tool_call>` that `StrayToolCallEndMask` masks on this row
+            // is caught here, pinned or not: this row's verdict comes from the masked pipeline
+            // over its own rows of the shared logits buffer (`row_base = i * k`), and the
+            // accept walk below compares the drafts with those picks. Read before any propose,
+            // like every other read of the shared outputs.
+            let stray =
+                crate::scheduler::verify_pipeline_helper::raw_verdict_hits_stray_tool_call_end(
+                    a, raw, verify_ctx,
+                );
+            if !stray && !(pinned && super::dflash_batch_rows::verdict_uses_pipeline(sched, a)) {
+                return raw.to_vec();
+            }
+            host_rows += 1;
+            let picked = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+                model,
+                raw,
+                a,
+                verify_ctx,
+                i * k,
+            );
+            // 2026-10-09: A position with no pick falls back to the GPU argmax (as the MTP
+            // batch does).
+            (0..k)
+                .map(|j| picked.get(j).copied().unwrap_or(raw[j]))
+                .collect()
+        })
+        .collect();
+    let accepted_per_seq: Vec<usize> = batch
+        .iter_mut()
+        .enumerate()
+        .map(|(i, a)| {
+            let verified = &verdicts[i];
+            let drafts = &drafts_all[i];
+            a.last_token_time = now;
+            let mut num_accepted = 0usize;
+            for j in 0..drafts.len() {
+                if j + 1 >= verified.len() || drafts[j] != verified[j] {
+                    break;
+                }
+                num_accepted += 1;
+            }
+            crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
+            num_accepted
+        })
+        .collect();
+    if !broadcast_batch_verdict(model, batch, &accepted_per_seq, &ks) {
+        return None;
+    }
+
+    // 2026-09-25: First pass, per sequence: rewind, ctx commit and emit. The
+    // shared-buffer reads happen here, before any propose.
+    let mut stash_rows: Vec<usize> = Vec::with_capacity(n);
     for (i, a) in batch.iter_mut().enumerate() {
         let off = i * k;
-        let raw = &results[off..off + k];
+        let verified = &verdicts[i];
         let drafts = &drafts_all[i];
-        a.last_token_time = now;
-
-        // 2026-10-15: the partition in `mtp_step.rs` runs before this forward,
-        // so a raw argmax on a stray `</tool_call>` that `StrayToolCallEndMask`
-        // masks on this row is caught here: this row's verdict comes from the
-        // masked pipeline over its own rows of the shared logits buffer
-        // (`row_base = off`, as `step_verify_k4_batched` reads them after the
-        // same `decode_verify_batched`), and the accept walk below compares the
-        // drafts with those picks. A position with no pick keeps its raw argmax.
-        // Read before any propose, like every other read of the shared outputs.
-        let repicked: Option<Vec<u32>> =
-            if crate::scheduler::verify_pipeline_helper::raw_verdict_hits_stray_tool_call_end(
-                a, raw, verify_ctx,
-            ) {
-                let processed =
-                    crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
-                        model, raw, a, verify_ctx, off,
-                    );
-                Some(
-                    (0..k)
-                        .map(|j| processed.get(j).copied().unwrap_or(raw[j]))
-                        .collect(),
-                )
-            } else {
-                None
-            };
-        let verified: &[u32] = repicked.as_deref().unwrap_or(raw);
-
-        // 2026-09-25: judged on the raw argmax, the basis the drafter
-        // proposes on. Unlike `verify_dflash_step`, this path does not
-        // read `dflash_masked_verify`.
-        let mut num_accepted = 0usize;
-        for j in 0..drafts.len() {
-            if j + 1 >= verified.len() || drafts[j] != verified[j] {
-                break;
-            }
-            num_accepted += 1;
-        }
-        accepted_per_seq.push(num_accepted);
-        crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
+        let num_accepted = accepted_per_seq[i];
 
         // 2026-09-25: rewind the forward's +k to the accepted prefix plus
         // the bonus slot (the same arithmetic as `verify_dflash_step`).
@@ -236,6 +282,8 @@ pub fn step_verify_dflash_batched(
             // a commit error does for one sequence.
             tracing::error!("gdn_fold_accepted (dflash batched): {e:#}");
             fail_dflash_batch(batch, &format!("gdn_fold_accepted (dflash batched): {e:#}"));
+            // 2026-10-09: the workers wait for this gather after real verdict words.
+            retire_failed_on_workers(model, batch, u32::MAX);
             return None;
         }
         for (i, a) in batch.iter_mut().enumerate() {
@@ -256,6 +304,9 @@ pub fn step_verify_dflash_batched(
     if let Err(e) = model.stash_verify_hidden_rows(&stash_rows, 0) {
         tracing::warn!("stash_verify_hidden_rows (dflash batched): {e:#}");
     }
+    // 2026-10-09: multi-rank: the workers' commit failures, gathered once, before any propose
+    // (the DFlash propose runs on rank 0 alone and sends the workers nothing).
+    retire_failed_on_workers(model, batch, 0);
 
     // 2026-09-25: Second pass: per-sequence trim, then the batched re-propose
     // (with a per-sequence fallback). The shared buffers may be
@@ -366,7 +417,7 @@ pub fn step_verify_dflash_batched(
     let total_accepted: usize = accepted_per_seq.iter().sum();
     tracing::info!(
         "DFLASH BATCHED verify: n={n} γ={drafts_per_seq} accepted={total_accepted}/{} ({:.0}%) \
-         verify={verify_ms:.1}ms propose={:.1}ms",
+         verify={verify_ms:.1}ms propose={:.1}ms host_rows={host_rows}",
         n * drafts_per_seq,
         100.0 * (total_accepted as f64) / ((n * drafts_per_seq) as f64),
         sched

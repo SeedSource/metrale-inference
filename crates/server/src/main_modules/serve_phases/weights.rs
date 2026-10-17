@@ -523,6 +523,9 @@ fn skip_mtp(config: &ModelConfig) -> bool {
 /// block, `layers.{num_hidden_layers}`, is never bound as the proposer, so its
 /// weights (~3 GB per rank under EP) are not loaded. `None` for every other
 /// case, so serves without `--dflash` are unchanged.
+///
+/// 2026-10-10: A hybrid serve (`METRALE_HYBRID_DFLASH=1`) passes `--dflash --speculative`, so it
+/// loads the MTP block: its MTP head is the proposer beside the drafter.
 fn skip_mtp_layers_from(args: &cli::ServeArgs, config: &ModelConfig) -> Option<usize> {
     (args.dflash
         && !args.speculative

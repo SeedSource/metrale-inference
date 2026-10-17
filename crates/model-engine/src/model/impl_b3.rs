@@ -5,7 +5,8 @@
 //! Owner: model-engine.
 //! Invariants:
 //! - The DFlash capture and context-length methods do nothing on a comm rank other than 0.
-//! - DFlash prefill capture never writes at or past `max_ctx_len`, and
+//! - DFlash prefill capture keeps the last `max_ctx_len` prompt positions
+//!   (`PrefillCtxWindow`, 2026-10-10; the first ones before), never more, and
 //!   `try_dflash_capture_all_at` never writes past `dflash_hidden_save_rows`.
 
 #![allow(unused_imports, dead_code)]
@@ -44,7 +45,10 @@ impl TransformerModel {
         seq: &mut SequenceState,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
-        let proposer = match &self.proposer {
+        // 2026-10-10: The step's proposer (`hybrid_spec.rs`): on a hybrid serve's DFLASH step the
+        // DFlash drafter and its state, else `proposer` and `proposer_state` as before.
+        let hybrid_dflash = self.hybrid_on() && self.dflash_step();
+        let proposer = match self.step_proposer() {
             Some(p) => p.as_ref(),
             None => return Ok(Vec::new()),
         };
@@ -110,17 +114,29 @@ impl TransformerModel {
         // propose of this sequence: a whole-prompt drafter prefill on a cold
         // turn or, with the carry lever on, the previous turn's drafter rows
         // plus an append on a warm one. See `ensure_drafter_context`.
-        self.ensure_drafter_context(proposer, seq, &ctx, stream);
-        let prop_state = seq
-            .proposer_state
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
+        // 2026-10-10: Skipped on a hybrid DFLASH step: it prefills the MTP head from the MTP
+        // capture (the eager consume at end of prefill already did on a hybrid serve).
+        if !hybrid_dflash {
+            self.ensure_drafter_context(proposer, seq, &ctx, stream);
+            // 2026-10-14: The slot's first MTP propose after a hybrid DFlash stretch: catch the
+            // drafter up (`METRALE_HYBRID_MTP_CATCHUP`) and log `HYBRID MTP resume`. The worker
+            // runs this propose too (`EP_CMD_MTP_PROPOSE`), with the same `position`.
+            self.hybrid_mtp_resume(proposer, seq, position, stream);
+        }
+        let prop_state = if hybrid_dflash {
+            seq.dflash_state.as_mut()
+        } else {
+            seq.proposer_state.as_mut()
+        }
+        .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
         // 2026-09-25: METRALE_MTP_CATCHUP: before proposing, feed the drafter
         // the pairs it missed during serial decode. Pair key k is
         // (embed(tokens[k+1]), hidden_k) at RoPE k+1. The serial-decode hook
         // writes each step's hidden under the post-step `seq_len`, so ring
         // label n holds hidden_{n-1} and pair key k reads label k+1.
-        if metrale_model_layers::speculative::mtp_catchup_enabled()
+        // 2026-10-10: MTP head only, so never on a hybrid DFLASH step.
+        if !hybrid_dflash
+            && metrale_model_layers::speculative::mtp_catchup_enabled()
             && !self.mtp_catchup_ring.is_null()
         {
             let rows = proposer.drafter_rows(prop_state.as_mut());
@@ -267,13 +283,15 @@ impl TransformerModel {
     /// `hidden_states()` (the layer just run) into the sequence's DFlash
     /// context accumulator. The prefill layer loops call it after each layer.
     ///
-    /// Row `t` lands at element `((chunk_start + t) * n_capture + slot_idx) * h`
-    /// of the accumulator, one `copy_d2d_async` per row. Positions at or past
-    /// `max_ctx_len` are dropped.
+    /// Row `t` lands at element `((chunk_start + t - start) * n_capture + slot_idx) * h`
+    /// of the accumulator, one `copy_d2d_async` per row, for the positions of the window
+    /// `[start, prompt_len)` (`PrefillCtxWindow`, 2026-10-10: the last `max_ctx_len` prompt
+    /// positions; the rest are dropped). For a prompt within `max_ctx_len`, `start` is 0 and
+    /// the copies are the ones the first-W capture made.
     ///
     /// No-op when there are no DFlash capture layers, `layer_idx` is not one
     /// of them, the sequence has no `DflashProposerState`, or this is a comm
-    /// rank other than 0.
+    /// rank other than 0 (2026-10-09: unless `dflash_capture_on_every_rank`).
     pub(super) fn try_dflash_prefill_capture_layer(
         &self,
         seq: &mut crate::traits::SequenceState,
@@ -293,12 +311,18 @@ impl TransformerModel {
             Some(s) => s,
             None => return Ok(()),
         };
+        // 2026-10-10: Hybrid serve under SP prefill: every rank, before the rank-0 check, has the
+        // layer swap the tap rows this capture keeps (`hybrid_spec.rs`).
+        self.hybrid_sp_tap_gather(seq, layer_idx, chunk_start, proc_count, stream)?;
         if let Some(ref c) = self.comm
             && c.rank() != 0
+            && !self.dflash_capture_on_every_rank()
         {
             return Ok(());
         }
-        let dstate = match seq.proposer_state.as_mut() {
+        let (prompt_len, run_start) = (seq.prompt_len, seq.prefill_run_start);
+        // 2026-10-10: `dflash_ctx_state`: the hybrid serve's DFlash state, else `proposer_state`.
+        let dstate = match self.dflash_ctx_state(seq) {
             Some(ps) => match ps
                 .as_any_mut()
                 .downcast_mut::<metrale_model_arch::dflash_head::DflashProposerState>()
@@ -312,25 +336,40 @@ impl TransformerModel {
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
+        let win = metrale_model_arch::dflash_head::PrefillCtxWindow::new(
+            prompt_len,
+            chunk_start + proc_count,
+            dstate.max_ctx_len,
+            run_start,
+        );
         let src_base = self.buffers.hidden_states();
-        for t in 0..proc_count {
-            let abs_pos = chunk_start + t;
-            if abs_pos >= max_ctx {
-                break;
-            }
-            let src = src_base.offset(t * h * bf16);
-            let dst_offset = abs_pos * n_capture * h * bf16 + slot_idx * h * bf16;
-            self.gpu
-                .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
+        let (t0, rows) = win.chunk_rows(chunk_start, proc_count);
+        if rows == 0 {
+            return Ok(());
         }
+        // 2026-10-11: One pitched copy for the chunk's window rows (source rows contiguous,
+        // accumulator rows `n_capture * h` apart) instead of one `copy_d2d_async` per row: up to
+        // 2057 launches per tap layer were a flat TTFT cost on the hybrid serve (#82 row G,
+        // 2K/8K +49 ms). Same bytes to the same places.
+        let slot_row0 = chunk_start + t0 - win.start;
+        self.gpu.copy_d2d_2d_async(
+            src_base.offset(t0 * h * bf16),
+            h * bf16,
+            acc_base.offset(slot_row0 * n_capture * h * bf16 + slot_idx * h * bf16),
+            n_capture * h * bf16,
+            h * bf16,
+            rows,
+            stream,
+        )?;
         Ok(())
     }
 
     /// 2026-09-25: After a prefill chunk, set the sequence's DFlash `ctx_len`
-    /// to `chunk_start + proc_count` (capped at `max_ctx_len`) so the first
+    /// to the rows captured so far (2026-10-10: of the window `PrefillCtxWindow`, the last
+    /// `max_ctx_len` prompt positions) so the first
     /// propose sees every captured prompt position. No-op without capture
-    /// layers or a `DflashProposerState`, and on comm ranks other than 0.
+    /// layers or a `DflashProposerState`, and on comm ranks other than 0 (2026-10-09: unless
+    /// `dflash_capture_on_every_rank`).
     pub(super) fn update_dflash_ctx_len_after_prefill(
         &self,
         seq: &mut crate::traits::SequenceState,
@@ -342,20 +381,37 @@ impl TransformerModel {
         }
         if let Some(ref c) = self.comm
             && c.rank() != 0
+            && !self.dflash_capture_on_every_rank()
         {
             return Ok(());
         }
-        if let Some(ps) = seq.proposer_state.as_mut()
+        let (prompt_len, run_start) = (seq.prompt_len, seq.prefill_run_start);
+        if let Some(ps) = self.dflash_ctx_state(seq)
             && let Some(dstate) =
                 ps.as_any_mut()
                     .downcast_mut::<metrale_model_arch::dflash_head::DflashProposerState>()
         {
-            let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
+            let chunk_end = chunk_start + proc_count;
+            let win = metrale_model_arch::dflash_head::PrefillCtxWindow::new(
+                prompt_len,
+                chunk_end,
+                dstate.max_ctx_len,
+                run_start,
+            );
+            dstate.ctx_len = win.len_after(chunk_end);
             // 2026-09-25: Prefill slot i holds prompt position i, so each
             // slot's fixed RoPE position is its index. `ctx_positions` is
             // rebuilt to the same length as `ctx_len` on every chunk.
-            dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
+            // 2026-10-10: Slot i holds absolute position `start + i` (`start` is 0 for a prompt
+            // within the window, as before).
+            dstate.ctx_positions = win.positions_after(chunk_end);
+            if win.start > 0 {
+                // 2026-10-10: No drafter K/V of an earlier window survives a tail window.
+                dstate.ctx_committed = 0;
+            }
+            // 2026-10-09: Two-rank drafter: rank 1 captured the same prompt rows.
+            // 2026-10-10: Same window on both ranks (same prompt length and `max_ctx_len`).
+            dstate.tp_synced_pos = dstate.ctx_positions.last().copied();
         }
         Ok(())
     }
@@ -395,6 +451,23 @@ impl TransformerModel {
         let dst_slot = dst.offset(slot * h * bf16);
         self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
         Ok(())
+    }
+
+    /// 2026-10-10: The DFlash capture of a single-sequence K-row verify (K2/K3/K4): row `k - 1`
+    /// as before, or, on a hybrid serve, rows `0..k`, so the scheduler commits every accepted
+    /// row to the drafter context (`commit_ctx`) whichever proposer drafted. Fixed per process,
+    /// so a captured verify graph never bakes the other choice.
+    pub(super) fn try_dflash_capture_verify(
+        &self,
+        layer_idx: usize,
+        k: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if self.hybrid_on() {
+            self.try_dflash_capture_all(layer_idx, k, stream)
+        } else {
+            self.try_dflash_capture(layer_idx, k - 1, stream)
+        }
     }
 
     /// 2026-09-25: `Model::save_dflash_hidden_for_propose`: run

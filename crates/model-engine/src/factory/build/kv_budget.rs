@@ -133,6 +133,8 @@ pub(super) fn dflash_reserve_bytes(
     dflash_args: &Option<DflashBuildArgs<'_>>,
     config: &ModelConfig,
     max_seq_len: usize,
+    hybrid: bool,
+    rank_world: Option<(usize, usize)>,
     gib: impl Fn(usize) -> f64,
 ) -> usize {
     let dflash_reserve: usize = dflash_args
@@ -142,16 +144,28 @@ pub(super) fn dflash_reserve_bytes(
             let kv_dim = c.num_key_value_heads * c.head_dim;
             let drafter_kv = max_seq_len * c.num_hidden_layers * 2 * kv_dim * 2;
             let fused_kv = c.num_hidden_layers * 2 * kv_dim * c.hidden_size * 2;
-            let capture = max_seq_len * config.hidden_size * 2;
-            // 2026-09-25: The same test as the allocation in
-            // dflash_head/from_weights.rs: on unless the variable is `0`.
-            let fp8_mirrors =
-                if std::env::var("METRALE_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("0") {
-                    a.drafter_store.total_bytes() / 2
-                } else {
-                    0
-                };
-            drafter_kv + fused_kv + capture + fp8_mirrors + (300 << 20)
+            // 2026-10-10: A hybrid serve's term is its one DFlash ctx accumulator, every tap row
+            // of the full window (`max_seq_len` is the window there; review F1).
+            let capture = if hybrid {
+                metrale_model_layers::speculative::hybrid::hybrid_ctx_state_bytes(
+                    config.dflash_capture_layers.len().max(1),
+                    max_seq_len,
+                    config.hidden_size,
+                )
+            } else {
+                max_seq_len * config.hidden_size * 2
+            };
+            // 2026-10-14: The FP8 mirrors this rank allocates (was half the store: a TP2 rank
+            // holds only its shard; #82 hybrid M1b).
+            let fp8_mirrors = dflash_fp8_mirror_reserve_bytes(c, rank_world);
+            // 2026-10-14: Hybrid MTP catch-up ring and zero rows (`METRALE_HYBRID_MTP_CATCHUP`),
+            // allocated at the drafter install (`set_hybrid_dflash_proposer`), after this sizing.
+            let mtp_catchup = metrale_model_layers::speculative::hybrid::hybrid_mtp_catchup_bytes(
+                hybrid && metrale_model_layers::speculative::hybrid::hybrid_mtp_catchup_enabled(),
+                metrale_model_layers::speculative::hybrid::hybrid_mtp_catchup_rows(),
+                config.hidden_size,
+            );
+            drafter_kv + fused_kv + capture + fp8_mirrors + mtp_catchup + (300 << 20)
         })
         .unwrap_or(0);
     if dflash_reserve > 0 {
@@ -160,6 +174,82 @@ pub(super) fn dflash_reserve_bytes(
         );
     }
     dflash_reserve
+}
+
+/// 2026-10-14: The post-sizing FP8 mirror bytes this rank's install allocates
+/// (`BlockDiffusionDraftHead::predicted_fp8_mirror_bytes`, one shard rule with the
+/// allocation); `0` under `METRALE_DFLASH_DRAFTER_FP8=0`. The reserve and the install's
+/// check both call this, so they read one number.
+pub(super) fn dflash_fp8_mirror_reserve_bytes(
+    drafter_config: &metrale_model_arch::weight_loader::DflashConfig,
+    rank_world: Option<(usize, usize)>,
+) -> usize {
+    metrale_model_arch::dflash_head::BlockDiffusionDraftHead::predicted_fp8_mirror_bytes(
+        drafter_config,
+        metrale_model_arch::dflash_head::levers::DFlashLevers::from_env().draft_tp2,
+        rank_world,
+        std::env::var("METRALE_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("0"),
+    )
+}
+
+/// 2026-10-14: The install's check on [`dflash_fp8_mirror_reserve_bytes`]: logs the post-sizing
+/// mirrors against the reserve and returns `Err` when the head allocated more than reserved
+/// plus 64 MiB (rounding), since the KV pool then runs over its budget by the difference.
+pub(super) fn check_dflash_mirror_reserve(reserved: usize, actual: usize) -> anyhow::Result<()> {
+    tracing::info!(target: "metrale_model_engine::factory::build", "KV budget: DFlash post-sizing mirrors {:.3} GB vs reserved {:.3} GB",
+        actual as f64 / (1u64 << 30) as f64,
+        reserved as f64 / (1u64 << 30) as f64,
+    );
+    if actual > reserved + (64 << 20) {
+        anyhow::bail!(
+            "DFlash mirror reserve: the KV sizing reserved {reserved} bytes for the FP8 drafter \
+             mirrors, but the install allocated {actual}: the KV pool is over its \
+             --gpu-memory-utilization budget by the difference. The reserve's shard rule and \
+             the allocation disagree (METRALE_DFLASH_DRAFT_TP2 / lm_head / NVFP4 copies)."
+        );
+    }
+    Ok(())
+}
+
+/// 2026-10-14: Bytes of BF16 drafter layer weights that are resident at KV sizing and freed by
+/// the install once the head runs on their FP8 mirrors
+/// (`BlockDiffusionDraftHead::predicted_bf16_layer_release_bytes`); `0` without DFlash.
+/// The budget term credits them back to `used_so_far` (#82 hybrid M1: 1.93 GB, about 368K KV
+/// tokens, went back to the host instead of the pool). The free-memory clamp does not, because
+/// the bytes are still allocated when the pool is. `install_dflash_drafter` refuses the
+/// serve when the release frees less.
+pub(super) fn dflash_bf16_credit_bytes(
+    dflash_args: &Option<DflashBuildArgs<'_>>,
+    gib: impl Fn(usize) -> f64,
+) -> usize {
+    let credit = dflash_args.as_ref().map_or(0, |a| {
+        metrale_model_arch::dflash_head::BlockDiffusionDraftHead::predicted_bf16_layer_release_bytes(
+            a.drafter_store,
+            std::env::var("METRALE_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("0"),
+            metrale_model_arch::dflash_head::levers::DFlashLevers::from_env().option_b,
+        )
+    });
+    if credit > 0 {
+        tracing::info!(target: "metrale_model_engine::factory::build", "KV budget: crediting {:.2} GB of BF16 DFlash drafter layer weights freed after sizing (FP8 mirrors)",
+            gib(credit),
+        );
+    }
+    credit
+}
+
+/// 2026-10-14: The install's check on [`dflash_bf16_credit_bytes`]: `Err` when the release freed
+/// less than the KV sizing credited, since the pool then runs over the `--gpu-memory-utilization`
+/// budget by the difference. 64 MiB of slack covers rounding only.
+pub(super) fn check_dflash_bf16_credit(credited: usize, freed: usize) -> anyhow::Result<()> {
+    if freed + (64 << 20) < credited {
+        anyhow::bail!(
+            "DFlash KV credit: the KV sizing credited {credited} bytes of BF16 drafter layer weights, \
+             but the install freed {freed}: the KV pool is over its --gpu-memory-utilization budget \
+             by the difference. The head did not reach the FP8 path its prediction assumed (FP8 \
+             GEMM kernels missing, or a layer without all seven mirrors)."
+        );
+    }
+    Ok(())
 }
 
 /// 2026-09-26: Bytes reserved for the MTP head's paged KV pool, which
@@ -226,4 +316,43 @@ pub(super) fn glm_mtp_reserve(
         stage_rows.min(max_seq_len),
     );
     bytes
+}
+
+#[cfg(test)]
+mod dflash_credit_tests {
+    use super::{check_dflash_bf16_credit, check_dflash_mirror_reserve};
+
+    /// 2026-10-14: The mirror check passes up to 64 MiB over the reserve and fails beyond;
+    /// under-using the reserve passes (#82 hybrid M1b).
+    #[test]
+    fn the_mirror_check_has_a_64_mib_slack_edge() {
+        let gb = 1usize << 30;
+        assert!(check_dflash_mirror_reserve(0, 0).is_ok());
+        assert!(check_dflash_mirror_reserve(gb, gb / 2).is_ok());
+        assert!(check_dflash_mirror_reserve(gb, gb + (64 << 20)).is_ok());
+        assert!(check_dflash_mirror_reserve(gb, gb + (64 << 20) + 1).is_err());
+        assert!(
+            check_dflash_mirror_reserve(0, 65 << 20).is_err(),
+            "mirrors built where none were reserved (FP8=0 reserve, FP8 install)"
+        );
+    }
+
+    /// 2026-10-14: The install refuses a serve whose release freed less than the KV credit,
+    /// beyond 64 MiB of rounding; freeing as much or more passes (#82 hybrid M1).
+    #[test]
+    fn a_short_release_fails_the_install() {
+        let gb = 1usize << 30;
+        assert!(check_dflash_bf16_credit(0, 0).is_ok());
+        assert!(check_dflash_bf16_credit(2 * gb, 2 * gb).is_ok());
+        assert!(
+            check_dflash_bf16_credit(2 * gb, 3 * gb).is_ok(),
+            "AUX_FP8 frees more"
+        );
+        assert!(check_dflash_bf16_credit(2 * gb, 2 * gb - (32 << 20)).is_ok());
+        assert!(
+            check_dflash_bf16_credit(2 * gb, 0).is_err(),
+            "BF16 fallback freed nothing"
+        );
+        assert!(check_dflash_bf16_credit(2 * gb, 2 * gb - (65 << 20)).is_err());
+    }
 }

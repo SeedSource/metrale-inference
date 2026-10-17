@@ -58,6 +58,11 @@ impl Qwen3SsmLayer {
         // 2026-09-25: The strided kernels place sequence b's conv and h state at
         // `b * conv_bytes` and `b * h_bytes` from the first, so the states must sit
         // there; the h intermediates need a uniform stride across sequences.
+        //
+        // 2026-10-10: Known, not fixed: on a hybrid serve (`METRALE_HYBRID_DFLASH=1`) slot 0
+        // (`ssm_reserve::HYBRID_DFLASH_SLOT`) holds more h intermediates than the other slots,
+        // so a batch that includes it fails the uniform-stride check and every sequence takes
+        // the per-row exact arm. Same numerics, slower; `--exact-verify` is not the car path.
         let mut seqs: Vec<ExactMultiSeq> = Vec::with_capacity(n);
         let mut conv_base = DevicePtr::NULL;
         let mut h_base = DevicePtr::NULL;

@@ -171,7 +171,7 @@ pub(crate) fn load_model(
     )?;
 
     load_phases::validate_kv_kernels(gpu.as_ref(), kv_dtype, &layer_dtypes, &config)?;
-    let dflash_drafter_state =
+    let mut dflash_drafter_state =
         serve_phases::load_dflash_drafter(&args, &config, &ptx_set, gpu.as_ref())?;
     // 2026-09-26: LoRA adapters load before `gpu` moves into `build_model`.
     // `lora_states` outlives it: `lora_args` borrows each `store`, and
@@ -190,7 +190,7 @@ pub(crate) fn load_model(
         );
     }
     let lora_args = adapters::lora_build_args(&args, &lora_states);
-    let dflash_args = adapters::dflash_build_args(&args, &dflash_drafter_state);
+    let dflash_args = adapters::dflash_build_args(&args, &mut dflash_drafter_state);
     let nllb_lang = adapters::resolve_nllb_lang(&args, &config, &model_dir)?;
     let (nllb_lora_dir, nllb_adapter_name) = adapters::resolve_nllb_adapter(&args, is_nllb)?;
     let model = serve_phases::build_model(
@@ -279,8 +279,8 @@ pub(crate) fn load_model(
     let scheduler_eos = eos_tokens;
     let max_batch_size =
         scheduler_setup::resolve_max_batch_size(&args, world_size, scheduler_model.as_ref())?;
-    let (use_speculative, use_self_spec, use_ngram_spec, num_drafts, dflash_rung) =
-        scheduler_setup::resolve_speculation(&args, scheduler_model.as_ref());
+    let (use_speculative, use_self_spec, use_ngram_spec, num_drafts, dflash_rung, hybrid) =
+        scheduler_setup::resolve_speculation(&args, scheduler_model.as_ref(), &config.model_type);
 
     let policy = scheduler_setup::scheduling_policy(&args)?;
 
@@ -308,7 +308,9 @@ pub(crate) fn load_model(
     // the pre-sample pipeline. The `dflash_masked_verify` lever
     // (`METRALE_DFLASH_MASKED_VERIFY`, on unless `0`) sends the picks back
     // through the masking at the pick sites; it does not change this bool.
-    let dflash_verify_raw_argmax = args.dflash;
+    // 2026-10-10: A hybrid serve picks it per step (`scheduler::hybrid_mode`); its serve-wide
+    // value is the MTP lane's.
+    let dflash_verify_raw_argmax = args.dflash && !crate::main_modules::hybrid_serve(&args);
     // 2026-09-29: A146: MTP-lane speculation inside `<think>`: default on only
     // for architectures that passed the spec-in-think quality and safety
     // gates (GLM-5.3); resolved from the model config once, here, so the
@@ -371,6 +373,7 @@ pub(crate) fn load_model(
                 max_batch_size,
                 use_speculative,
                 dflash_verify_raw_argmax,
+                hybrid,
                 mtp_spec_think_default,
                 num_drafts,
                 policy,

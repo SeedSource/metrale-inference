@@ -20,6 +20,9 @@ pub struct DflashKernels {
     /// read. `.0 == 0` when the target has no `w4a16_gemm` kernel.
     pub w4a16_gemm: KernelHandle,
     pub dense_gemm_pipelined: KernelHandle,
+    /// 2026-10-08: `dense_gemv_bf16_batchm`, resolved only under
+    /// `METRALE_DFLASH_DRAFT_GEMV=1` (`draft_gemm.rs`); `KernelHandle(0)` otherwise.
+    pub dense_gemv_batchm: KernelHandle,
     pub rope_qwen3: KernelHandle,
     pub reshape_cache_fp8: KernelHandle,
     /// 2026-09-25: BF16 paged KV write: the ctx rows in `precompute_ctx_kv` and
@@ -78,6 +81,9 @@ pub struct DflashKernels {
     /// 2026-09-25: DFlash2 per-row top-16 over the drafter logits; overwrites each
     /// selected logit.
     pub dflash2_topk16: KernelHandle,
+    /// 2026-10-12: The one-scan top-16 (`METRALE_DFLASH_TOPK_REG`), same contract as
+    /// `dflash2_topk16`; `.0 == 0` when the module lacks it.
+    pub dflash2_topk16_reg: KernelHandle,
     /// 2026-09-25: DFlash2 candidate-selector chain walk, one launch, one block per
     /// sequence.
     pub dflash2_selector_walk: KernelHandle,

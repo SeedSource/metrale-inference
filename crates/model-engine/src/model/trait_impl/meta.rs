@@ -230,6 +230,9 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
         self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
         self.gpu.synchronize(stream)?;
+        // 2026-10-14: The hybrid MTP catch-up ring forgets the slot's previous occupant (both
+        // ranks allocate every slot, `EP` alloc command).
+        self.hybrid_mtp_ring_reset_slot(slot);
         let has_mtp = self.proposer.is_some() || self.self_speculative;
 
         // 2026-09-25: A fresh sequence resets the whole-prompt capture length, so the capture
@@ -306,6 +309,26 @@ impl TransformerModel {
             Some(p) => Some(p.alloc_state_for(self.gpu.as_ref(), budget_tokens)?),
             None => None,
         };
+        // 2026-10-10: Hybrid serve: the DFlash drafter's state too, only on `HYBRID_DFLASH_SLOT`,
+        // the one slot whose verify pools fit the DFlash verify: a sequence elsewhere never takes
+        // a DFlash step. Both ranks claim the same slot, so they agree. Its ctx accumulator is
+        // always the full drafter window (`usize::MAX` budget; the head's `max_seq_len` is the
+        // window), whatever the request length, so both ranks allocate the same size, the one
+        // the KV budget reserved (review F1: the worker allocates with no budget). On failure
+        // the MTP state just allocated is freed.
+        let dflash_slot = slot == metrale_model_layers::ssm_reserve::HYBRID_DFLASH_SLOT;
+        let dflash_state = match &self.dflash_proposer {
+            Some(d) if dflash_slot => match d.alloc_state_for(self.gpu.as_ref(), usize::MAX) {
+                Ok(st) => Some(st),
+                Err(e) => {
+                    if let (Some(p), Some(mut st)) = (&self.proposer, proposer_state) {
+                        let _ = p.free_state(self.gpu.as_ref(), st.as_mut());
+                    }
+                    return Err(e);
+                }
+            },
+            _ => None,
+        };
 
         // 2026-09-25: `disk_last_offloaded_per_layer` is sized once to the attention-layer
         // count, so the offload helper never grows it.
@@ -324,9 +347,11 @@ impl TransformerModel {
             seq_len: 0,
             layer_states,
             proposer_state,
+            dflash_state,
             slot_idx: slot,
             ssm_slot: Some(slot_guard),
             marconi_skip_to: 0,
+            prefill_run_start: 0,
             marconi_exact_snap: None,
             session_hash: 0,
             mtp_capture_gen: 0,

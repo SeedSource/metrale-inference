@@ -106,7 +106,9 @@ pub(crate) fn build_model(
         args.mtp_vocab,
         comm,
         args.self_speculative || args.ngram_speculative,
-        if args.dflash {
+        // 2026-10-10: A hybrid serve's `num_drafts` is the MTP head's depth; the model sizes the
+        // DFlash verify from the drafter's gamma itself (`ssm_setup::size_rollback_pools`).
+        if args.dflash && !crate::main_modules::hybrid_serve(args) {
             // 2026-09-26: The drafter head is not built yet: `--dflash-gamma`
             // (else 16) minus one. `serve_load` takes the scheduler's
             // `num_drafts` from the built head's gamma.
@@ -294,7 +296,8 @@ pub(crate) fn maybe_run_ep_worker(
                     );
                 }
                 // 2026-09-26: Any other error came from the receive: the link to
-                // the head is gone.
+                // the head is gone. 2026-10-10: or a hybrid step-mode switch failed
+                // after rank 0 switched; this rank must not keep serving.
                 Err(e) => {
                     tracing::error!("EP worker error: {e:#}");
                     break;

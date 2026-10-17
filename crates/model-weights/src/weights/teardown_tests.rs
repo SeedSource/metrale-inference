@@ -158,3 +158,59 @@ fn releasing_twice_is_harmless_for_derived_buffers() {
     store.release(&gpu).expect("released again");
     assert_eq!(gpu.alloc_count(), 0);
 }
+
+/// 2026-10-14: `freeable_bytes_matching` predicts exactly the bytes `free_matching` then frees
+/// for the same predicate (the DFlash KV credit, #82 hybrid M1), and skips what it skips.
+#[test]
+fn freeable_bytes_matching_equals_what_free_matching_frees() {
+    let gpu = MockGpuBackend::new();
+    let mut map = HashMap::new();
+    for (name, shape, dtype) in [
+        (
+            "layers.0.self_attn.q_proj.weight",
+            vec![64, 32],
+            WeightDtype::BF16,
+        ),
+        (
+            "layers.0.mlp.down_proj.weight",
+            vec![32, 128],
+            WeightDtype::BF16,
+        ),
+        (
+            "layers.1.self_attn.q_proj.weight",
+            vec![64, 32],
+            WeightDtype::FP8E4M3,
+        ),
+        ("fc.weight", vec![32, 32], WeightDtype::BF16),
+    ] {
+        let t = WeightTensor {
+            ptr: gpu.alloc(1024).expect("alloc"),
+            shape,
+            dtype,
+        };
+        map.insert(name.to_string(), t);
+    }
+    let mut store = WeightStore::from_map(map);
+    let pred =
+        |n: &str, t: &WeightTensor| n.ends_with("_proj.weight") && t.dtype == WeightDtype::BF16;
+    let predicted = store.freeable_bytes_matching(pred);
+    assert_eq!(
+        predicted,
+        (64 * 32 + 32 * 128) * 2,
+        "the two BF16 projections only"
+    );
+    let names: std::collections::HashSet<String> = store
+        .names()
+        .filter(|n| pred(n, store.get(n).expect("present")))
+        .map(str::to_owned)
+        .collect();
+    let (count, freed) = store
+        .free_matching(&gpu, |n| names.contains(n))
+        .expect("freed");
+    assert_eq!((count, freed), (2, predicted));
+    assert_eq!(
+        store.freeable_bytes_matching(pred),
+        0,
+        "nothing left to free"
+    );
+}

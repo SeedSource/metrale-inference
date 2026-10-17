@@ -40,6 +40,17 @@ impl DraftProposer for BlockDiffusionDraftHead {
         grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<metrale_gpu_runtime::gpu::DevicePtr>,
     ) -> Result<Vec<u32>> {
+        if self.tp.is_some() {
+            return self.propose_tp(
+                last_token,
+                position,
+                num_drafts,
+                state,
+                ctx,
+                stream,
+                target_hidden_stack,
+            );
+        }
         self.propose_drafts(
             last_token,
             target_hidden,
@@ -63,7 +74,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _buffers: &metrale_gpu_runtime::buffers::BufferArena,
         _config: &metrale_config::ModelConfig,
     ) -> usize {
-        if !self.dflash2_active() {
+        // 2026-10-09: The two-rank drafter proposes one sequence at a time.
+        if !self.dflash2_active() || self.tp.is_some() {
             return 1;
         }
         let want = self.levers.batch_propose_width;
@@ -98,6 +110,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             || positions.len() != n
             || states.len() != n
             || !self.dflash2_active()
+            || self.tp.is_some()
         {
             return Ok(None);
         }
@@ -241,7 +254,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.last_num_drafted = 0;
         dstate.last_num_accepted = 0;
         dstate.skip_next_decode_append = false;
+        dstate.tp_synced_pos = None;
         Ok(())
+    }
+
+    /// 2026-10-09: True with the two-rank drafter (`tp.rs`): the engine then sends the worker
+    /// `EP_CMD_MTP_PROPOSE` before every propose and hands the forward the communicator.
+    fn needs_comm(&self) -> bool {
+        self.tp.is_some()
     }
 }
 
@@ -307,6 +327,7 @@ impl BlockDiffusionDraftHead {
             max_ctx_count_drafter: 0,
             ctx_committed: 0,
             ctx_positions: Vec::new(),
+            tp_synced_pos: None,
         }))
     }
 }

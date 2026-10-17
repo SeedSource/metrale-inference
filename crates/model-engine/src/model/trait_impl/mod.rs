@@ -45,6 +45,10 @@ mod ep_misc;
 mod feed;
 mod gdn_woa;
 mod graph_borrow;
+// 2026-10-10: Hybrid MTP + DFlash proposer routing (`METRALE_HYBRID_DFLASH`).
+// 2026-10-14: Hybrid MTP catch-up at the DFlash -> MTP switch (`METRALE_HYBRID_MTP_CATCHUP`).
+mod hybrid_mtp_catchup;
+mod hybrid_spec;
 mod impl_adapters;
 mod impl_device_feed;
 mod impl_draft;
@@ -80,6 +84,8 @@ mod verify_e;
 pub(in crate::model) mod verify_e2;
 // 2026-10-02: The multi-rank batched MTP verify (`EP_CMD_VERIFY_BATCH`).
 pub(in crate::model) mod verify_ep;
+// 2026-10-09: GLM DFlash batched verify across ranks (`METRALE_GLM_DFLASH_BATCHED_VERIFY`).
+mod verify_ep_dflash;
 // 2026-10-04: The batched MTP propose that mirrors the per-sequence one
 // (`EP_CMD_MTP_PROPOSE_BATCH`).
 pub(in crate::model) mod propose_batch_ep;

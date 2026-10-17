@@ -21,7 +21,7 @@ use crate::weight_loader::DflashWeights;
 
 impl BlockDiffusionDraftHead {
     pub fn from_weights(
-        weights: DflashWeights,
+        mut weights: DflashWeights,
         embed_tokens_shared: DevicePtr,
         lm_head_shared: DevicePtr,
         lm_head_nvfp4: Option<metrale_model_layers::weight_map::QuantizedWeight>,
@@ -35,6 +35,8 @@ impl BlockDiffusionDraftHead {
         // gamma-sized scratch holds this many bands of gamma rows, and the drafter KV
         // pool holds this many sequences' blocks.
         max_batch_size: usize,
+        // 2026-10-09: `(rank, world)` of a multi-rank serve, for METRALE_DFLASH_DRAFT_TP2.
+        tp_rank: Option<(usize, usize)>,
     ) -> Result<Self> {
         let nb = max_batch_size.max(1);
         let target_layer_ids = weights
@@ -61,11 +63,18 @@ impl BlockDiffusionDraftHead {
 
         let num_layers = weights.config.num_hidden_layers;
         let hidden_size = weights.config.hidden_size;
-        let intermediate_size = weights.config.intermediate_size;
-        let num_q_heads = weights.config.num_attention_heads;
-        let num_kv_heads = weights.config.num_key_value_heads;
         let head_dim = weights.config.head_dim;
-        let vocab_size = weights.config.vocab_size;
+        // 2026-10-09: METRALE_DFLASH_DRAFT_TP2 (`tp.rs`): this rank's dims and weight views.
+        let levers = super::levers::DFlashLevers::from_env();
+        let tp = super::tp::TpPlan::prepare(
+            &levers,
+            tp_rank,
+            &mut weights,
+            target_hidden_size,
+            (lm_head_shared, lm_head_nvfp4.is_some()),
+        )?;
+        let (num_q_heads, num_kv_heads, intermediate_size, vocab_size) = tp.dims;
+        let lm_head_shared = tp.lm_head;
         // 2026-09-25: `gamma` is `--dflash-gamma` when given, else `default_dflash_gamma`
         // of the drafter's `effective_block_size()` (`dflash_config.block_size`, else the
         // top-level `block_size`, which defaults to 16). The model factory sizes its
@@ -305,7 +314,7 @@ impl BlockDiffusionDraftHead {
         let mut head = Self {
             // 2026-09-25: The drafter's `DFlashLevers`, resolved from the environment once,
             // here.
-            levers: super::levers::DFlashLevers::from_env(),
+            levers,
             num_layers,
             hidden_size,
             intermediate_size,
@@ -359,9 +368,17 @@ impl BlockDiffusionDraftHead {
                     attention_conv_proj: l.attention_conv_proj,
                     mlp_conv_base: l.mlp_conv_base,
                     mlp_conv_proj: l.mlp_conv_proj,
+                    attention_conv_proj_fp8: None,
+                    mlp_conv_proj_fp8: None,
+                    nv4: super::nv4::LayerNv4::default(),
                 })
                 .collect(),
             fused_kv_weight: Some(fused_kv_weight),
+            fc_fp8: None,
+            fused_kv_fp8: None,
+            fp8_mirror_bytes: 0,
+            selector_hidden_proj_fp8: None,
+            nv4: super::nv4::HeadNv4::default(),
             kv_cache: Mutex::new(kv_cache),
             scratch,
             kernels,
@@ -421,6 +438,7 @@ impl BlockDiffusionDraftHead {
             selector_pred: weights.selector_pred,
             selector_succ: weights.selector_succ,
             selector_hidden_proj: weights.selector_hidden_proj,
+            tp: None,
         };
         if head.selector_pred.is_some() {
             tracing::info!(
@@ -457,25 +475,23 @@ impl BlockDiffusionDraftHead {
             head.target_layer_ids,
         );
 
-        // 2026-09-25: FP8 drafter weights, on unless METRALE_DFLASH_DRAFTER_FP8=0:
-        // quantize each layer's seven dense GEMM weights (q/k/v/o/gate/up/down) to FP8
-        // E4M3 with one f32 scale per row, give the lm_head an FP8 copy, and set
-        // `quant = Fp8Weights`. Needs the row-scaled FP8 GEMM and its m16 variant;
-        // without them the drafter stays on BF16 with a warning.
-        let fp8_requested =
-            std::env::var("METRALE_DFLASH_DRAFTER_FP8").ok().as_deref() != Some("0");
-        let fp8_kernels_present = head.kernels.fp8_gemm_n128_row_scaled.0 != 0
-            && head.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0;
-        if fp8_requested && !fp8_kernels_present {
-            tracing::warn!(
-                "METRALE_DFLASH_DRAFTER_FP8=1 but fp8_gemm_t_row_scaled(_m16) kernels are \
-                 not in this target's w4a16 PTX module — staying on the BF16 drafter path. \
-                 Port the Phase G kernels from kernels/gb10/qwen3.6-27b/nvfp4/w4a16_gemm.cu."
-            );
+        // 2026-09-25: FP8 drafter weights (METRALE_DFLASH_DRAFTER_FP8), see
+        // `fp8_weights::arm_drafter_fp8`. 2026-10-08: then the S1a batchm GEMV lever.
+        if let Some(p) = tp.plan {
+            head.tp = Some(super::tp::DraftTp::new(p, &head, gpu)?);
         }
-        if fp8_requested && fp8_kernels_present {
-            fp8_weights::quantize_drafter_fp8(&mut head, gpu, q_dim, kv_dim, lm_head_native_fp8)?;
-        }
+        fp8_weights::arm_drafter_fp8(&mut head, gpu, q_dim, kv_dim, lm_head_native_fp8)?;
+        // 2026-10-12: METRALE_DFLASH_AUX_FP8 mirrors (needs the FP8 head armed above).
+        head.arm_aux_fp8(gpu)?;
+        // 2026-10-12: METRALE_DFLASH_NV4_* ENGAGED / NOT ENGAGED lines (copies built above).
+        head.report_nv4();
+        // 2026-10-12: METRALE_DFLASH_NV4_TC: the tensor-core route for the copies above.
+        head.arm_nv4_tc(gpu);
+        // 2026-10-12: METRALE_DFLASH_NV4_GROUP: grouped q/k/v and gate/up on that route.
+        head.arm_nv4_group();
+        head.arm_draft_gemv(gpu);
+        head.tp_validate()?;
+        head.log_tp_graphs_lever();
 
         Ok(head)
     }

@@ -8,12 +8,15 @@
 //! Invariants:
 //! - A DeepSeek-V4 or GLM-5.3 proposer build error is logged and not returned;
 //!   a DFlash drafter error is returned.
+//! - Under `METRALE_HYBRID_DFLASH` (2026-10-10) a drafter that does not install on this rank is
+//!   a startup error.
 
 use anyhow::Result;
 use metrale_gpu_runtime::gpu::DevicePtr;
 use metrale_model_arch::weight_loader::deepseek_v4::mtp::DeepseekV4MtpModule;
 use metrale_model_arch::weight_loader::glm5_next_mtp::Glm5NextMtpModule;
 use metrale_model_arch::weight_loader::load_dflash_weights;
+use metrale_model_layers::speculative::DraftProposer as _;
 use metrale_model_layers::weight_map::{DenseWeight, Fp8DenseWeight, QuantizedWeight};
 
 use crate::factory::DflashBuildArgs;
@@ -81,6 +84,8 @@ pub(super) fn install_glm_mtp_proposer(
 
 /// 2026-09-26: Installs the DFlash drafter when `dflash_args` is given and its
 /// store has DFlash weights.
+/// 2026-10-14: `dflash_credit` = the BF16 bytes the KV sizing credited
+/// (`kv_budget::dflash_bf16_credit_bytes`); the install fails when it frees less.
 pub(super) fn install_dflash_drafter(
     model: &mut TransformerModel,
     dflash_args: Option<DflashBuildArgs<'_>>,
@@ -91,6 +96,7 @@ pub(super) fn install_dflash_drafter(
     target_hidden_for_dflash: usize,
     max_seq_len: usize,
     max_batch_size: usize,
+    dflash_credit: usize,
 ) -> Result<()> {
     if let Some(args) = dflash_args {
         let weights = load_dflash_weights(
@@ -100,7 +106,7 @@ pub(super) fn install_dflash_drafter(
             1,
         )?;
         if let Some(weights) = weights {
-            let head = metrale_model_arch::dflash_head::BlockDiffusionDraftHead::from_weights(
+            let mut head = metrale_model_arch::dflash_head::BlockDiffusionDraftHead::from_weights(
                 weights,
                 target_embed_for_dflash,
                 target_lm_head_for_dflash,
@@ -112,14 +118,64 @@ pub(super) fn install_dflash_drafter(
                 model.gpu_backend(),
                 max_seq_len,
                 max_batch_size,
+                model.dflash_tp_rank(),
             )?;
-            model.set_dflash_proposer(std::sync::Arc::new(head));
-            tracing::info!(target: "metrale_model_engine::factory::build", "DFlash drafter installed as the active proposer");
+            // 2026-10-10: The BF16 copies of the layer GEMM weights are dead once the head
+            // runs on FP8 mirrors (#82 P2); every rank frees its own.
+            let released =
+                head.release_bf16_layer_weights(args.drafter_store, model.gpu_backend())?;
+            if let Some((n, bytes)) = released {
+                tracing::info!(target: "metrale_model_engine::factory::build",
+                    "DFlash drafter: freed {n} BF16 layer weight tensor(s), {:.2} GB; the head \
+                     runs on their FP8 mirrors",
+                    bytes as f64 / 1e9
+                );
+            }
+            super::kv_budget::check_dflash_bf16_credit(
+                dflash_credit,
+                released.map_or(0, |(_, bytes)| bytes),
+            )?;
+            // 2026-10-14: The mirrors this rank allocated against the reserve (#82 hybrid M1b).
+            super::kv_budget::check_dflash_mirror_reserve(
+                super::kv_budget::dflash_fp8_mirror_reserve_bytes(
+                    &args.drafter_config,
+                    model.dflash_tp_rank(),
+                ),
+                head.fp8_mirror_bytes,
+            )?;
+            if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
+                // 2026-10-10: Hybrid serve: the drafter goes beside the MTP head, which stays in
+                // `proposer` with every buffer it was sized with (`hybrid_spec.rs`).
+                let gamma = head.block_gamma();
+                model.set_hybrid_dflash_proposer(std::sync::Arc::new(head))?;
+                tracing::info!(target: "metrale_model_engine::factory::build",
+                    "HYBRID DFLASH: ENGAGED — proposers: MTP head (proposer slot) + DFlash drafter \
+                     (γ={gamma:?}, KV window {max_seq_len} tokens); rank 0 picks one per step \
+                     (METRALE_HYBRID_DFLASH_DWELL_MS={} ms)",
+                    metrale_model_layers::speculative::hybrid::hybrid_dflash_dwell_ms(),
+                );
+            } else {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!(target: "metrale_model_engine::factory::build", "DFlash drafter installed as the active proposer");
+            }
+        } else if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
+            // 2026-10-10: Under the hybrid serve a rank without the drafter would answer DFlash
+            // steps with the MTP head while the other rank drafts: a startup error, not a warn.
+            anyhow::bail!(
+                "METRALE_HYBRID_DFLASH=1 but the DFlash drafter store has no fc.weight: the \
+                 drafter did not install on this rank, and a hybrid serve needs it on every rank"
+            );
         } else {
+            super::kv_budget::check_dflash_bf16_credit(dflash_credit, 0)?;
             tracing::warn!(target: "metrale_model_engine::factory::build", "DFlash drafter store had no fc.weight — proposer not installed; \
                  falling back to whatever proposer (if any) the target's MTP path built"
             );
         }
+    } else if metrale_model_layers::speculative::hybrid::hybrid_dflash_enabled() {
+        anyhow::bail!(
+            "METRALE_HYBRID_DFLASH=1 but this rank has no DFlash drafter (--dflash): a hybrid \
+             serve needs the drafter installed on every rank"
+        );
     }
     Ok(())
 }

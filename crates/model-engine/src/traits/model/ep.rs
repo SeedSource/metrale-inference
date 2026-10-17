@@ -19,7 +19,8 @@ pub trait ModelEp {
     /// run the command in slot `seq_id`. Returns `Ok(false)` when the worker should shut down.
     ///
     /// An `Err` carrying [`EpCommandFailed`] means the command ran and failed, and the worker
-    /// stays up; any other `Err` means the receive failed, and the worker exits.
+    /// stays up; any other `Err` means the receive failed (or, since 2026-10-10, a hybrid
+    /// `EP_CMD_SPEC_MODE` switch failed after rank 0 had switched), and the worker exits.
     ///
     /// `slots` is sized to `--max-batch-size`; a `seq_id >= slots.len()` fails. Default:
     /// `Ok(true)`.

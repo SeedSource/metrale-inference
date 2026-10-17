@@ -17,7 +17,29 @@ use crate::dflash_head::BlockDiffusionDraftHead;
 
 impl BlockDiffusionDraftHead {
     /// 2026-09-26: Final RMSNorm of the block rows, lm_head and token selection.
+    ///
+    /// 2026-10-12: Runs [`Self::block_tail_logits`], the two-rank top-16 merge (DFlash2
+    /// only; a no-op without TP), then [`Self::block_tail_pick`]: the launches the single
+    /// body issued, in its order. `METRALE_DFLASH_TP_GRAPHS` captures the two halves and
+    /// runs the merge eagerly between them.
     pub(super) fn block_tail_select(
+        &self,
+        d: &BlockDims<'_>,
+        ctx: &ForwardContext,
+        stream: u64,
+        stream_noise_local: DevicePtr,
+        norm_noise_local: DevicePtr,
+    ) -> Result<()> {
+        self.block_tail_logits(d, ctx, stream, stream_noise_local, norm_noise_local)?;
+        if self.dflash2_active() {
+            self.tp_merge_top16(ctx, d.g as usize, stream)?;
+        }
+        self.block_tail_pick(d, ctx, stream, norm_noise_local)
+    }
+
+    /// 2026-10-12: Final RMSNorm, lm_head and, on the DFlash2 path, the per-row top-16.
+    /// Device launches only.
+    pub(super) fn block_tail_logits(
         &self,
         d: &BlockDims<'_>,
         ctx: &ForwardContext,
@@ -28,10 +50,8 @@ impl BlockDiffusionDraftHead {
         let BlockDims {
             gpu,
             n_seq,
-            width,
             g,
             h: h_local,
-            bf16: bf16_local,
             ..
         } = *d;
         ops::rms_norm(
@@ -51,7 +71,8 @@ impl BlockDiffusionDraftHead {
         );
         // 2026-09-25: lm_head: NVFP4 when the target's lm_head is NVFP4
         // (`lm_head_shared` is valid only for a BF16 lm_head), else FP8 with
-        // `Fp8Weights` and an FP8 copy present, else BF16.
+        // `Fp8Weights` and an FP8 copy present, else BF16. 2026-10-12: before FP8, the
+        // METRALE_DFLASH_NV4_HEAD copy when built.
         if let Some(q) = self.lm_head_nvfp4.as_ref() {
             ops::w4a16_gemm(
                 gpu,
@@ -63,6 +84,20 @@ impl BlockDiffusionDraftHead {
                 self.vocab_size as u32,
                 h_local,
                 stream,
+            )?;
+        } else if let Some(q) = self.nv4.lm_head.as_ref() {
+            // 2026-10-12: METRALE_DFLASH_NV4_HEAD (`nv4.rs`): this rank's NVFP4 head copy on
+            // the CUDA-core tiers, `[g, vocab]` BF16 logits at stride vocab like the FP8 sweep.
+            crate::dflash_head::nv4::gemv(
+                gpu,
+                norm_noise_local,
+                q,
+                self.scratch.logits,
+                g,
+                self.vocab_size as u32,
+                h_local,
+                stream,
+                self.nv4.tc,
             )?;
         } else if lm_head_fp8 {
             if let Some(fp8) = self.lm_head_shared_fp8.as_ref() {
@@ -130,9 +165,8 @@ impl BlockDiffusionDraftHead {
                     )?;
                 }
             } else {
-                ops::dense_gemm_bf16_pipelined(
+                self.draft_gemm_bf16(
                     gpu,
-                    self.kernels.dense_gemm_pipelined,
                     norm_noise_local,
                     &metrale_model_layers::weight_map::DenseWeight {
                         weight: self.lm_head_shared,
@@ -145,9 +179,8 @@ impl BlockDiffusionDraftHead {
                 )?;
             }
         } else {
-            ops::dense_gemm_bf16_pipelined(
+            self.draft_gemm_bf16(
                 gpu,
-                self.kernels.dense_gemm_pipelined,
                 norm_noise_local,
                 &metrale_model_layers::weight_map::DenseWeight {
                     weight: self.lm_head_shared,
@@ -159,11 +192,33 @@ impl BlockDiffusionDraftHead {
                 stream,
             )?;
         }
-        // 2026-09-25: DFlash2: per-row top-16 and the chain walk (dflash2.rs), device
-        // work only, so it captures with the tail. Row 0 of each band is not
-        // written; propose drops it.
+        // 2026-09-25: DFlash2: per-row top-16 (dflash2.rs), device work only.
         if self.dflash2_active() {
-            self.dflash2_select_block(ctx, norm_noise_local, n_seq as u32, stream)?;
+            self.dflash2_topk_block(ctx, n_seq as u32, stream)?;
+        }
+        Ok(())
+    }
+
+    /// 2026-10-12: Token selection after the logits: the DFlash2 selector projection and
+    /// chain walk, the DSpark Markov chain, or per-row argmax. Device launches only.
+    pub(super) fn block_tail_pick(
+        &self,
+        d: &BlockDims<'_>,
+        ctx: &ForwardContext,
+        stream: u64,
+        norm_noise_local: DevicePtr,
+    ) -> Result<()> {
+        let BlockDims {
+            gpu,
+            n_seq,
+            width,
+            bf16: bf16_local,
+            ..
+        } = *d;
+        // 2026-09-25: DFlash2: the chain walk over the top-16 (dflash2.rs). Row 0 of
+        // each band is not written; propose drops it.
+        if self.dflash2_active() {
+            self.dflash2_walk_block(ctx, norm_noise_local, n_seq as u32, stream)?;
         } else
         // 2026-09-25: DSpark: with a Markov head (`markov_active`),
         // `markov_argmax_block` (markov.rs) picks the tokens left to right with the

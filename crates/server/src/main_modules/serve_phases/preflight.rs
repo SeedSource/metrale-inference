@@ -80,22 +80,40 @@ pub(crate) fn preflight_reserve(
     } else {
         args.resolved_num_drafts()
     };
-    let ssm_pool_bytes = metrale_model_layers::ssm_reserve::ssm_pool_reserve_bytes(
-        args.max_batch_size,
-        config.num_ssm_layers() * h_state_bytes,
-        config.num_ssm_layers() * conv_state_bytes,
-        spec_on_pool,
-        pool_num_drafts,
-        mtp_state_slots,
-        args.dflash,
-        // 2026-09-26: The h-pool narrowing `SsmStatePool::new` applies under
-        // `--ssm-h-dtype f16-pool`.
-        metrale_model_layers::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
-        // 2026-09-26: `--ssm-rollback-mode`, published by `serve_flags` before
-        // this runs. Replay mode reserves only the checkpoint blob per verify
-        // slot; its input ring is the separate term below.
-        metrale_model_layers::ssm_reserve::ssm_rollback_mode(),
-    );
+    // 2026-10-10: A hybrid serve keeps the MTP per-slot widths and widens only the DFlash slot
+    // to γ (`ssm_reserve::ssm_pool_reserve_bytes_hybrid_with`, as `SsmStatePool::new` sizes it).
+    let hybrid = crate::main_modules::hybrid_serve(args);
+    let ssm_pool_bytes = if hybrid {
+        let mtp_nd = args.resolved_num_drafts();
+        metrale_model_layers::ssm_reserve::ssm_pool_reserve_bytes_hybrid_with(
+            args.max_batch_size,
+            config.num_ssm_layers() * h_state_bytes,
+            config.num_ssm_layers() * conv_state_bytes,
+            mtp_nd,
+            pool_num_drafts,
+            mtp_state_slots,
+            metrale_model_layers::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
+            metrale_model_layers::ssm_reserve::ssm_no_checkpoint(),
+            |slot| metrale_model_layers::ssm_reserve::verify_slot_drafts(slot, mtp_nd),
+        )
+    } else {
+        metrale_model_layers::ssm_reserve::ssm_pool_reserve_bytes(
+            args.max_batch_size,
+            config.num_ssm_layers() * h_state_bytes,
+            config.num_ssm_layers() * conv_state_bytes,
+            spec_on_pool,
+            pool_num_drafts,
+            mtp_state_slots,
+            args.dflash,
+            // 2026-09-26: The h-pool narrowing `SsmStatePool::new` applies under
+            // `--ssm-h-dtype f16-pool`.
+            metrale_model_layers::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
+            // 2026-09-26: `--ssm-rollback-mode`, published by `serve_flags` before
+            // this runs. Replay mode reserves only the checkpoint blob per verify
+            // slot; its input ring is the separate term below.
+            metrale_model_layers::ssm_reserve::ssm_rollback_mode(),
+        )
+    };
     // 2026-09-26: Replay mode's verify-window input ring, sized by
     // `ssm_replay_ring_bytes` as `SsmStatePool::new` sizes it.
     let ssm_replay_ring = if spec_on_pool

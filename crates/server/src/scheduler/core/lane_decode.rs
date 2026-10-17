@@ -22,6 +22,7 @@ impl SchedulerCore {
             mtp_gate,
             ngram_proposer,
             pipeline,
+            hybrid,
             ..
         } = self;
         let prefill_stream = self.prefill_stream;
@@ -85,6 +86,24 @@ impl SchedulerCore {
             // is not speculated until it has emitted this many tokens after
             // `</think>` (see `spec_dispatch_eligible`).
             let dflash_resume_guard = sched.levers.dflash_resume_guard;
+            // 2026-10-10: Hybrid serve (`hybrid_mode`): this step's proposer, decided here on
+            // rank 0 and handed to the model (which sends it to the workers) before any propose.
+            // `None` on every other serve, which keeps the serve-wide flag and draft count.
+            let step_mode = hybrid.as_mut().map(|h| {
+                super::hybrid_lane::decide_and_apply(
+                    h,
+                    active,
+                    sched,
+                    spec_slot_cap,
+                    dflash_resume_guard,
+                )
+            });
+            let (dflash_verify_raw_argmax, num_drafts) = crate::scheduler::hybrid_mode::step_flags(
+                hybrid.as_ref(),
+                step_mode,
+                dflash_verify_raw_argmax,
+                num_drafts,
+            );
             // 2026-09-29: A146: spec-in-think, per lane and per model. The MTP
             // lane speculates inside `<think>` by default only on models whose
             // `mtp_spec_think_default` is on (GLM-5.3);
@@ -104,7 +123,10 @@ impl SchedulerCore {
             let spec_slots_covered = active.iter().all(|a| a.seq.slot_idx < spec_slot_cap);
             // 2026-09-25: MTP also needs `active.len() <= mtp_max_seqs`.
             // `note_width_regime` only records this decision for reporting.
-            let spec_width_ok = active.len() <= sched.levers.mtp_max_seqs;
+            // 2026-10-10: A hybrid PLAIN step never speculates.
+            let spec_width_ok = active.len() <= sched.levers.mtp_max_seqs
+                && step_mode
+                    != Some(metrale_model_layers::speculative::hybrid::SpecStepMode::Plain);
             // 2026-10-10: `METRALE_MTP_POOL_CAP` evidence: MTP steps lost only because an
             // active sequence sits on a slot the verify pools do not cover.
             if use_mtp && spec_width_ok && !spec_slots_covered {
@@ -168,9 +190,37 @@ impl SchedulerCore {
                 // 2026-10-14 (race-memory, A184): a batched MTP step's retryable KV refusal,
                 // handled after the step's accounting below.
                 let mut spec_refusal: Option<String> = None;
+                if let Some(h) = hybrid.as_mut() {
+                    h.count_step(
+                        step_mode.unwrap_or(
+                            metrale_model_layers::speculative::hybrid::SpecStepMode::Mtp,
+                        ),
+                    );
+                }
                 // 2026-09-25: The MTP gate chooses each step (plain decode or MTP verify)
                 // by measured delivered throughput (`metrale_speculative::mtp_gate`).
-                if let Some(gate) = mtp_gate.as_mut() {
+                // 2026-10-10: A hybrid DFLASH step bypasses the gate, as the C<=2 DFlash pin
+                // would, and is not recorded in it: the gate measures the MTP lane only.
+                let hybrid_dflash_step = step_mode
+                    == Some(metrale_model_layers::speculative::hybrid::SpecStepMode::Dflash);
+                if hybrid_dflash_step {
+                    let lens_before: Vec<usize> = active.iter().map(|a| a.seq.seq_len).collect();
+                    // 2026-10-16 (race-memory, union line c31df): a hybrid DFLASH step's KV
+                    // refusal takes the same preemption as an MTP step's (A184); dropped, the
+                    // batched DFlash verify would put its drafts back and stall every step.
+                    spec_refusal = step_mtp(
+                        sched.io.dev.model(),
+                        active,
+                        sched,
+                        num_drafts,
+                        &verify_ctx,
+                        dflash_verify_raw_argmax,
+                    );
+                    for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
+                        a.mtp_acct
+                            .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
+                    }
+                } else if let Some(gate) = mtp_gate.as_mut() {
                     if gate.maybe_remeasure(active[0].seq.seq_len) {
                         for a in active.iter_mut() {
                             a.mtp_acct.note_regime_reprobe();
@@ -203,6 +253,8 @@ impl SchedulerCore {
                     {
                         let lens_before: Vec<usize> =
                             active.iter().map(|a| a.seq.seq_len).collect();
+                        // 2026-10-14: Hybrid MTP-mode acceptance, post-switch vs other (`hybrid_lane`).
+                        let hy_snap = super::hybrid_lane::mtp_snapshot(hybrid.as_ref(), active);
                         spec_refusal = step_mtp(
                             sched.io.dev.model(),
                             active,
@@ -211,6 +263,7 @@ impl SchedulerCore {
                             &verify_ctx,
                             dflash_verify_raw_argmax,
                         );
+                        super::hybrid_lane::note_mtp_step(hybrid.as_mut(), active, &hy_snap);
                         for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
                             a.mtp_acct
                                 .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
@@ -262,6 +315,9 @@ impl SchedulerCore {
                                 let lens_before: Vec<usize> =
                                     active.iter().map(|a| a.seq.seq_len).collect();
                                 let t0 = sched.io.clock.now();
+                                // 2026-10-14: Hybrid MTP-mode acceptance, post-switch vs other (`hybrid_lane`).
+                                let hy_snap =
+                                    super::hybrid_lane::mtp_snapshot(hybrid.as_ref(), active);
                                 spec_refusal = step_mtp(
                                     sched.io.dev.model(),
                                     active,
@@ -269,6 +325,11 @@ impl SchedulerCore {
                                     num_drafts,
                                     &verify_ctx,
                                     dflash_verify_raw_argmax,
+                                );
+                                super::hybrid_lane::note_mtp_step(
+                                    hybrid.as_mut(),
+                                    active,
+                                    &hy_snap,
                                 );
                                 let emitted: usize = active
                                     .iter()
@@ -306,6 +367,8 @@ impl SchedulerCore {
                     // 2026-09-25: Gate disarmed (`--mtp-gate force` or
                     // `METRALE_MTP_GATE_FORCE`): always MTP.
                     let lens_before: Vec<usize> = active.iter().map(|a| a.seq.seq_len).collect();
+                    // 2026-10-14: Hybrid MTP-mode acceptance, post-switch vs other (`hybrid_lane`).
+                    let hy_snap = super::hybrid_lane::mtp_snapshot(hybrid.as_ref(), active);
                     spec_refusal = step_mtp(
                         sched.io.dev.model(),
                         active,
@@ -314,6 +377,7 @@ impl SchedulerCore {
                         &verify_ctx,
                         dflash_verify_raw_argmax,
                     );
+                    super::hybrid_lane::note_mtp_step(hybrid.as_mut(), active, &hy_snap);
                     for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
                         a.mtp_acct
                             .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
@@ -327,6 +391,9 @@ impl SchedulerCore {
                     );
                 }
             } else {
+                if let Some(h) = hybrid.as_mut() {
+                    h.count_step(metrale_model_layers::speculative::hybrid::SpecStepMode::Plain);
+                }
                 // 2026-09-25: Plain decode. With MTP on, drop any pending drafts first.
                 if use_mtp {
                     for a in active.iter_mut() {

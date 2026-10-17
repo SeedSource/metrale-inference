@@ -49,6 +49,13 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+        // 2026-10-10: `METRALE_GLM_NV4_TC=multi` also routes this verify's GEMVs (k >= 4 rows)
+        // when the step runs DFlash (`dflash_step`: a hybrid serve in DFLASH mode, or a DFlash
+        // serve). Both ranks run this verify for the same step in the same mode, so both route
+        // alike, and the per-(slot, K) graphs bake the same choice. Held to the end of the call.
+        let _nv4_tc = self.dflash_step().then(|| {
+            metrale_model_arch::glm5next_layer::dense_nv4_tc::MultiSeqScope::enter_dflash_verify(k)
+        });
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;

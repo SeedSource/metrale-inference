@@ -243,8 +243,11 @@ pub(super) fn bootstrap_seq(
     let was_suspended = crate::scheduler::adaptive_spec::is_suspended(a, sched);
     let will_propose = crate::scheduler::adaptive_spec::spec_allowed(a, sched);
     let reprobe_resume = was_suspended && will_propose;
+    // 2026-10-10: A hybrid serve commits this token on every bootstrap, whichever proposer
+    // runs next: its DFlash propose then skips its own decode-append (`skip_next_decode_append`),
+    // and its MTP propose leaves the drafter context untouched.
     if sched.levers.dflash_unified_ctx {
-        if !will_propose || reprobe_resume {
+        if !will_propose || reprobe_resume || model.hybrid_dflash() {
             let base_pos = a.seq.seq_len.saturating_sub(1);
             if let Err(e) = model.commit_ctx(&mut a.seq, 1, base_pos, 0) {
                 tracing::error!(target: "met::scheduler::mtp_step", "commit_ctx (mtp serial): {e:#}");

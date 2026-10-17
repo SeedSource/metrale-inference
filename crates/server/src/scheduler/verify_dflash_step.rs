@@ -112,13 +112,11 @@ pub fn step_verify_dflash(
     // 2026-09-29: A144: raw argmax never sees `logit_bias`; when decode
     // would apply a non-empty bias to this row, take the masked pipeline
     // instead.
+    // 2026-09-29: A146: a thinking row never takes the raw verdict.
+    // 2026-10-09: The rule lives in `dflash_batch_rows::verdict_uses_pipeline`, which the
+    // batched step applies under the GLM batched pin.
     let verified = if dflash_verify_raw_argmax
-        && !sched.levers.dflash_masked_verify
-        // 2026-09-29: A146: a thinking row never takes the raw verdict.
-        && !crate::scheduler::sample_step::speculative_raw_argmax_forbidden(
-            a,
-            sched.levers.think_ended_gpu_argmax,
-        )
+        && !super::dflash_batch_rows::verdict_uses_pipeline(sched, a)
         // 2026-10-15: a raw argmax on a masked stray `</tool_call>` takes the
         // masked pipeline (`StrayToolCallEndMask`).
         && !crate::scheduler::verify_pipeline_helper::raw_verdict_hits_stray_tool_call_end(
@@ -253,6 +251,31 @@ pub fn step_verify_dflash(
         100.0 * (num_accepted as f64) / (drafts.len() as f64),
         a.seq.seq_len,
     );
+
+    // 2026-10-08: `METRALE_DFLASH_CONF_LOG=1`: the drafter's top-1 probability (p) and
+    // top-1 minus top-2 margin (m) per draft position, from the propose that made these
+    // drafts (`metrale_model_arch::dflash_head::conf_log`; softmax over the selector's
+    // top-16 logits). Absent when that propose was batched or not DFlash2.
+    if sched.levers.dflash_conf_log
+        && let Some(conf) = metrale_model_arch::dflash_head::conf_log::take_last()
+    {
+        let join = |f: fn(&(f32, f32)) -> f32| {
+            conf.iter()
+                .take(drafts.len())
+                .map(|c| format!("{:.4}", f(c)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        // 2026-10-09: `kept` (appended; earlier fields unchanged) is the verified draft count
+        // (verify width - 1), so a `METRALE_DFLASH_CONF_TAU` run yields its width histogram.
+        tracing::info!(
+            "DFLASH CONF: a={} p={} m={} kept={}",
+            num_accepted,
+            join(|c| c.0),
+            join(|c| c.1),
+            drafts.len(),
+        );
+    }
 
     // 2026-09-25: commit the SSM state to rows `0..=num_accepted` of the
     // `drafts.len() + 1` verified rows; `commit_accepted_prefix` treats a

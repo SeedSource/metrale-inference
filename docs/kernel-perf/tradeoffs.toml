@@ -308,6 +308,12 @@ prs = []
 source = "kernels/gb10/common/dflash2.cu:68"
 
 [[t]]
+match = "kernels/gb10/common/dflash2.cu::dflash2_topk16_reg"
+text = "dflash2_topk16 in one scan (METRALE_DFLASH_TOPK_REG): each of the 1024 threads keeps its 16 best in registers (ties in scan order), then 16 warp-shuffle pops with ties to the lower bit-reversed tid, which is where the old fold-halves tree sends them. Same picks and -1e30 writes as dflash2_topk16 except on a row with fewer than 16 logits above -1e30. Needs blockDim.x == 1024."
+prs = []
+source = "kernels/gb10/common/dflash2.cu:116"
+
+[[t]]
 match = "kernels/gb10/common/dsa_indexer.cu"
 text = "Replay-safe geometry: under CUDA-graph capture the selector kernels read S, pool counts, select_k and the top-k tile from a device geom vector. dsa_kpool_compress and dsa_index_scores stride over the live pools on a few waves of blocks (8 per SM; METRALE_GLM_DSA_GRID_STRIDE, default on) only if the module defines dsa_indexer_grid_stride_v1; with =0 or without it, one block per ceiling pool."
 prs = []

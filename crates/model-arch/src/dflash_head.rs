@@ -23,7 +23,7 @@ use metrale_model_layers::speculative::{DraftProposer, ProposerState};
 use metrale_model_layers::weight_map::{DenseWeight, QuantizedWeight};
 
 pub use kernels::DflashKernels;
-pub use state::{DflashProposerState, DflashScratch};
+pub use state::{DflashProposerState, DflashScratch, PrefillCtxWindow};
 
 /// 2026-09-25: Cross-sequence batch for one drafter forward: per sequence its
 /// last token, position, drafter block table (a device pointer) and filled
@@ -82,6 +82,13 @@ pub struct DflashLayer {
     pub attention_conv_proj: Option<DenseWeight>,
     pub mlp_conv_base: Option<DenseWeight>,
     pub mlp_conv_proj: Option<DenseWeight>,
+    /// 2026-10-12: FP8 mirrors of the two conv kernel projections
+    /// (`METRALE_DFLASH_AUX_FP8`, `aux_fp8.rs`); `None` otherwise.
+    pub attention_conv_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    pub mlp_conv_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    /// 2026-10-12: NVFP4 copies (`METRALE_DFLASH_NV4_LAYERS` / `_AUX`, `nv4.rs`); all `None`
+    /// unless a lever built them.
+    pub nv4: nv4::LayerNv4,
 }
 
 #[allow(dead_code)]
@@ -94,6 +101,11 @@ pub struct DflashLayer {
 pub struct ProposeGraphs {
     pub by_width: std::collections::HashMap<usize, Vec<metrale_gpu_runtime::gpu::GraphHandle>>,
     pub warmup: std::collections::HashMap<usize, usize>,
+    /// 2026-10-12: `METRALE_DFLASH_TP_GRAPHS`: the two-rank propose's segment graphs per
+    /// block width (`4 * num_layers + 2`, `forward_block/tp_graphs.rs`) and their warm-up
+    /// counts. Each rank keeps its own; no collective is ever captured.
+    pub tp_by_width: std::collections::HashMap<usize, Vec<metrale_gpu_runtime::gpu::GraphHandle>>,
+    pub tp_warmup: std::collections::HashMap<usize, usize>,
 }
 
 /// 2026-09-25: Block-diffusion draft head; its public API is the
@@ -171,6 +183,19 @@ pub struct BlockDiffusionDraftHead {
     /// `layers[i]` at construction, so `precompute_ctx_kv` computes every
     /// layer's ctx K/V with one GEMM.
     pub fused_kv_weight: Option<DevicePtr>,
+    /// 2026-10-12: `METRALE_DFLASH_AUX_FP8` (`aux_fp8.rs`): FP8 mirrors of `fc`, the fused
+    /// ctx K/V weight and the selector's hidden projection; `None` otherwise.
+    pub fc_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    pub fused_kv_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    pub selector_hidden_proj_fp8: Option<metrale_model_layers::weight_map::Fp8DenseWeight>,
+    /// 2026-10-14: Bytes of the FP8 layer and lm_head mirrors this rank allocated at the
+    /// install (`quantize_drafter_fp8`), counted by the same `fp8_mirror_alloc_bytes` rule as
+    /// the KV reserve's prediction; 0 on the BF16 path (#82 hybrid M1b).
+    pub fp8_mirror_bytes: usize,
+    /// 2026-10-12: NVFP4 copies of the lm_head (`METRALE_DFLASH_NV4_HEAD`) and of `fc`, the
+    /// fused ctx K/V and the selector's hidden projection (`METRALE_DFLASH_NV4_AUX`), `nv4.rs`;
+    /// all `None` unless a lever built them.
+    pub nv4: nv4::HeadNv4,
 
     /// 2026-09-25: The drafter's paged bf16 KV cache: one cache holding all
     /// `num_layers` drafter layers, block-table-keyed like the target's.
@@ -246,10 +271,17 @@ pub struct BlockDiffusionDraftHead {
     pub selector_pred: Option<DenseWeight>,
     pub selector_succ: Option<DenseWeight>,
     pub selector_hidden_proj: Option<DenseWeight>,
+    /// 2026-10-09: Two-rank tensor parallelism (`METRALE_DFLASH_DRAFT_TP2`, `tp.rs`); `None`
+    /// runs the drafter on one rank. With `Some`, the geometry fields above are this rank's.
+    pub tp: Option<tp::DraftTp>,
 }
 
 mod attn_width;
+mod aux_fp8;
 mod dflash2;
+mod nv4;
+pub mod conf_log;
+mod draft_gemm;
 /// 2026-09-25: Rows the batched ctx precompute staging holds per step.
 pub(super) const PRECOMPUTE_BATCH_ROWS: usize = 256;
 
@@ -284,8 +316,10 @@ mod markov;
 mod precompute_ctx_kv;
 mod precompute_ctx_kv_batched;
 mod propose;
+mod propose_prep;
 mod proposer;
 mod state;
+pub mod tp;
 
 /// 2026-09-25: Read once: false only when `METRALE_NO_DFLASH_FP8_RT=1`, so the
 /// kernel choice stays fixed across CUDA-graph captures.

@@ -290,3 +290,38 @@ fn both_scheduler_routers_are_accepted_and_the_default_stays_sync() {
     let err = validate_serve_args(&parse(&["--scheduler-config", "nonsense"])).unwrap_err();
     assert!(err.contains("--scheduler-config"), "{err}");
 }
+
+/// 2026-10-10: clap no longer rejects `--dflash --speculative`; without
+/// `METRALE_HYBRID_DFLASH` (unset in tests) `validate_serve_args` still does.
+#[test]
+fn dflash_with_speculative_is_refused_without_the_hybrid_lever() {
+    let err = validate_serve_args(&parse(&["--dflash", "--speculative"]))
+        .expect_err("one proposer per serve unless hybrid");
+    assert!(err.contains("--speculative"), "{err}");
+    assert!(err.contains("METRALE_HYBRID_DFLASH"), "{err}");
+    assert!(validate_serve_args(&parse(&["--speculative"])).is_ok());
+}
+
+/// 2026-10-10: The hybrid rules, with the lever passed in.
+#[test]
+fn hybrid_lever_flag_rules() {
+    let check = |extra: &[&str], hybrid: bool| {
+        let mut v = Vec::new();
+        check_hybrid_dflash(&mut v, &parse(extra), hybrid);
+        v.len()
+    };
+    assert_eq!(check(&["--dflash", "--speculative"], false), 1);
+    assert_eq!(check(&["--dflash"], false), 0);
+    assert_eq!(check(&["--speculative"], false), 0);
+    assert_eq!(check(&["--dflash", "--speculative"], true), 0);
+    assert_eq!(check(&["--dflash"], true), 1);
+    assert_eq!(check(&["--speculative"], true), 1);
+    assert_eq!(check(&[], true), 1);
+    assert_eq!(
+        check(
+            &["--dflash", "--speculative", "--ssm-rollback-mode", "replay"],
+            true
+        ),
+        1
+    );
+}

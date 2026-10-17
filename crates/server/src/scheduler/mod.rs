@@ -18,6 +18,11 @@ mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_slice;
 mod decode_step;
+mod dflash_batch_rows;
+#[cfg(test)]
+mod dflash_batch_rows_tests;
+pub(crate) mod dflash_conf_tau;
+pub(crate) mod dflash_ksel;
 #[cfg(test)]
 mod emit_eos_thinking_tests;
 #[cfg(test)]
@@ -32,6 +37,12 @@ mod first_token_policy;
 #[cfg(test)]
 mod first_token_policy_tests;
 mod helpers;
+// 2026-10-10: Hybrid MTP + DFlash step-mode choice (`METRALE_HYBRID_DFLASH`).
+pub(crate) mod hybrid_mode;
+// 2026-10-11: Hybrid policy D2sR: per-sequence DFlash/MTP wall rates and the rate gate.
+pub(crate) mod hybrid_rate;
+#[cfg(test)]
+mod hybrid_rate_tests;
 pub(crate) mod io;
 mod lifecycle;
 #[cfg(test)]
@@ -87,6 +98,9 @@ mod think_skip_tests;
 #[cfg(test)]
 mod trace_harness;
 mod types;
+mod verify_batch_ep;
+#[cfg(test)]
+mod verify_dflash_batch_ep_tests;
 mod verify_dflash_batch_step;
 mod verify_dflash_step;
 mod verify_k2_step;
@@ -124,6 +138,7 @@ use sample_step::*;
 use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;
 use types::*;
+use verify_batch_ep::*;
 use verify_dflash_batch_step::*;
 use verify_dflash_step::*;
 use verify_k2_step::*;

@@ -430,11 +430,19 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            dflash_proposer: None,
+            spec_mode: std::sync::atomic::AtomicU8::new(
+                metrale_model_layers::speculative::hybrid::SpecStepMode::Mtp as u8,
+            ),
             mtp_hidden_save,
             verify_hidden_stash,
             verify_catchup_stash,
             mtp_catchup_ring,
             mtp_catchup_meta: parking_lot::Mutex::new((0, 0)),
+            hybrid_mtp_ring: DevicePtr::NULL,
+            hybrid_mtp_ring_rows: 0,
+            hybrid_mtp_zero_rows: DevicePtr::NULL,
+            hybrid_mtp_ring_meta: parking_lot::Mutex::new(Default::default()),
             mtp_prefill_hidden,
             // 2026-09-25: The rows actually allocated (both caps applied), which
             // the capture guard in `drafter_prefill.rs` checks against.

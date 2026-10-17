@@ -35,7 +35,6 @@ use metrale_gpu_runtime::kernel_args::KernelLaunch;
 
 use super::{BlockDiffusionDraftHead, DflashLayer};
 use metrale_model_layers::layer::ForwardContext;
-use metrale_model_layers::layers::ops;
 
 /// 2026-09-25: Which sublayer a conv application wraps.
 #[derive(Clone, Copy)]
@@ -74,6 +73,17 @@ impl BlockDiffusionDraftHead {
                 layer.mlp_conv_base.as_ref()?.weight,
                 layer.mlp_conv_proj.as_ref()?.weight,
             )),
+        }
+    }
+
+    /// 2026-10-12: The FP8 mirror of `site`'s kernel projection (`METRALE_DFLASH_AUX_FP8`).
+    fn conv_proj_fp8(
+        layer: &DflashLayer,
+        site: ConvSite,
+    ) -> Option<&metrale_model_layers::weight_map::Fp8DenseWeight> {
+        match site {
+            ConvSite::Attention => layer.attention_conv_proj_fp8.as_ref(),
+            ConvSite::Mlp => layer.mlp_conv_proj_fp8.as_ref(),
         }
     }
 
@@ -142,11 +152,19 @@ impl BlockDiffusionDraftHead {
         let groups = h / self.conv_group_size as u32;
         let dyn_cols = 2 * self.conv_kernel_size as u32 * groups;
         // 2026-09-25: Dynamic kernels for both applications, from the pre-conv hidden.
-        ops::dense_gemm_bf16_pipelined(
+        // 2026-10-12: On the FP8 mirror under METRALE_DFLASH_AUX_FP8 (BF16 freed).
+        self.draft_gemm_aux(
             ctx.gpu,
-            self.kernels.dense_gemm_pipelined,
             hidden_in,
-            &metrale_model_layers::weight_map::DenseWeight { weight: proj },
+            (
+                &metrale_model_layers::weight_map::DenseWeight { weight: proj },
+                Self::conv_proj_fp8(layer, site),
+                match site {
+                    ConvSite::Attention => layer.nv4.attention_conv_proj.as_ref(),
+                    ConvSite::Mlp => layer.nv4.mlp_conv_proj.as_ref(),
+                },
+                false,
+            ),
             self.scratch.conv_dyn,
             g,
             dyn_cols,
@@ -195,11 +213,42 @@ impl BlockDiffusionDraftHead {
         Ok(self.scratch.conv_tmp)
     }
 
-    /// 2026-09-25: Selector tail over `n_seq` bands: top-16 per row (overwriting the
-    /// selected entries of `scratch.logits`), the H(h_t) projection, then one
-    /// chain-walk launch writing rows 1.. of each band of `draft_tokens_dev`. Row 0 of
-    /// each band is not written.
-    pub(super) fn dflash2_select_block(
+    // 2026-09-25: The selector tail over `n_seq` bands: top-16 per row (overwriting the
+    // selected entries of `scratch.logits`), the H(h_t) projection, then one chain-walk
+    // launch writing rows 1.. of each band of `draft_tokens_dev` (row 0 of each band is
+    // not written). 2026-10-12: split into `dflash2_topk_block` and `dflash2_walk_block`;
+    // `block_tail_select` (forward_block/tail.rs) runs the two-rank top-16 merge between
+    // them, in the order the single body ran, so `METRALE_DFLASH_TP_GRAPHS` can capture
+    // each side.
+
+    /// 2026-10-12: The per-row top-16 over `scratch.logits` (writes `sel_vals` and
+    /// `sel_idx`, leaves `draft_tokens_dev` alone). One launch: `dflash2_topk16_reg` under
+    /// `METRALE_DFLASH_TOPK_REG` when the module has it (same picks, one scan), else
+    /// `dflash2_topk16`.
+    pub(super) fn dflash2_topk_block(
+        &self,
+        ctx: &ForwardContext,
+        n_seq: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let rows = self.block_g() as u32 * n_seq.max(1);
+        let kernel = topk_kernel(
+            self.levers.topk_reg,
+            self.kernels.dflash2_topk16_reg,
+            self.kernels.dflash2_topk16,
+        );
+        KernelLaunch::new(ctx.gpu, kernel)
+            .grid([rows, 1, 1])
+            .block([1024, 1, 1])
+            .arg_ptr(self.scratch.logits)
+            .arg_ptr(self.scratch.sel_vals)
+            .arg_ptr(self.scratch.sel_idx)
+            .arg_u32(self.vocab_size as u32)
+            .launch(stream)
+    }
+
+    /// 2026-10-12: The H(h_t) projection, then the chain walk from row 1 of each band.
+    pub(super) fn dflash2_walk_block(
         &self,
         ctx: &ForwardContext,
         norm_noise: DevicePtr,
@@ -210,7 +259,6 @@ impl BlockDiffusionDraftHead {
         let n = n_seq.max(1);
         let g = self.block_g() as u32;
         let rows = g * n;
-        let vocab = self.vocab_size as u32;
         let rank = self.selector_rank as u32;
         let hproj = self
             .selector_hidden_proj
@@ -225,23 +273,17 @@ impl BlockDiffusionDraftHead {
             .as_ref()
             .expect("dflash2_active() checked selector_succ");
 
-        // 2026-09-25: Order: top-16 (writes sel_vals and sel_idx, leaves
-        // draft_tokens_dev alone), the H(h_t) GEMM, then the walk.
-        KernelLaunch::new(gpu, self.kernels.dflash2_topk16)
-            .grid([rows, 1, 1])
-            .block([1024, 1, 1])
-            .arg_ptr(self.scratch.logits)
-            .arg_ptr(self.scratch.sel_vals)
-            .arg_ptr(self.scratch.sel_idx)
-            .arg_u32(vocab)
-            .launch(stream)?;
-
-        // 2026-09-25: H(h_t): [rows, hidden] → [rows, rank].
-        ops::dense_gemm_bf16_pipelined(
+        // 2026-09-25: H(h_t): [rows, hidden] → [rows, rank]. 2026-10-12: on the FP8
+        // mirror under METRALE_DFLASH_AUX_FP8 (BF16 freed).
+        self.draft_gemm_aux(
             gpu,
-            self.kernels.dense_gemm_pipelined,
             norm_noise,
-            hproj,
+            (
+                hproj,
+                self.selector_hidden_proj_fp8.as_ref(),
+                self.nv4.selector_hidden_proj.as_ref(),
+                false,
+            ),
             self.scratch.sel_hproj,
             rows,
             rank,
@@ -268,5 +310,49 @@ impl BlockDiffusionDraftHead {
         // 2026-09-25: Row 0 of each band is not rewritten: propose (propose.rs) and
         // the batched split (proposer.rs) drop row 0 whenever `mask_token_id != 0`.
         Ok(())
+    }
+}
+
+/// 2026-10-12: `METRALE_DFLASH_TOPK_REG` engaged / not-engaged line, once per process.
+static TOPK_REG_LOG: std::sync::Once = std::sync::Once::new();
+
+/// 2026-10-12: The top-16 entry `dflash2_topk_block` launches: the one-scan `reg` when the
+/// lever is on and the module has it, else `old` (with a NOT ENGAGED warning when the lever
+/// asked for it).
+fn topk_kernel(
+    lever: bool,
+    reg: metrale_gpu_runtime::gpu::KernelHandle,
+    old: metrale_gpu_runtime::gpu::KernelHandle,
+) -> metrale_gpu_runtime::gpu::KernelHandle {
+    if !lever {
+        return old;
+    }
+    let engaged = reg.0 != 0;
+    TOPK_REG_LOG.call_once(|| {
+        if engaged {
+            tracing::info!("METRALE_DFLASH_TOPK_REG=1: ENGAGED (dflash2_topk16_reg)");
+        } else {
+            tracing::warn!(
+                "METRALE_DFLASH_TOPK_REG=1: NOT ENGAGED: the dflash2 module has no \
+                 dflash2_topk16_reg entry; dflash2_topk16 stays"
+            );
+        }
+    });
+    if engaged { reg } else { old }
+}
+
+#[cfg(test)]
+mod topk_kernel_tests {
+    use super::topk_kernel;
+    use metrale_gpu_runtime::gpu::KernelHandle;
+
+    #[test]
+    fn lever_picks_reg_only_when_present() {
+        // 2026-10-12: Off: the old entry whatever the module has. On: `reg` when it exists,
+        // the old entry when it does not (never a null handle).
+        let (reg, old) = (KernelHandle(7), KernelHandle(3));
+        assert_eq!(topk_kernel(false, reg, old).0, 3);
+        assert_eq!(topk_kernel(true, reg, old).0, 7);
+        assert_eq!(topk_kernel(true, KernelHandle(0), old).0, 3);
     }
 }

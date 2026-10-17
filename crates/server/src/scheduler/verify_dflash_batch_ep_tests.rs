@@ -446,6 +446,41 @@ fn ep_short_result_sends_zero_verdict_and_an_all_failed_gather() {
     }
 }
 
+/// 2026-10-16 (race-decode review of c31df, item d): a fold error fails only the rows still
+/// running. Sequence 0 reaches its length limit on its first emitted token in this step's walk
+/// (`remaining` 1), before the fold; it keeps that normal finish, with no error. Sequence 1 gets
+/// the error frame.
+#[test]
+fn fold_error_keeps_a_row_that_already_stopped() {
+    for k in 2..=4 {
+        let mut m = EpFake::new(false, Fwd::Ok);
+        m.fold_fails = true;
+        let model = Arc::new(m);
+        let mut sched = SchedCtx::for_test_with(model.clone());
+        let mut levers = SchedLevers::defaults();
+        levers.dflash_unified_ctx = true;
+        sched.levers = Arc::new(levers);
+        let mut seqs: Vec<ActiveSeq> = (0..2)
+            .map(|i| {
+                let (mut a, _rx) = active_seq(i, 3);
+                a.pending_drafts = drafts(i, k);
+                a
+            })
+            .collect();
+        seqs[0].remaining = 1;
+        let c = ctx(&sched, &seqs[0]);
+        {
+            let mut refs: Vec<&mut ActiveSeq> = seqs.iter_mut().collect();
+            let refusal =
+                step_verify_dflash_batched(&*model, &mut refs, &sched, k - 1, k - 1, &c);
+            assert!(refusal.is_none(), "k={k}: {refusal:?}");
+        }
+        assert!(pos(&model.trace(), "fold").len() == 1, "k={k}");
+        assert!(seqs[0].finished && seqs[0].error.is_none(), "k={k}: {:?}", seqs[0].error);
+        assert!(seqs[1].finished && seqs[1].error.is_some(), "k={k}");
+    }
+}
+
 #[test]
 fn ep_fold_error_still_makes_the_gather() {
     for k in 2..=4 {

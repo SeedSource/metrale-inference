@@ -9,9 +9,12 @@
 //!   sends the verdict words (`broadcast_batch_verdict`) once every accept is walked, and then
 //!   makes exactly one failure-mask gather (`retire_failed_on_workers`) on every exit (short
 //!   result, fold error, normal tail) before any propose. An `Err` forward sends nothing more
-//!   (`decode_verify_batched` sent the abort words) and finishes the batch, since a worker may
-//!   have advanced. The verify width `k` is whatever the caller's drafts carry (2..=4 across
-//!   ranks); nothing here assumes 4.
+//!   (`decode_verify_batched` sent the abort words) and fails the batch with error frames, since
+//!   a worker may have advanced. 2026-10-16 (race-memory, A184 on c31df): except a rank-agreed KV
+//!   refusal (`preempt::spec_kv_refusal_retryable`): the vote (`agree_decode_kv_blocks`, model-engine
+//!   `verify_e.rs`) runs before the first collective on every rank, so no rank advanced; it returns
+//!   `Some(msg)` and finishes nothing, and the caller preempts a victim. The verify width `k` is
+//!   whatever the caller's drafts carry (2..=4 across ranks); nothing here assumes 4.
 //! - 2026-10-09: `METRALE_GLM_DFLASH_KSEL` (`dflash_ksel`) may cut every row to one narrower
 //!   width before the rows are built; the worker learns it from the `ks` meta only.
 //! - 2026-10-09: Under the batched GLM pin (`DflashRung::multi_batched`) each sequence's
@@ -433,8 +436,12 @@ pub fn step_verify_dflash_batched(
 
 /// 2026-10-14 (race-memory, A184): Fail every sequence of the batch with `msg`, so each
 /// client gets an error frame (`lifecycle::fail_sequence`), not a cut reply ending "stop".
+/// 2026-10-16 (race-decode review of c31df, item d): a sequence that already ended (its own
+/// stop emitted in this step's walk, or an earlier error) keeps its outcome.
 fn fail_dflash_batch(batch: &mut [&mut ActiveSeq], msg: &str) {
     for a in batch.iter_mut() {
-        super::lifecycle::fail_sequence(a, msg.to_string());
+        if a.error.is_none() && !a.finished {
+            super::lifecycle::fail_sequence(a, msg.to_string());
+        }
     }
 }

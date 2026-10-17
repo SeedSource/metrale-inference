@@ -120,13 +120,38 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         dense(store, "model.language_model.norm.weight")
     }
 
+    /// 2026-10-16: The head every reader treats as BF16 `[vocab, hidden]`
+    /// (`lm_head_setup` quantizes it, the MTP draft head copies it). The official
+    /// checkpoint ships BF16 and binds as-is. FP4-Local ships MXFP8 (`F8_E4M3` +
+    /// U8 E8M0 per-32): before this it bound the F8 buffer as if it were BF16 and
+    /// `quantize_to_fp8` read twice its size. It is now dequantized (exact) and
+    /// uploaded as BF16; any other dtype is refused (`lm_head_bf16_plan`).
     fn load_lm_head(
         &self,
         store: &WeightStore,
         _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        dense(store, "lm_head.weight")
+        let w = store.get("lm_head.weight")?;
+        let scale = match store.get("lm_head.weight_scale") {
+            Ok(s) => Some((s.dtype, s.shape.clone(), host_bytes(gpu, s)?)),
+            Err(_) => None,
+        };
+        let host = if w.dtype == WeightDtype::FP8E4M3 { host_bytes(gpu, w)? } else { Vec::new() };
+        match lm_head_bf16_plan(w.dtype, &w.shape, &host, scale.as_ref())? {
+            None => dense(store, "lm_head.weight"),
+            Some(bf16) => {
+                let p = gpu.alloc(bf16.len())?;
+                gpu.copy_h2d(&bf16, p)?;
+                tracing::info!(
+                    "glm5_next: lm_head {:?} {:?} + scale dequantized to BF16 ({:.2} GB) for the head setup",
+                    w.dtype,
+                    w.shape,
+                    bf16.len() as f64 / 1e9
+                );
+                Ok(DenseWeight { weight: p })
+            }
+        }
     }
 
     /// 2026-09-25: `None`: the GLM-5.3 MTP layer is loaded by
@@ -825,5 +850,31 @@ impl Glm5NextWeightLoader {
             out.push(Box::new(layer));
         }
         Ok(out)
+    }
+}
+
+/// 2026-10-16: What `load_lm_head` binds for a stored head of `dtype`: `None` =
+/// the stored tensor as-is (BF16, the only form its readers take); `Some(bytes)`
+/// = a BF16 dequantization of a scaled-FP8 head. Every other dtype is an error,
+/// never a silent reinterpretation.
+pub(super) fn lm_head_bf16_plan(
+    dtype: WeightDtype,
+    shape: &[usize],
+    fp8_bytes: &[u8],
+    scale: Option<&(WeightDtype, Vec<usize>, Vec<u8>)>,
+) -> Result<Option<Vec<u8>>> {
+    match dtype {
+        // U8 = an NVFP4-prepacked head, bound as-is by lm_head_setup (lm_head_prepacked_nvfp4).
+        WeightDtype::BF16 | WeightDtype::UInt8 => Ok(None),
+        WeightDtype::FP8E4M3 => {
+            let Some((sdt, sshape, sbytes)) = scale else {
+                bail!("lm_head.weight is F8_E4M3 but lm_head.weight_scale is absent: an unscaled FP8 head is not read");
+            };
+            Ok(Some(super::fp8_dequant::dequant_one("lm_head.weight", shape, fp8_bytes, *sdt, sshape, sbytes)?))
+        }
+        other => bail!(
+            "lm_head.weight is {other:?}: the GLM-5.3 head is read as BF16 [vocab, hidden] by lm_head_setup and the MTP \
+             draft head; only BF16, prepacked NVFP4 (U8) or scaled F8_E4M3 (MXFP8 / block-128) is accepted"
+        ),
     }
 }

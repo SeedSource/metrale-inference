@@ -134,6 +134,10 @@ pub struct AppState {
     /// 2026-09-26: `METRALE_LORA_PEER`, the weight peer a `--lora-stageable`
     /// promote reads from; without it those names are not promoted.
     pub lora_peer_addr: Option<String>,
+    /// 2026-10-17 (A191): Ranks in this serve (`--world-size`, from `resolve_topology`).
+    /// `/v1/completions` refuses prompt logprobs when it is above 1
+    /// (`completions::multi_rank_prompt_logprobs_refusal`).
+    pub world_size: usize,
     /// 2026-09-26: Single-flight coordinator for promotions. `Some` only with a
     /// resident pool and a stageable source: `--lora-stageable` with a peer,
     /// or `--lora-stageable-disk`.

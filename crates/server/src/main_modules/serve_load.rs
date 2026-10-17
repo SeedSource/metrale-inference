@@ -480,6 +480,7 @@ pub(crate) fn load_model(
         dump_writer,
         lora_stageable,
         lora_peer_addr,
+        world_size,
         promotion,
         promoted_slots: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         lora_disk_stageable,

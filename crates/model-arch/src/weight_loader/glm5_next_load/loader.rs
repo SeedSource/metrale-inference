@@ -173,6 +173,15 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        // 2026-10-16: an F8 head was bound as a BF16 copy (`load_lm_head`); the stored
+        // F8 head and its scale are dead weight from here (lm_head_setup has run).
+        let (n_head, b_head) = free_superseded_fp8_head(store, gpu)?;
+        if n_head > 0 {
+            tracing::info!(
+                "glm5_next: freed the stored F8 lm_head + scale ({:.2} GB), superseded by its BF16 copy",
+                b_head as f64 / 1e9
+            );
+        }
         let n = config.num_hidden_layers;
         // 2026-10-06: The derived weight arena's boot-log line, now that every routed expert,
         // the MTP block's included, is bound; silent when it never allocated.
@@ -877,4 +886,15 @@ pub(super) fn lm_head_bf16_plan(
              draft head; only BF16, prepacked NVFP4 (U8) or scaled F8_E4M3 (MXFP8 / block-128) is accepted"
         ),
     }
+}
+
+/// 2026-10-16: Free `lm_head.weight` and `lm_head.weight_scale` when the stored
+/// head is scaled F8 (FP4-Local): `load_lm_head` bound a BF16 copy, so these are
+/// dead. A BF16 (official) or prepacked-U8 head is the bound tensor itself and is
+/// never touched. Returns `(tensors freed, bytes freed)`.
+pub(super) fn free_superseded_fp8_head(store: &mut WeightStore, gpu: &dyn GpuBackend) -> Result<(usize, usize)> {
+    if !store.get("lm_head.weight").is_ok_and(|w| w.dtype == WeightDtype::FP8E4M3) {
+        return Ok((0, 0));
+    }
+    store.free_matching(gpu, |n| n == "lm_head.weight" || n == "lm_head.weight_scale")
 }

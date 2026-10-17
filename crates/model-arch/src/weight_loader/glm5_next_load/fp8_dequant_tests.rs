@@ -165,3 +165,48 @@ fn lm_head_plan_refuses_unscaled_fp8_and_other_dtypes() {
         assert!(e.contains("only BF16, prepacked NVFP4 (U8) or scaled F8_E4M3"), "{dt:?}: {e}");
     }
 }
+
+mod head_free {
+    use super::super::loader::free_superseded_fp8_head;
+    use metrale_gpu_runtime::gpu::GpuBackend;
+    use metrale_gpu_runtime::gpu::mock::MockGpuBackend;
+    use metrale_model_weights::weights::{WeightDtype, WeightStore, WeightTensor};
+    use std::collections::HashMap;
+
+    fn t(gpu: &MockGpuBackend, dtype: WeightDtype, shape: Vec<usize>) -> WeightTensor {
+        let n: usize = shape.iter().product::<usize>() * dtype.byte_size();
+        WeightTensor { ptr: gpu.alloc(n).unwrap(), shape, dtype }
+    }
+
+    /// 2026-10-16 (race-lead: free before any serve, test the resident bytes): the
+    /// FP4-Local F8 head (here [8, 64] + U8 [8, 2] = 528 B) leaves the store; the norm stays.
+    #[test]
+    fn fp8_head_and_scale_leave_the_store() {
+        let gpu = MockGpuBackend::new();
+        let mut m = HashMap::new();
+        m.insert("lm_head.weight".to_string(), t(&gpu, WeightDtype::FP8E4M3, vec![8, 64]));
+        m.insert("lm_head.weight_scale".to_string(), t(&gpu, WeightDtype::UInt8, vec![8, 2]));
+        m.insert("model.language_model.norm.weight".to_string(), t(&gpu, WeightDtype::BF16, vec![64]));
+        let mut store = WeightStore::from_map(m);
+        let before = store.resident_bytes();
+        assert_eq!(free_superseded_fp8_head(&mut store, &gpu).unwrap(), (2, 528));
+        assert_eq!(before - store.resident_bytes(), 528);
+        assert!(!store.contains("lm_head.weight") && !store.contains("lm_head.weight_scale"));
+        assert!(store.contains("model.language_model.norm.weight"));
+    }
+
+    /// The official BF16 head is the tensor `load_lm_head` binds: it must stay.
+    #[test]
+    fn bf16_and_prepacked_heads_are_kept() {
+        for dt in [WeightDtype::BF16, WeightDtype::UInt8] {
+            let gpu = MockGpuBackend::new();
+            let mut m = HashMap::new();
+            m.insert("lm_head.weight".to_string(), t(&gpu, dt, vec![8, 64]));
+            let mut store = WeightStore::from_map(m);
+            let before = store.resident_bytes();
+            assert_eq!(free_superseded_fp8_head(&mut store, &gpu).unwrap(), (0, 0), "{dt:?}");
+            assert_eq!(store.resident_bytes(), before);
+            assert!(store.contains("lm_head.weight"));
+        }
+    }
+}

@@ -335,3 +335,66 @@ fn expert_tp_defers_every_routed_expert_tensor_only() {
         assert!(!is_routed_expert_tensor(n), "{n}");
     }
 }
+
+/// 2026-10-16: The FP4-Local twin of the packed test above: the same expert with its block scales
+/// stored as csf_32x2_v1 parts (encoded by the test oracle) uploads the same bytes on each rank as
+/// the plain-scale expert, so decoding happens before the row/column cut.
+#[test]
+fn expert_tp_bind_decodes_csf32_scales_then_slices_like_plain() {
+    let mut full = HashMap::new();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    for (k, p) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+        let (rows, cols) = shape_of(p);
+        let h = Nvfp4Host {
+            packed: bytes(3 + k as u64, rows * cols / 2),
+            scale: bytes(30 + k as u64, rows * cols / 16),
+            scale_2: 0.01 * (k + 1) as f32,
+            input_scale: 0.0,
+        };
+        let (b, c, o, pb, e) = super::csf32::encode(rows, cols / 16, &h.scale);
+        blobs.push(h.packed.clone());
+        blobs.push(b);
+        blobs.push(c);
+        blobs.push(o.iter().flat_map(|x| x.to_le_bytes()).collect());
+        blobs.push(pb.iter().flat_map(|x| x.to_le_bytes()).collect());
+        blobs.push(e.iter().flat_map(|x| x.to_le_bytes()).collect());
+        blobs.push(h.scale_2.to_le_bytes().to_vec());
+        full.insert(*p, h);
+    }
+    let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+    let (path, offs) = stage("csf32", &refs);
+    for rank in 0..2 {
+        let mut store = WeightStore::from_map(HashMap::new());
+        for (k, p) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+            let (rows, cols) = shape_of(p);
+            let base = format!("mlp.experts.1.{p}");
+            let o = &offs[7 * k..7 * k + 7];
+            let n = |i: usize| blobs[7 * k + i].len();
+            for (leaf, off, shape, dtype) in [
+                ("weight", o[0], vec![rows, cols / 2], WeightDtype::UInt8),
+                ("weight_scale.csf32_bases", o[1], vec![n(1)], WeightDtype::UInt8),
+                ("weight_scale.csf32_codes", o[2], vec![n(2)], WeightDtype::UInt8),
+                ("weight_scale.csf32_offsets", o[3], vec![n(3) / 2], WeightDtype::UInt16),
+                ("weight_scale.csf32_page_bases", o[4], vec![n(4) / 4], WeightDtype::UInt32),
+                ("weight_scale.csf32_exceptions", o[5], vec![n(5) / 2], WeightDtype::UInt16),
+                ("weight_scale_2", o[6], vec![], WeightDtype::FP32),
+            ] {
+                defer(&mut store, qualified(&format!("{base}.{leaf}")), &path, off, shape, dtype);
+            }
+        }
+        let gpu = MockGpuBackend::new();
+        let e = bind_expert_cfg(&gpu, &store, LAYER, 1, &cfg(rank, true)).unwrap();
+        for (p, got) in [("gate_proj", &e.gate_proj), ("up_proj", &e.up_proj), ("down_proj", &e.down_proj)] {
+            let (rows, cols) = shape_of(p);
+            let want = slice_nvfp4(&full[p], rows, cols, Cut::of(p), rank, 2).unwrap();
+            let (packed, scale) = read(&gpu, got);
+            assert_eq!(packed, want.packed, "rank {rank} {p}: packed");
+            assert_eq!(scale, want.scale, "rank {rank} {p}: decoded block scales");
+            assert_eq!(got.scale_2, full[p].scale_2, "rank {rank} {p}: scale_2");
+        }
+        // Lever off: csf scales are refused by name, not read as a missing plain scale.
+        let err = bind_expert_cfg(&gpu, &store, LAYER, 1, &cfg(rank, false)).unwrap_err().to_string();
+        assert!(err.contains("METRALE_GLM_EXPERT_TP=1"), "{err}");
+    }
+    let _ = std::fs::remove_file(&path);
+}

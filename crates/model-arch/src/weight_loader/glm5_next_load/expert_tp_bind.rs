@@ -44,6 +44,53 @@ pub(super) fn bind_expert_tp(
     })
 }
 
+/// 2026-10-16: A projection's block scale: the deferred plain tensor (read by range, as before),
+/// or the whole decoded csf_32x2_v1 scale.
+enum ScaleSrc<'a> {
+    Plain(&'a metrale_model_weights::weights::DeferredTensor),
+    Decoded(Vec<u8>),
+}
+
+impl ScaleSrc<'_> {
+    fn byte_size(&self) -> usize {
+        match self {
+            Self::Plain(d) => d.byte_size(),
+            Self::Decoded(v) => v.len(),
+        }
+    }
+    fn read_host_range(&self, start: usize, len: usize) -> Result<Vec<u8>> {
+        match self {
+            Self::Plain(d) => d.read_host_range(start, len),
+            Self::Decoded(v) => v
+                .get(start..start + len)
+                .map(<[u8]>::to_vec)
+                .with_context(|| format!("decoded scale range {start}+{len} outside {} bytes", v.len())),
+        }
+    }
+}
+
+/// 2026-10-16: `base`'s csf_32x2_v1 scale decoded to plain `[rows, c]` E4M3 bytes, or `None` when
+/// the projection has no `.weight_scale.csf32_bases` (every checkpoint but FP4-Local). All five
+/// parts are routed-expert tensors, so deferred with the weight; a missing part is an error.
+fn csf32_scale(store: &WeightStore, layer: usize, base: &str, rows: usize, c: usize) -> Result<Option<Vec<u8>>> {
+    let part = |p: &str| qualify(layer, &format!("{base}.weight_scale.csf32_{p}"));
+    if store.deferred(&part("bases")).is_none() {
+        return Ok(None);
+    }
+    let read = |p: &str| -> Result<Vec<u8>> {
+        let n = part(p);
+        let d = store.deferred(&n).with_context(|| format!("{n}: csf_32x2_v1 part missing or not deferred"))?;
+        d.read_host_range(0, d.byte_size()).with_context(|| format!("{n}: reading from its shard"))
+    };
+    let u16s = |v: Vec<u8>| v.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect::<Vec<_>>();
+    let (bases, codes) = (read("bases")?, read("codes")?);
+    let offsets = u16s(read("offsets")?);
+    let page_bases: Vec<u32> = read("page_bases")?.chunks_exact(4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])).collect();
+    let exceptions = u16s(read("exceptions")?);
+    let parts = super::csf32::Csf32Parts { bases: &bases, codes: &codes, offsets: &offsets, page_bases: &page_bases, exceptions: &exceptions };
+    super::csf32::decode(&qualify(layer, base), rows, c, &parts).map(Some)
+}
+
 /// 2026-10-05: This rank's NVFP4 slice of projection `base` (`mlp.experts.{id}.{proj}`) on the
 /// host.
 fn slice_proj(
@@ -71,9 +118,15 @@ fn slice_proj(
             let cols = half_k * 2;
             check_geometry(&wname, rows, cols, cut, cfg)?;
             let sname = qualify(layer, &format!("{base}.weight_scale"));
-            let s = store.deferred(&sname).with_context(|| {
-                format!("{sname}: expert-TP needs the block scale deferred with its weight")
-            })?;
+            // 2026-10-16: FP4-Local ships the block scale as csf_32x2_v1 parts: decoded whole here
+            // (before the row cut), then sliced like a plain scale. A plain scale is read exactly
+            // as before (only this rank's rows).
+            let s = match csf32_scale(store, layer, base, rows, cols / 16)? {
+                Some(full) => ScaleSrc::Decoded(full),
+                None => ScaleSrc::Plain(store.deferred(&sname).with_context(|| {
+                    format!("{sname}: expert-TP needs the block scale deferred with its weight")
+                })?),
+            };
             if s.byte_size() != rows * cols / 16 {
                 bail!(
                     "{sname}: {} bytes, expected {} for a [{rows}, {cols}] NVFP4 projection",

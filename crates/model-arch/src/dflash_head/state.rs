@@ -141,6 +141,89 @@ impl ProposerState for DflashProposerState {
     }
 }
 
+/// 2026-10-17 (A200): A slide of the ctx accumulator before an append: drop the oldest
+/// `drop` rows and move the next `keep` rows to the front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtxSlide {
+    pub drop: usize,
+    pub keep: usize,
+}
+
+impl CtxSlide {
+    /// 2026-10-17 (A200): The slide that makes room for `n` more rows in a window of
+    /// `max_ctx_len` holding `ctx_len`, `None` when they fit. It keeps the newest
+    /// `min(max_ctx_len / 2, max_ctx_len - n)` rows (the rule `commit_ctx` used). Errors when
+    /// `ctx_len` already exceeds the window or `n` exceeds the window.
+    pub fn plan(ctx_len: usize, max_ctx_len: usize, n: usize) -> Result<Option<Self>> {
+        anyhow::ensure!(
+            ctx_len <= max_ctx_len,
+            "DFlash ctx: {ctx_len} rows in a {max_ctx_len}-row window"
+        );
+        anyhow::ensure!(
+            n <= max_ctx_len,
+            "DFlash ctx: {n} new rows exceed the {max_ctx_len}-row window"
+        );
+        if ctx_len + n <= max_ctx_len {
+            return Ok(None);
+        }
+        let keep = (max_ctx_len / 2).min(max_ctx_len - n).min(ctx_len);
+        Ok(Some(Self {
+            drop: ctx_len - keep,
+            keep,
+        }))
+    }
+
+    /// 2026-10-17 (A200): The row moves `(src_row, dst_row, rows)` that take rows
+    /// `[drop, drop + keep)` to `[0, keep)`, in pieces of at most `drop` rows: no piece's
+    /// source overlaps its destination, and no piece overwrites a row a later piece reads.
+    /// `commit_ctx` used one copy, whose ranges overlap when `drop < keep`.
+    pub fn pieces(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        if self.drop == 0 {
+            return out;
+        }
+        let mut moved = 0;
+        while moved < self.keep {
+            let n = (self.keep - moved).min(self.drop);
+            out.push((self.drop + moved, moved, n));
+            moved += n;
+        }
+        out
+    }
+}
+
+impl DflashProposerState {
+    /// 2026-10-17 (A200): Slide the window, if needed, so `n` more rows fit; every append
+    /// to `ctx_hidden_acc` calls this first. Moved rows keep their absolute positions, and
+    /// `ctx_committed = 0` makes the next propose recompute their K/V (the paged cache slots
+    /// follow the row index). On a two-rank drafter, rank 0's next header carries the slid
+    /// rows and rank 1 conforms to it (`tp/follower.rs`). Returns the slide applied.
+    pub fn make_room_for(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        n: usize,
+        stream: u64,
+    ) -> Result<Option<CtxSlide>> {
+        let Some(s) = CtxSlide::plan(self.ctx_len, self.max_ctx_len, n)? else {
+            return Ok(None);
+        };
+        let slot = self.ctx_slot_bytes;
+        for (src, dst, rows) in s.pieces() {
+            gpu.copy_d2d_async(
+                self.ctx_hidden_acc.offset(src * slot),
+                self.ctx_hidden_acc.offset(dst * slot),
+                rows * slot,
+                stream,
+            )?;
+        }
+        self.ctx_positions
+            .drain(..s.drop.min(self.ctx_positions.len()));
+        self.ctx_len = s.keep;
+        self.ctx_committed = 0;
+        Ok(Some(s))
+    }
+}
+
 /// 2026-10-10: The prompt positions a DFlash prefill capture keeps: the last `max_ctx_len` of
 /// the prompt, absolute `[start, end)` with `end` the prompt length and
 /// `start = end - max_ctx_len` (saturating). The drafter attends over a sliding window of the

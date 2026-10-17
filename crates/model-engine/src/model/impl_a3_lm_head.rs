@@ -460,19 +460,19 @@ impl TransformerModel {
     ///
     /// `None` unless there is a communicator with at least 2 ranks and the vocab
     /// divides evenly by the world size, or when `METRALE_NO_LMHEAD_VOCAB_TP=1`
-    /// (read once per process). Only the BF16 dense-head paths call it.
+    /// (read once per process), or inside a [`RankLocalHead`] scope. Only the BF16
+    /// dense-head paths call it.
     fn lmhead_vocab_shard(&self, v: u32) -> Option<(usize, usize)> {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *OFF.get_or_init(|| std::env::var("METRALE_NO_LMHEAD_VOCAB_TP").as_deref() == Ok("1")) {
-            return None;
-        }
+        let off =
+            *OFF.get_or_init(|| std::env::var("METRALE_NO_LMHEAD_VOCAB_TP").as_deref() == Ok("1"));
         let comm = self.comm_ref()?;
-        let ws = comm.world_size();
-        if ws < 2 || !(v as usize).is_multiple_of(ws) {
-            return None;
-        }
-        let len = v as usize / ws;
-        Some((comm.rank() * len, len))
+        vocab_shard(
+            comm.world_size(),
+            comm.rank(),
+            v as usize,
+            off || HEAD_RANK_LOCAL.with(std::cell::Cell::get),
+        )
     }
 
     pub(super) fn lm_head(&self, hidden: DevicePtr, stream: u64) -> Result<DevicePtr> {
@@ -584,5 +584,70 @@ impl TransformerModel {
             self.apply_logit_softcap_dtype(logits, v, cap, fp32, stream)?;
         }
         Ok(logits)
+    }
+}
+
+thread_local! {
+    /// 2026-10-17 (A191): Set inside a [`RankLocalHead`] scope; `lmhead_vocab_shard` then
+    /// returns `None`, so every head path computes the whole vocab with no all-reduce.
+    static HEAD_RANK_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 2026-10-17 (A191): Scope in which this rank projects rows through the LM head alone.
+/// The prompt-logprob windows (`prefill_b/prompt_logprobs.rs`) run on rank 0 only, so a
+/// vocab-split head (whose all-reduce rank 1 never joins) hung a 2-rank serve. Each rank
+/// holds the whole head, so the whole-vocab projection gives the same logits per row
+/// without a collective. Restores the previous state on drop (nesting is safe).
+pub(crate) struct RankLocalHead(bool);
+
+impl RankLocalHead {
+    pub(crate) fn enter() -> Self {
+        Self(HEAD_RANK_LOCAL.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for RankLocalHead {
+    fn drop(&mut self) {
+        HEAD_RANK_LOCAL.with(|c| c.set(self.0));
+    }
+}
+
+/// 2026-10-17: `(begin, len)` of the vocab this rank projects, or `None` for the whole
+/// vocab: `None` when `whole` (the kill switch or a [`RankLocalHead`] scope), with fewer
+/// than 2 ranks, or when the vocab does not divide by the world size.
+fn vocab_shard(world: usize, rank: usize, v: usize, whole: bool) -> Option<(usize, usize)> {
+    if whole || world < 2 || !v.is_multiple_of(world) {
+        return None;
+    }
+    let len = v / world;
+    Some((rank * len, len))
+}
+
+#[cfg(test)]
+mod rank_local_head_tests {
+    use super::*;
+
+    #[test]
+    fn vocab_shard_splits_only_across_ranks_and_outside_a_local_scope() {
+        assert_eq!(vocab_shard(2, 1, 154_880, false), Some((77_440, 77_440)));
+        assert_eq!(vocab_shard(2, 0, 154_880, true), None);
+        assert_eq!(vocab_shard(1, 0, 154_880, false), None);
+        assert_eq!(vocab_shard(3, 0, 154_880, false), None);
+    }
+
+    #[test]
+    fn rank_local_scope_sets_and_restores_the_flag() {
+        let get = || HEAD_RANK_LOCAL.with(std::cell::Cell::get);
+        assert!(!get());
+        {
+            let _outer = RankLocalHead::enter();
+            assert!(get());
+            {
+                let _inner = RankLocalHead::enter();
+                assert!(get());
+            }
+            assert!(get(), "the inner scope restores the outer one");
+        }
+        assert!(!get());
     }
 }

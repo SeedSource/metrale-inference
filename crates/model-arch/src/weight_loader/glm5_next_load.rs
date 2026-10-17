@@ -47,6 +47,9 @@ mod expert_tp_bind;
 mod expert_tp_bind_tests;
 #[cfg(test)]
 mod export_layout_tests;
+mod fp8_dequant;
+#[cfg(test)]
+mod fp8_dequant_tests;
 mod loader;
 mod nvfp4_dequant;
 mod nvfp4_quant;
@@ -293,10 +296,16 @@ impl LayerSource {
             names.push(rel.to_string());
             let t = store.get(&format!("{prefix}{rel}"))?;
             let bytes = host_bytes(gpu, t)?;
-            if let Some(cast) = plan_dtype::cast_to_plan_dtype(rel, t.dtype, &bytes)? {
-                plan_cast.insert(rel.to_string(), cast);
-            }
             tensors.insert(rel.to_string(), (t.dtype, t.shape.clone(), bytes));
+        }
+        // 2026-10-16: Scaled-FP8 weights (FP4-Local) become BF16 before the plan
+        // cast; their scale siblings leave the layer (see `fp8_dequant`). A no-op
+        // on the official checkpoint, which has no F8_E4M3 `.weight` here.
+        fp8_dequant::dequant_scaled_fp8(&mut tensors, &mut names)?;
+        for (rel, (dtype, _, bytes)) in &tensors {
+            if let Some(cast) = plan_dtype::cast_to_plan_dtype(rel, *dtype, bytes)? {
+                plan_cast.insert(rel.clone(), cast);
+            }
         }
         Ok(Self {
             names,

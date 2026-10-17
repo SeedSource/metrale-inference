@@ -312,7 +312,10 @@ impl LayerSource {
         // 2026-10-16: Scaled-FP8 weights (FP4-Local) become BF16 before the plan
         // cast; their scale siblings leave the layer (see `fp8_dequant`). A no-op
         // on the official checkpoint, which has no F8_E4M3 `.weight` here.
-        fp8_dequant::dequant_scaled_fp8(&mut tensors, &mut names)?;
+        let n_fp8 = fp8_dequant::dequant_scaled_fp8(&mut tensors, &mut names)?;
+        if n_fp8 > 0 {
+            tracing::info!("glm5_next: layer {layer}: {n_fp8} scaled-FP8 weights dequantized to BF16");
+        }
         for (rel, (dtype, _, bytes)) in &tensors {
             if let Some(cast) = plan_dtype::cast_to_plan_dtype(rel, *dtype, bytes)? {
                 plan_cast.insert(rel.clone(), cast);

@@ -314,7 +314,9 @@ impl LayerSource {
         // on the official checkpoint, which has no F8_E4M3 `.weight` here.
         let n_fp8 = fp8_dequant::dequant_scaled_fp8(&mut tensors, &mut names)?;
         if n_fp8 > 0 {
-            tracing::info!("glm5_next: layer {layer}: {n_fp8} scaled-FP8 weights dequantized to BF16");
+            tracing::info!(
+                "glm5_next: layer {layer}: {n_fp8} scaled-FP8 weights dequantized to BF16"
+            );
         }
         for (rel, (dtype, _, bytes)) in &tensors {
             if let Some(cast) = plan_dtype::cast_to_plan_dtype(rel, *dtype, bytes)? {

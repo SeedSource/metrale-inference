@@ -136,6 +136,10 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
             "I8" => (WeightDtype::UInt8, false),
             "F8_E4M3" => (WeightDtype::FP8E4M3, false),
             "F8_E8M0" => (WeightDtype::FP8E8M0, false),
+            // csf_32x2_v1 compressed expert scales (nvidia/GLM-5.3-Flash-FP4-Local):
+            // csf32_offsets / csf32_exceptions are U16, csf32_page_bases U32.
+            "U16" => (WeightDtype::UInt16, false),
+            "U32" => (WeightDtype::UInt32, false),
             "I64" => (WeightDtype::Int64, false),
             other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
         };
@@ -168,4 +172,66 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
     // Sort by offset so the reader does sequential disk access.
     out.sort_by_key(|t| t.abs_offset);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    /// A minimal safetensors file: `entries` = (name, dtype, shape, byte len), data zero-filled.
+    fn write_st(entries: &[(&str, &str, &[usize], usize)]) -> File {
+        let mut hdr = serde_json::Map::new();
+        let mut off = 0usize;
+        for (name, dtype, shape, len) in entries {
+            hdr.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [off, off + len]}),
+            );
+            off += len;
+        }
+        let h = serde_json::to_vec(&Value::Object(hdr)).unwrap();
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(&(h.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(&h).unwrap();
+        f.write_all(&vec![0u8; off]).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f
+    }
+
+    /// 2026-10-16 (FP4-Local loader, race-prefill): csf_32x2_v1 scale tensors are U16/U32.
+    /// Before this the header parser bailed "Unsupported safetensors dtype 'U16'", so no
+    /// FP4-Local expert shard opened. Shapes/lens mirror layers.10.mlp.experts.0.gate_proj.
+    #[test]
+    fn csf_u16_u32_containers_parse_with_their_byte_width() {
+        let mut f = write_st(&[
+            ("e.gate_proj.csf32_bases", "U8", &[2048], 2048),
+            ("e.gate_proj.csf32_offsets", "U16", &[528], 1056),
+            ("e.gate_proj.csf32_page_bases", "U32", &[16], 64),
+            ("e.gate_proj.csf32_exceptions", "U16", &[1709], 3418),
+        ]);
+        let t = parse_header(&mut f).unwrap();
+        let by = |n: &str| t.iter().find(|m| m.name == n).unwrap();
+        for (n, dt, numel) in [
+            ("e.gate_proj.csf32_offsets", WeightDtype::UInt16, 528usize),
+            ("e.gate_proj.csf32_page_bases", WeightDtype::UInt32, 16),
+            ("e.gate_proj.csf32_exceptions", WeightDtype::UInt16, 1709),
+        ] {
+            let m = by(n);
+            assert_eq!(m.dtype, dt, "{n}");
+            assert_eq!(m.len, numel * dt.byte_size(), "{n}: header span must equal numel x byte width");
+        }
+        assert_eq!(WeightDtype::from_safetensors_str("U16").unwrap(), WeightDtype::UInt16);
+        assert_eq!(WeightDtype::from_safetensors_str("U32").unwrap(), WeightDtype::UInt32);
+    }
+
+    #[test]
+    fn unknown_dtype_still_refused() {
+        let mut f = write_st(&[("x", "U64", &[1], 8)]);
+        let e = match parse_header(&mut f) {
+            Ok(_) => panic!("U64 must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("Unsupported safetensors dtype 'U64'"), "{e}");
+    }
 }

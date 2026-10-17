@@ -38,6 +38,12 @@ pub enum WeightDtype {
     FP8E4M3,
     FP8E8M0,
     UInt8,
+    /// Raw 16-/32-bit unsigned containers. Only the csf_32x2_v1 compressed expert
+    /// scales of nvidia/GLM-5.3-Flash-FP4-Local use them (csf32_offsets U16,
+    /// csf32_page_bases U32, csf32_exceptions U16); they are decoded on the host
+    /// at load and never reach a kernel.
+    UInt16,
+    UInt32,
     Int64,
     /// Keep-packed PrismML ternary Q2_0 (ggml id 42): raw on-disk blocks stay
     /// 2-bit in VRAM (fp16 scale + 2-bit codes per group of `group` elements),
@@ -71,6 +77,8 @@ impl WeightDtype {
             Self::FP8E4M3 => 1,
             Self::FP8E8M0 => 1,
             Self::UInt8 => 1,
+            Self::UInt16 => 2,
+            Self::UInt32 => 4,
             Self::Int64 => 8,
             Self::PackedQ2_0 { .. } => 0,
             Self::Q2K => 0,
@@ -89,6 +97,8 @@ impl WeightDtype {
             safetensors::Dtype::I8 => Ok(Self::UInt8),
             safetensors::Dtype::F8_E4M3 => Ok(Self::FP8E4M3),
             safetensors::Dtype::F8_E8M0 => Ok(Self::FP8E8M0),
+            safetensors::Dtype::U16 => Ok(Self::UInt16),
+            safetensors::Dtype::U32 => Ok(Self::UInt32),
             safetensors::Dtype::I64 => Ok(Self::Int64),
             other => bail!("Unsupported safetensors dtype: {other:?}"),
         }
@@ -109,6 +119,8 @@ impl WeightDtype {
             "I8" => Self::UInt8,
             "F8_E4M3" => Self::FP8E4M3,
             "F8_E8M0" => Self::FP8E8M0,
+            "U16" => Self::UInt16,
+            "U32" => Self::UInt32,
             "I64" => Self::Int64,
             other => bail!("Unsupported safetensors dtype '{other}'"),
         })

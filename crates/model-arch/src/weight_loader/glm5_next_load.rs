@@ -43,6 +43,9 @@ mod defer_hook_tests;
 pub mod expert_arena;
 mod expert_quant;
 mod expert_tp_bind;
+mod csf32;
+#[cfg(test)]
+mod csf32_tests;
 #[cfg(test)]
 mod expert_tp_bind_tests;
 #[cfg(test)]
@@ -178,6 +181,14 @@ pub fn bind_expert_cfg(
     if cfg.is_expert_tp() {
         expert_tp_bind::bind_expert_tp(gpu, store, layer, id, cfg)
     } else {
+        // 2026-10-16: csf_32x2_v1 scales (FP4-Local) are decoded only on the expert-TP path.
+        let probe = format!("model.language_model.layers.{layer}.mlp.experts.{id}.gate_proj.weight_scale.csf32_bases");
+        if store.contains(&probe) || store.deferred(&probe).is_some() {
+            bail!(
+                "layer {layer} expert {id}: csf_32x2_v1 compressed scales (FP4-Local) are decoded on the expert-TP \
+                 path only; set METRALE_GLM_EXPERT_TP=1"
+            );
+        }
         bind_expert(gpu, store, layer, id)
     }
 }

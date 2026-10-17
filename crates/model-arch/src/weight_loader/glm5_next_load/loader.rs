@@ -115,9 +115,10 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
         &self,
         store: &WeightStore,
         _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        dense(store, "model.language_model.norm.weight")
+        // 2026-10-17: FP4-Local ships the final norm as F32 (official: BF16).
+        dense_bf16_or_cast(store, "model.language_model.norm.weight", gpu)
     }
 
     /// 2026-10-16: The head every reader treats as BF16 `[vocab, hidden]`

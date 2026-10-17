@@ -511,9 +511,37 @@ pub(super) fn bind_expert(
     })
 }
 
+/// 2026-10-17: The store tensor's own buffer, which every reader treats as BF16; any other dtype
+/// is refused. Before this guard FP4-Local's F32 `model.language_model.norm.weight` was bound
+/// as BF16 (half the buffer read as BF16 pairs), and every reply was EOS at token 1
+/// (race-pf-fp4lm3-L34, GSM8K500 0/500).
 fn dense(store: &WeightStore, name: &str) -> Result<DenseWeight> {
+    let t = store.get(name)?;
+    if t.dtype != WeightDtype::BF16 {
+        bail!(
+            "{name}: {:?} {:?} would be bound as BF16; only a BF16 tensor binds as-is",
+            t.dtype,
+            t.shape
+        );
+    }
+    Ok(DenseWeight { weight: t.ptr })
+}
+
+/// 2026-10-17: `dense`, but an F32 tensor (nvidia/GLM-5.3-Flash-FP4-Local ships the final norm
+/// as F32; the official checkpoint ships BF16) is cast to BF16 and uploaded as a new buffer.
+fn dense_bf16_or_cast(
+    store: &WeightStore,
+    name: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<DenseWeight> {
+    let t = store.get(name)?;
+    if t.dtype != WeightDtype::FP32 {
+        return dense(store, name);
+    }
+    let v = host_f32(gpu, t, name)?;
+    tracing::info!("glm5_next: {name} F32 {:?} cast to BF16 at load", t.shape);
     Ok(DenseWeight {
-        weight: store.get(name)?.ptr,
+        weight: upload_f32_as_bf16(gpu, &v)?,
     })
 }
 
@@ -529,6 +557,9 @@ pub(super) fn upload_f32_as_bf16(gpu: &dyn GpuBackend, v: &[f32]) -> Result<Devi
 
 #[cfg(test)]
 mod prune_tests;
+
+#[cfg(test)]
+mod dense_dtype_tests;
 
 /// 2026-09-25: [`LayerSource::collect`], for the MTP loader.
 pub(super) fn layer_source(

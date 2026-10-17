@@ -210,3 +210,15 @@ mod head_free {
         }
     }
 }
+
+#[test]
+fn e8m0_factor_is_exact_across_the_byte_range() {
+    // every exponent byte 0..=254 gives exactly 2^(e-127) on a 1.0 (0x38) element
+    for e in 0u8..=254 {
+        let w = vec![0x38u8; 32];
+        let out = bf16s(&dequant_one("x.weight", &[1, 32], &w, WeightDtype::UInt8, &[1, 1], &[e]).unwrap());
+        let want = half::bf16::from_f32(2f32.powi(e as i32 - 127)).to_f32();
+        assert_eq!(out[0], want, "e = {e}");
+        assert!(out.iter().all(|v| *v == want));
+    }
+}

@@ -62,6 +62,12 @@ pub(super) fn dequant_scaled_fp8(tensors: &mut HostTensors, names: &mut Vec<Stri
     Ok(fp8.len())
 }
 
+/// 2026-10-16: E8M0 exponent byte `e` (0..=254) as the exact f32 2^(e-127): the f32 bit
+/// pattern for e >= 1, the one subnormal 2^-127 for e = 0. One per 32 elements, not per element.
+fn e8m0(e: u8) -> f32 {
+    if e == 0 { f32::from_bits(1 << 22) } else { f32::from_bits((e as u32) << 23) }
+}
+
 /// 2026-10-16: One scaled-FP8 weight `[N, K]` to little-endian BF16 bytes.
 pub(super) fn dequant_one(
     name: &str,
@@ -85,15 +91,18 @@ pub(super) fn dequant_one(
             if !k.is_multiple_of(MX_GROUP) || scale_shape != [n, k / MX_GROUP] || scale.len() != n * (k / MX_GROUP) {
                 bail!("{name}: MXFP8 scale shape {scale_shape:?} ({} B) does not match weight [{n}, {k}] / 32", scale.len());
             }
+            let g = k / MX_GROUP;
             for r in 0..n {
-                for c in 0..k {
-                    let e = scale[r * (k / MX_GROUP) + c / MX_GROUP];
+                for gi in 0..g {
+                    let e = scale[r * g + gi];
                     // E8M0: 255 is NaN by the OCP MX spec; refuse rather than carry it.
                     if e == 255 {
-                        bail!("{name}: E8M0 scale NaN (0xFF) at row {r}, group {}", c / MX_GROUP);
+                        bail!("{name}: E8M0 scale NaN (0xFF) at row {r}, group {gi}");
                     }
-                    let v = e4m3[bytes[r * k + c] as usize] * 2f32.powi(e as i32 - 127);
-                    out.extend_from_slice(&bf16(v));
+                    let f = e8m0(e);
+                    for &b in &bytes[r * k + gi * MX_GROUP..r * k + (gi + 1) * MX_GROUP] {
+                        out.extend_from_slice(&bf16(e4m3[b as usize] * f));
+                    }
                 }
             }
         }

@@ -252,3 +252,63 @@ fn two_rank_follower_conforms_to_a_slid_leader() {
     assert_eq!(f, lead.ctx_positions);
     assert!(f.len() <= 10, "tp_install's room check holds");
 }
+
+/// 2026-10-17 (A201): a one-row source holding `marker`.
+fn row(gpu: &MockGpuBackend, marker: u32) -> metrale_gpu_runtime::gpu::DevicePtr {
+    let r = gpu.alloc(SLOT).unwrap();
+    gpu.copy_h2d(&marker.to_le_bytes(), r).unwrap();
+    r
+}
+
+#[test]
+fn decode_append_at_full_window_slides_then_appends() {
+    let gpu = MockGpuBackend::new();
+    let mut d = state(&gpu, 10, 10);
+    let s = d.decode_append(&gpu, row(&gpu, 0xAB), 999, 0).unwrap();
+    assert_eq!(s, Some(CtxSlide { drop: 5, keep: 5 }));
+    assert_eq!(d.ctx_len, 6);
+    let m = markers(&gpu, &d);
+    assert_eq!(&m[..5], &[5, 6, 7, 8, 9]);
+    assert_eq!(m[5], 0xAB);
+    assert_eq!(*d.ctx_positions.last().unwrap(), 999);
+    assert_eq!(d.ctx_positions.len(), 6);
+    assert_eq!(d.ctx_committed, 0);
+}
+
+#[test]
+fn decode_append_below_full_window_does_not_slide() {
+    let gpu = MockGpuBackend::new();
+    let mut d = state(&gpu, 10, 4);
+    let s = d.decode_append(&gpu, row(&gpu, 0xAB), 999, 0).unwrap();
+    assert_eq!(s, None);
+    assert_eq!(d.ctx_len, 5);
+    assert_eq!(d.ctx_positions, vec![100, 101, 102, 103, 999]);
+    assert_eq!(d.ctx_committed, 4);
+    assert_eq!(markers(&gpu, &d)[4], 0xAB);
+}
+
+#[test]
+fn decode_append_repeated_from_full_never_errors() {
+    let gpu = MockGpuBackend::new();
+    let mut d = state(&gpu, 10, 10);
+    for i in 0..20 {
+        d.decode_append(&gpu, row(&gpu, 1000 + i), 500 + i as i32, 0)
+            .unwrap();
+        assert!(d.ctx_len <= d.max_ctx_len);
+        assert_eq!(d.ctx_positions.len(), d.ctx_len);
+        assert_eq!(*markers(&gpu, &d).last().unwrap(), 1000 + i);
+    }
+}
+
+#[test]
+fn both_decode_append_sites_slide() {
+    let propose = include_str!("propose.rs");
+    let leader = include_str!("tp/leader.rs");
+    for (name, src) in [("propose.rs", propose), ("tp/leader.rs", leader)] {
+        assert!(src.contains("decode_append("), "{name} must call decode_append(");
+        assert!(
+            !src.contains("ctx_len < dstate.max_ctx_len"),
+            "{name} still skips the append at a full window"
+        );
+    }
+}

@@ -222,6 +222,31 @@ impl DflashProposerState {
         self.ctx_committed = 0;
         Ok(Some(s))
     }
+
+    /// 2026-10-17 (A201): The decode-time append of one ctx row: slide first if the window is
+    /// full (`make_room_for`), then copy one `ctx_slot_bytes` row from `row`, stamp
+    /// `position`, and grow `ctx_len`. Before A201 both decode sites skipped the append at a
+    /// full window, so after a prompt of at least the window the drafter never saw a new
+    /// token. Returns the slide applied, if any.
+    pub fn decode_append(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        row: DevicePtr,
+        position: i32,
+        stream: u64,
+    ) -> Result<Option<CtxSlide>> {
+        let slide = self.make_room_for(gpu, 1, stream)?;
+        gpu.copy_d2d_async(
+            row,
+            self.ctx_hidden_acc.offset(self.ctx_len * self.ctx_slot_bytes),
+            self.ctx_slot_bytes,
+            stream,
+        )?;
+        debug_assert_eq!(self.ctx_positions.len(), self.ctx_len);
+        self.ctx_positions.push(position);
+        self.ctx_len += 1;
+        Ok(slide)
+    }
 }
 
 /// 2026-10-10: The prompt positions a DFlash prefill capture keeps: the last `max_ctx_len` of

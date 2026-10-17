@@ -114,18 +114,25 @@ impl BlockDiffusionDraftHead {
         if !self.levers.no_decode_append
             && !eagle_skip
             && let Some(latest_ctx) = target_hidden_stack
-            && dstate.ctx_len < dstate.max_ctx_len
         {
-            ctx.gpu.copy_d2d_async(
+            // 2026-10-17 (A201): a full window slides (A200) instead of skipping the append;
+            // the slide sets `ctx_committed = 0`, and the follower conforms from the header.
+            if let Some(s) = dstate.decode_append(
+                ctx.gpu,
                 latest_ctx,
-                dstate
-                    .ctx_hidden_acc
-                    .offset(dstate.ctx_len * dstate.ctx_slot_bytes),
-                dstate.ctx_slot_bytes,
+                position.saturating_sub(1) as i32,
                 stream,
-            )?;
-            dstate.ctx_positions.push(position.saturating_sub(1) as i32);
-            dstate.ctx_len += 1;
+            )? {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        "DFlash ctx slide (decode append, TP leader): dropped {} oldest, keep {} (window {}); first at this site",
+                        s.drop,
+                        s.keep,
+                        dstate.max_ctx_len
+                    )
+                });
+            }
         }
         anyhow::ensure!(
             dstate.ctx_positions.len() == dstate.ctx_len

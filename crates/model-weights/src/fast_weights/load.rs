@@ -81,19 +81,31 @@ impl WeightLoader for FastSafetensorsLoader {
         let pick: &dyn Fn(&str, crate::weights::WeightDtype) -> bool = &arena_pick;
         let arena_sel: arena_plan::ArenaSel<'_> = self.arena.as_ref().map(|_| (&arena, pick));
 
+        // 2026-10-17: Group the index by the path `resolve_shards` built for each value
+        // (`model_dir.join(value)`), not by file name: nvidia/GLM-5.3-Flash-FP4-Local routes
+        // 214 tensors to `tensors/native-QB.safetensors`, and the bare file name matched no
+        // index value, so that shard silently loaded 0 tensors.
+        let mut by_shard: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        if let Some(map) = &tensor_to_shard {
+            for (t, s) in map {
+                by_shard
+                    .entry(model_dir.join(s))
+                    .or_default()
+                    .push(t.clone());
+            }
+        }
+
         for (i, shard_path) in shard_files.iter().enumerate() {
             // When an index is present, only load the tensors it routes here;
             // otherwise load everything in the shard. `None` means "load all".
             let shard_name = shard_path
-                .file_name()
-                .and_then(|n| n.to_str())
+                .strip_prefix(model_dir)
+                .ok()
+                .and_then(|p| p.to_str())
                 .unwrap_or_default();
-            let tensor_filter: Option<Vec<String>> = tensor_to_shard.as_ref().map(|map| {
-                map.iter()
-                    .filter(|(_, s)| *s == shard_name)
-                    .map(|(t, _)| t.clone())
-                    .collect()
-            });
+            let tensor_filter: Option<Vec<String>> = tensor_to_shard
+                .as_ref()
+                .map(|_| by_shard.get(shard_path).cloned().unwrap_or_default());
 
             tracing::info!(
                 "Fast-loading shard {}/{}: {}{}",

@@ -411,6 +411,10 @@ fn advise_prefetch_shard(file: &File, shard_path: &Path, file_size: u64) {
 fn advise_prefetch_shard(_file: &File, _shard_path: &Path, _file_size: u64) {}
 
 #[cfg(test)]
+#[path = "subdir_shard_tests.rs"]
+mod subdir_shard_tests;
+
+#[cfg(test)]
 mod skip_vision_tests {
     use super::{FastSafetensorsLoader, is_vision_tensor};
 

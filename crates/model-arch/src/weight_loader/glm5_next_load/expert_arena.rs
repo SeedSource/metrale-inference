@@ -81,7 +81,10 @@ pub fn expert_upload_sizes(
         for proj in ["gate_proj", "up_proj", "down_proj"] {
             if let Some((rows, cols)) = uploaded_shape(store, layer, id, proj, cfg) {
                 sizes.push(rows * cols / 2);
-                sizes.push(rows * cols / 16);
+                // 2026-10-17: csfcar: a scale `precode_csf_layer` encoded uploads its encoding.
+                sizes.push(
+                    super::expert_tp_bind::pending_len(layer, id, proj).unwrap_or(rows * cols / 16),
+                );
             }
         }
     }

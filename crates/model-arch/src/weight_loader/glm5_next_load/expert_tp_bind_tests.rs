@@ -142,7 +142,12 @@ fn expert_tp_bind_uploads_exactly_this_ranks_slice_of_a_packed_expert() {
             let o = &offs[3 * k..3 * k + 3];
             for (leaf, off, shape, dtype) in [
                 ("weight", o[0], vec![rows, cols / 2], WeightDtype::UInt8),
-                ("weight_scale", o[1], vec![rows, cols / 16], WeightDtype::FP8E4M3),
+                (
+                    "weight_scale",
+                    o[1],
+                    vec![rows, cols / 16],
+                    WeightDtype::FP8E4M3,
+                ),
                 ("weight_scale_2", o[2], vec![], WeightDtype::FP32),
             ] {
                 let name = qualified(&format!("{base}.{leaf}"));
@@ -202,7 +207,14 @@ fn expert_tp_bind_quantises_a_bf16_expert_whole_then_slices_it() {
     for (k, p) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
         let (rows, cols) = shape_of(p);
         let name = qualified(&format!("mlp.experts.0.{p}.weight"));
-        defer(&mut store, name, &path, offs[k], vec![rows, cols], WeightDtype::BF16);
+        defer(
+            &mut store,
+            name,
+            &path,
+            offs[k],
+            vec![rows, cols],
+            WeightDtype::BF16,
+        );
     }
 
     let gpu_full = MockGpuBackend::new();
@@ -260,7 +272,14 @@ fn expert_tp_bind_refuses_resident_and_misshapen_experts() {
     let (path, offs) = stage("narrow", &[zeros.as_slice()]);
     let mut store = WeightStore::from_map(HashMap::new());
     let name = qualified("mlp.experts.0.gate_proj.weight");
-    defer(&mut store, name, &path, offs[0], vec![32, HIDDEN / 2], WeightDtype::UInt8);
+    defer(
+        &mut store,
+        name,
+        &path,
+        offs[0],
+        vec![32, HIDDEN / 2],
+        WeightDtype::UInt8,
+    );
     let err = bind_expert_cfg(&gpu, &store, LAYER, 0, &cfg(0, true))
         .unwrap_err()
         .to_string();
@@ -283,7 +302,12 @@ fn expert_tp_off_binds_exactly_what_bind_expert_binds() {
         gpu.copy_h2d(&0.5f32.to_le_bytes(), s2).unwrap();
         for (leaf, ptr, shape, dtype) in [
             ("weight", w, vec![rows, cols / 2], WeightDtype::UInt8),
-            ("weight_scale", s, vec![rows, cols / 16], WeightDtype::FP8E4M3),
+            (
+                "weight_scale",
+                s,
+                vec![rows, cols / 16],
+                WeightDtype::FP8E4M3,
+            ),
             ("weight_scale_2", s2, vec![], WeightDtype::FP32),
         ] {
             let t = WeightTensor { ptr, shape, dtype };
@@ -372,19 +396,55 @@ fn expert_tp_bind_decodes_csf32_scales_then_slices_like_plain() {
             let n = |i: usize| blobs[7 * k + i].len();
             for (leaf, off, shape, dtype) in [
                 ("weight", o[0], vec![rows, cols / 2], WeightDtype::UInt8),
-                ("weight_scale.csf32_bases", o[1], vec![n(1)], WeightDtype::UInt8),
-                ("weight_scale.csf32_codes", o[2], vec![n(2)], WeightDtype::UInt8),
-                ("weight_scale.csf32_offsets", o[3], vec![n(3) / 2], WeightDtype::UInt16),
-                ("weight_scale.csf32_page_bases", o[4], vec![n(4) / 4], WeightDtype::UInt32),
-                ("weight_scale.csf32_exceptions", o[5], vec![n(5) / 2], WeightDtype::UInt16),
+                (
+                    "weight_scale.csf32_bases",
+                    o[1],
+                    vec![n(1)],
+                    WeightDtype::UInt8,
+                ),
+                (
+                    "weight_scale.csf32_codes",
+                    o[2],
+                    vec![n(2)],
+                    WeightDtype::UInt8,
+                ),
+                (
+                    "weight_scale.csf32_offsets",
+                    o[3],
+                    vec![n(3) / 2],
+                    WeightDtype::UInt16,
+                ),
+                (
+                    "weight_scale.csf32_page_bases",
+                    o[4],
+                    vec![n(4) / 4],
+                    WeightDtype::UInt32,
+                ),
+                (
+                    "weight_scale.csf32_exceptions",
+                    o[5],
+                    vec![n(5) / 2],
+                    WeightDtype::UInt16,
+                ),
                 ("weight_scale_2", o[6], vec![], WeightDtype::FP32),
             ] {
-                defer(&mut store, qualified(&format!("{base}.{leaf}")), &path, off, shape, dtype);
+                defer(
+                    &mut store,
+                    qualified(&format!("{base}.{leaf}")),
+                    &path,
+                    off,
+                    shape,
+                    dtype,
+                );
             }
         }
         let gpu = MockGpuBackend::new();
         let e = bind_expert_cfg(&gpu, &store, LAYER, 1, &cfg(rank, true)).unwrap();
-        for (p, got) in [("gate_proj", &e.gate_proj), ("up_proj", &e.up_proj), ("down_proj", &e.down_proj)] {
+        for (p, got) in [
+            ("gate_proj", &e.gate_proj),
+            ("up_proj", &e.up_proj),
+            ("down_proj", &e.down_proj),
+        ] {
             let (rows, cols) = shape_of(p);
             let want = slice_nvfp4(&full[p], rows, cols, Cut::of(p), rank, 2).unwrap();
             let (packed, scale) = read(&gpu, got);
@@ -393,8 +453,119 @@ fn expert_tp_bind_decodes_csf32_scales_then_slices_like_plain() {
             assert_eq!(got.scale_2, full[p].scale_2, "rank {rank} {p}: scale_2");
         }
         // Lever off: csf scales are refused by name, not read as a missing plain scale.
-        let err = bind_expert_cfg(&gpu, &store, LAYER, 1, &cfg(rank, false)).unwrap_err().to_string();
+        let err = bind_expert_cfg(&gpu, &store, LAYER, 1, &cfg(rank, false))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("METRALE_GLM_EXPERT_TP=1"), "{err}");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 2026-10-17: csfcar: the packed expert of the first test bound with scale rows. Each rank's
+/// scale pointer is tagged, its row section holds exactly `scale_rows::encode` of that rank's
+/// plain slice (which decodes back to it), the packed bytes are unchanged; and a layer encoded
+/// first (`precode_csf_layer_on`, the arena plan's path) binds the same bytes, reports their
+/// sizes to the plan, and leaves nothing parked.
+#[test]
+fn expert_tp_bind_holds_checkpoint_scales_as_scale_rows() {
+    use super::expert_tp_bind::{bind_expert_tp_csf, pending_len, precode_csf_layer_on};
+    use crate::glm5next_mlp::scale_rows;
+    let mut full = HashMap::new();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    for (k, p) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+        let (rows, cols) = shape_of(p);
+        // Scale bytes in a narrow band with a few outliers, like the checkpoint's.
+        let scale: Vec<u8> = bytes(40 + k as u64, rows * cols / 16)
+            .into_iter()
+            .map(|b| if b % 50 == 0 { b } else { 90 + b % 12 })
+            .collect();
+        let h = Nvfp4Host {
+            packed: bytes(3 + k as u64, rows * cols / 2),
+            scale,
+            scale_2: 0.01,
+            input_scale: 0.0,
+        };
+        blobs.push(h.packed.clone());
+        blobs.push(h.scale.clone());
+        blobs.push(0.01f32.to_le_bytes().to_vec());
+        full.insert(*p, h);
+    }
+    let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+    let (path, offs) = stage("csfrows", &refs);
+    for rank in 0..2 {
+        let mut store = WeightStore::from_map(HashMap::new());
+        for id in 0..2 {
+            for (k, p) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+                let (rows, cols) = shape_of(p);
+                let o = &offs[3 * k..3 * k + 3];
+                for (leaf, off, shape, dtype) in [
+                    ("weight", o[0], vec![rows, cols / 2], WeightDtype::UInt8),
+                    (
+                        "weight_scale",
+                        o[1],
+                        vec![rows, cols / 16],
+                        WeightDtype::FP8E4M3,
+                    ),
+                    ("weight_scale_2", o[2], vec![], WeightDtype::FP32),
+                ] {
+                    let name = qualified(&format!("mlp.experts.{id}.{p}.{leaf}"));
+                    defer(&mut store, name, &path, off, shape, dtype);
+                }
+            }
+        }
+        let c = cfg(rank, true);
+        for precode in [false, true] {
+            if precode {
+                precode_csf_layer_on(&store, LAYER, &c).unwrap();
+            }
+            for id in 0..2 {
+                let gpu = MockGpuBackend::new();
+                let e = bind_expert_tp_csf(&gpu, &store, LAYER, id, &c, true).unwrap();
+                for (p, got) in [
+                    ("gate_proj", &e.gate_proj),
+                    ("up_proj", &e.up_proj),
+                    ("down_proj", &e.down_proj),
+                ] {
+                    let (rows, cols) = shape_of(p);
+                    let want = slice_nvfp4(&full[p], rows, cols, Cut::of(p), rank, 2).unwrap();
+                    let (rr, cc) = match Cut::of(p) {
+                        Cut::Rows => (rows / 2, cols / 16),
+                        Cut::Cols => (rows, cols / 32),
+                    };
+                    let enc = scale_rows::encode(rr, cc, &want.scale).unwrap();
+                    assert_eq!(scale_rows::decode(rr, cc, &enc).unwrap(), want.scale);
+                    assert_eq!(
+                        got.scale.0 & 1,
+                        1,
+                        "rank {rank} {p}: scale pointer not tagged"
+                    );
+                    let base =
+                        metrale_gpu_runtime::gpu::DevicePtr((got.scale.0 ^ 1) - enc.head as u64);
+                    assert_eq!(
+                        gpu.read_alloc(base).unwrap(),
+                        enc.bytes,
+                        "rank {rank} {p} precode {precode}: scale rows"
+                    );
+                    assert_eq!(
+                        gpu.read_alloc(got.packed).unwrap(),
+                        want.packed,
+                        "rank {rank} {p}: packed"
+                    );
+                    if precode {
+                        assert_eq!(pending_len(LAYER, id, p), None, "taken by the bind");
+                    }
+                }
+            }
+        }
+        // a second precode of the same layer with nothing left over is fine; one with leftovers
+        // refuses
+        precode_csf_layer_on(&store, LAYER, &c).unwrap();
+        assert!(pending_len(LAYER, 0, "gate_proj").is_some());
+        assert!(precode_csf_layer_on(&store, LAYER, &c).is_err());
+        for id in 0..2 {
+            let gpu = MockGpuBackend::new();
+            bind_expert_tp_csf(&gpu, &store, LAYER, id, &c, true).unwrap();
+        }
     }
     let _ = std::fs::remove_file(&path);
 }

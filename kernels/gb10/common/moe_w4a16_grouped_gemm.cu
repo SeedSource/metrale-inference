@@ -24,6 +24,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "moe_scale_rows.cuh"
 
 #define M_TILE 64
 #define N_TILE 64
@@ -328,7 +329,8 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable(
                     unsigned int nibble = (gk & 1) ? (packed_byte >> 4) : (packed_byte & 0xF);
 
 
-                    unsigned char scale_byte = S_expert[(unsigned long long)gn * num_groups + scale_group];
+                    // 2026-10-17: plain or tagged scale rows (moe_scale_rows.cuh).
+                    unsigned char scale_byte = moe_scale_byte(S_expert, gn, num_groups, scale_group);
                     float fp8_val;
                     {
                         __nv_fp8_e4m3 fp8;
@@ -1066,8 +1068,9 @@ __device__ __forceinline__ void moe_w4a16_grouped_core(
                     } else {
                         const unsigned char* bp =
                             B_expert + (unsigned long long)gn * half_K + (gk / 2);
+                        // 2026-10-17: plain or tagged scale rows (moe_scale_rows.cuh).
                         unsigned char sb =
-                            S_expert[(unsigned long long)gn * num_groups + (gk / GROUP_SIZE)];
+                            moe_scale_byte(S_expert, gn, num_groups, gk / GROUP_SIZE);
                         __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;
                         sc = (float)fp8 * scale2;
                         w0 = *(const unsigned int*)(bp);

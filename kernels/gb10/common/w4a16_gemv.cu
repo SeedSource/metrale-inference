@@ -23,6 +23,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "moe_scale_rows.cuh"
 
 // 2026-09-25: Software E4M3 decode for the SCALE and HIP builds: exponent 0 is subnormal
 // (m * 2^-9), and the NaN code (exponent 15, mantissa 7) decodes to 0. CUDA builds use the
@@ -141,7 +142,8 @@ __device__ __forceinline__ float w4a16_gemv_partial(
                                             a_hi.x, a_hi.y, a_hi.z, a_hi.w};
             unsigned long long packed8 = *(const unsigned long long*)(
                 B_packed + (unsigned long long)n * half_K + kk * 8);
-            unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + kk];
+            // 2026-10-17: plain or tagged scale rows (moe_scale_rows.cuh).
+            unsigned char scale_byte = moe_scale_byte(B_scale, n, num_groups, kk);
             __nv_fp8_e4m3 fp8;
             *(unsigned char*)&fp8 = scale_byte;
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
@@ -2747,7 +2749,8 @@ __device__ __forceinline__ void w4a16_gemv_partial_rows(
 
             unsigned long long packed8 = *(const unsigned long long*)(
                 B_packed + (unsigned long long)n * half_K + kk * 8);
-            unsigned char scale_byte = B_scale[(unsigned long long)n * num_groups + kk];
+            // 2026-10-17: plain or tagged scale rows (moe_scale_rows.cuh).
+            unsigned char scale_byte = moe_scale_byte(B_scale, n, num_groups, kk);
             __nv_fp8_e4m3 fp8;
             *(unsigned char*)&fp8 = scale_byte;
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
@@ -3014,8 +3017,8 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
         const bool ok = n < N;
         q[c][0] = (ok && v0) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk0 * 8) : 0ull;
         q[c][1] = (ok && v1) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk1 * 8) : 0ull;
-        sb[c][0] = (ok && v0) ? B_scale[(unsigned long long)n * num_groups + kk0] : (unsigned char)0;
-        sb[c][1] = (ok && v1) ? B_scale[(unsigned long long)n * num_groups + kk1] : (unsigned char)0;
+        sb[c][0] = (ok && v0) ? moe_scale_byte(B_scale, n, num_groups, kk0) : (unsigned char)0;
+        sb[c][1] = (ok && v1) ? moe_scale_byte(B_scale, n, num_groups, kk1) : (unsigned char)0;
     }
 
     // 2026-10-08: Stage the live rows' activations as FP32 (exact) and the E2M1 table.
@@ -3088,8 +3091,8 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_down_body(
                 const bool ok = (p + 1 < MOE_DOWN_FAST_COLS_PER_WARP / 2) && n < N;
                 q[c][0] = (ok && v0) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk0 * 8) : 0ull;
                 q[c][1] = (ok && v1) ? *(const unsigned long long*)(B_packed + (unsigned long long)n * half_K + kk1 * 8) : 0ull;
-                sb[c][0] = (ok && v0) ? B_scale[(unsigned long long)n * num_groups + kk0] : (unsigned char)0;
-                sb[c][1] = (ok && v1) ? B_scale[(unsigned long long)n * num_groups + kk1] : (unsigned char)0;
+                sb[c][0] = (ok && v0) ? moe_scale_byte(B_scale, n, num_groups, kk0) : (unsigned char)0;
+                sb[c][1] = (ok && v1) ? moe_scale_byte(B_scale, n, num_groups, kk1) : (unsigned char)0;
             }
         }
 
@@ -3320,7 +3323,6 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
             + (unsigned int)j * N_PER_BLOCK_SW + w;
         if (n >= N) break;
         const unsigned long long wo = (unsigned long long)n * half_K;
-        const unsigned long long so = (unsigned long long)n * num_groups;
 
         float t[2];
         #pragma unroll
@@ -3339,8 +3341,8 @@ __device__ __forceinline__ void w4a16_gemv_sw_moe_batchm_gateup_body(
                      kk < K16; kk += 128u) {
                     const unsigned long long q0 = ok0 ? *(const unsigned long long*)(Bp0 + wo + kk * 8) : 0ull;
                     const unsigned long long q1 = ok1 ? *(const unsigned long long*)(Bp1 + wo + kk * 8) : 0ull;
-                    const unsigned char b0 = ok0 ? Bs0[so + kk] : (unsigned char)0;
-                    const unsigned char b1 = ok1 ? Bs1[so + kk] : (unsigned char)0;
+                    const unsigned char b0 = ok0 ? moe_scale_byte(Bs0, n, num_groups, kk) : (unsigned char)0;
+                    const unsigned char b1 = ok1 ? moe_scale_byte(Bs1, n, num_groups, kk) : (unsigned char)0;
                     __nv_fp8_e4m3 f0, f1;
                     *(unsigned char*)&f0 = b0;
                     *(unsigned char*)&f1 = b1;

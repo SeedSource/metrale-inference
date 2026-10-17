@@ -790,8 +790,10 @@ __global__ void pack_weight_sfb_batched_k(
   }
   const int col = (int)(idx / groups);
   const int group = (int)(idx % groups);
+  // 2026-10-17: n-major reads go through moe_scale_byte (plain or tagged scale rows); a tagged
+  // pointer is only ever n-major (the GLM expert scales).
   unsigned char metrale_scale =
-      src_n_major ? src[(unsigned long long)col * groups + group]
+      src_n_major ? moe_scale_byte(src, (unsigned long long)col, (unsigned int)groups, (unsigned int)group)
                   : src[(unsigned long long)group * n + col];
   __nv_fp8_e4m3 in;
   *reinterpret_cast<unsigned char*>(&in) = metrale_scale;

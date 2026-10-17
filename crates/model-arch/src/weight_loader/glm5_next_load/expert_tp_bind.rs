@@ -18,7 +18,11 @@
 //! - At most one projection's host bytes are held at a time; each is dropped once uploaded.
 
 use super::*;
-use crate::glm5next_mlp::expert_tp::{Cut, Nvfp4Host, row_range, slice_nvfp4};
+use crate::glm5next_mlp::expert_tp::{Cut, Nvfp4Host, col_part, row_range, slice_nvfp4};
+use crate::glm5next_mlp::scale_rows::{self, ScaleRows};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// 2026-10-05: The ledger label of every buffer [`upload_slice`] adopts.
 const EXPERT_TP_LABEL: &str = "glm5_next routed expert, expert-TP slice";
@@ -32,10 +36,35 @@ pub(super) fn bind_expert_tp(
     id: usize,
     cfg: &Glm5NextMlpConfig,
 ) -> Result<Glm5NextExpertWeights> {
+    bind_expert_tp_csf(gpu, store, layer, id, cfg, csf_scales_enabled(cfg)?)
+}
+
+/// 2026-10-17: [`bind_expert_tp`] with the csfcar choice made by the caller (tests drive both
+/// arms without the process-wide lever).
+pub(super) fn bind_expert_tp_csf(
+    gpu: &dyn GpuBackend,
+    store: &WeightStore,
+    layer: usize,
+    id: usize,
+    cfg: &Glm5NextMlpConfig,
+    csf: bool,
+) -> Result<Glm5NextExpertWeights> {
     let proj = |p: &str| -> Result<Nvfp4Proj> {
         let base = format!("mlp.experts.{id}.{p}");
         let host = slice_proj(gpu, store, layer, &base, Cut::of(p), cfg)?;
-        upload_slice(gpu, store, host)
+        // 2026-10-17: `METRALE_GLM_MOE_CSF_SCALES=1`: a checkpoint NVFP4 scale (not one
+        // quantised here from BF16) is held as scale rows: the encoding `precode_csf_layer` made
+        // for the arena plan, or encoded now.
+        let rows = if csf && is_u8_checkpoint(store, layer, &base) {
+            Some(match take_pending(layer, id, p) {
+                Some(r) => r,
+                None => encode_rank_scale(&host.scale, Cut::of(p), cfg)
+                    .with_context(|| qualify(layer, &base))?,
+            })
+        } else {
+            None
+        };
+        upload_slice(gpu, store, host, rows)
     };
     Ok(Glm5NextExpertWeights {
         gate_proj: proj("gate_proj")?,
@@ -64,7 +93,12 @@ impl ScaleSrc<'_> {
             Self::Decoded(v) => v
                 .get(start..start + len)
                 .map(<[u8]>::to_vec)
-                .with_context(|| format!("decoded scale range {start}+{len} outside {} bytes", v.len())),
+                .with_context(|| {
+                    format!(
+                        "decoded scale range {start}+{len} outside {} bytes",
+                        v.len()
+                    )
+                }),
         }
     }
 }
@@ -72,22 +106,44 @@ impl ScaleSrc<'_> {
 /// 2026-10-16: `base`'s csf_32x2_v1 scale decoded to plain `[rows, c]` E4M3 bytes, or `None` when
 /// the projection has no `.weight_scale.csf32_bases` (every checkpoint but FP4-Local). All five
 /// parts are routed-expert tensors, so deferred with the weight; a missing part is an error.
-fn csf32_scale(store: &WeightStore, layer: usize, base: &str, rows: usize, c: usize) -> Result<Option<Vec<u8>>> {
+fn csf32_scale(
+    store: &WeightStore,
+    layer: usize,
+    base: &str,
+    rows: usize,
+    c: usize,
+) -> Result<Option<Vec<u8>>> {
     let part = |p: &str| qualify(layer, &format!("{base}.weight_scale.csf32_{p}"));
     if store.deferred(&part("bases")).is_none() {
         return Ok(None);
     }
     let read = |p: &str| -> Result<Vec<u8>> {
         let n = part(p);
-        let d = store.deferred(&n).with_context(|| format!("{n}: csf_32x2_v1 part missing or not deferred"))?;
-        d.read_host_range(0, d.byte_size()).with_context(|| format!("{n}: reading from its shard"))
+        let d = store
+            .deferred(&n)
+            .with_context(|| format!("{n}: csf_32x2_v1 part missing or not deferred"))?;
+        d.read_host_range(0, d.byte_size())
+            .with_context(|| format!("{n}: reading from its shard"))
     };
-    let u16s = |v: Vec<u8>| v.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect::<Vec<_>>();
+    let u16s = |v: Vec<u8>| {
+        v.chunks_exact(2)
+            .map(|x| u16::from_le_bytes([x[0], x[1]]))
+            .collect::<Vec<_>>()
+    };
     let (bases, codes) = (read("bases")?, read("codes")?);
     let offsets = u16s(read("offsets")?);
-    let page_bases: Vec<u32> = read("page_bases")?.chunks_exact(4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])).collect();
+    let page_bases: Vec<u32> = read("page_bases")?
+        .chunks_exact(4)
+        .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+        .collect();
     let exceptions = u16s(read("exceptions")?);
-    let parts = super::csf32::Csf32Parts { bases: &bases, codes: &codes, offsets: &offsets, page_bases: &page_bases, exceptions: &exceptions };
+    let parts = super::csf32::Csf32Parts {
+        bases: &bases,
+        codes: &codes,
+        offsets: &offsets,
+        page_bases: &page_bases,
+        exceptions: &exceptions,
+    };
     super::csf32::decode(&qualify(layer, base), rows, c, &parts).map(Some)
 }
 
@@ -250,7 +306,14 @@ fn scalar_f32(gpu: &dyn GpuBackend, store: &WeightStore, name: &str) -> Result<f
 
 /// 2026-10-05: Upload one slice's packed codes and block scales; the store's derived-weight
 /// ledger adopts both buffers, so the store owns them. The host bytes are dropped on return.
-fn upload_slice(gpu: &dyn GpuBackend, store: &WeightStore, h: Nvfp4Host) -> Result<Nvfp4Proj> {
+/// 2026-10-17: With `rows` (csfcar), the block scale uploaded is that encoding, and the
+/// projection's scale pointer is its tagged row section (`ScaleRows::device_ptr`).
+fn upload_slice(
+    gpu: &dyn GpuBackend,
+    store: &WeightStore,
+    h: Nvfp4Host,
+    rows: Option<ScaleRows>,
+) -> Result<Nvfp4Proj> {
     let up = |b: &[u8]| -> Result<DevicePtr> {
         // 2026-10-06: Into the derived weight arena when this layer planned it
         // (`METRALE_GLM_WEIGHT_ARENA=1`, `expert_arena::plan_expert_layer`); else one allocation.
@@ -262,10 +325,203 @@ fn upload_slice(gpu: &dyn GpuBackend, store: &WeightStore, h: Nvfp4Host) -> Resu
         store.derived().adopt(EXPERT_TP_LABEL, p, b.len());
         Ok(p)
     };
+    let scale = match rows {
+        Some(r) => DevicePtr(r.device_ptr(up(&r.bytes)?.0)),
+        None => up(&h.scale)?,
+    };
     Ok(Nvfp4Proj {
         packed: up(&h.packed)?,
-        scale: up(&h.scale)?,
+        scale,
         scale_2: h.scale_2,
         input_scale: h.input_scale,
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2026-10-17: csfcar (`METRALE_GLM_MOE_CSF_SCALES=1`): routed-expert block scales held as scale
+// rows (`glm5next_mlp::scale_rows`). The arena plan (`expert_arena::expert_upload_sizes`) needs
+// each buffer's exact size before the bind, and an encoded size depends on the bytes, so
+// `precode_csf_layer` encodes this rank's scale slices of a layer first and parks them here;
+// the bind takes them (`take_pending`). Without the arena the bind encodes on its own.
+// Invariants: the parked map is empty after each layer's bind (`precode_csf_layer` refuses a
+// leftover); an encoding is of exactly the bytes `slice_proj` uploads plain (same `ScaleSrc`,
+// same row range or `col_part`), so the plan and the bind agree.
+// ---------------------------------------------------------------------------------------------
+
+type PendingKey = (usize, usize, String);
+static PENDING: Mutex<BTreeMap<PendingKey, ScaleRows>> = Mutex::new(BTreeMap::new());
+static CSF_PLAIN: AtomicUsize = AtomicUsize::new(0);
+static CSF_HELD: AtomicUsize = AtomicUsize::new(0);
+static CSF_EXC: AtomicUsize = AtomicUsize::new(0);
+
+/// 2026-10-17: Whether the bind holds checkpoint scales as scale rows: the lever, checked
+/// against what it needs (expert-TP) and what it cannot serve (the W4A16 prefill-MMA kernel
+/// reads plain scales).
+pub(super) fn csf_scales_enabled(cfg: &Glm5NextMlpConfig) -> Result<bool> {
+    if !metrale_config::glm_moe_csf_scales() {
+        return Ok(false);
+    }
+    if !cfg.is_expert_tp() {
+        bail!(
+            "METRALE_GLM_MOE_CSF_SCALES=1 needs METRALE_GLM_EXPERT_TP=1 (it encodes the expert-TP slices); unset one"
+        );
+    }
+    if std::env::var("METRALE_GLM_MOE_PREFILL_GROUPED_W4A16").as_deref() == Ok("1") {
+        bail!(
+            "METRALE_GLM_MOE_CSF_SCALES=1 with METRALE_GLM_MOE_PREFILL_GROUPED_W4A16=1: moe_w4a16_prefill_mma reads plain scales; unset one"
+        );
+    }
+    Ok(true)
+}
+
+/// Whether `base`'s weight is a packed U8 NVFP4 checkpoint tensor (its scale comes from the
+/// checkpoint; a BF16 one is quantised at bind and keeps plain scales).
+fn is_u8_checkpoint(store: &WeightStore, layer: usize, base: &str) -> bool {
+    store
+        .deferred(&qualify(layer, &format!("{base}.weight")))
+        .is_some_and(|d| d.dtype == WeightDtype::UInt8)
+}
+
+/// 2026-10-17: Encode this rank's plain scale slice (`[rows, c]` after the cut).
+fn encode_rank_scale(scale: &[u8], cut: Cut, cfg: &Glm5NextMlpConfig) -> Result<ScaleRows> {
+    let (rows, c) = match cut {
+        Cut::Rows => (cfg.moe_intermediate, cfg.hidden / 16),
+        Cut::Cols => (cfg.hidden, cfg.moe_intermediate / 16),
+    };
+    let r = scale_rows::encode(rows, c, scale)?;
+    CSF_PLAIN.fetch_add(scale.len(), Ordering::Relaxed);
+    CSF_HELD.fetch_add(r.bytes.len(), Ordering::Relaxed);
+    CSF_EXC.fetch_add(r.exceptions, Ordering::Relaxed);
+    Ok(r)
+}
+
+/// This rank's plain scale slice of projection `base`, read exactly as `slice_proj` reads it.
+fn rank_scale(
+    store: &WeightStore,
+    layer: usize,
+    base: &str,
+    cut: Cut,
+    cfg: &Glm5NextMlpConfig,
+) -> Result<Vec<u8>> {
+    let wname = qualify(layer, &format!("{base}.weight"));
+    let d = store
+        .deferred(&wname)
+        .with_context(|| format!("{wname}: not deferred"))?;
+    let [rows, half_k] = d.shape[..] else {
+        bail!("{wname}: packed NVFP4 must be 2-D, got shape {:?}", d.shape);
+    };
+    let cols = half_k * 2;
+    let sname = qualify(layer, &format!("{base}.weight_scale"));
+    let s = match csf32_scale(store, layer, base, rows, cols / 16)? {
+        Some(full) => ScaleSrc::Decoded(full),
+        None => ScaleSrc::Plain(
+            store
+                .deferred(&sname)
+                .with_context(|| format!("{sname}: not deferred"))?,
+        ),
+    };
+    let (rank, world) = (cfg.ep_rank, cfg.ep_world_size);
+    match cut {
+        Cut::Rows => {
+            let sr = row_range(s.byte_size(), rows, rank, world)?;
+            s.read_host_range(sr.start, sr.len())
+        }
+        Cut::Cols => col_part(&s.read_host_range(0, s.byte_size())?, rows, rank, world),
+    }
+}
+
+/// 2026-10-17: Encode and park every checkpoint-NVFP4 scale slice layer `layer` will bind on
+/// this rank (lever on); the arena plan reads their sizes ([`pending_len`]). Logs the layer's
+/// totals. A no-op with the lever off.
+pub(super) fn precode_csf_layer(
+    store: &WeightStore,
+    layer: usize,
+    cfg: &Glm5NextMlpConfig,
+) -> Result<()> {
+    if !csf_scales_enabled(cfg)? {
+        return Ok(());
+    }
+    precode_csf_layer_on(store, layer, cfg)
+}
+
+/// 2026-10-17: [`precode_csf_layer`]'s body, lever check left to the caller (tests).
+pub(super) fn precode_csf_layer_on(
+    store: &WeightStore,
+    layer: usize,
+    cfg: &Glm5NextMlpConfig,
+) -> Result<()> {
+    let mut map = PENDING
+        .lock()
+        .map_err(|_| anyhow::anyhow!("csf scale cache poisoned"))?;
+    if !map.is_empty() {
+        bail!(
+            "glm5_next layer {layer}: {} encoded scales left over from an earlier layer's bind",
+            map.len()
+        );
+    }
+    let (p0, h0, e0) = (
+        CSF_PLAIN.load(Ordering::Relaxed),
+        CSF_HELD.load(Ordering::Relaxed),
+        CSF_EXC.load(Ordering::Relaxed),
+    );
+    for id in cfg.local_expert_range() {
+        for p in ["gate_proj", "up_proj", "down_proj"] {
+            let base = format!("mlp.experts.{id}.{p}");
+            if !is_u8_checkpoint(store, layer, &base) {
+                continue;
+            }
+            let cut = Cut::of(p);
+            let plain =
+                rank_scale(store, layer, &base, cut, cfg).with_context(|| qualify(layer, &base))?;
+            let r = encode_rank_scale(&plain, cut, cfg).with_context(|| qualify(layer, &base))?;
+            map.insert((layer, id, p.to_string()), r);
+        }
+    }
+    let (p1, h1, e1) = (
+        CSF_PLAIN.load(Ordering::Relaxed),
+        CSF_HELD.load(Ordering::Relaxed),
+        CSF_EXC.load(Ordering::Relaxed),
+    );
+    if p0 == 0 && p1 > 0 {
+        tracing::warn!(
+            "METRALE_GLM_MOE_CSF_SCALES=1: ENGAGED - routed-expert block scales held as scale rows (moe_scale_byte)"
+        );
+    }
+    if p1 > p0 {
+        tracing::info!(
+            "glm5_next layer {layer}: csf scales {} projections, {} -> {} bytes ({:.2}%), {} exceptions; rank total {} -> {} bytes",
+            map.len(),
+            p1 - p0,
+            h1 - h0,
+            100.0 * (h1 - h0) as f64 / (p1 - p0) as f64,
+            e1 - e0,
+            p1,
+            h1
+        );
+    }
+    Ok(())
+}
+
+/// 2026-10-17: The parked encoding's size for (layer, expert, projection), if any.
+pub(super) fn pending_len(layer: usize, id: usize, proj: &str) -> Option<usize> {
+    PENDING
+        .lock()
+        .ok()?
+        .get(&(layer, id, proj.to_string()))
+        .map(|r| r.bytes.len())
+}
+
+fn take_pending(layer: usize, id: usize, proj: &str) -> Option<ScaleRows> {
+    PENDING.lock().ok()?.remove(&(layer, id, proj.to_string()))
+}
+
+/// 2026-10-17: Plain vs held scale bytes and exceptions encoded so far on this rank (boot log,
+/// tests).
+#[allow(dead_code)]
+pub(super) fn csf_totals() -> (usize, usize, usize) {
+    (
+        CSF_PLAIN.load(Ordering::Relaxed),
+        CSF_HELD.load(Ordering::Relaxed),
+        CSF_EXC.load(Ordering::Relaxed),
+    )
 }

@@ -19,6 +19,8 @@
 #include <cuda_fp8.h>
 
 #include "cutlass/float8.h"
+// 2026-10-17: moe_scale_byte (csfcar scale rows), read by sfb_tile_words and the scalar SFB pack.
+#include "../../../kernels/gb10/common/moe_scale_rows.cuh"
 
 // 2026-10-03: Round-to-nearest-even E2M1 code, saturating at 6: sign bit 8, magnitude code
 // 0..7 = {0, 0.5, 1, 1.5, 2, 3, 4, 6}. This is the rounding of PTX `cvt.rn.satfinite.e2m1x2.f32`
@@ -103,8 +105,13 @@ __device__ __forceinline__ void sfb_tile_words(
     if (aligned) {
       in4 = *reinterpret_cast<const unsigned int*>(src + at);
     } else {
-      in4 = (unsigned int)src[at] | ((unsigned int)src[at + 1] << 8) |
-            ((unsigned int)src[at + 2] << 16) | ((unsigned int)src[at + 3] << 24);
+      // 2026-10-17: byte reads through moe_scale_byte, so a tagged scale-rows pointer (odd, so
+      // never `aligned`) reads its decoded bytes; a plain pointer reads src[at + i] as before.
+      const unsigned int g = (unsigned int)(kb * 4);
+      in4 = (unsigned int)moe_scale_byte(src, row, (unsigned int)groups, g) |
+            ((unsigned int)moe_scale_byte(src, row, (unsigned int)groups, g + 1u) << 8) |
+            ((unsigned int)moe_scale_byte(src, row, (unsigned int)groups, g + 2u) << 16) |
+            ((unsigned int)moe_scale_byte(src, row, (unsigned int)groups, g + 3u) << 24);
     }
     unsigned int w = 0;
 #pragma unroll

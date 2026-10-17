@@ -253,6 +253,7 @@ use = [
   "../gb10/common/moe_gate_topk.cu",
   "../gb10/common/moe_permute.cu",
   "../gb10/common/moe_prefill.cu",
+  "../gb10/common/moe_scale_rows.cuh",
   "../gb10/common/moe_shared_expert_fused.cu",
   "../gb10/common/moe_shared_expert_fused_batch2.cu",
   "../gb10/common/moe_shared_expert_fused_batch2_t.cu",

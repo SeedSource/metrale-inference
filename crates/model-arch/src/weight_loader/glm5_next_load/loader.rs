@@ -138,7 +138,11 @@ impl ModelWeightLoader for Glm5NextWeightLoader {
             Ok(s) => Some((s.dtype, s.shape.clone(), host_bytes(gpu, s)?)),
             Err(_) => None,
         };
-        let host = if w.dtype == WeightDtype::FP8E4M3 { host_bytes(gpu, w)? } else { Vec::new() };
+        let host = if w.dtype == WeightDtype::FP8E4M3 {
+            host_bytes(gpu, w)?
+        } else {
+            Vec::new()
+        };
         match lm_head_bf16_plan(w.dtype, &w.shape, &host, scale.as_ref())? {
             None => dense(store, "lm_head.weight"),
             Some(bf16) => {
@@ -662,6 +666,11 @@ impl Glm5NextWeightLoader {
                     // 2026-10-06: `METRALE_GLM_WEIGHT_ARENA=1`: plan this layer's uploads into
                     // the derived weight arena; a no-op when the lever is off.
                     let on = metrale_config::glm_weight_arena();
+                    // 2026-10-17: csfcar: encode this layer's scale slices first, so the plan
+                    // has their sizes (no-op with METRALE_GLM_MOE_CSF_SCALES off).
+                    if on {
+                        expert_tp_bind::precode_csf_layer(store, idx, &mlp_cfg)?;
+                    }
                     expert_arena::plan_expert_layer(store, idx, &mlp_cfg, on);
                     let expert = |id: usize| bind_expert_cfg(gpu, store, idx, id, &mlp_cfg);
                     Glm5NextMlpSite::Moe(Box::new(mlp_build::build_moe(
@@ -878,9 +887,18 @@ pub(super) fn lm_head_bf16_plan(
         WeightDtype::BF16 | WeightDtype::UInt8 => Ok(None),
         WeightDtype::FP8E4M3 => {
             let Some((sdt, sshape, sbytes)) = scale else {
-                bail!("lm_head.weight is F8_E4M3 but lm_head.weight_scale is absent: an unscaled FP8 head is not read");
+                bail!(
+                    "lm_head.weight is F8_E4M3 but lm_head.weight_scale is absent: an unscaled FP8 head is not read"
+                );
             };
-            Ok(Some(super::fp8_dequant::dequant_one("lm_head.weight", shape, fp8_bytes, *sdt, sshape, sbytes)?))
+            Ok(Some(super::fp8_dequant::dequant_one(
+                "lm_head.weight",
+                shape,
+                fp8_bytes,
+                *sdt,
+                sshape,
+                sbytes,
+            )?))
         }
         other => bail!(
             "lm_head.weight is {other:?}: the GLM-5.3 head is read as BF16 [vocab, hidden] by lm_head_setup and the MTP \
@@ -893,9 +911,17 @@ pub(super) fn lm_head_bf16_plan(
 /// head is scaled F8 (FP4-Local): `load_lm_head` bound a BF16 copy, so these are
 /// dead. A BF16 (official) or prepacked-U8 head is the bound tensor itself and is
 /// never touched. Returns `(tensors freed, bytes freed)`.
-pub(super) fn free_superseded_fp8_head(store: &mut WeightStore, gpu: &dyn GpuBackend) -> Result<(usize, usize)> {
-    if !store.get("lm_head.weight").is_ok_and(|w| w.dtype == WeightDtype::FP8E4M3) {
+pub(super) fn free_superseded_fp8_head(
+    store: &mut WeightStore,
+    gpu: &dyn GpuBackend,
+) -> Result<(usize, usize)> {
+    if !store
+        .get("lm_head.weight")
+        .is_ok_and(|w| w.dtype == WeightDtype::FP8E4M3)
+    {
         return Ok((0, 0));
     }
-    store.free_matching(gpu, |n| n == "lm_head.weight" || n == "lm_head.weight_scale")
+    store.free_matching(gpu, |n| {
+        n == "lm_head.weight" || n == "lm_head.weight_scale"
+    })
 }

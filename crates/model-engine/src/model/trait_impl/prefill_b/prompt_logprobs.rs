@@ -68,6 +68,9 @@ impl TransformerModel {
             return Ok(());
         }
 
+        // 2026-10-17 (A191): Only this rank runs these windows, so the head must not
+        // split the vocab: a split head's all-reduce has no peer and hangs the serve.
+        let _local_head = crate::model::impl_a3_lm_head::RankLocalHead::enter();
         let mut host = vec![0u8; BATCH_ROWS * v * 2];
         let mut start = 0usize;
         while start < rows_to_score {

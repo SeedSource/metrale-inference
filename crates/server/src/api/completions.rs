@@ -47,29 +47,6 @@ mod prompts;
 
 use prompts::resolve_prompts;
 
-#[cfg(test)]
-mod prompt_logprobs_refusal_tests;
-
-/// 2026-10-17 (A191): Why a `/v1/completions` request for prompt logprobs (`echo` with
-/// `logprobs`) is refused on a serve of more than one rank, else `None`. The prompt-logprob
-/// windows (`prefill_b/prompt_logprobs.rs`) run on rank 0 only: rank 1's prefill command does
-/// not carry the request. A window of at most 16 rows takes the vocab-split tensor-core LM head,
-/// whose all-reduce rank 1 never joins, so the serve hangs (A191, 2026-10-15: a 333-token
-/// prompt, 12-row last window). Interim until rank 1 mirrors the windows.
-pub(crate) fn multi_rank_prompt_logprobs_refusal(
-    world_size: usize,
-    echo: bool,
-    logprobs: bool,
-) -> Option<String> {
-    (world_size > 1 && echo && logprobs).then(|| {
-        format!(
-            "echo with logprobs (prompt logprobs) is not supported on a multi-rank serve \
-             (world_size={world_size}): the prompt-logprob pass runs on rank 0 only and can \
-             hang the serve. Send echo without logprobs, or logprobs without echo."
-        )
-    })
-}
-
 pub async fn completions(
     CurrentModel(state): CurrentModel,
     req: Result<Json<CompletionRequest>, JsonRejection>,
@@ -83,11 +60,6 @@ pub async fn completions(
             );
         }
     };
-    if let Some(msg) =
-        multi_rank_prompt_logprobs_refusal(state.world_size, req.echo, req.logprobs.is_some())
-    {
-        return openai_error_response(StatusCode::BAD_REQUEST, msg);
-    }
     let prompts = match resolve_prompts(&state, &req.prompt) {
         Ok(t) => t,
         Err((status, msg)) => return openai_error_response(status, msg),

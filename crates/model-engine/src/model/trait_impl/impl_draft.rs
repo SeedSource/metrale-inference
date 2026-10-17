@@ -11,7 +11,9 @@
 //! Invariants: the ones in `trait_impl/mod.rs`.
 
 use anyhow::Result;
-use metrale_gpu_runtime::gpu::DevicePtr;
+use metrale_gpu_runtime::gpu::{DevicePtr, GpuBackend};
+use metrale_model_arch::dflash_head::DflashProposerState;
+use metrale_model_layers::layers::ops::ModelStats;
 
 use crate::model::types::TransformerModel;
 use crate::traits::{ModelDraft, SequenceState};
@@ -149,6 +151,15 @@ impl ModelDraft for TransformerModel {
             return Ok(());
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
+        make_ctx_room(
+            self.gpu.as_ref(),
+            &self.stats,
+            d,
+            1,
+            self.gpu.default_stream(),
+            "accept_append",
+            "log:dflash_ctx_slide_accept",
+        )?;
         let save_1 = base.offset(ctx_slot_bytes);
         let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
         self.gpu
@@ -182,6 +193,15 @@ impl ModelDraft for TransformerModel {
         let stream = self.gpu.default_stream();
         let pos_row0 = (seq_len_now as i32).saturating_sub(2);
         let pos_row1 = (seq_len_now as i32).saturating_sub(1);
+        make_ctx_room(
+            self.gpu.as_ref(),
+            &self.stats,
+            d,
+            2,
+            stream,
+            "eagle_accept_append",
+            "log:dflash_ctx_slide_eagle_accept",
+        )?;
         let save_0 = base;
         let dst_0 = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
         self.gpu
@@ -224,6 +244,15 @@ impl ModelDraft for TransformerModel {
         }
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
         let stream = self.gpu.default_stream();
+        make_ctx_room(
+            self.gpu.as_ref(),
+            &self.stats,
+            d,
+            num_accepted + 1,
+            stream,
+            "eagle_kgamma_append",
+            "log:dflash_ctx_slide_kgamma",
+        )?;
         for t in 0..=num_accepted {
             let row = base.offset(t * ctx_slot_bytes);
             let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
@@ -288,27 +317,16 @@ impl ModelDraft for TransformerModel {
         }
 
         // 2026-09-25: If the incoming rows would overflow the accumulator,
-        // slide first: keep the newest `keep` rows and drop the oldest.
-        // `ctx_committed = 0` makes the next propose recompute K/V for every
-        // kept row, and `ctx_positions` keeps absolute positions. `drop_n >=
-        // keep` holds only when `ctx_len >= 2 * keep`; when `ctx_len` is below
-        // that, the source and destination ranges of the single copy overlap.
-        if d.ctx_len + num_committed > d.max_ctx_len {
-            let keep = (d.max_ctx_len / 2).min(d.max_ctx_len.saturating_sub(num_committed));
-            let drop_n = d.ctx_len.saturating_sub(keep);
-            if drop_n > 0 {
-                let src = d.ctx_hidden_acc.offset(drop_n * ctx_slot_bytes);
-                let dst0 = d.ctx_hidden_acc.offset(0);
-                self.gpu
-                    .copy_d2d_async(src, dst0, keep * ctx_slot_bytes, stream)?;
-                d.ctx_positions.drain(..drop_n);
-                d.ctx_len = keep;
-                d.ctx_committed = 0;
-                tracing::info!(target: "metrale_model_engine::model::trait_impl", "DFlash UNIFIED_CTX watermark: slid ctx window (dropped {} oldest, keep {})",
-                    drop_n,
-                    keep,
-                );
-            }
+        // slide first: keep the newest rows and drop the oldest. `ctx_committed = 0`
+        // makes the next propose recompute K/V for every kept row, and
+        // `ctx_positions` keeps absolute positions. 2026-10-17 (A200): the shared
+        // `make_room_for`, which moves the rows in non-overlapping pieces (the single
+        // copy here overlapped when `drop_n < keep`).
+        if let Some(sl) = d.make_room_for(self.gpu.as_ref(), num_committed, stream)? {
+            tracing::info!(target: "metrale_model_engine::model::trait_impl", "DFlash UNIFIED_CTX watermark: slid ctx window (dropped {} oldest, keep {})",
+                sl.drop,
+                sl.keep,
+            );
         }
 
         // 2026-09-25: Append at the tail. The destination row is indexed by
@@ -374,24 +392,14 @@ impl ModelDraft for TransformerModel {
         let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
         let stream = self.gpu.default_stream();
         // 2026-09-25: When the accumulator is full, slide the window: keep the
-        // newest `max_ctx_len / 2` rows and drop the oldest. Here `ctx_len >=
-        // max_ctx_len`, so `drop_n >= keep` and the single copy's source and
-        // destination ranges do not overlap. `ctx_committed = 0` makes the next
-        // propose recompute K/V for every kept row, and `ctx_positions` keeps
-        // absolute positions.
-        if d.ctx_len >= d.max_ctx_len {
-            let keep = d.max_ctx_len / 2;
-            let drop_n = d.ctx_len - keep;
-            let src = d.ctx_hidden_acc.offset(drop_n * ctx_slot_bytes);
-            let dst0 = d.ctx_hidden_acc.offset(0);
-            self.gpu
-                .copy_d2d_async(src, dst0, keep * ctx_slot_bytes, stream)?;
-            d.ctx_positions.drain(..drop_n);
-            d.ctx_len = keep;
-            d.ctx_committed = 0;
+        // newest `max_ctx_len / 2` rows and drop the oldest. `ctx_committed = 0`
+        // makes the next propose recompute K/V for every kept row, and
+        // `ctx_positions` keeps absolute positions. 2026-10-17 (A200): the shared
+        // `make_room_for` (same rule for one row).
+        if let Some(sl) = d.make_room_for(self.gpu.as_ref(), 1, stream)? {
             tracing::info!(target: "metrale_model_engine::model::trait_impl", "DFlash SERIAL_APPEND watermark: slid ctx window (dropped {} oldest, keep {})",
-                drop_n,
-                keep,
+                sl.drop,
+                sl.keep,
             );
         }
         let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
@@ -454,4 +462,31 @@ impl ModelDraft for TransformerModel {
     ) -> Result<()> {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
+}
+
+/// 2026-10-17 (A200): Make room for `n` rows before an append to the DFlash ctx accumulator
+/// (`DflashProposerState::make_room_for`), and log the first slide at each site once per serve.
+/// Before this, `dflash_accept_append`, `dflash_eagle_accept_append` and
+/// `dflash_eagle_kgamma_append` wrote at `ctx_len` with no bound: a prompt longer than
+/// `METRALE_DFLASH_CTX_CAP` starts decode with a full window, and the first K=2 accept wrote
+/// two rows past the allocation (fp4lbdf, 2026-10-17: both ranks hung, no error).
+fn make_ctx_room(
+    gpu: &dyn GpuBackend,
+    stats: &ModelStats,
+    d: &mut DflashProposerState,
+    n: usize,
+    stream: u64,
+    site: &'static str,
+    once_key: &'static str,
+) -> Result<()> {
+    if let Some(s) = d.make_room_for(gpu, n, stream)?
+        && stats.once(once_key)
+    {
+        tracing::info!(target: "metrale_model_engine::model::trait_impl", "DFlash ctx slide ({site}): dropped {} oldest, keep {} (window {}, appending {n}); first at this site",
+            s.drop,
+            s.keep,
+            d.max_ctx_len,
+        );
+    }
+    Ok(())
 }

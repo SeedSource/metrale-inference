@@ -23,7 +23,7 @@ use metrale_model_layers::speculative::{DraftProposer, ProposerState};
 use metrale_model_layers::weight_map::{DenseWeight, QuantizedWeight};
 
 pub use kernels::DflashKernels;
-pub use state::{DflashProposerState, DflashScratch, PrefillCtxWindow};
+pub use state::{CtxSlide, DflashProposerState, DflashScratch, PrefillCtxWindow};
 
 /// 2026-09-25: Cross-sequence batch for one drafter forward: per sequence its
 /// last token, position, drafter block table (a device pointer) and filled
@@ -301,6 +301,8 @@ pub(super) fn option_b_from(v: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod option_b_tests;
+#[cfg(test)]
+mod ctx_slide_tests;
 
 mod forward_block;
 mod forward_block_layer;

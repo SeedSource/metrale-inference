@@ -50,6 +50,9 @@ mod hybrid_spec;
 mod impl_adapters;
 mod impl_device_feed;
 mod impl_draft;
+// 2026-10-17 (A200): every DFlash ctx append makes room before it writes.
+#[cfg(test)]
+mod impl_draft_ctx_tests;
 mod impl_ep;
 mod impl_forward;
 mod impl_lifecycle;
